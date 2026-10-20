@@ -1,0 +1,2305 @@
+SafeQL: Search-based Refinement for Safe and Efficient
+LLM-based Text-to-SQL
+Geonho Lee
+
+Min-Soo Kim∗
+
+ghlee5084@kaist.ac.kr
+Korea Advanced Institute of Science and Technology
+Republic of Korea
+
+minsoo.k@kaist.ac.kr
+Korea Advanced Institute of Science and Technology
+Republic of Korea
+
+ABSTRACT
+Large language models (LLMs) have advanced Text-to-SQL by
+enabling natural language interfaces to databases without taskspecific fine-tuning. However, existing LLM-based systems remain
+unreliable, often generating SQL queries that are invalid under
+the database schema, referencing non-existent tables, attributes,
+functions, or values. Such errors persist because interactions with
+the database management system (DBMS) are typically limited to
+error messages, leaving it in a largely passive role during query
+refinement. This paper proposes SafeQL, a search-based refinement
+paradigm that redefines the role of the DBMS as an active guide in
+the refinement process. Instead of regenerating entire queries after
+execution failure, SafeQL interprets DBMS feedback to incrementally repair only the erroneous components. Each refinement step
+is formulated as a guided search within a safe query space, where
+candidate queries are progressively validated through DBMS execution, thereby converging to an executable query and preventing
+repeated regeneration of errors. Experiments on the Bird and Spider
+benchmarks show that SafeQL significantly improves execution
+accuracy and efficiency compared to regeneration-based methods.
+PVLDB Reference Format:
+Geonho Lee and Min-Soo Kim. SafeQL: Search-based Refinement for Safe
+and Efficient LLM-based Text-to-SQL. PVLDB, 19(9): 2210-2223, 2026.
+doi:10.14778/3819518.3819545
+PVLDB Artifact Availability:
+The source code, data, and/or other artifacts have been made available at
+https://github.com/Geonho-Lee/SafeQL.
+
+1
+
+INTRODUCTION
+
+Natural language interfaces to databases (NLIDBs) have long been
+a key research goal at the intersection of database systems and natural language processing [11, 58]. Among them, Text-to-SQL—the
+task of translating a natural language question into an executable
+SQL query—represents the most concrete realization of this vision,
+enabling users to access structured data through natural language
+rather than query syntax. By eliminating the need for SQL expertise,
+Text-to-SQL systems make data access more inclusive and have
+broad applications in analytics, business intelligence, and scientific
+data exploration [12, 13, 21].
+∗ Corresponding author.
+
+This work is licensed under the Creative Commons BY-NC-ND 4.0 International
+License. Visit https://creativecommons.org/licenses/by-nc-nd/4.0/ to view a copy of
+this license. For any use beyond those covered by this license, obtain permission by
+emailing info@vldb.org. Copyright is held by the owner/author(s). Publication rights
+licensed to the VLDB Endowment.
+Proceedings of the VLDB Endowment, Vol. 19, No. 9 ISSN 2150-8097.
+doi:10.14778/3819518.3819545
+
+Research on Text-to-SQL has evolved through several generations. Early symbolic systems such as PRECISE [29], NaLIR [17],
+SQLizer [55], and ATHENA [36] relied on rule-based parsing and
+semantic grammars that explicitly mapped natural language to SQL
+templates. Although interpretable, these systems were fragile and
+required manual engineering for each domain. Subsequent neural semantic parsers replaced handcrafted rules with data-driven
+models trained on paired natural-language and SQL examples. Representative models include Seq2SQL [63], SQLNet [53], IRNet [9],
+RAT-SQL [49], and SmBoP [35], which introduced neural encoders
+and schema linking for cross-domain generalization. Later work
+incorporated syntax constraints and intermediate representations
+to improve validity and cross-schema transfer [20, 38]. Despite substantial progress, these models still require expensive annotation
+and retraining whenever the database schemas change, limiting
+their scalability in practical deployments.
+The emergence of large language models (LLMs) such as GPT [3]
+has profoundly transformed the Text-to-SQL landscape. Promptbased approaches like DAIL-SQL [7] and MCS-SQL [15] demonstrated that general-purpose LLMs can perform Text-to-SQL generation through schema-aware prompting, without task-specific
+fine-tuning. Building on this paradigm, subsequent prompting techniques—including few-shot sampling [3, 7, 15, 19, 24, 47], chain-ofthought reasoning [50, 59], and least-to-most decomposition [31, 32,
+64]—further improved logical coherence and interpretability. More
+recently, multi-agent systems including MAC-SQL [48], CHESSSQL [42], CHASE-SQL [30], Alpha-SQL [16], and OpenSearchSQL [52] have introduced collaborative reasoning, in which multiple LLM agents decompose, verify, and align candidate SQL queries
+to ensure consistent output. These systems mark a shift from oneshot generation to autonomous reasoning pipelines that incorporate
+coordination among multiple agents.
+Despite these advances, reliability remains a critical challenge
+due to the inherent hallucination tendencies of LLMs. In practice,
+many failures arise when generated queries cannot be executed,
+for example, due to references to nonexistent relations, attributes,
+or functions. Even state-of-the-art LLMs often produce queries that
+appear plausible but fail at the DBMS level. Such failures expose
+a mismatch between the user’s intent and the database schema
+and disrupt downstream workflows, making it essential to refine
+queries into safe (i.e., executable) ones.
+Recent studies [31, 34, 42, 48, 52] have attempted to mitigate this
+issue through regeneration-based refinement: executing the generated SQL, capturing DBMS error messages, and prompting the LLM
+to regenerate a corrected query. However, this paradigm treats the
+DBMS primarily as a passive checker that provides error messages,
+and repeatedly regenerates entire queries based on the errors. As a
+
+result, the regeneration loop is both inefficient—requiring excessive
+tokens and computation—and unreliable, often reintroducing previous errors with no guarantee of convergence. Figure 1(a) illustrates
+a regeneration-based refinement process. The model begins with
+an initial query 𝑞 0 , which fails during execution. Upon failure, the
+entire query is discarded, and a new query 𝑞 1 is regenerated based
+on the previous error message. This cycle repeats (e.g., 𝑞 2 , 𝑞 3 . . . )
+until an executable query is obtained. Each iteration re-parses and
+re-executes the entire query, resulting in redundant computation
+and limited reuse of valid fragments.
+In contrast, we propose SafeQL, a refinement framework that
+achieves safe and efficient correction through a search-based refinement paradigm that fundamentally rethinks how Text-to-SQL
+errors are corrected. Rather than discarding the initial query 𝑞 0 ,
+SafeQL interprets and incrementally refines it. As shown in Figure 1(b), when 𝑞 0 fails, SafeQL does not regenerate a new 𝑞 1 . Instead,
+it analyzes the DBMS feedback to precisely locate the faulty component—whether a relation, attribute, or function—and applies a
+minimal, structure-preserving correction as depicted in blue arrows
+in the Figure 1(b). This transforms 𝑞 0 directly into refined and executable queries, while preserving all valid fragments of the original
+logic. Through this process, SafeQL replaces the traditional trialand-error regeneration loop with a guided search over a safe query
+space as depicted in the green part of the Figure 1(b), where candidates are incrementally repaired to satisfy schema-level constraints
+enforced by the DBMS. Since this safe query space may contain
+multiple executable refinements for a single input 𝑞 0 —for example,
+when an unknown attribute can be repaired using several attributes
+in the schema-—SafeQL selects the candidate that is semantically
+the most aligned with the initial query 𝑞 0 . This paradigm shift redefines the DBMS from a passive checker into an active reasoning
+engine that incrementally narrows the search to the most faithful
+executable query, improving both safety and efficiency.
+LLM
+DBMS
+execu�on layer 1
+(check rela�ons)
+
+𝑞0
+
+LLM
+𝑞1
+
+𝑞2
+
+Error
+Error
+
+execu�on layer 2
+(check a�ributes)
+execu�on layer N
+(check types)
+
+DBMS
+
+𝑞0
+
+execu�on layer 1
+(check rela�ons)
+
+Error
+
+(a) Regenera�on-based reﬁnement
+
+execu�on layer 2
+(check a�ributes)
+execu�on layer N
+(check types)
+
+𝑞0
+
+Execu�on result
+(b) Search-based reﬁnement
+
+Figure 1: High-level comparison of refinement paradigms.
+Beyond the paradigm itself, the effectiveness of SafeQL critically
+depends on how search and optimization processes are conducted.
+The safe query space can grow exponentially, as each detected error
+may yield multiple candidate substitutions for relations, attributes,
+or values. To manage this combinatorial complexity, SafeQL employs a best-first search strategy guided by a semantic distance
+metric that combines structural similarity and embedding-based
+relevance. This prioritization ensures that the most promising candidates are explored first, improving convergence while preserving
+the user’s original query intent. In terms of optimizations, SafeQL incorporates type-based pruning, which eliminates type-inconsistent
+
+refinements, and top-𝐾 pruning, which restricts candidate substitutions to the most semantically relevant ones. Together, these
+optimizations make search-based refinement both practical and
+scalable.
+Equally important is how SafeQL is realized as a practical, systemlevel framework rather than merely an algorithmic concept. SafeQL
+is integrated directly into the DBMS, enabling refinement through
+the database’s own parser, binder, and type analyzer instead of treating SQL as plain text. This tight integration allows for precise error
+localization, while system-level optimizations—such as caching and
+vector indexing—make semantic similarity computations efficient at
+scale. Moreover, SafeQL incorporates a hybrid refinement strategy
+that combines its search-based refinement with selective regeneration to handle cases where the initial query is fundamentally
+misgenerated. Together, these system-level integrations make our
+SafeQL a complete, end-to-end framework that delivers reliable and
+efficient Text-to-SQL refinement in real-world environments.
+Our main contributions are summarized as follows:
+• We propose a search-based refinement paradigm that reformulates Text-to-SQL refinement as a guided exploration of a safe
+query space, where execution feedback serves as actionable semantic guidance rather than passive error reporting.
+• We propose a best-first search guided by a semantic distance
+metric, augmented with type-based and top-K pruning, enabling
+scalable and accurate refinement.
+• We implement SafeQL as a DBMS-integrated refinement framework, incorporating caching, vector indexing, and hybrid refinement to achieve efficient and robust execution.
+• We conduct comprehensive experiments on Bird and Spider
+benchmarks, demonstrating up to 5.8% improvements in execution accuracy and 15× reductions in token usage compared to
+regeneration-based baselines.
+The remainder of this paper is organized as follows. Section 2
+provides background and definitions. Section 3 introduces the safe
+query space and the refinement tree formulation. Section 4 details
+the search strategy, and Section 5 presents pruning optimizations
+for scalable refinement. Section 6 describes the system architecture,
+and Section 7 reports the experimental results. Finally, Section 8
+discusses related work, and Section 9 concludes the paper.
+
+2 PRELIMINARIES
+2.1 Text-to-SQL Stages
+The Text-to-SQL task translates a natural language question into
+an executable SQL query over a given database. Typically, this
+process can be decomposed into three stages: (1) extracting database
+information, (2) generating candidate SQL queries, and (3) refining
+them using DBMS execution. We formalize these stages as follows.
+Definition 1 (Text-to-SQL Process). Let 𝐷 denote a database, and
+let N , P, and Q denote the natural language, prompt, and query
+spaces, respectively. The Text-to-SQL process is defined as
+𝑓extract
+
+𝑓generate
+
+𝑓refine
+
+N −−−−−→ P −−−−−−→ Q −−−−−→ Q,
+
+where:
+
+• Extraction.
+𝑓extract : N × 𝐷 → P
+interprets the natural language question in the context of 𝐷 and
+constructs a prompt enriched with database-level hints.
+
+• Generation.
+𝑓generate : P → Q
+synthesizes an SQL query using the LLM that reflects the intent
+expressed in the prompt.
+• Refinement.
+𝑓refine : Q × 𝐷 → Q
+corrects the generated query using feedback obtained from DBMS
+execution over 𝐷.
+□
+Although LLMs can generate plausible SQL queries, they may
+still suffer from hallucinations. Hence, the refinement stage using DBMS execution is crucial to ensure reliability, regardless of
+whether the generation is based on the prompt [7, 15, 19, 31, 59] or
+the agent [5, 16, 40, 42, 52].
+
+2.2
+
+Refinement Stage
+
+In the refinement stage, the execution of the DBMS plays a central
+role in guiding the correction of the query, as shown in Figure 1.
+Execution errors provide essential feedback signals that enable the
+Text-to-SQL system to identify and correct invalid parts of a query.
+By interpreting these errors, the system can transform an invalid
+query into one that is both executable and semantically faithful
+to the user’s intent. To formalize how DBMS execution supports
+this process, we first define the notions of Database and Execution
+Error, describing how DBMS is utilized during refinement. Here,
+we adopt a simplified database definition tailored for Text-to-SQL
+scenarios (e.g., assuming that all attributes in 𝐴𝑡𝑡𝑠 are distinct).
+Definition 2 (Database). A database 𝐷 is a collection of relations,
+attributes, and values under schema and type constraints. Formally,
+𝐷 = (𝑅𝑒𝑙𝑠, 𝐴𝑡𝑡𝑠, 𝑉 𝑎𝑙𝑠,𝑇𝑦𝑝𝑠, Λ, Γ), where:
+• 𝑅𝑒𝑙𝑠 and 𝐴𝑡𝑡𝑠 are the sets of relations and attributes, respectively.
+• 𝑉 𝑎𝑙𝑠 is a set of instance-level values that populate the relations.
+• 𝑇𝑦𝑝𝑠 is a set of data types (e.g., int, varchar, text).
+• Λ : 𝑅𝑒𝑙𝑠 → 2𝐴𝑡𝑡𝑠 is a relation signature mapping each relation to
+its corresponding set of attributes.
+• Γ : 𝐴𝑡𝑡𝑠 ∪ 𝑉 𝑎𝑙𝑠 → 𝑇𝑦𝑝𝑠 is a type constraint mapping each
+attribute or value to its data type.
+□
+Figure 2 illustrates a simple schema with two relations, Users and
+Posts, where Λ(Users) = {ID, name, age} and Γ(name) = varchar.
+Users
+
+Posts
+
+ID
+name
+age
+(int) (varchar) (int)
+1
+James
+24
+2
+Leo
+20
+3
+Hana
+26
+
+UserID txt txt_len
+�me
+(int) (text) (int)
+(date)
+1,352 2025/7/28
+1
+1
+973
+2025/9/25
+7,492 2025/10/18
+3
+
+𝑅𝑒𝑙𝑠 : bold
+𝐴𝑡𝑡𝑠 : italic
+𝑉𝑎𝑙𝑠 : plain
+𝑇𝑦𝑝𝑠: (bracket)
+
+Figure 2: Example of a database.
+During query refinement, some candidate queries fail during
+execution due to schema or type violations. We refer to these cases
+as execution errors, as formally defined as follows.
+Definition 3 (Execution Error). Consider a DBMS that manages
+a database 𝐷. We denote the execution of 𝑞 ∈ Q by the DBMS as
+𝐷 ⊢ 𝑞 ⇒ ⟦𝑞⟧, where DBMS executes 𝑞 on 𝐷 and returns the
+result ⟦𝑞⟧. An execution error occurs when the execution fails, in
+which case we write:
+DBMS : 𝐷 ⊢ 𝑞 ⇒ 𝜖 (𝑞),
+
+where 𝜖 (𝑞) is the error reported by the DBMS. The most common
+errors in the Text-to-SQL scenario include:
+• unknown relation: The query references a non-existent table.
+• unknown attribute: The query refers to an undefined column.
+• unknown function (or operator): The query invokes a function
+(or operator) not supported by the DBMS.
+• empty result: The query executes successfully, but returns no
+tuples due to unsatisfiable predicates.
+□
+Figure 3 presents typical examples of execution errors along
+with their correct (gold) SQL counterparts. The top-left query fails
+because it references a non-existent attribute (username), whereas
+the top-right query accesses attributes (txt, time) from another
+relation without performing a join. In the bottom-left example, the
+function strftime fails to execute, illustrating how dialect-specific
+differences in SQL function support can cause errors. Finally, the
+bottom-right query returns an empty result due to a case-sensitive
+predicate mismatch (‘leo’ vs. ‘Leo’). Although empty results do
+not trigger runtime errors in standard DBMSs, many Text-to-SQL
+benchmarks treat them as errors [34, 39]. We follow this convention,
+while noting that empty results may not always correspond to
+incorrect queries in practice. Our system also provides configurable
+controls for refinement per error type, and reports detailed error
+statistics (Figure 9) to facilitate analysis.
+Error: unknown a�ribute
+Generated SELECT ID, username, age
+FROM Users
+SQL
+WHERE age >= 24;
+
+Gold
+SQL
+
+Error: unknown a�ribute
+SELECT txt, time
+FROM Users
+WHERE age >= 24;
+
+SELECT txt, time
+FROM Users
+JOIN Posts ON UserID = ID
+WHERE age >= 24;
+
+SELECT ID, name, age
+FROM Users
+WHERE age >= 24;
+
+(a) Errors requiring diﬀerent types of reﬁnements
+Error: unknown func�on
+
+Error: empty result
+
+SELECT txt
+Generated FROM Posts
+WHERE
+SQL
+strftime(′y′,time) = 2025
+
+SELECT name, age
+FROM Users
+WHERE name = ′leo′;
+
+SELECT txt
+FROM Posts
+WHERE
+date_part(′y′,time) = 2025
+
+SELECT name, age
+FROM Users
+WHERE name = ′Leo′;
+
+Gold
+SQL
+
+(b) Errors lacking inferable hints from error messages
+
+Figure 3: Examples of erroneous SQLs and gold SQLs.
+Regeneration-based Text-to-SQL methods [31, 34, 42, 48, 52]
+attempt to correct these errors through a regeneration-based refinement process, formally defined as follows.
+Definition 4 (Regeneration-based Refinement). Let 𝑞𝑖 ∈ 𝑄 denote
+the query at iteration 𝑖 (𝑖 ≥ 0). The refinement process
+regenerate
+
+𝑓refine
+
+: Q × 𝐷 → Q,
+
+consists of:
+
+• Execution. The DBMS executes the current query 𝑞𝑖 . If execution succeeds (i.e., 𝐷 ⊢ 𝑞𝑖 ⇒ ⟦𝑞𝑖 ⟧), it returns the result ⟦𝑞𝑖 ⟧.
+Otherwise, if execution failed, it returns an execution error 𝜖 (𝑞𝑖 ).
+• Regeneration. The refiner updates the prompt 𝑝𝑖 into the new
+one 𝑝𝑖+1 with the error information and regenerates a new query:
+𝑝𝑖+1 = (𝑝𝑖 , 𝑞𝑖 , 𝜖 (𝑞𝑖 )),
+
+𝑞𝑖+1 = 𝑓generate (𝑝𝑖+1 )
+
+This repeats until a valid query 𝑞𝑘 satisfies 𝐷 ⊢ 𝑞𝑘 ⇒ ⟦𝑞𝑘 ⟧. □
+
+Figure 4 illustrates this common prompt structure adopted by
+most regeneration-based methods. However, as shown in Figure 3(a),
+identical error messages Error: unknown attribute may correspond
+to different underlying causes, each requiring a distinct refinement
+strategy. Moreover, as shown in Figure 3(b), DBMS error messages
+often provide little or no actionable guidance, making it difficult for
+the model to determine the correct fix. To alleviate these limitations,
+several follow-up methods [34, 42, 52] enrich the error context. REDSQL [34] augments the error message with constraints violations
+details to provide a more informative signal. Meanwhile, CHESSSQL [42] and OpenSearch-SQL [52] incorporate few-shot refinement
+examples to guide the model toward more plausible refinements.
+Despite these improvements, all regeneration-based methods
+fundamentally rely on the LLM to regenerate an error-free query.
+Since the model offers no guaranty that a newly generated query
+will execute successfully, the process often requires multiple iterations before convergence. This iterative regeneration loop is
+both computationally expensive and time-consuming, significantly
+increasing LLM token usage and system latency.
+
+Based on this grammar, we define the refinement stage a sequence of atomic refinement steps, where each step is a transformation between two SQL queries that modifies exactly one syntactic
+component while preserving the structural validity of the query.
+Each refinement step corresponds to one of several canonical operations, formally described in Definition 5.
+𝑟
+Definition 5 (Refinement Step, −
+→ ). A refinement step 𝑟 is the
+application of one of the following operations to a given SQL query.
+
+• Relation Refinement: replace a relation 𝑅 with another 𝑅 ′ :
+𝑟
+FROM 𝑅 −
+→ FROM 𝑅 ′
+• Join Refinement: add a join with another relation 𝑅 ′ and a
+suitable condition 𝑊 ′ :
+𝑟
+FROM 𝑅 −
+→ FROM 𝑅 JOIN 𝑅 ′ ON 𝑊 ′
+• Attribute Refinement: replace an attribute 𝑎 with another 𝑎 ′ ,
+in either SELECT or WHERE. Typical cases include:
+𝑟
+SELECT 𝑎 −
+→ SELECT 𝑎 ′
+𝑟
+SELECT 𝑓 (𝑎 1, 𝑎 2, . . .) −
+→ SELECT 𝑓 (𝑎 1′ , 𝑎 2, . . .)
+𝑟
+WHERE 𝑎 1 ⊕ 𝑎 2 −
+→ WHERE 𝑎 1′ ⊕ 𝑎 2
+
+Refine the SQL based on the followings.
+[Question]
+Show me the posts from people who are older than 24
+[Database Schema]
+CREATE TABLE Users (ID int, name varchar, age int)
+CREATE TABLE Posts (UserID int, txt text, time date)
+[Generated SQL]
+SELECT txt, time FROM Users WHERE age >= 24
+[Execution result] Error: unknown attribute - txt
+[Few shot] {refinement examples}
+
+Figure 4: Example of a regeneration prompt.
+
+3
+
+SAFE QUERY SPACE
+
+This section formalizes the search space in which SafeQL performs
+query refinement. Unlike regenerating entire queries after each
+failure, SafeQL systematically explores a structured space of refinements—syntactic transformations that incrementally repair an
+erroneous query based on its observed error. SafeQL focuses on
+error-directed transformations, i.e., targeted adjustments that resolve
+the specific cause of failure while retaining the original query’s
+structure and intent. We first define by defining the atomic refinement step, then construct the safe refinement tree that organizes
+these steps into error-resolving paths, and finally formalize the safe
+query space comprising executable, error-free queries.
+
+3.1
+
+Refinement Step
+
+We begin with a simplified SQL grammar that captures the core
+syntactic components. Section 6.4 later extends this grammar to
+support subquery, aliasing, and other complex SQL structures.
+Query ::=
+F
+::=
+W
+::=
+S
+::=
+
+SELECT S FROM F WHERE W
+R | F JOIN R ON W
+𝑎1 ⊕† 𝑎2 | 𝑎 ⊕ 𝑣
+𝑣 | 𝑎 | f(𝑎 1, 𝑎 2, ...)
+
+Figure 5: Simplified SQL syntax.
+
+† The symbol ⊕ denotes a comparison operator (e.g., =, <, >).
+
+𝑟
+
+or
+
+WHERE 𝑎 1 ⊕ 𝑎 2′
+
+WHERE 𝑎 ′ ⊕ 𝑣
+
+WHERE 𝑎 ⊕ 𝑣 −
+→
+• Value Refinement: replace a constant value 𝑣 with another 𝑣 ′ :
+𝑟
+WHERE 𝑎 ⊕ 𝑣 −
+→ WHERE 𝑎 ⊕ 𝑣 ′
+• Function Refinement: replace a function symbol 𝑓 with another
+𝑓 ′ while preserving its argument structure:
+𝑟
+SELECT 𝑓 (𝑎 1, 𝑎 2, . . .) −
+□
+→ SELECT 𝑓 ′ (𝑎 1, 𝑎 2, . . .)
+
+3.2
+
+Safe Refinement Tree
+
+Although each refinement step defines a syntactically valid transformation, executing all possible steps would lead to an excessively
+large and semantically irrelevant search space. In practice, most execution errors arise from specific syntactic components of the query
+(e.g., relations, attributes, or functions), and only refinements targeting those components can effectively resolve the error [4, 26, 39].
+For instance, an unknown relation error is typically resolved by
+replacing the relation in the FROM clause, whereas an unknown
+attribute error is commonly addressed by replacing the invalid
+attribute in the SELECT clause. These refinements differs from traditional rule-based generation [17, 36, 55], whose handcrafted rules
+restrict what queries can be produced in the first place; SafeQL’s
+refinement act only after a query is generated, correcting errors
+without limiting the overall expressiveness of the query. This observation motivates the notion of a safe refinement tree, which defines
+the entire search space of SafeQL that can be explored through
+admissible refinement steps for a given error.
+Definition 6 (Safe Refinement Tree, Tsafe,𝑞 ). Given an query 𝑞, the
+safe refinement tree Tsafe,𝑞 is a directed tree that represents errorresolving refinement paths from 𝑞 and is defined as follows:
+• The root of Tsafe,𝑞 is the initial query 𝑞.
+• An edge is added if the parent query produces an execution error.
+• Each edge corresponds to a refinement step
+𝑟
+𝑞−
+→ 𝑞 ′ for some 𝑟 ∈ R (𝜖 (𝑞)).
+Here, R (𝜖) denotes the set of admissible refinement operations
+allowed for each error 𝜖:
+
+⎧
+Relation Refinement
+⎪
+⎪
+⎪
+⎪
+⎪
+⎪
+Relation Refinement
+⎪
+⎪
+⎞
+⎪
+⎪
+Join Refinement ⎟
+⎨
+⎪
+R (𝜖) = Attribute Refinement ⎠
+⎪
+)︃
+⎪
+⎪
+Function Refinement
+⎪
+⎪
+⎪
+⎪
+Attribute Refinement
+⎪
+⎪
+⎪
+⎪
+Value Refinement
+⎩
+
+for its error type. To complete this intuition, we now formalize that
+such error-resolving refinements are not merely illustrative but are
+guaranteed to exist within the Safe Refinement Tree.
+
+if 𝜖 = unknown relation
+if 𝜖 = unknown attribute
+if 𝜖 = unknown function
+if 𝜖 = empty result
+
+□
+
+For unknown attribute and unknown function errors, multiple
+refinement operations are admissible because their causes are often
+indirect. An unknown attribute may not only indicate a misspelled
+or mismatched column name, but also reveal that the necessary
+relation has not been joined at all. Likewise, an unknown function
+may arise either from an undefined function name or from invalid
+arguments within its call—for example, when a missing attribute
+renders the function signature invalid.
+Figure 6 illustrates an example Safe Refinement Tree. The root
+query first fails with an unknown attribute error because the attribute txt does not exist in the Users relation in the FROM clause.
+Accordingly, SafeQL explores only the admissible refinements for
+this error type—Attribute, Join, and Relation refinement—and Figure 6 highlights three representative refinement steps:
+(1) Relation Refinement (Users → Posts);
+(2) Join Refinement (Users JOIN Posts ON UserID = ID);
+(3) Attribute Refinement (txt → name).
+After the attribute error is resolved—e.g., txt is resolved through
+the middle branch, where a Join Refinement introduces the missing
+Posts relation—the next level of the refinement tree produces a
+new failure in the function call. Although sum is a valid aggregate
+function, it is not defined over string-typed arguments such as txt,
+leading to an unknown function error. At this refinement level, both
+function-level and attribute-level corrections are admissible, and
+two representative refinements are shown:
+(1) Function Refinement (sum → count);
+(2) Attribute Refinement (txt → txt_len).
+unknown a�ribute
+SELECT sum(txt)
+FROM Users
+WHERE age = 24
+
+…
+JOIN
+Posts
+unknown func�on
+
+Users → Posts
+unknown a�ribute
+
+txt → name
+unknown func�on
+
+SELECT sum(txt)
+FROM Users
+JOIN Posts ON ...
+WHERE age = 24
+
+SELECT sum(txt)
+FROM Posts
+WHERE age = 24
+
+…
+
+…
+
+…
+sum → count
+SELECT count(txt)
+FROM Users
+JOIN Posts ON ...
+WHERE age = 24
+
+SELECT sum(name)
+FROM Users
+WHERE age = 24
+
+txt → txt_len
+
+SELECT sum(txt_len)
+FROM Users
+JOIN Posts ON ...
+WHERE age = 24
+
+sum → count
+
+SELECT count(name)
+FROM Users
+WHERE age = 24
+
+name → age
+SELECT sum(age)
+FROM Users
+WHERE age = 24
+
+Safe Query Space
+
+Figure 6: Example of a Safe Refinement Tree.
+The example above provides the intuition that each execution
+error can be resolved by one of the admissible refinements defined
+
+Lemma 7 (Reachability of Error-resolving Refinements).
+Given a database 𝐷 = (𝑅𝑒𝑙𝑠, 𝐴𝑡𝑡𝑠, 𝑉 𝑎𝑙𝑠,𝑇𝑦𝑝𝑠, Λ, Γ) and the safe refinement tree Tsafe,𝑞 , every execution error 𝜖 (𝑞) at a node 𝑞 ∈ Tsafe,𝑞
+has a corresponding refinement edge (𝑞, 𝑞 ′ ) such that the refinement
+operation 𝑟 ∈ R (𝜖 (𝑞)) resolves the error under the database 𝐷.
+To formalize this guarantee, we introduce a lightweight operational semantics [10] of SQL execution, in which an error judgment
+𝐷 ⊢ 𝑞 ⇒ 𝜖 (𝑞) is produced when the corresponding error condition
+holds. Formally:
+the error condition indicating a violation of execution premise
+𝐷 ⊢ 𝑞 ⇒ 𝜖 (𝑞)
+Proof. We analyze each error type by making its operational
+error condition explicit and showing that at least one refinement in
+R (𝜖) always restores the violated execution premise. Let relations(𝐹 )
+denote the set of base relations that appear in the FROM clause 𝐹 .
+(1) Unknown Relation. SQL execution requires that every relation
+referenced in 𝐹 exist in the database schema:
+∃𝑅 ∈ relations(𝐹 ), 𝑅 ∉ 𝑅𝑒𝑙𝑠
+𝐷 ⊢ SELECT S FROM F WHERE W ⇒ unknown relation
+A Relation Refinement replaces the invalid 𝑅 with a valid
+relation 𝑅 ′ ∈ 𝑅𝑒𝑙𝑠, thereby restoring the failed premise. Thus, at
+least one refinement edge (𝑞, 𝑞 ′ ) always exists.
+(2) Unknown Attribute. An attribute must belong to the union of
+attribute signatures of all relations in F:
+⋃︁
+𝑎 ∉ 𝑅 ∈relations(𝐹 ) Λ(𝑅)
+𝐷 ⊢ SELECT a FROM F WHERE W ⇒ unknown attribute
+This error can be repaired by one of the following refinements:
+(2.1) Relation Refinement. Replace a relation 𝑅 in the FROM
+clause with a relation 𝑅 ′ such that 𝑎 ∈ Λ(𝑅 ′ ), ensuring that the
+referenced attribute exists in the revised schema context.
+(2.2) Join Refinement. Add a relation 𝑅 ′ to the query such that
+𝑎 ∈ Λ(𝑅 ′ ), so that relations(𝐹 ) is extended with 𝑅 ′ and the attribute reference to be valid.
+(2.3) Attribute Refinement. Replace the unresolved attribute
+⋃︁
+𝑎 with an attribute 𝑎 ′ satisfying 𝑎 ′ ∈ 𝑅 ∈relations(𝐹 ) Λ(𝑅), making
+the attribute reference to match one of the attributes provided
+by the current FROM clause.
+In either case, the violated condition is recoverable: if 𝑎 exists
+elsewhere in the schema, Relation or Join refinement brings the corresponding relation into the query; otherwise, Attribute refinement
+replaces 𝑎 with a valid attribute. Hence at least one refinement edge
+(𝑞, 𝑞 ′ ) always resolves the error.
+(3) Unknown Function. A function expression may fail for one
+of two reasons: either the function itself is unsupported by the
+DBMS, or the function exists, but its argument expressions do not
+satisfy the type requirements imposed by its signature. Here, 𝐹𝑢𝑛𝑐𝑠
+denotes the set of all function symbols supported by the DBMS.
+𝑓 ∉ 𝐹𝑢𝑛𝑐𝑠
+𝐷 ⊢ 𝑓 (𝑎 1, . . . , 𝑎𝑘 ) ⇒ unknown function
+𝑓 : 𝜏1, . . . , 𝜏𝑘 → 𝜏out, Γ(𝑎𝑖 ) = 𝜏𝑖′, (𝜏1′ , . . . , 𝜏𝑘′ ) ≠ (𝜏1, . . . , 𝜏𝑘 )
+𝐷 ⊢ 𝑓 (𝑎 1, . . . , 𝑎𝑘 ) ⇒ unknown function
+
+This error can be repaired by one of the following refinements:
+(3.1) Function Refinement. If 𝑓 ∉ 𝐹𝑢𝑛𝑐𝑠, replace 𝑓 with a supported function 𝑓 ′ ∈ 𝐹𝑢𝑛𝑐𝑠, restoring the violated condition.
+(3.2) Attribute Refinement. If the function symbol exists, but
+the argument types do not match its signature 𝑓 : 𝜏1, . . . , 𝜏𝑘 →
+𝜏out , we assume the schema includes at least one attribute of each
+required type 𝜏𝑖 . Under this assumption, the violation is repaired
+by replacing one or more arguments 𝑎𝑖 with attributes 𝑎𝑖′ such
+that Γ(𝑎𝑖′ ) = 𝜏𝑖 , thereby restoring the required types.
+In either case, the violation is recoverable: it is replaced, and a
+type mismatch is fixed via argument refinement. Thus, at least one
+refinement edge (𝑞, 𝑞 ′ ) resolves the error.
+(4) Empty Result. This error occurs when the query is syntactically and semantically valid, but its predicate evaluates to false
+for all tuples. Typical causes include overly restrictive comparison
+operators (e.g., =, >, < applied in a way that no tuple can satisfy),
+comparisons against values that do not exist in the database, or contradictory filter conditions. In such cases, the error can be repaired
+by adjusting the value conditions, such as relaxing a comparison,
+modifying a constant, or substituting a value that appears in the
+data—so that the predicate becomes satisfiable. Accordingly, a Value
+Refinement typically provides a refinement edge (𝑞, 𝑞 ′ ) that adjusts
+the predicate to produce a non-empty result.
+Taken together, these four cases show that every violated execution premise can be repaired by an admissible refinement.
+□
+To illustrate how the operational semantics used in the proof
+relate to the refinement process, we present two examples that
+instantiate the refinement steps shown in Figure 6.
+Example 1 (Join Refinement; Case 2.2).
+txt ∉ Λ(Users)
+𝐷 ⊢ SELECT txt FROM Users ⇒ unknown attribute
+If txt ∈ Λ(Posts), then Join Refinement extends FROM clause:
+FROM Users → FROM Users JOIN Posts ON UserID = ID.
+The violated premise is restored because txt ∈ Λ(Posts), This
+corresponds to the middle edge of the first level shown in Figure 6.
+Example 2 (Attribute Refinement; Case 3.2).
+sum : int → int, Γ(name) = text, text ≠ int
+𝐷 ⊢ SELECT sum(name) FROM Users ⇒ unknown function
+If the schema provides an attribute of the required type, such as
+Γ(age) = int, then Attribute Refinement replaces the argument:
+sum(name) → sum(age).
+This corresponds to the rightmost edge of the second level shown
+in Figure 6. Together, the Lemma 7 ensures that every erroneous
+node in the safe refinement tree has at least one valid refinement
+leading to a safe (i.e., executable) query. Consequently, the refinement process is guaranteed to reach a region of error-free queries,
+which we define as the safe query space, formalized below.
+Definition 8 (Safe Query Space). Every leaf node 𝑞 ′ in the refinement tree Tsafe,𝑞 satisfies ⟦𝑞 ′ ⟧ ≠ 𝜖 (𝑞). We refer to the set of all such
+leaf nodes as the Safe Query Space:
+Qsafe = { 𝑞 ′ | 𝑞 ′ is a leaf node of Tsafe,𝑞 and ⟦𝑞 ′ ⟧ ≠ 𝜖 (𝑞 ′ ) }.
+Proof. By construction of Tsafe,𝑞 , a query 𝑞 is refined when
+⟦𝑞⟧ = 𝜖 (𝑞). Thus, if a node 𝑞 ′ has no children (i.e., it is a leaf), it
+must satisfy ⟦𝑞 ′ ⟧ ≠ 𝜖 (𝑞 ′ ). Therefore, all leaf nodes in Tsafe,𝑞 are
+error-free, and their set constitutes the safe query space.
+□
+
+In Figure 6, the green-highlighted queries correspond exactly to
+such leaf nodes in Tsafe,𝑞 and thus serve as concrete instances of
+queries contained in the safe query space.
+
+4
+
+SEARCH ALGORITHM
+
+This section explains how SafeQL navigates the safe query space
+to identify the most semantically faithful executable query. We
+first define the search objective based on semantic distance, then
+describe a best-first search algorithm that prioritizes refinements
+closest to the original query.
+
+4.1
+
+Search Objective under Semantics
+
+Having defined the safe query space Qsafe , we now formalize the
+objective that governs the search process within this space. Even
+among valid candidates in Qsafe , refinements may differ in how well
+they preserve the original intent. To quantify such a deviation, we
+define a semantic distance that jointly measures structural change
+and embedding-level drift.
+Definition 9 (Semantic Distance, 𝛿). For two queries 𝑞𝑖 and 𝑞 𝑗 ,
+the semantic distance 𝛿 (𝑞𝑖 , 𝑞 𝑗 ) is defined as
+𝛿 (𝑞𝑖 , 𝑞 𝑗 ) = 𝛼 · 𝑑 struct (𝑞𝑖 , 𝑞 𝑗 ) + (1 − 𝛼) · 𝑑 embed (𝑞𝑖 , 𝑞 𝑗 ), 𝛼 ∈ [0, 1].
+• 𝑑 struct (𝑞𝑖 , 𝑞 𝑗 ) measures structural deviation (e.g., relation or join
+refinements) using the normalized tree edit distance [60] between the abstract syntax trees of 𝑞𝑖 and 𝑞 𝑗 , a standard metric
+for comparing hierarchical structures such as XML and JSON.
+• 𝑑 embed (𝑞𝑖 , 𝑞 𝑗 ) measures semantic deviation based on embeddings:
+∑︂
+𝑑 embed (𝑞𝑖 , 𝑞 𝑗 ) =
+∥𝑣𝑡 − 𝑣𝑡 ′ ∥,
+(𝑡 →𝑡 ′ )
+
+where (𝑡 →𝑡 ′ ) denotes each replaced token (relation, attribute,
+or value) and 𝑣𝑡 is the embedding vector of token 𝑡 computed by
+a neural embedding model [33].
+□
+This hybrid formulation is conceptually analogous to the sparsedense hybrid retrieval in information retrieval, which combines
+complementary lexical and semantic signals to improve ranking
+robustness [6, 37]. Similarly, combining 𝑑 struct and 𝑑 embed provides a
+more robust and balanced measure of syntactic fidelity and semantic preservation, while remaining a heuristic rather than a strict
+notion of semantic equivalence. The former enforces grammatical
+consistency, while the latter maintains semantic proximity in embedding space. The weighting parameter 𝛼 controls this trade-off,
+and we empirically validate its effect in Section 7.4.
+With semantic distance formalized, we now explain how SafeQL
+leverages it during the refinement process. Unlike regenerationbased methods that repeatedly apply Q → Q by regenerating full
+SQLs after every failure, SafeQL redefines refinement as a guided
+search from the general query space Q into the executable subset
+Qsafe under the database 𝐷. In this view, each erroneous query
+serves not as a terminal failure but as a starting point from which
+SafeQL identifies the nearest semantically consistent counterpart
+in Qsafe under the distance metric 𝛿. We formalize this as follows:
+Definition 10 (Search-based Refinement). The refinement process
+finds the safe query nearest to the input query 𝑞 within a distance 𝛿.
+search
+𝑓refine
+: Q × 𝐷 → Qsafe,
+
+𝑞 safe = arg ′min 𝛿 (𝑞, 𝑞 ′ ).
+𝑞 ∈ Qsafe
+
+4.2
+
+Best-first Search-based Refinement
+
+The overall refinement process follows a best-first exploration of
+the safe query space, as shown in Algorithm 1. Unlike exhaustive
+search, which explore all refinements uniformly, best-first search
+naturally limits exploration in a branch-and-bound style [25], accelerating convergence. The search initializes a priority queue ordered
+by semantic distance from the LLM-generated initial query, expanding the closest candidates first. This design takes the initial query as
+the reference point under the assumption that it reflects the LLM’s
+interpretation of the user’s intent and thus serves as a reasonable
+available signal for recovering the original intent. When this initial query is fundamentally misgenerated, search-based refinement
+alone is insufficient, and SafeQL therefore incorporates a hybrid
+refinement strategy to regenerate the query and establish a better
+starting point, as described later in Section 6.3.
+During each iteration of the loop (Lines 4-16), the algorithm
+dequeues the nearest candidate query 𝑞 (Line 5) and attempts to
+execute it within the tryExecute block (Lines 7). If execution succeeds, the algorithm immediately returns 𝑞 as the nearest safe query
+(Line 8), thus guaranteeing that the first valid query discovered is
+the one most semantically similar to the original input.
+When execution fails, SafeQL captures the corresponding error
+type 𝜖 (𝑞) within the catchError block (Lines 9-16) and uses it to
+guide subsequent refinements. The GenerateRefinements procedure (Line 10) selects the appropriate refinement operations (e.g.,
+relation, join, or attribute refinements) based on 𝜖, while PruneRefinements (Line 11) filters out redundant or semantically invalid
+refinements. Each surviving refinement 𝑟 is then applied to produce
+a new candidate query 𝑞 ′ (Line 13), which is enqueued for future
+exploration only if it has not been visited previously (Lines 16).
+
+5
+
+Algorithm 1: Best-first Search-based Refinement
+Input: 𝑞
+/* original query */
+Input: 𝛼
+/* structure–embedding weight factor */
+Input: refineQueue /* priority queue ordered by 𝛿 (𝑞, 𝑞 ′ ) */
+1 push (𝑞, 0) into refineQueue;
+2 mark 𝑞 as visited;
+3 Function searchBasedRefine(𝑞):
+4
+while refineQueue is not empty do
+5
+𝑞 current ← arg min𝑞 ′ ∈refineQueue 𝛿 (𝑞, 𝑞 ′ );
+6
+mark 𝑞 current as visited;
+7
+tryExecute (𝑞 current )
+8
+return 𝑞 current ; /* nearest safe query found */
+9
+catchError
+10
+R ← generateRefinements(𝜖 (𝑞 current ));
+11
+R pruned ← pruneRefinements(R);
+12
+forall 𝑟 ∈ R pruned do
+13
+𝑞 ′ ← applyRefinements (𝑞 current, 𝑟 );
+14
+if 𝑞 ′ not visited then
+15
+𝛿 ← calculateDistance(𝑞, 𝑞 ′, 𝛼);
+16
+push (𝑞 ′, 𝛿) into refineQueue;
+unknown a�ribute
+Type-based pruned
+Top-K pruned (K = 1)
+
+…
+user
+ID
+→
+(text) (int)
+
+Proposition 11 (Exponential Size of Safe Query Space). For
+a safe refinement tree Tsafe,𝑞 with branching factor 𝑟 and depth 𝑑,
+the total size of the search space is O (𝑟 𝑑 ), since each refinement can
+generate 𝑟 new candidates at every level.
+This exponential growth makes exhaustive enumeration infeasible even for moderately complex databases. To mitigate this issue,
+SafeQL introduces pruning mechanisms that restrict the number
+of refinements explored at each step. These strategies—type-based
+pruning and top 𝐾 refinement pruning—jointly suppress unpromising branches in the refinement tree, effectively reducing fan-out
+while preserving meaningful candidates.
+
+user name user age
+→
+→
+(text) (text) (text) (int)
+empty result
+
+SELECT ID, age
+FROM Users
+WHERE ID = ′leo′
+
+SELECT ID, age
+FROM Users
+WHERE name = ′leo′
+
+SELECT ID, age
+FROM Users
+WHERE age = ′leo′
+
+…
+
+PRUNING METHODS
+
+Although all queries in the safe space are executable, the space can
+grow rapidly as each refinement generates many candidates. For
+each error, all schema-level elements (relations, attributes, values)
+are considered, causing a single step to branch into dozens of candidates. Value refinements can expand even further, since every
+possible value in the database becomes a potential substitution.
+For example, in Figure 7, an unknown attribute error for user
+leads SafeQL to try all attributes (e.g., name, ID, age). Even after
+correction, WHERE name = ‘leo’ may produce an empty result,
+triggering another round of refinements where ‘leo’ is substituted
+with every possible value in the table—‘Leo’, ‘Hana’, ‘James’, and
+so on. This results in combinatorial growth of candidates across
+refinement layers.
+
+SELECT ID, age
+FROM Users
+WHERE user = ′leo′
+
+ʹleoʹ→ ʹLeoʹ ʹleoʹ→ ʹHanaʹ ʹleoʹ→ ʹJamesʹ
+(𝛿 = 0.13)
+(𝛿 = 0.27)
+(𝛿 = 0.49)
+SELECT ID, age
+FROM Users
+WHERE name = ′Leo′
+
+SELECT ID, age
+FROM Users
+WHERE name = ′Hana′
+
+SELECT ID, age
+FROM Users
+WHERE name = ′James′
+
+Figure 7: Example of pruning in the safe refinement tree.
+
+5.1
+
+Type-based Refinement Pruning
+
+Type information provides a strong pruning signal because any
+type mismatch immediately yields an invalid query. In SQL, each
+operator and function has a fixed input signature; thus, if a substituted attribute or value violates this signature, execution inevitably
+results in an error. SafeQL leverages the typing environment Γ to
+discard such candidates before semantic evaluation.
+Algorithm 2 presents this mechanism. It validates refinements
+under Γ and prunes type-inconsistent candidates. In Figure 7, WHERE
+user = ‘leo’ yields name, ID, and age, with Γ(name) = TEXT and
+Γ(ID) = Γ(age) = INT. Applying TypeCheck, only name is retained
+since ‘leo’ is TEXT. This prevents non-executable branches from
+entering the search.
+
+5.2
+
+Top-𝐾 Refinement Pruning
+
+Even after type-based pruning, many refinements remain typeconsistent but semantically distant. To improve efficiency, SafeQL
+ranks candidates by embedding similarity and retains only the top𝐾 per category. This is particularly beneficial for value refinements,
+
+where the out-degree is large and most database values are semantically unrelated to the query; in such cases, embedding-based
+similarity provides an effective signal for filtering out implausible
+candidates. A smaller 𝐾 yields higher efficiency but risks overpruning, while a larger 𝐾 improves accuracy at increased search
+cost, a tradeoff we examine empirically in Section 7.4.
+Algorithm 3 summarizes this mechanism. SafeQL retrieves candidates, ranks them by semantic distance, and retains only the top-𝐾.
+Examples are shown in Figure 7. This pruning suppresses unpromising branches and focuses refinement on relevant candidates.
+Algorithm 2: Type-Based Refinement Pruning
+Function pruneRefinements(R):
+foreach 𝑟 ∈ R do
+3
+switch 𝑟 do
+𝑟
+4
+case Attribute Refinement: 𝑎 1 ⊕ 𝑎 2 −
+→ 𝑎 1′ ⊕ 𝑎 2 do
+′
+5
+𝜏1, 𝜏2 ← Γ(𝑎 1 ), Γ(𝑎 2 );
+6
+if typeCheck(⊕, 𝜏1, 𝜏2 ) pass then
+7
+add 𝑟 to R pruned ;
+𝑟
+8
+case Value Refinement: 𝑎 ⊕ 𝑣 −
+→ 𝑎 ⊕ 𝑣 ′ do
+′
+9
+𝜏𝑎 , 𝜏𝑣 ← Γ(𝑎), Γ(𝑣 );
+10
+if typeCheck(𝜏𝑎 , 𝜏𝑣 ) pass then
+11
+add 𝑟 to R pruned ;
+𝑟
+12
+case Function Refinement: 𝑓 −
+→ 𝑓 ′ do
+′
+13
+if typeCheck(𝑓 , Γ(𝑎 1 ), . . .) pass then
+14
+add 𝑟 to R pruned ;
+1
+
+2
+
+Algorithm 3: Top-𝐾 Refinement Pruning
+Input: 𝐾
+/* number of nearest neighbors to explore */
+1 Function pruneRefinements(R):
+2
+foreach 𝑟 ∈ R do
+3
+switch 𝑟 do
+𝑟
+4
+case Relation Refinement: 𝑅 −
+→ 𝑅 ′ do
+5
+if |{𝑥 ∈ 𝑅𝑒𝑙𝑠 : ∥𝑣 𝑅 − 𝑣 𝑥 ∥ ≤ ∥𝑣 𝑅 − 𝑣 𝑅 ′ ∥}| ≤ 𝐾
+6
+add 𝑟 to R pruned ;
+𝑟
+7
+case Attribute Refinement: 𝑎 −
+→ 𝑎 ′ do
+8
+if |{𝑥 ∈ 𝐴𝑡𝑡𝑠 : ∥𝑣 𝑎 − 𝑣 𝑥 ∥ ≤ ∥𝑣 𝑎 − 𝑣 𝑎′ ∥}| ≤ 𝐾
+9
+add 𝑟 to R pruned ;
+𝑟
+10
+case Value Refinement: 𝑣 −
+→ 𝑣 ′ do
+11
+if |{𝑥 ∈ 𝑉 𝑎𝑙𝑠 : ∥𝑣 𝑣 − 𝑣 𝑥 ∥ ≤ ∥𝑣 𝑣 − 𝑣 𝑣 ′ ∥}| ≤ 𝐾
+12
+add 𝑟 to R pruned ;
+𝑟
+13
+case Function Refinement: 𝑓 −
+→ 𝑓 ′ do
+14
+if |{𝑥 ∈ 𝐹𝑢𝑛𝑐 : ∥𝑣 𝑓 − 𝑣 𝑥 ∥ ≤ ∥𝑣 𝑓 − 𝑣 𝑓 ′ ∥}| ≤ 𝐾
+15
+add 𝑟 to R pruned ;
+
+6
+
+SYSTEM ARCHITECTURE DESIGN
+
+Although the core of SafeQL lies in its search-based refinement
+algorithm, realizing it as a refinement framework for building practical text-to-SQL systems requires addressing several system-level
+challenges. Unlike a conceptual refinement algorithm, an actual
+implementation must integrate deeply with the DBMS, eliminate
+redundant computation, remain robust against fundamentally incorrect queries, support syntactically complex SQL structures, and
+stay compatible with diverse Text-to-SQL systems. Consequently,
+SafeQL’s architecture is built around five key design considerations:
+
+• In-DBMS integration for precise error detection.
+• Systematic optimization for scalable refinement.
+• Hybrid refinement that complements search with regeneration.
+• Grammar extensions enabling broad SQL coverage.
+• Compatibility with diverse Text-to-SQL systems as a postgeneration refinement layer. We describe each aspect below.
+
+6.1
+
+In-DBMS Integration
+
+External Text-to-SQL systems rely on error strings, which may
+mention identifiers (e.g., unknown relation R) but do not reliably
+indicate error locations; some DBMSs provide no positions, and
+even when they do (e.g., position 15), they refer only to character
+offsets and cannot distinguish multiple occurrences such as SELECT
+R.a FROM R. Locating the correct occurrence thus requires additional parsing, which is ambiguous under aliasing, nested queries,
+or repeated references. SafeQL instead performs refinement inside
+the DBMS over the Abstract Syntax Tree (AST). When a query 𝑞𝑖
+fails, the analyzer directly identifies the corresponding AST node.
+Modifications are restricted to these nodes; since the AST encodes
+attribute–relation links (e.g., R.a refers to R), updates can be applied without affecting unrelated occurrences, and each refined
+query is re-analyzed and validated. This enables precise and safer
+structurally grounded refinement beyond text-based approaches,
+despite slightly higher implementation complexity.
+
+6.2
+
+Systematic Optimization
+
+Executing refinement inside the DBMS introduces a new bottleneck: repeated embedding and similarity computations across overlapping query fragments. To eliminate such redundancy, SafeQL
+incorporates two in-database optimization layers:
+• Embedding Cache. Embeddings of relations, attributes, and
+values are precomputed and stored on disk, while frequently
+accessed items are cached in memory. This prevents repeated
+embedding computation across refinements.
+• Vector Index. To efficiently perform nearest-neighbor search
+(particularly for Top-𝐾 pruning), SafeQL builds an HNSW-based
+vector similarity index over cached embeddings.
+Since these structures are maintained in the DBMS, tuple and
+embedding updates are consistently reflected in the vector index
+via a vector extended relational system. Optimizing update maintenance via incremental techniques [54, 56] is left for future work.
+
+6.3
+
+Hybrid Refinement Strategy
+
+Even with precise in-database refinement, some queries are fundamentally misgenerated. To handle these, SafeQL adopts a hybrid
+strategy combining search-based and regeneration-based refinement. When the number of refinement steps reaches a threshold
+(default 100) without producing a valid query, SafeQL triggers a regeneration loop. Such cases typically indicate that the initial query
+is too far from a valid structure for localized refinement to succeed,
+in which case an LLM generates a new candidate conditioned on
+the original input, the current query, and the DBMS error feedback. This also addresses LLM-side errors, such as invalid or even
+non-parsable generations by reinitializing the search from a new
+candidate. The relative contribution of search-based refinement
+and hybrid fallback is analyzed in Table 3 and Subsection 7.2.1. This
+hybrid design ensures robustness to deeply misgenerated queries
+without undermining the efficiency of search-based refinement.
+
+6.4
+
+Grammar Extensions
+
+Practical Text-to-SQL systems must handle more complex SQL than
+the simplified grammar presented in Section 3. SafeQL therefore
+extends its support to standard SQL constructs appearing in benchmarks such as Bird [18] and Spider [57], including:
+• Nested subqueries: supports recursively scoped queries by refining subqueries in an inside-out manner. A subquery 𝑞𝑠 is
+recursively refined into 𝑞𝑠′ (Line 3) and replaced (Line 5), after
+which refinement continues on the outer query (Line 6). The
+output Λ(𝑞𝑠′ ) is exposed to the DBMS analyzer (Line 4), enabling
+proper scope resolution for outer references.
+• Alias refinement: extends relation and attribute refinement to
+handle alias normalization (e.g., R.a).
+• Clause-level extensions: support clauses such as GROUP BY,
+ORDER BY, and LIMIT. For example, ORDER BY O takes the form
+(O ::= 𝑎 | 𝑓 (𝑎 1, 𝑎 2, . . .)) and is refined as:
+𝑟
+𝑟
+𝑟
+ORDER BY 𝑎 −
+→ 𝑓 ′ (𝑎 1, ...).
+→ 𝑎 ′, 𝑓 (𝑎 1, ...) −
+→ 𝑓 (𝑎 1′ , ...), 𝑓 (𝑎 1, ...) −
+GROUP BY and LIMIT are handled analogously.
+
+refinement manager (Section 6.3). Throughout the process, all intermediate queries are parsed and validated under the extended SQL
+grammar (Section 6.4), ensuring that even complex transformations
+remain syntactically correct and executable. Together, these mechanisms elevate SafeQL from an algorithmic concept to a practical,
+database-native Text-to-SQL refinement framework.
+Implementation: SafeQL is implemented on top of PostgreSQL’s
+RawStmt structure, the canonical AST representation of SQL queries.
+It is packaged as a PostgreSQL [46] extension, using fastembed [43]
+with the bge-base-en-v1.5 model [51] for embedding computation
+and pgvecto.rs [45] for efficient vector indexing inside the DBMS.
+
+7
+
+EXPERIMENTAL EVALUATION
+
+In this section, we evaluate SafeQL in terms of two key dimensions:
+(1) accuracy, measured by execution accuracy, and (2) efficiency,
+measured by elapsed time and the number of LLM tokens consumed.
+Our goal is to demonstrate that SafeQL improves accuracy while
+reducing expensive LLM invocations across various settings.
+
+Algorithm 4: Nested Subqery Refinement
+
+7.1
+
+Function recursiveRefine(𝑞):
+2
+if 𝑞 contains a subquery 𝑞𝑠 then
+3
+𝑞𝑠′ ← recursiveRefine(𝑞𝑠 );
+4
+Λ(𝑞𝑠′ ) ← {𝑎 1, 𝑎 2, . . . };
+/* 𝑞𝑠′ = SELECT 𝑎 1 , 𝑎 2 , . . . */
+′
+5
+replace 𝑞𝑠 in 𝑞 with 𝑞𝑠 ;
+6
+return searchBasedRefine(𝑞);
+
+7.1.1 Benchmarks.
+Bird [18] is a widely used cross-domain Text-to-SQL benchmark
+and our primary evaluation dataset. To align with our PostgreSQLbased implementation, we migrated the Bird to PostgreSQL. We
+evaluate both the full dev set (1,534 queries) and the mini dev set
+(500 queries), for main and detailed evaluation, respectively. Both
+dev sets span 11 databases and cover diverse queries, including
+joins, grouping, and subqueries.
+Spider [57] is another major cross-domain benchmark, consisting
+of 10,181 text-to-SQL pairs across 200 relational databases spanning
+more than 130 domains. For our experiments, we migrated Spider
+to PostgreSQL to verify SafeQL’s generalizability across different
+benchmarks and database environments.
+
+1
+
+6.5
+
+Compatibility with Text-to-SQL Systems
+
+SafeQL integrates with diverse Text-to-SQL systems as a postgeneration refinement layer. It attaches to prompt-based systems
+without modifying prompts and applies to agent-based systems by
+refining their final queries to ensure safe execution in the DBMS.
+
+6.6
+
+Architecture
+
+Figure 8 summarizes how these components interact within the
+SafeQL architecture. When a query 𝑞𝑖 fails over the database 𝐷, the
+query refiner operates inside the DBMS to locate the error source
+𝜖 (𝑞𝑖 ) and generate refined candidates 𝑞𝑖′ that correct the erroneous
+AST nodes (Section 6.1), while leveraging cached embeddings and
+vector indices for efficient similarity computation (Section 6.2).
+Hybrid Reﬁnement Manager
+𝑞𝑖
+
+𝑞safe
+
+𝑞𝑖
+
+regenera�on
+𝑞𝑖+1
+loop
+
+DBMS
+Query Parser
+𝑞𝑖 ′
+Query
+Executor
+
+search
+loop
+𝑞𝑖, 𝜖(𝑞𝑖 )
+
+Query Reﬁner
+Cache
+Manager
+
+Vector Index
+Manager
+
+Large
+Language
+Model
+
+Database (𝐷)
+
+Figure 8: Architecture of the SafeQL framework.
+Within the search loop, the query refiner iteratively explores candidate refinements until a valid query 𝑞 safe is found. If unsuccessful
+until a threshold is reached, control moves to the regeneration loop,
+where an LLM regenerates a new query 𝑞𝑖+1 guided by the hybrid
+
+Experimental Setup
+
+7.1.2 Testbed systems. We integrate SafeQL with two representative Text-to-SQL approaches: prompt-based and agent-based methods. Specifically, we adopt DAIL-SQL and OpenSearch-SQL as the
+state-of-the-art systems for these approaches, respectively.
+DAIL-SQL [7] is a prompt-based system that optimizes question
+representation, example selection, and example organization for incontext learning. As the state-of-the-art prompt-based method on
+the Spider benchmark, it serves as a strong baseline for evaluating
+SafeQL’s refinement in prompting-based settings.
+OpenSearch-SQL [52] is an agent-based system that decomposes
+the Text-to-SQL process into four modules—Preprocessing, Extraction, Generation, and Refinement—linked through a consistency
+alignment mechanism. It leverages dynamic few-shot learning with
+self-taught Query-CoT-SQL pairs and structured few-shot templates, achieving state-of-the-art performance on the Bird benchmark. We integrate SafeQL into OpenSearch-SQL to evaluate its
+refinement behavior under multi-agent coordination.
+7.1.3 Comparison methods. To isolate the effect of refinement,
+we compare SafeQL with the refinement methods of five prominent Text-to-SQL systems—DIN-SQL, MAC-SQL, RED-SQL, CHESSSQL, and OpenSearch-SQL—all of which adopt regeneration-based
+paradigms.
+
+• DIN-SQL [31] refines SQL without execution, assuming potential
+errors. Among its two prompt variants, GENERIC and GENTLE,
+we use GENTLE, which performed better in our experiments.
+• MAC-SQL [48] regenerates SQL using DBMS error messages.
+• RED-SQL [34] refines SQL using constraint-based violation
+reports rather than raw DBMS errors, providing data-aware feedback that helps the LLM correct semantic inconsistencies.
+• CHESS-SQL [42] uses few-shot refinement examples combined
+with an execution error message.
+• OpenSearch-SQL [52] also uses few-shot examples, but provides
+more structured templates tailored to specific error messages.
+Table 1: Comparison of refinement methods.
+Refinement
+Refinement
+Use of
+Use of
+Methods
+Paradigm
+Error Msg Examples
+DIN-SQL
+No
+Zero-shot
+MAC-SQL
+Yes
+Zero-shot
+Regeneration
+RED-SQL
+Yes†
+Zero-shot
+CHESS-SQL
+Yes
+Few-shot
+OpenSearch-SQL
+Yes
+Few-shot
+SafeQL (ours)
+Search + Regeneration
+Yes
+Few-shot
+† RED-SQL uses constraint violation reports as extended error feedback.
+
+7.1.4 Models. We use GPT-OSS-120B [1] as the primary model
+for all methods, as it provides strong performance among opensource LLMs while ensuring transparent and reproducible evaluation across methods. We also evaluate SafeQL with two complementary model families:
+• commercial LLMs—GPT-4o [28] and GPT-3.5-turbo [27]
+• open source LLMs—Llama-3 [2] and Qwen-2.5 [44]
+This diversity allows us to assess SafeQL’s robustness and portability across model architectures and training paradigms.
+7.1.5 Hardware and Software Environment. All experiments were
+conducted on a single server equipped with two AMD EPYC 7302
+CPUs (3.0 GHz, 16 cores each), 2096 GB RAM (3200 MHz), and two
+NVIDIA A100 GPUs. LLM inference was served using vLLM [14].
+
+7.2
+
+Main results
+
+We evaluate SafeQL on both the Bird and Spider benchmarks, measuring its impact on execution accuracy, token efficiency, and refinement time. Across all settings, SafeQL consistently achieves
+higher accuracy while consuming far fewer LLM tokens than prior
+regeneration-based refinement methods.
+7.2.1 Bird results. Table 3 summarizes the results on the Bird full
+dev benchmark. SafeQL achieves the best overall performance, improving execution accuracy to 63.3% with DAIL-SQL in the promptbased approach and 69.4% with OpenSearch-SQL in the agent-based
+approach—gains of +5.8% and +5.2%, respectively—while reducing
+execution errors by up to 87.4%, showing its robustness across
+both approaches. A deeper look at the regeneration-based methods
+highlights their inherent trade-offs:
+• DIN-SQL regenerates queries without execution feedback, and
+this often makes the queries worse, leading to accuracy loss.
+• MAC-SQL incorporates raw error messages but provides limited
+semantic guidance, resulting in modest gains.
+• RED-SQL improves accuracy with constraint-violation feedback,
+but at the cost of extremely high token usage and latency.
+
+• CHESS-SQL and OpenSearch-SQL leverage few-shot examples
+for stronger accuracy; among them, OpenSearch-SQL is the most
+balanced, requiring fewer tokens through a short prompt design
+while maintaining high performance. However, both still rely on
+full regeneration after every failure.
+In contrast, SafeQL(hybrid) employs search-based refinement
+that explores a structured space of error-directed transformations
+and invokes regeneration only when necessary. This approach
+enables SafeQL to reach valid queries with 1.8–15.1× fewer tokens
+and 1.9–29.6× far shorter refinement latency, achieving both higher
+accuracy and greater efficiency than existing regeneration-based
+methods. In addition, SafeQL(search), which relies solely on searchbased refinement without issuing new SQL generations, resolves a
+large fraction of errors with no token overhead. As reflected in ΔErr
+(%), search-based refinement already reduces a substantial portion
+of errors, leaving only 13%–17% of erroneous queries to proceed to
+hybrid fallback, while incurring a moderate runtime overhead of
+approximately 1.3–1.8× on average.
+7.2.2 Spider results. Table 4 shows the results on the Spider benchmark in the prompt-based setting (DAIL-SQL), where prompting
+systems already achieve strong performance and agent-based systems offer limited additional benefit. SafeQL achieves 91.7% execution accuracy, improving the baseline by +4.6% and outperforming
+regeneration-based methods by 2.6–6.4%. SafeQL also demonstrates
+strong efficiency, requiring 5.1–96.5× fewer tokens and achieving
+4.2–34.5× shorter refinement latency, while reducing execution
+errors by 77.4%. SafeQL(search) delivers most gains without additional tokens, indicating that search-based refinement remains
+effective and stable even in larger, diverse settings.
+
+7.3
+
+Accuracy analysis
+
+7.3.1 Model-wise results. Table 2 compares SafeQL across different
+model families on the Bird mini dev benchmark. The results show
+that SafeQL consistently improves execution accuracy regardless of
+model size or architecture. Open-source models such as Qwen and
+Llama exhibit substantial gains of +5–12%, narrowing the performance gap with larger proprietary models, while commercial LLMs
+(GPT-3.5-Turbo, GPT-4o) also improve by +4–9% in both prompt
+and agent-based settings.
+These results indicate that SafeQL’s search-based refinement
+is model-agnostic: it strengthens weaker models through explicit
+structural guidance while still providing measurable gains for strong
+systems. This consistency across model families highlights its general applicability and robustness across diverse LLM architectures.
+Table 2: Model-wise comparison of SafeQL performance on
+the Bird mini dev benchmark, where ΔEX denotes the accuracy gain over the no-refinement baseline.
+Model
+
+Prompt-based
+
+Agent-based
+
+EX (%)
+
+ΔEX (%)
+
+EX (%)
+
+ΔEX (%)
+
+Qwen-2.5-7B
+Qwen-2.5-72B
+
+44.0
+60.2
+
++9.6
++5.8
+
+47.2
+63.4
+
++9.0
++5.2
+
+Llama-3-8B
+Llama-3.3-70B
+
+37.4
+60.6
+
++11.6
++5.6
+
+39.8
+63.6
+
++10.2
++5.4
+
+GPT-3.5-Turbo
+GPT-4o
+
+52.4
+61.8
+
++9.4
++4.8
+
+53.0
+66.0
+
++8.8
++4.6
+
+Table 3: Comparison on the Bird full dev benchmark using GPT-OSS-120B, showing the absolute execution accuracy (EX), error
+reduction (ΔErr), additional LLM costs (ΔTokens), and elapsed time (ΔTime) for accuracy gains (ΔEX) via refinements.
+Prompt-based (DAIL-SQL)
+
+Refinements
+
+Agent-based (OpenSearch-SQL)
+
+EX (%) ΔEX (%) ΔErr (%) ΔTokens (𝐾) ΔTime (s) EX (%) ΔEX (%) ΔErr (%) ΔTokens (𝐾) ΔTime (s)
+
+No refinement
+
+57.5
+
+–
+
+–
+
+–
+
+–
+
+64.2
+
+–
+
+–
+
+–
+
+–
+
+DIN-SQL [31]
+MAC-SQL [48]
+RED-SQL [34]
+CHESS-SQL [42]
+OpenSearch-SQL [52]
+
+57.2
+59.3
+62.9
+62.6
+62.0
+
+−0.3
++1.8
++5.4
++5.1
++4.5
+
+4.2
+23.0
+44.2
+69.1
+63.0
+
++7,748
++3,865
++19,594
++6,653
++3,799
+
++5,079
++3,505
++20,110
++3,295
++3,141
+
+62.7
+65.6
+66.7
+68.5
+68.3
+
+−1.6
++1.4
++2.5
++4.3
++4.1
+
+11.0
+19.7
+46.5
+80.3
+69.3
+
++118,615
++66,358
++411,469
++79,934
++53,143
+
++62,104
++42,004
++474,390
++35,573
++30,880
+
+SafeQL (search)
+SafeQL (hybrid)
+
+62.5
+63.3
+
++5.0
++5.8
+
++70.9
++83.0
+
++0
++1,305
+
++1,249
++1,653
+
+68.1
+69.4
+
++3.9
++5.2
+
++70.1
++87.4
+
++0
++28,779
+
++8,656
++16,029
+
+Table 4: Comparison on the Spider benchmark using GPTOSS-120B under the DAIL-SQL prompt.
+
+No refinement
+
+87.1
+
+–
+
+–
+
+–
+
+–
+
+DIN-SQL
+MAC-SQL
+RED-SQL
+CHESS-SQL
+OpenSearch-SQL
+
+85.3
+88.4
+88.6
+89.1
+89.1
+
+−1.8
++1.3
++1.5
++2.0
++2.0
+
+−3.2
+−22.6
+−29.0
+−45.1
+−48.7
+
++1, 055
++396
++7,528
++1,279
++465
+
++1194
++753
++6,120
++1,305
++1,050
+
+sequence of valid refinement steps can ever transform them into
+an executable query.
+In contrast, the agent-based setting, as shown in Figure 9(b)
+starts from a stronger baseline, as the LLM handles both extraction
+and generation, leading to a more balanced error distribution. Even
+so, SafeQL further eliminates nearly all remaining structural and
+functional errors—resolving 100% of unknown relation, attribute,
+and function errors—and reduces empty result errors by 84%. These
+results demonstrate that SafeQL operates orthogonally to the underlying Text-to-SQL systems and that the defined safe query space
+is not only theoretically sound but also practically effective in capturing nearly all executable refinements in real workloads.
+
+SafeQL (search) 91.3
+SafeQL (hybrid) 91.7
+
++4.2
++4.6
+
+-68.5
+-77.4
+
++0
++78
+
++37
++177
+
+7.4
+
+Refinements
+
+Prompt-based
+EX (%) ΔEX (%) ΔErr (%) ΔTokens (𝐾) ΔTime (s)
+
+∎ Occurred errors ∎ Resolved errors
+Before
+Reﬁnements
+
+A�er
+Reﬁnements
+
+unknown
+rela�on
+unknown
+a�ribute
+unknown
+func�on
+empty
+result
+
+𝛥𝐸𝑟𝑟
+100%
+
+others
+
+𝛥𝐸𝑟𝑟
+40%
+
+Before
+Reﬁnements
+
+𝛥𝐸𝑟𝑟
+80%
+
+(a) Prompt-based
+
+A�er
+Reﬁnements
+
+unknown
+rela�on
+unknown
+a�ribute
+unknown
+func�on
+𝛥𝐸𝑟𝑟 empty
+71% result
+
+𝛥𝐸𝑟𝑟
+100%
+𝛥𝐸𝑟𝑟
+100%
+𝛥𝐸𝑟𝑟
+100%
+
+others
+
+𝛥𝐸𝑟𝑟
+100%
+
+𝛥𝐸𝑟𝑟
+81%
+
+Efficiency analysis
+
+Figure 10 presents efficiency ablation experiments on the Bird mini
+dev under the prompt-based setting, isolating the effects of SafeQL’s
+components: (1) pruning methods and (2) systematic optimizations.
+
+𝛥𝐸𝑟𝑟
+84%
+
+(b) Agent-based
+
+Figure 9: Error statistics of SafeQL.
+7.3.2 Error analysis. Figure 9 compares the SafeQL’s error reduction across the major error categories. These four representative
+forms of errors—unknown relation, unknown attribute, unknown
+function, and empty result—cover most of the execution failures
+observed in practice, and SafeQL consistently reduces all of them
+in both prompting- and agent-based settings.
+In the prompt-based setting, as shown in Figure 9(a), the majority
+of errors arise from unknown attribute or empty result. Because its
+extraction stage is less sophisticated than that of an agent-based setting, attribute mismatches and overly restrictive predicates appear
+more frequently. SafeQL resolves 81% of unknown attribute errors
+and 71% of empty result cases, demonstrating that search-based
+refinement substantially improves the reliability of prompt-driven
+generation. The remaining failures typically stem from severely
+misgenerated queries that cannot enter the safe query space, so no
+
+• Effect of pruning. Figure 10(a) shows that pruning substantially
+improves search efficiency without any loss of accuracy. Without
+pruning, refinement requires 1403 sec on Bird and 581 sec on
+Spider. Applying either type-based or top-𝐾 pruning individually shortens this time, and combining both achieves the best
+performance—reducing the elapsed time to 647 sec and 177 sec, respectively. These results show that pruning strategies effectively
+bound the search space while preserving refinement quality.
+• Effect of systematic optimizations. Figure 10(b) evaluates the
+impact of systematic optimization on refinement latency. The
+baseline–lacking caching and indexing–requires over 20,000 sec
+on Bird and 9,000 sec on Spider. Introducing caching reduces this
+time to 1357 sec and 433 sec, while indexing alone yields only
+a modest improvement. When combined, the total time further
+decreases to 647 sec and 177 sec—amounting to over 30× overall reduction—again with no degradation in execution accuracy.
+Among these optimizations, caching contributes the most by
+eliminating redundant embedding computations, whereas indexing provides complementary acceleration for similarity lookups.
+Figure 11 shows how performance changes on the Bird mini
+dev benchmark, as we vary the two key parameters 𝛼 and 𝐾. We
+report results in a search-only setting to isolate the effect of these
+parameters.
+
+• Effect of 𝜶 . The higher 𝛼 increases the penalty for structural
+transformation during refinement, making the search space more
+compact and substantially reducing latency. However, this also
+introduces a trade-off: mid-range values (𝛼 ≈ 0.3–0.4) consistently provide the best execution accuracy, while larger 𝛼 values
+prioritize speed over precision.
+• Effect of 𝑲 . Raising 𝐾 allows SafeQL to keep more candidates
+at each refinement step, effectively widening the search tree.
+This improves accuracy through broader exploration but also
+increases search time. In practice, accuracy saturates once 𝐾 ≥ 3,
+so setting 𝐾 to at least 3 provides near-optimal performance
+while keeping runtime manageable.
+
+1000
+
+1216
+
+964
+
+337
+100
+
+647
+
+581
+254
+
+177
+
+Type Top-K Both
+Not
+pruned pruned pruned pruned
+
+∎ Spider
+Elapsed Time (sec)
+
+Elapsed Time (sec)
+
+∎ Bird
+1403
+
+10000
+
+20373 18725
+9129 9035
+1357
+647
+433
+177
+
+1000
+100
+
+Baseline +index +cache +both
+
+(a) Eﬀect of Pruning methods
+
+(b) Eﬀect of Systema�c op�miza�ons
+
+Figure 10: Efficiency ablation studies.
+Elapsed �me
+
+(a) Execu�on accuracy while varying 𝜶
+59.8
+
+60
+59
+
+60.2 60.2 60.2 60.2 60.2
+
+58.2
+
+58
+𝐾=
+
+1
+
+2
+
+3
+
+4
+
+5
+
+7
+
+10
+
+(c) Execu�on accuracy while varying 𝑲
+
+379
+
+243 189176 157155
+
+α=
+
+2
+
+0
+
+(b) Elapsed �me while varying 𝜶
+Elapsed Time (sec)
+
+61
+
+400
+
+1
+
+1
+
+α=
+
+2
+
+57
+
+800 780 621 517
+
+0.2
+0.2
+5
+0.3
+0.3
+5
+0.4
+0.4
+5
+0.5
+
+59.7
+58.6
+57.2
+
+Elapsed Time (sec)
+
+59.2
+59 58.4
+
+60 60.2 60.2 60
+
+0.2
+0.2
+5
+0.3
+0.3
+5
+0.4
+0.4
+5
+0.5
+
+Execu�on Accuracy (%) Execu�on Accuracy (%)
+
+Execu�on accuracy
+61
+
+750
+498
+
+550
+350
+150
+𝐾=
+
+179 202
+1
+
+2
+
+243
+3
+
+566 601
+
+325
+
+4
+
+5
+
+7
+
+10
+
+(c) Elapsed �me while varying 𝑲
+
+System overhead
+
+Table 5 reports the system overhead of SafeQL on the Bird dev database; Spider is omitted due to its small size (<1 GB), where both the
+embedding cache and index are negligible. The reported primary
+storage includes all tuples and value embeddings, which are common in Text-to-SQL systems [21] and are not introduced by SafeQL.
+SafeQL adds two auxiliary structures—an embedding cache and
+a vector index—both substantially smaller than the primary data,
+resulting in minimal storage overhead. Although index construction is relatively expensive with a single thread (2472 sec), it can be
+significantly reduced via parallelism (295 sec). Since construction
+is performed once upfront and subsequent updates can be handled
+via incremental strategies [54, 56], the overhead remains moderate
+in practice and can be further reduced with future optimizations.
+Table 5: SafeQL overhead on the Bird database (T = # threads).
+Primary
+SafeQL overhead
+storage Cache size Index size Index build time (1T / 16T)
+8.04 GB
+
+686.6 MB
+
+375.2 MB
+
+2472 sec / 295 sec
+
+RELATED WORK
+
+• LLM-based Text-to-SQL can be broadly categorized into promptbased and agent-based approaches. Prompt-based approaches improve generation quality via prompt design. DAIL-SQL [7], MCSSQL [15], PET-SQL [19], and CodexDB [47] enable in-context
+learning through few-shot prompting. Act-SQL [59] and CoTSQL [41] enhance reasoning via Chain-of-Thought, while DTSSQL [32] and DIN-SQL [31] uses a decomposition to breakdown
+complex questions. Agent-based approaches coordinate agents to
+generate queries and maintain consistency. C3 [5], CHESS [42],
+and CSC-SQL [40] select consistent outputs across candidates,
+OpenSearch-SQL [52] aligns intermediate states, and AlphaSQL [16] applies Monte Carlo Tree Search over agent actions.
+• Search techniques in Text-to-SQL are used in decoding during generation, where greedy search selects the most probable
+token, as in SQLNet [53] and Seq2SQL [63], and beam search explores multiple candidates, as in RAT-SQL [49], EditSQL [62], SmBoP [35], and ZeroNL2SQL [8]. At a higher level, Alpha-SQL [16]
+applies search via MCTS over agent actions to guide generation.
+These approaches perform search during generation, exploring
+multiple candidates while constructing SQL. However, while
+substantially enhancing generation quality and robustness, this
+also involves maintaining multiple candidates during decoding
+and generation, introducing additional computational overhead,
+which is further exacerbated in large models (e.g., LLMs), along
+with hallucination issues inherent to such models that may compromise query safety. In contrast, SafeQL introduces search in the
+refinement stage within the DBMS, leveraging execution feedback to ensure safety while avoiding unnecessary regeneration,
+enabling faster and more token-efficient refinement.
+
+9
+
+Figure 11: Effects of the parameters 𝛼 and 𝐾.
+
+7.5
+
+8
+
+CONCLUSION AND DISCUSSION
+
+SafeQL introduces a novel search-based perspective on Text-toSQL refinement, transforming database feedback into structured
+guidance for executable, intent-preserving queries. By coupling
+semantic search with in-database optimization, it achieves both
+reliability and efficiency, improving execution accuracy by up to
+5.8% while reducing token usage by 15× over regeneration-based
+baselines. Rather than replacing existing generation paradigms,
+SafeQL complements them through structured, error-guided search
+process tightly coupled with database semantics.
+More broadly, this work relates to efforts to improve the safety of
+LLMs under formal correctness constraints, where hallucinations
+often produce invalid or non-executable results. Recent work in
+Automatic Program Repair (APR) similarly treats generation as a
+constraint-guided process integrated with type systems [22, 23, 61].
+Likewise, SafeQL uses the DBMS analyzer as structured constraints
+to ground refinement in database semantics and ensure executionsafe query construction, suggesting broader integration of symbolic
+database reasoning with LLMs for more reliable database interfaces.
+
+ACKNOWLEDGMENTS
+This work was supported by the National Research Foundation
+of Korea(NRF) grant funded by the Korea government(MSIT)(No.
+RS-2024-00347471) and Institute of Information & communications
+Technology Planning & Evaluation (IITP) grant funded by the Korea
+government(MSIT) (No. 2019-0-01267, GPU-based Ultrafast Multitype Graph Database Engine SW).
+
+REFERENCES
+[1] Sandhini Agarwal, Lama Ahmad, Jason Ai, Sam Altman, Andy Applebaum,
+Edwin Arbus, Rahul K Arora, Yu Bai, Bowen Baker, Haiming Bao, et al. 2025.
+gpt-oss-120b & gpt-oss-20b model card. arXiv preprint arXiv:2508.10925 (2025).
+[2] Meta AI. 2024. The Llama 3 Herd of Models. https://ai.meta.com/llama/
+[3] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D. Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry,
+Amanda Askell, Sandhini Agarwal, Ariel Herbert-Voss, Gretchen Krueger,
+Tom Henighan, Rewon Child, Aditya Ramesh, Daniel Ziegler, Jeffrey Wu,
+Clemens Winter, Chris Hesse, Mark Chen, Eric Sigler, Mateusz Litwin, Scott
+Gray, Benjamin Chess, Jack Clark, Christopher Berner, Sam McCandlish,
+Alec Radford, Ilya Sutskever, and Dario Amodei. 2020. Language Models
+are Few-Shot Learners. In Advances in Neural Information Processing Systems. 1877–1901. https://proceedings.neurips.cc/paper_files/paper/2020/hash/
+1457c0d6bfcb4967418bfb8ac142f64a-Abstract.html
+[4] Ziru Chen, Shijie Chen, Michael White, Raymond Mooney, Ali Payani, Jayanth
+Srinivasa, Yu Su, and Huan Sun. 2023. Text-to-SQL Error Correction with Language Models of Code. In Proceedings of the 61st Annual Meeting of the Association
+for Computational Linguistics (Volume 2: Short Papers). 1359–1372.
+[5] Xuemei Dong, Chao Zhang, Yuhang Ge, Yuren Mao, Yunjun Gao, Jinshu Lin,
+Dongfang Lou, et al. 2023. C3: Zero-shot text-to-sql with chatgpt. arXiv preprint
+arXiv:2307.07306 (2023).
+[6] Thibault Formal, Benjamin Piwowarski, and Stéphane Clinchant. 2021. SPLADE:
+Sparse Lexical and Expansion Model for First Stage Ranking. In Proceedings of
+the 44th International ACM SIGIR Conference on Research and Development in
+Information Retrieval. 2288–2292. https://doi.org/10.1145/3404835.3463098
+[7] Dawei Gao, Haibin Wang, Yaliang Li, Xiuyu Sun, Yichen Qian, Bolin Ding, and
+Jingren Zhou. 2024. Text-to-SQL Empowered by Large Language Models: A
+Benchmark Evaluation. Proc. VLDB Endow. 17, 5 (2024), 1132–1145. https:
+//doi.org/10.14778/3641204.3641221
+[8] Zihui Gu, Ju Fan, Nan Tang, Songyue Zhang, Yuxin Zhang, Zui Chen, Lei Cao,
+Guoliang Li, Sam Madden, and Xiaoyong Du. 2023. Interleaving pre-trained
+language models and large language models for zero-shot nl2sql generation.
+arXiv preprint arXiv:2306.08891 (2023).
+[9] Jiaqi Guo, Zecheng Zhan, Yan Gao, Yan Xiao, Jian-Guang Lou, Ting Liu, and
+Dongmei Zhang. 2019. Towards Complex Text-to-SQL in Cross-Domain Database
+with Intermediate Representation. https://doi.org/10.48550/arXiv.1905.08205
+[10] Jaemin Hong and Sukyoung Ryu. 2003. Introduction to Programming Languages.
+(2003).
+[11] Radu Cristian Alexandru Iacob, Florin Brad, Elena-Simona Apostol, CiprianOctavian Truică, Ionel Alexandru Hosu, and Traian Rebedea. 2020. Neural
+approaches for natural language interfaces to databases: A survey. In proceedings
+of the 28th International Conference on Computational Linguistics. 381–395.
+[12] George Katsogiannis-Meimarakis and Georgia Koutrika. 2023. A survey on deep
+learning approaches for text-to-SQL. The VLDB Journal 32, 4 (2023), 905–936.
+[13] Hyeonji Kim, Byeong-Hoon So, Wook-Shin Han, and Hongrae Lee. 2020. Natural
+language to SQL: Where are we today? Proceedings of the VLDB Endowment 13,
+10 (2020), 1737–1750.
+[14] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng,
+Cody Hao Yu, Joseph Gonzalez, Hao Zhang, and Ion Stoica. 2023. Efficient
+memory management for large language model serving with pagedattention. In
+Proceedings of the 29th symposium on operating systems principles. 611–626.
+[15] Dongjun Lee, Choongwon Park, Jaehyuk Kim, and Heesoo Park. 2025. MCS-SQL:
+Leveraging Multiple Prompts and Multiple-Choice Selection For Text-to-SQL
+Generation. In Proceedings of the 31st International Conference on Computational
+Linguistics. 337–353. https://aclanthology.org/2025.coling-main.24/
+[16] Boyan Li, Jiayi Zhang, Ju Fan, Yanwei Xu, Chong Chen, Nan Tang, and Yuyu
+Luo. 2025. Alpha-SQL: Zero-Shot Text-to-SQL using Monte Carlo Tree Search.
+https://openreview.net/forum?id=kGg1ndttmI
+[17] Fei Li and Hosagrahar V. Jagadish. 2014. NaLIR: An Interactive Natural Language
+Interface for Querying Relational Databases. In Proceedings of the 2014 ACM
+SIGMOD International Conference on Management of Data. 709–712. https:
+//doi.org/10.1145/2588555.2594519
+[18] Jinyang Li, Binyuan Hui, Ge Qu, Jiaxi Yang, Binhua Li, Bowen Li, Bailin Wang,
+Bowen Qin, Ruiying Geng, Nan Huo, et al. 2024. Can LLM Already Serve as a
+Database Interface? A Big Bench for Large-Scale Database Grounded Text-toSQLs. Advances in Neural Information Processing Systems 36 (2024).
+[19] Zhishuai Li, Xiang Wang, Jingjing Zhao, Sun Yang, Guoqing Du, Xiaoru Hu, Bin
+Zhang, Yuxiao Ye, Ziyue Li, Rui Zhao, et al. 2024. Pet-sql: A prompt-enhanced
+two-stage Text-to-SQL framework with cross-consistency. CoRR (2024).
+[20] Xi Victoria Lin, Richard Socher, and Caiming Xiong. 2020. Bridging Textual
+and Tabular Data for Cross-Domain Text-to-SQL Semantic Parsing. https:
+//doi.org/10.48550/arXiv.2012.12627
+[21] Xinyu Liu, Shuyu Shen, Boyan Li, Peixian Ma, Runzhi Jiang, Yuxin Zhang, Ju Fan,
+Guoliang Li, Nan Tang, and Yuyu Luo. 2025. A survey of text-to-sql in the era of
+llms: Where are we, and where are we going? IEEE Transactions on Knowledge
+and Data Engineering (2025).
+
+[22] Niels Mündler, Jingxuan He, Hao Wang, Koushik Sen, Dawn Song, and Martin
+Vechev. 2025. Type-constrained code generation with language models. Proceedings of the ACM on Programming Languages 9, PLDI (2025), 601–626.
+[23] Shaan Nagy, Timothy Zhou, Nadia Polikarpova, and Loris D’Antoni. 2026. ChopChop: A Programmable Framework for Semantically Constraining the Output of
+Language Models. Proceedings of the ACM on Programming Languages 10, POPL
+(2026), 1905–1932.
+[24] Linyong Nan, Yilun Zhao, Weijin Zou, Narutatsu Ri, Jaesung Tae, Ellen Zhang,
+Arman Cohan, and Dragomir Radev. 2023. Enhancing Text-to-SQL Capabilities
+of Large Language Models: A Study on Prompt Design Strategies. In Findings of
+the Association for Computational Linguistics: EMNLP 2023. 14935–14956. https:
+//doi.org/10.18653/v1/2023.findings-emnlp.996
+[25] Narendra and Fukunaga. 1977. A branch and bound algorithm for feature subset
+selection. IEEE Transactions on computers 100, 9 (1977), 917–922.
+[26] Zheng Ning, Yuan Tian, Zheng Zhang, Tianyi Zhang, and Toby Jia-Jun Li. 2024.
+Insights into natural language database query errors: From attention misalignment to user handling strategies. ACM Transactions on Interactive Intelligent
+Systems 14, 4 (2024), 1–32.
+[27] OpenAI. 2023. GPT-3.5 Technical Report. https://openai.com
+[28] OpenAI. 2024. GPT-4o System Card. https://openai.com
+[29] Ana-Maria Popescu, Oren Etzioni, and Henry Kautz. [n.d.]. Towards a Theory
+of Natural Language Interfaces to Databases. ([n. d.]).
+[30] Mohammadreza Pourreza, Hailong Li, Ruoxi Sun, Yeounoh Chung, Shayan Talaei,
+Gaurav Tarlok Kakkar, Yu Gan, Amin Saberi, Fatma Ozcan, and Sercan O. Arik.
+2024. CHASE-SQL: Multi-Path Reasoning and Preference Optimized Candidate
+Selection in Text-to-SQL. https://openreview.net/forum?id=CvGqMD5OtX
+[31] Mohammadreza Pourreza and Davood Rafiei. 2023. DIN-SQL: Decomposed InContext Learning of Text-to-SQL with Self-Correction. In Proceedings of the 37th
+International Conference on Neural Information Processing Systems. 36339–36348.
+[32] Mohammadreza Pourreza and Davood Rafiei. 2024. DTS-SQL: Decomposed
+Text-to-SQL with Small Large Language Models. In Findings of the Association
+for Computational Linguistics: EMNLP 2024. 8212–8220.
+[33] Nils Reimers and Iryna Gurevych. 2019. Sentence-BERT: Sentence Embeddings
+using Siamese BERT-Networks. https://doi.org/10.48550/arXiv.1908.10084
+[34] Tonghui Ren, Chen Ke, Yuankai Fan, Yinan Jing, Zhenying He, Kai Zhang, and
+X. Sean Wang. 2025. The Power of Constraints in Natural Language to SQL
+Translation. Proc. VLDB Endow. 18, 7 (March 2025), 2097–2111. https://doi.org/
+10.14778/3734839.3734847
+[35] Ohad Rubin and Jonathan Berant. 2021. SmBoP: Semi-autoregressive Bottom-up
+Semantic Parsing. In Proceedings of the 2021 Conference of the North American
+Chapter of the Association for Computational Linguistics: Human Language Technologies. 311–324. https://doi.org/10.18653/v1/2021.naacl-main.29
+[36] Diptikalyan Saha, Avrilia Floratou, Karthik Sankaranarayanan, Umar Farooq
+Minhas, Ashish R. Mittal, and Fatma Özcan. 2016. ATHENA: An Ontology-Driven
+System for Natural Language Querying over Relational Data Stores. Proc. VLDB
+Endow. 9, 12 (2016), 1209–1220. https://doi.org/10.14778/2994509.2994536
+[37] Keshav Santhanam, Omar Khattab, Jon Saad-Falcon, Christopher Potts, and Matei
+Zaharia. 2022. ColBERTv2: Effective and Efficient Retrieval via Lightweight Late
+Interaction. In Proceedings of the 2022 Conference of the North American Chapter
+of the Association for Computational Linguistics: Human Language Technologies.
+3715–3734. https://doi.org/10.18653/v1/2022.naacl-main.272
+[38] Torsten Scholak, Nathan Schucher, and Dzmitry Bahdanau. 2021. PICARD:
+Parsing Incrementally for Constrained Auto-Regressive Decoding from Language
+Models. 9895–9901. https://doi.org/10.18653/v1/2021.emnlp-main.779
+[39] Jiawei Shen, Chengcheng Wan, Ruoyi Qiao, Jiazhen Zou, Hang Xu, Yuchen Shao,
+Yueling Zhang, Weikai Miao, and Geguang Pu. 2025. A Study of In-ContextLearning-Based Text-to-SQL Errors. arXiv preprint arXiv:2501.09310 (2025).
+[40] Lei Sheng and Shuai-Shuai Xu. 2025. CSC-SQL: Corrective Self-Consistency in
+Text-to-SQL via Reinforcement Learning. https://doi.org/10.48550/arXiv.2505.
+13271
+[41] Chang-Yu Tai, Ziru Chen, Tianshu Zhang, Xiang Deng, and Huan Sun. 2023.
+Exploring Chain of Thought Style Prompting for Text-to-SQL. 5376–5393. https:
+//doi.org/10.18653/v1/2023.emnlp-main.327
+[42] Shayan Talaei, Mohammadreza Pourreza, Yu-Chen Chang, Azalia Mirhoseini, and
+Amin Saberi. 2024. CHESS: Contextual Harnessing for Efficient SQL Synthesis.
+https://arxiv.org/abs/2405.16755v3
+[43] Qdrant Team. 2024. FastEmbed: Lightweight and Efficient Text Embedding Library.
+https://github.com/qdrant/fastembed Python library for fast text embedding
+inference.
+[44] Qwen Team. 2024. Qwen2 Technical Report. https://qwen.ai
+[45] TensorChord Team. 2024. pgvecto.rs: High-performance Vector Search Extension
+for PostgreSQL. https://github.com/tensorchord/pgvecto.rs Rust-based vector
+indexing extension for PostgreSQL.
+[46] The PostgreSQL Global Development Group. 2024. PostgreSQL: The World’s Most
+Advanced Open Source Relational Database. https://www.postgresql.org/ Version
+17.
+[47] Immanuel Trummer. 2022. CodexDB: Synthesizing code for query processing
+from natural language instructions using GPT-3 Codex. Proceedings of the VLDB
+
+Endowment 15, 11 (2022), 2921–2928.
+[48] Bing Wang, Changyu Ren, Jian Yang, Xinnian Liang, Jiaqi Bai, Linzheng Chai,
+Zhao Yan, Qian-Wen Zhang, Di Yin, Xing Sun, et al. 2025. Mac-sql: A multi-agent
+collaborative framework for text-to-sql. In Proceedings of the 31st International
+Conference on Computational Linguistics. 540–557.
+[49] Bailin Wang, Richard Shin, Xiaodong Liu, Oleksandr Polozov, and Matthew
+Richardson. 2020. RAT-SQL: Relation-Aware Schema Encoding and Linking for
+Text-to-SQL Parsers. In Proceedings of the 58th Annual Meeting of the Association
+for Computational Linguistics. 7567–7578. https://doi.org/10.18653/v1/2020.aclmain.677
+[50] Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten Bosma, Brian Ichter, Fei
+Xia, Ed Chi, Quoc V. Le, and Denny Zhou. 2022. Chain-of-Thought Prompting
+Elicits Reasoning in Large Language Models. Advances in Neural Information
+Processing Systems 35 (Dec. 2022), 24824–24837.
+[51] Jun Xiao, Chenglin Wang, Yuxin Huang, et al. 2024. BGE-base-en-v1.5: English
+Text Embedding Model. https://huggingface.co/BAAI/bge-base-en-v1.5. Beijing
+Academy of Artificial Intelligence (BAAI).
+[52] Xiangjin Xie, Guangwei Xu, Lingyan Zhao, and Ruijie Guo. 2025. OpenSearchSQL: Enhancing Text-to-SQL with Dynamic Few-shot and Consistency Alignment. Proc. ACM Manag. Data 3, 3 (2025), 194:1–194:24. https://doi.org/10.1145/
+3725331
+[53] Xiaojun Xu, Chang Liu, and Dawn Song. 2017. SQLNet: Generating Structured
+Queries From Natural Language Without Reinforcement Learning.
+https:
+//doi.org/10.48550/arXiv.1711.04436
+[54] Yuming Xu, Hengyu Liang, Jin Li, Shuotao Xu, Qi Chen, Qianxi Zhang, Cheng
+Li, Ziyue Yang, Fan Yang, Yuqing Yang, et al. 2023. Spfresh: Incremental in-place
+update for billion-scale vector search. In Proceedings of the 29th Symposium on
+Operating Systems Principles. 545–561.
+[55] Navid Yaghmazadeh, Yuepeng Wang, Isil Dillig, and Thomas Dillig. 2017. SQLizer:
+Query Synthesis from Natural Language. Proc. ACM Program. Lang. 1, OOPSLA
+(2017), 1–26. https://doi.org/10.1145/3133887
+[56] Song Yu, Shengyuan Lin, Shufeng Gong, Yongqing Xie, Ruicheng Liu, Yijie
+Zhou, Ji Sun, Yanfeng Zhang, Guoliang Li, and Ge Yu. 2026. A Topology-Aware
+Localized Update Strategy for Graph-Based ANN Index. Proc. VLDB Endow. 19, 3
+(2026), 495–508.
+
+[57] Tao Yu, Rui Zhang, Kai Yang, Michihiro Yasunaga, Dongxu Wang, Zifan Li,
+James Ma, Irene Li, Qingning Yao, Shanelle Roman, Zilin Zhang, and Dragomir
+Radev. 2018. Spider: A Large-Scale Human-Labeled Dataset for Complex and
+Cross-Domain Semantic Parsing and Text-to-SQL Task. In Proceedings of the 2018
+Conference on Empirical Methods in Natural Language Processing, Ellen Riloff,
+David Chiang, Julia Hockenmaier, and Jun’ichi Tsujii (Eds.). Association for
+Computational Linguistics, Brussels, Belgium, 3911–3921. https://doi.org/10.
+18653/v1/D18-1425
+[58] John M Zelle and Raymond J Mooney. 1996. Learning to parse database queries
+using inductive logic programming. In Proceedings of the national conference on
+artificial intelligence. 1050–1055.
+[59] Hanchong Zhang, Ruisheng Cao, Lu Chen, Hongshen Xu, and Kai Yu. [n.d.]. ACTSQL: In-Context Learning for Text-to-SQL with Automatically-Generated Chainof-Thought. In The 2023 Conference on Empirical Methods in Natural Language
+Processing.
+[60] Kaizhong Zhang and Dennis Shasha. 1989. Simple Fast Algorithms for the Editing
+Distance between Trees and Related Problems. SIAM J. Comput. 18, 6 (Dec. 1989),
+1245–1262.
+[61] Quanjun Zhang, Chunrong Fang, Yang Xie, YuXiang Ma, Weisong Sun, Yun
+Yang, and Zhenyu Chen. 2024. A systematic literature review on large language
+models for automated program repair. ACM Transactions on Software Engineering
+and Methodology (2024).
+[62] Rui Zhang, Tao Yu, Heyang Er, Sungrok Shim, Eric Xue, Xi Victoria Lin, Tianze
+Shi, Caiming Xiong, Richard Socher, and Dragomir Radev. 2019. Editing-based
+SQL query generation for cross-domain context-dependent questions. In Proceedings of the 2019 Conference on Empirical Methods in Natural Language Processing and the 9th International Joint Conference on Natural Language Processing
+(EMNLP-IJCNLP). 5338–5349.
+[63] Victor Zhong, Caiming Xiong, and Richard Socher. 2017. Seq2SQL: Generating
+Structured Queries from Natural Language using Reinforcement Learning. https:
+//doi.org/10.48550/arXiv.1709.00103
+[64] Denny Zhou, Nathanael Schärli, Le Hou, Jason Wei, Nathan Scales, Xuezhi Wang,
+Dale Schuurmans, Claire Cui, Olivier Bousquet, Quoc V. Le, and Ed H. Chi. 2022.
+Least-to-Most Prompting Enables Complex Reasoning in Large Language Models.
+https://openreview.net/forum?id=WZH7099tgfM
+
+

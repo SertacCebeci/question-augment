@@ -1,0 +1,2880 @@
+Goldilocks RL: Tuning Task Difficulty to Escape Sparse Rewards for
+Reasoning
+Ilia Mahrooghi†1 , Aryo Lotfi2 , and Emmanuel Abbe1,2
+1
+
+EPFL
+Apple
+
+arXiv:2602.14868v3 [cs.LG] 2 Oct 2026
+
+2
+
+Abstract
+Reinforcement learning has emerged as a powerful paradigm for unlocking reasoning capabilities in language
+models. However, relying on sparse rewards makes this process highly sample-inefficient, as models must navigate
+vast search spaces with minimal feedback. While classic curriculum learning aims to mitigate this by ordering data
+based on complexity, prior works have primarily targeted small datasets and do not directly transfer to the large-scale
+settings typical of modern language model training. Furthermore, the right ordering for a specific model is often
+unclear. To address this, we propose Goldilocks, an adaptive data-selection strategy that uses a Selector network
+to predict the standard deviation of rewards across the model’s rollouts for each candidate question. The Selector
+prioritizes questions with high predicted reward variability, corresponding to questions that are neither too easy
+nor too hard for the model’s current capabilities (Goldilocks principle), while training the model with GRPO. By
+leveraging the model’s performance on seen samples, the Selector continuously adapts to the model’s evolving abilities.
+Across the OpenMathReasoning and Polaris datasets, Goldilocks consistently improves over standard GRPO, requiring
+up to 78% fewer optimization steps to reach the corresponding GRPO performance.
+
+1
+
+Introduction
+
+The reasoning capabilities of Transformer-based models have been a focal point of recent research, with Reinforcement
+Learning (RL) emerging as a powerful paradigm for enhancing these abilities. Recent RL methods incentivize the
+generation of a detailed Chain of Thought (CoT) [27], enabling models to solve complex problems [32, 10, 13]. Additionally,
+increasing the computational budget at inference time, known as scaling test-time compute, has been shown to further
+enhance these reasoning capabilities [24]. While RL has proven effective in unlocking complex reasoning behaviors,
+the computational efficiency of these methods remains a significant challenge. Recent findings by Khatri et al. [14]
+underscore that scaling is a fundamental driver of performance. This observation suggests that while models have the
+potential for continued improvement, realizing this potential through brute-force scaling is resource-intensive, making
+training efficiency a paramount concern.
+Reinforcement learning with verifiable rewards (RLVR) [6, 22] provides a scalable way to improve reasoning by assigning
+rewards using automatically checkable outcomes. However, when the reward is determined primarily by final-answer
+correctness, the resulting feedback is sparse, since a generated trajectory is primarily judged by whether it reaches
+a correct final answer: a generated trajectory is rewarded if it reaches a correct answer. This creates a substantial
+efficiency challenge during training. Questions that are far beyond the model’s current capabilities are likely to produce
+groups of uniformly incorrect rollouts, while questions that are already mastered tend to produce uniformly correct ones.
+In either case, substantial generation compute may be spent on rollout groups that provide little or no within-group
+reward variation, and therefore little useful relative signal for the GRPO update.
+This inefficiency becomes increasingly important as language-model training moves toward larger data and compute
+regimes. Scaling studies have established the importance of jointly increasing model capacity, data, and compute [12],
+while recent frontier models are trained on trillions of tokens [7]. Reasoning post-training is following a similar trend,
+with recent systems relying on increasingly large-scale reinforcement learning [11, 31, 14]. Reasoning datasets are also
+† Corresponding Author, ilia.mahrooghi@epfl.ch
+
+1
+
+growing to millions of questions [17]. In such a large-pool regime, an effective data-selection strategy cannot assume
+that the model has already interacted with every candidate question. Instead, it should be able to estimate the learning
+value of previously unseen questions from limited model feedback, and ideally make this decision before incurring the
+cost of generating rollouts.
+Curriculum Learning (CL) [4] provides a natural framework for prioritizing training examples, but many existing
+approaches rely on information that becomes difficult to obtain in this regime. History-based methods estimate the
+difficulty or utility of a question from the model’s previous performance on that same instance [21, 23]; such estimates
+become informative only after sufficient observations of the question have been collected. Other approaches schedule
+predefined difficulty categories or data partitions [20, 5], requiring structure that may not be available for a large
+heterogeneous question pool. A different line of work identifies uninformative examples only after generating their
+rollouts and then skips the corresponding policy update [26, 28]; this avoids an unhelpful optimization step, but not the
+generation cost already incurred. This motivates a curriculum that can infer the utility of previously unseen questions
+from recent model feedback, make the selection before rollout generation, and adapt as the model improves.
+In this work, we propose Goldilocks, a pre-rollout data-selection framework that uses a learned Selector. Alongside
+model RL training, a lightweight Selector network learns from recent model outcomes to predict the reward variability of
+candidate questions. It then prioritizes questions with high reward variability that are expected to produce informative
+rollout groups (neither those already mastered by the model nor those currently beyond its capabilities). Because the
+prediction is made from the question itself, the Selector can generalize to candidates the model has never encountered
+and continuously update its curriculum as the model improves. We show theoretically that this criterion is aligned
+with the learning signal of GRPO [22] under binary verifiable rewards, and empirically evaluate it across large- and
+small-pool training regimes against predictive and history-based curriculum baselines.
+The paper is organized as follows. Section 2 discusses related work. Section 3 analyzes GRPO gradient dynamics
+under verifiable rewards. Section 4 presents our joint training framework. Sections 5 and 7 report empirical results and
+ablations and Section 8 concludes.
+
+2
+
+Related Work
+
+Reasoning and Reinforcement Learning. Intermediate reasoning traces have been shown to substantially improve
+language-model performance on complex tasks, through supervised scratchpads [18], Chain-of-Thought prompting
+[27, 15], and reinforcement learning [22]. Recent RL methods for reasoning optimize such trajectories using verifiable
+rewards, but their efficiency is limited by the large generation cost and by questions that provide little useful learning
+signal. This has motivated methods that improve which problems are selected for training or how rollout compute is
+allocated.
+History-Based Curricula and Adaptive Sampling. A large class of curriculum methods estimates question utility
+from previous interactions with the same question. MoPPS [21] maintains prompt-specific estimates of model success,
+while BOTS [23] similarly uses accumulated evidence to guide online task selection. Such history-based methods are
+most effective when questions are revisited frequently enough for their estimates to become informative. We therefore
+include MoPPS as a baseline in our smaller-dataset setting, where repeated exposure provides a favorable regime for
+question-specific histories. Other approaches operate over predefined data categories [5], adapt rollout allocation [16], or
+identify uninformative samples only after generation [26, 28, 8]; these improve training efficiency but do not directly
+address predicting the utility of previously unseen questions before rollout.
+Predictive Pre-Rollout Selection. The closest prior work to Goldilocks is Prompt Curriculum Learning (PCL) [9],
+which, among the methods we consider, is the only approach that learns a prompt-conditioned predictor from model
+feedback and uses it to score unseen questions before generating model rollouts. PCL predicts the model’s probability of
+success and selects questions near a target difficulty, whereas Goldilocks directly predicts the reward variability of the
+rollout group, the quantity motivated by our GRPO analysis. PCL is evaluated on substantially smaller question pools
+than the large-scale regime considered in our main experiments; we therefore use it as our primary predictive baseline to
+test whether this form of pre-rollout generalization remains effective as the training pool grows.
+
+2
+
+3
+
+Theoretical Motivation: The Goldilocks Zone
+
+In the context of fine-tuning language models with RL, the objective is to maximize
+h the expectedi reward on a dataset of
+verifiable answers. The standard policy gradient loss is defined as LP G = −Est ,at log πθ (at |st )Ât , where πθ denotes the
+policy and Ât represents the estimated advantage. In the context of updating language models, the state st corresponds
+to the prompt q combined with the history of generated tokens o<t , and the action at is the next token ot . The objective
+is defined over the generated sequence of length T :
+" T
+#
+X
+LPG (θ) = −Eq∼D,o∼πθ
+log πθ (ot | q, o<t )Ât ,
+t=1
+
+where Ât represents the advantage estimated at token step t.
+In GRPO, the advantage is computed by normalizing rewards across a group of G outputs sampled for a single prompt.
+In the RLVR setting, the reward is assigned at the sequence level rather than per token, meaning all tokens within
+an output o share the same advantage estimate. Thus Ât is constant across token steps t for a given question q and
+output o, and we denote it Âq,o . We consider a binary verification reward rver = 1 for a correct final answer and rver = 0
+otherwise.
+Advantage computation. The verification reward follows a Bernoulli distribution: rver ∼ Bernoulli(pq ). The GRPO
+algorithm computes the advantage Âq,o by standardizing the reward:
+Âq,o =
+
+rver − mean(rver )
+.
+std(rver )
+
+p
+Since rver ∼ Bernoulli(pq ), the moments are mean(rver ) = pq and std(rver ) = pq (1 − pq ). Substituting these values,
+the advantage Âq,o takes on two distinct values depending on the correctness of the output1 :
+1 − pq
+• Correct answer (probability pq ): Âq,o = p
+pq (1 − pq )
+−pq
+• Incorrect answer (probability 1 − pq ): Âq,o = p
+pq (1 − pq )
+Zero-variance batches. When all G rollouts for a prompt q are simultaneously correct or simultaneously incorrect,
+every rollout receives the same reward, all advantages Âq,o are zero. The gradient contribution of the entire batch
+therefore vanishes and no parameter update occurs. The probability of this zero-variance event is
+G
+P(zero variance) = pG
+q + (1 − pq ) ,
+
+(1)
+
+which is minimized at pq = 1/2 and approaches 1 as pq → 0 or pq → 1. Therefore, prompts near the extremes waste an
+entire group of rollouts with high probability, regardless of model capacity or training budget.
+Gradient norm decomposition. We have shown that substituting these advantage values into the policy gradient
+objective and separating the contributions of correct and incorrect outcomes gives
+" T
+#
+" T
+#
+q
+X
+X
+∥∇θ LP G ∥ =
+pq (1 − pq ) E
+∇θ log πθ (ot | q, o<t ) rver = 1 − E
+∇θ log πθ (ot | q, o<t ) rver = 0 . (2)
+t=1
+
+t=1
+
+The proof is given in Appendix C.
+1 This analysis extends to any reward of the form r
+total = rver + f (t), where f (t) converges to a constant during training. See Appendix B
+for a formal proof.
+
+3
+
+Figure 1: Overview of the Goldilocks Framework. The continuous training loop.
+p
+Vanishing signal. Equation 2 isolates a pq (1 − pq ) prefactor in the gradient norm. Since the remaining conditionalexpectation term is itself question- and model-dependent, this factor alone does not determine the gradient magnitude.
+We therefore make its role precise by deriving a uniform upper bound. Under the additional assumption that the
+per-token gradient ∥∇θ log πθ (ot | q, o<t )∥ is uniformly bounded by some constant B and the context length T is finite,
+this scaling translates into the upper bound
+q
+∥∇θ LP G ∥ ≤ 2BT pq (1 − pq ),
+(3)
+where pq = pq (θ) is thepverification probability at the current parameters. Eq. 3 shows that the gradient norm is
+structurally bounded by pq (1 − pq ), with the constant 2BT uniform across all prompts at a fixed checkpoint. Therefore,
+as pq → 0 or pq → 1, the gradient norm ∥∇θ LPG ∥ → 0, leading to vanishing gradients. The formal proof is given in
+Appendix C.
+Taken together, Eq. 1 and Eq. 3 give two independent reasons why prompts near pq ∈ {0, 1} are wasteful: they suppress
+the gradient magnitude and are overwhelmingly likely to produce zero-variance batches. Conversely, prompts near
+pq = 1/2 minimize the probability of zero-variance batches (Eq. 1) and maximize the structural upper bound on the
+gradient norm (Eq.
+p3). This motivates the Goldilocks Selector: select prompts at the edge of the model’s current
+solvability, where pq (1 − pq ) is largest. We emphasize that the analysis is not intended as a complete theoretical
+account of RL dynamics, but rather as a simplified intuition for why intermediate-difficulty questions can provide more
+informative GRPO updates.
+
+4
+
+Joint Training Procedure
+
+We now detail the overall training loop, illustrated in Figure 1. The process operates in a cycle that alternates between
+data selection, model optimization via GRPO, and continuous Selector refinement.
+
+4.1
+
+Data Selection Policy (Steps 1-2)
+
+During the data selection phase, the Selector samples a candidate pool, denoted as C, consisting of Kcandidate examples
+drawn randomly from the dataset. For each candidate question q ∈ C, the Selector computes a predicted utility score
+v̂q = fϕ (q). To balance exploration and exploitation, the final training sample q ∗ is selected using an ϵ-greedy strategy
+(Algorithm 1):
+4
+
+• With probability ϵ, a question is selected uniformly at random from C to ensure diverse data coverage.
+• With probability 1 − ϵ, the question with the highest predicted utility is selected deterministically, i.e.,
+q ∗ = arg max v̂q .
+q∈C
+
+4.2
+
+Model Rollouts and Optimization (Steps 3-4)
+
+Once the prompt q ∗ is selected, the model generates a group of G rollouts, {o1 , . . . , oG }. The verification reward
+rver is computed for each output, and the advantages are estimated using the group-relative normalization described
+in Section 3. Based on these advantages, the gradient is computed. To ensure optimization stability, gradients are
+accumulated over a batch of selected prompts before a parameter update is applied to the model.
+
+4.3
+
+Selector Refinement (Steps 5-6)
+
+The Selector is trained online to predict the learning potential of specific prompts based on the model’s real-time
+feedback. Following the model’s rollouts for a question q, we calculate the empirical success rate p̂q as the fraction of
+correct solutions within the generated
+group. The regression target yq is then set to the empirical standard deviation of
+p
+the verification reward yq = p̂q (1 − p̂q ). This tuple (q, yq ) is pushed into a replay buffer Dreplay of capacity Nreplay ,
+which operates as a sliding window to retain the most recent interaction data.
+The Selector updates its parameters ϕ periodically as detailed in Algorithm 2. After every Mupdate samples processed
+by the model, the Selector undergoes a dedicated training phase lasting ESelector epochs. During this phase, we iterate
+over the entire replay buffer Dreplay , processing the data in mini-batches B to minimize the Mean Squared Error:
+LB (ϕ) =
+
+1
+|B|
+
+X
+
+2
+
+(fϕ (q) − yq ) .
+
+(q,yq )∈B
+
+This objective ensures the Selector continuously aligns its predictions with the model’s capabilities.
+
+5
+
+Experiments and Results
+
+To evaluate Goldilocks, we primarily focus on the large-scale OpenMathReasoning dataset [17], which comprises over
+3 million chain-of-thought problems that motivates our setting. We compare Goldilocks against standard GRPO and
+Prompt Curriculum Learning (PCL) [9], our closest predictive pre-rollout baseline. Given the substantial computational
+cost of long-run GRPO training on OpenMathReasoning, we prioritize extensive training on this benchmark rather than
+broad evaluation across many datasets. As a complementary smaller-scale setting, we additionally train and evaluate on
+Polaris [3], which contains approximately 50,000 questions, where questions are revisited more frequently. In this regime,
+we compare against both PCL and MoPPS [21], allowing us to contrast Goldilocks with a history-based curriculum
+under conditions where question-specific histories are more informative.
+Across these settings, we evaluate five models spanning different model families and sizes: OLMo2-1B [19], Qwen2.5-1.5B
+[29], Qwen3-4B-Base [30], Phi-4-mini-Instruct (4B) [1], and Qwen2.5-7B [29]. Following common practice in RL-based
+reasoning research [22, 2, 5], we focus on mathematical reasoning and train all models with GRPO. All experiments are
+implemented using the TRL library [25]. Additional dataset, training, and compute details are provided in Appendices D
+and E.
+
+5.1
+
+Experimental Setup
+
+For each model–dataset pair, we first tune the GRPO learning rate and global batch size, and use the best-performing
+configuration as the reference for all subsequent comparisons. We then evaluate Goldilocks and the corresponding
+baselines using the selected settings. All methods use a rollout group size of G = 16 in the main experiments, with
+additional ablations evaluating sensitivity to alternative group sizes.
+For all experiments, we use Qwen3-0.6B [30] as the Selector. In all experiments, we utilized a fixed computational
+budget of 8 GPUs. Vanilla GRPO uses all eight GPUs for model training, whereas Goldilocks and PCL reserve one GPU
+5
+
+for the Selector and use the remaining seven for the model. Accordingly, if the tuned GRPO global batch size is B, we
+use a model batch size of 78 B for Goldilocks and PCL, while keeping the per-GPU model configuration unchanged. This
+provides a matched hardware budget and explicitly accounts for the GPU required by the learned curriculum predictor
+rather than giving Selector-based methods additional compute. MoPPS, which does not require a Selector network,
+follows the corresponding model’s GRPO configuration. We justify this scheme in Appendix E.1.
+
+6
+
+Results
+
+Our primary experiments on OpenMathReasoning use a long-run training regime to reflect the scale of the dataset and
+evaluate whether the benefits of adaptive data selection persist over extended training. This extended training regime
+is particularly important in the large-pool setting, as it allows us to test whether the benefit of Goldilocks persists as
+the model’s capabilities evolve rather than being confined to the early stages of RL training. Our primary comparison
+focuses on training efficiency relative to tuned GRPO, while we also report validation accuracy at matched training
+steps. Because the models differ in size and are trained with different batch sizes, they are trained for different numbers
+of optimization steps under this regime; we therefore report the evaluation step in our tables. Complete hyperparameter
+searches, selected configurations, and compute accounting are reported in Appendix E. The total computational cost of
+these experiments is detailed in Appendix L.
+
+6.1
+
+OpenMathReasoning: Long-Run Performance and Efficiency
+
+Table 1 reports both performance and training efficiency on OpenMathReasoning. For each model, all methods are
+evaluated at the same model-specific training step, enabling a direct comparison under a matched training horizon. We
+further measure efficiency by identifying the earliest checkpoint whose held-out accuracy matches or exceeds the final
+GRPO accuracy at that horizon, and report the corresponding percentage reduction in optimization steps. Together,
+these results capture both the accuracy achieved after extended training and the relative training-step savings required
+for Goldilocks to reach the corresponding GRPO performance.
+Table 1: OpenMathReasoning Results. Validation accuracy (%) is averaged over the final five evaluation points at
+each model’s respective training horizon. Step Reduction reports the relative reduction in optimization steps required
+for each method to reach GRPO’s final accuracy, using five-point rolling averages. A × indicates that the method does
+not reach GRPO’s final accuracy within the available training horizon.
+Accuracy (%)
+Model
+OLMo
+Qwen2.5-1.5B
+Qwen3-4B
+Phi (4B)
+Qwen2.5-7B
+
+Step Reduction
+
+Eval. Step
+
+GRPO
+
+PCL
+
+Goldilocks
+
+PCL
+
+Goldilocks
+
+40,000
+13,400
+21,000
+16,000
+17,000
+
+16.02
+40.99
+54.00
+40.12
+48.27
+
+14.47
+37.46
+53.86
+38.39
+50.63
+
+20.01
+44.56
+56.67
+44.27
+52.61
+
+×
+×
+×
+×
+32.9%
+
+64.0%
+28.4%
+41.9%
+48.8%
+49.4%
+
+Figure 2 shows the validation accuracy throughout training for Qwen2.5-7B, comparing standard GRPO, Goldilocks, and
+PCL. Figures 5 and 6 in Appendix F report this comparison against wall-clock time and cumulative model-generated
+tokens, respectively. Goldilocks reaches the corresponding GRPO reference accuracy with less elapsed time and fewer
+generated tokens.
+
+6.2
+
+Polaris: Retaining the Benefit When Questions Recur
+
+The smaller Polaris dataset tests a different explanation for curriculum performance. With more opportunities to revisit
+each question, a history-based method can build and reuse estimates across a larger fraction of the training pool. This
+setting is therefore favorable to MoPPS, whose prompt-specific posteriors become more informative as observations
+accumulate. A benefit confined to sparse-history settings would be less compelling if it disappeared once these histories
+became readily available.
+
+6
+
+Validation accuracy
+
+Goldilocks
+GRPO
+PCL
+
+0.50
+0.45
+
+49% fewer steps
+
+0.40
+0.35
+0.30
+
+0
+
+5000
+
+10000
+
+Training step
+
+15000
+
+Figure 2: Long-run reasoning training. Held-out accuracy on OpenMathReasoning compares curriculum benefits
+across a large question pool.
+Goldilocks remains effective on Polaris despite the more frequent question revisitation that favors history-based methods.
+As shown in Table 2, it achieves higher final accuracy than GRPO and PCL at the common end step for each model.
+For Qwen2.5-1.5B, Goldilocks reaches 22.26% final accuracy compared with 21.52% for GRPO; it also reaches GRPO’s
+final accuracy with 40.0% fewer optimization steps. Goldilocks surpasses MoPPS in most settings; the exception is
+Qwen2.5-7B, where MoPPS achieves the highest final accuracy. Goldilocks also reaches the final GRPO performance
+earlier across all models. These results complement the OpenMathReasoning experiments by showing that Goldilocks
+remains competitive even when repeated exposure makes historical estimates more informative.
+Table 2: Training on the smaller Polaris dataset. Validation accuracy (%) averaged over the final five evaluation
+points at a common end step for each model. All methods are truncated at the shortest run’s end step. The smaller
+training pool leads to more frequent question revisits, providing a favorable setting for history-based selection methods
+such as MoPPS. Step Reduction reports the relative reduction in optimization steps required for each method to
+reach GRPO’s final accuracy, using five-point rolling averages. A × indicates that the method does not reach GRPO’s
+final accuracy within the available training horizon.
+Accuracy (%)
+Model
+OLMo
+Qwen2.5-1.5B
+Qwen3-4B
+Phi (4B)
+Qwen2.5-7B
+
+7
+
+Step Reduction
+
+End Step
+
+GRPO
+
+PCL
+
+MoPPS
+
+Goldilocks
+
+PCL
+
+MoPPS
+
+Goldilocks
+
+29,000
+6,000
+10,000
+10,000
+17,400
+
+21.15
+21.52
+31.32
+21.35
+33.63
+
+18.65
+19.85
+30.08
+23.39
+33.94
+
+20.04
+21.56
+30.95
+22.65
+38.89
+
+23.12
+22.26
+31.60
+25.87
+35.95
+
+×
+×
+×
+48.0%
+16.1%
+
+×
+23.3%
+×
+38.0%
+58.6%
+
+51.7%
+40.0%
+26.0%
+78.0%
+42.5%
+
+Training Dynamics and Ablations
+
+We first analyze how Goldilocks affects the training dynamics on OpenMathReasoning using Qwen2.5-7B as a representative model. We then use Qwen2.5-1.5B for controlled ablations.
+
+7.1
+
+Training Dynamics
+
+We study the training behavior of Goldilocks on Qwen2.5-7B by tracking the average training reward and the fraction of
+zero-variance rollout groups throughout optimization. As shown in Figure 3a, PCL keeps the average reward closer
+to 0.5, whereas Goldilocks does not necessarily match this value as closely. However, Figure 3b shows that Goldilocks
+
+7
+
+Fraction of zero var.
+
+Training reward
+
+produces substantially fewer zero-variance rollout groups than both GRPO and PCL. This distinction is important:
+an average reward near 0.5 does not by itself imply that individual questions have intermediate success probability,
+since the
+psame average can arise from a mixture of very easy and very difficult questions. Goldilocks instead directly
+targets pq (1 − pq ), which favors questions with high within-question reward variability and suppresses questions near
+pq ∈ {0, 1}. We discuss this distinction further in Appendix K. We provide analysis of the Selector training dynamics in
+Appendix G.
+
+0.5
+0.4
+Goldilocks
+GRPO
+PCL
+
+0.3
+0
+
+5000
+
+10000
+
+15000
+
+Training step
+
+0.5
+0.4
+
+Goldilocks
+GRPO
+PCL
+
+0.3
+0.2
+0.1
+
+0
+
+(a) Average training reward.
+
+5000
+
+10000
+
+Training step
+
+15000
+
+(b) Zero-variance rollout fraction.
+
+Figure 3: Training dynamics on Qwen2.5-7B.
+
+7.2
+
+Ablations
+
+We evaluate the main design choices of Goldilocks using Qwen2.5-1.5B, with Qwen3-0.6B as the Selector throughout.
+Table 3 summarizes objective robustness, selection hyperparameters, and rollout-group size, while additional learning
+curves are provided in Appendix H.
+
+Validation accuracy
+
+Robustness across seeds. We repeat the standard GRPO–Goldilocks comparison across four model seeds. Figure 4 shows the corresponding learning curves, demonstrating that the improvement is consistent across different
+initializations.
+
+Goldilocks
+GRPO
+
+0.4
+
+33% fewer steps
+
+0.3
+0.2
+0
+
+2500 5000 7500 10000 12500
+
+Training step
+
+Figure 4: Seed robustness on Qwen2.5-1.5B. GRPO and Goldilocks across four model seeds. Solid lines represent
+the mean performance, while the shaded regions show one standard deviation of the raw validation accuracies across
+seeds at each evaluation step.
+
+8
+
+Table 3: Ablations on OpenMathReasoning. Validation accuracy (%) with Qwen2.5-1.5B, averaged over the final
+five evaluations at the listed training horizon, shared by all runs in each comparison. The reference configuration uses
+G = 16; Goldilocks additionally uses K = 8 and ϵ = 0.2. Seed results are mean ± sample standard deviation across four
+seeds; their step reduction is computed from the mean curves. Step Red. reports the reduction in optimization steps
+required for Goldilocks to reach GRPO’s final rolling-average accuracy at the same horizon.
+Accuracy (%)
+
+Efficiency
+
+Group
+
+Setting
+
+Steps
+
+GRPO
+
+Goldilocks
+
+Step Red.
+
+Main Results
+
+Standard
+
+13,400
+
+40.99
+
+44.56
+
+28.4%
+
+Objective
+Robustness
+
+DAPO Loss
+Entropy Reg. β = 3 × 10−4
+
+13,400
+13,400
+
+39.50
+40.28
+
+43.66
+44.24
+
+38.8%
+29.9%
+
+Seeds
+
+Four seeds
+
+13,400
+
+40.33 ± 0.58
+
+44.46 ± 0.30
+
+32.8%
+
+ϵ=0
+ϵ = 0.2
+ϵ = 0.5
+
+13,400
+13,400
+13,400
+
+40.99
+40.99
+40.99
+
+44.26
+44.56
+42.43
+
+31.3%
+28.4%
+11.9%
+
+K=8
+K = 16
+K = 32
+
+13,400
+13,400
+13,400
+
+40.99
+40.99
+40.99
+
+44.56
+43.76
+44.02
+
+28.4%
+29.9%
+29.9%
+
+G=8
+G = 16
+G = 32
+
+13,400
+13,400
+13,400
+
+40.87
+40.99
+38.36
+
+44.38
+44.56
+42.75
+
+32.8%
+28.4%
+41.8%
+
+Selection
+Ablations
+
+Rollout
+Ablation
+
+Model Objective. Goldilocks continues to improve over the corresponding baseline when replacing the standard
+GRPO objective with a DAPO-style loss [31] and when adding entropy regularization. This suggests that the benefit of
+adaptive question selection is complementary to changes in the model optimization objective.
+Selection hyperparameters. Goldilocks is relatively insensitive to moderate changes in the exploration probability ϵ
+and candidate-pool size K at the final evaluation horizon. Without exploration, the Selector only receives feedback on
+questions favored by its current predictions, which can reinforce selection errors and reduce coverage of underestimated
+questions. A small amount of random exploration mitigates this feedback loop. The full learning curves for ϵ and K are
+in Appendix H.
+Generations per question. We additionally vary the rollout-group size G for both GRPO and Goldilocks. Across
+the tested settings, Goldilocks retains its advantage, indicating that its benefit is not specific to the default number of
+generations per question.
+
+8
+
+Limitations and Future Work
+
+Larger models. Our experiments study models up to 7B parameters and use a 0.6B Selector throughout. They do
+not establish how the approach scales to substantially larger models, whose evolving capabilities may be harder for a
+small predictor to track. Future work should evaluate larger Selector and model combinations, measure how prediction
+quality changes with the capacity gap, and determine whether curriculum gains persist after all Selector costs are
+included.
+Datasets beyond mathematics. OpenMathReasoning and Polaris differ in scale and question reuse, but both
+concern mathematical reasoning with verifiable answers. Generalization to other domains remains untested. Code
+generation, theorem proving, and multi-step tasks offer natural next settings, with different verifiers, reward distributions,
+and computational costs. Extending the selection target to these datasets, particularly when feedback is graded or noisy
+rather than binary, is an important direction for future work.
+
+9
+
+References
+[1] Marah Abdin, Jyoti Aneja, Harkirat Behl, Sébastien Bubeck, Ronen Eldan, Suriya Gunasekar, Michael Harrison,
+Russell J Hewett, Mojan Javaheripi, Piero Kauffmann, et al. Phi-4 technical report. arXiv preprint arXiv:2412.08905,
+2024.
+[2] Mohammad Hossein Amani, Aryo Lotfi, Nicolas Mario Baldwin, Samy Bengio, Mehrdad Farajtabar, Emmanuel
+Abbe, and Robert West. Rl for reasoning by adaptively revealing rationales. arXiv preprint arXiv:2506.18110, 2025.
+[3] Chenxin An, Zhihui Xie, Xiaonan Li, Lei Li, Jun Zhang, Shansan Gong, Ming Zhong, Jingjing Xu, Xipeng Qiu,
+Mingxuan Wang, and Lingpeng Kong. Polaris: A post-training recipe for scaling reinforcement learning on advanced
+reasoning models, 2025. URL https://hkunlp.github.io/blog/2025/Polaris.
+[4] Yoshua Bengio, Jérôme Louradour, Ronan Collobert, and Jason Weston. Curriculum learning. In Proceedings of
+the 26th annual international conference on machine learning, pages 41–48, 2009.
+[5] Xiaoyin Chen, Jiarui Lu, Minsu Kim, Dinghuai Zhang, Jian Tang, Alexandre Piché, Nicolas Gontier, Yoshua Bengio,
+and Ehsan Kamalloo. Self-evolving curriculum for llm reasoning. arXiv preprint arXiv:2505.14970, 2025.
+[6] Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun, Lukasz Kaiser, Matthias Plappert,
+Jerry Tworek, Jacob Hilton, Reiichiro Nakano, Christopher Hesse, and John Schulman. Training verifiers to solve
+math word problems. arXiv preprint arXiv:2110.14168, 2021.
+[7] DeepSeek-AI. Deepseek-v3 technical report, 2024. URL https://arxiv.org/abs/2412.19437.
+[8] Thomas Foster, Anya Sims, Johannes Forkel, and Jakob Foerster. Lilo: Learning to reason at the frontier of
+learnability. Advances in Neural Information Processing Systems, 38:48941–48974, 2026.
+[9] Zhaolin Gao, Joongwon Kim, Wen Sun, Thorsten Joachims, Sid Wang, Richard Yuanzhe Pang, and Liang Tan.
+Prompt curriculum learning for efficient llm post-training. In International Conference on Learning Representations,
+volume 2026, pages 58614–58652, 2026.
+[10] Daya Guo, Dejian Yang, Haowei Zhang, Junxiao Song, Peiyi Wang, Qihao Zhu, Runxin Xu, Ruoyu Zhang, Shirong
+Ma, Xiao Bi, et al. Deepseek-r1: Incentivizing reasoning capability in llms via reinforcement learning. arXiv preprint
+arXiv:2501.12948, 2025.
+[11] Daya Guo, Dejian Yang, Haowei Zhang, et al. Deepseek-r1 incentivizes reasoning in llms through reinforcement
+learning. Nature, 645:633–638, 2025. doi: 10.1038/s41586-025-09422-z.
+[12] Jordan Hoffmann, Sebastian Borgeaud, Arthur Mensch, Elena Buchatskaya, Trevor Cai, Eliza Rutherford, Diego
+de Las Casas, Lisa Anne Hendricks, Johannes Welbl, Aidan Clark, Tom Hennigan, Eric Noland, Katie Millican,
+George van den Driessche, Bogdan Damoc, Aurelia Guy, Simon Osindero, Karen Simonyan, Erich Elsen, Jack W.
+Rae, Oriol Vinyals, and Laurent Sifre. Training compute-optimal large language models. In Advances in Neural
+Information Processing Systems, 2022.
+[13] Zhenyu Hou, Xin Lv, Rui Lu, Jiajie Zhang, Yujiang Li, Zijun Yao, Juanzi Li, Jie Tang, and Yuxiao Dong.
+T1: Advancing language model reasoning through reinforcement learning and inference scaling. arXiv preprint
+arXiv:2501.11651, 2025.
+[14] Devvrit Khatri, Lovish Madaan, Rishabh Tiwari, Rachit Bansal, Venkata Sai Surya Subramanyam Duvvuri, Manzil
+Zaheer, Inderjit Dhillon, David Brandfonbrener, and Rishabh Agarwal. The art of scaling reinforcement learning
+compute for llms. In International Conference on Learning Representations, volume 2026, pages 72438–72467, 2026.
+[15] Takeshi Kojima, Shixiang Shane Gu, Machel Reid, Yutaka Matsuo, and Yusuke Iwasawa. Large language models
+are zero-shot reasoners. In Advances in Neural Information Processing Systems, 2022.
+[16] Ziniu Li, Congliang Chen, Tianyun Yang, Tian Ding, Ruoyu Sun, Ge Zhang, Wenhao Huang, and Zhi-Quan Luo.
+Knapsack rl: Unlocking exploration of llms via optimizing budget allocation. arXiv preprint arXiv:2509.25849,
+2025.
+
+10
+
+[17] Ivan Moshkov, Darragh Hanley, Ivan Sorokin, Shubham Toshniwal, Christof Henkel, Benedikt Schifferer, Wei
+Du, and Igor Gitman. Aimo-2 winning solution: Building state-of-the-art mathematical reasoning models with
+openmathreasoning dataset. arXiv preprint arXiv:2504.16891, 2025.
+[18] Maxwell Nye, Anders Johan Andreassen, Guy Gur-Ari, Henryk Michalewski, Jacob Austin, David Bieber, David
+Dohan, Aitor Lewkowycz, Maarten Bosma, David Luan, et al. Show your work: Scratchpads for intermediate
+computation with language models. arXiv preprint arXiv:2112.00114, 2021.
+[19] Team OLMo, Pete Walsh, Luca Soldaini, Dirk Groeneveld, Kyle Lo, Shane Arora, Akshita Bhagia, Yuling Gu,
+Shengyi Huang, Matt Jordan, et al. 2 olmo 2 furious. arXiv preprint arXiv:2501.00656, 2024.
+[20] Shubham Parashar, Shurui Gui, Xiner Li, Hongyi Ling, Sushil Vemuri, Blake Olson, Eric Li, Yu Zhang, James
+Caverlee, Dileep Kalathil, et al. Curriculum reinforcement learning from easy to hard tasks improves llm reasoning.
+arXiv preprint arXiv:2506.06632, 2025.
+[21] Yun Qu, Qi Wang, Yixiu Mao, Vincent Tao Hu, Björn Ommer, and Xiangyang Ji. Can prompt difficulty be online
+predicted for accelerating rl finetuning of reasoning models? In Proceedings of the 32nd ACM SIGKDD Conference
+on Knowledge Discovery and Data Mining V. 1, pages 1240–1250, 2026.
+[22] Zhihong Shao, Peiyi Wang, Qihao Zhu, Runxin Xu, Junxiao Song, Xiao Bi, Haowei Zhang, Mingchuan Zhang,
+YK Li, Yang Wu, et al. Deepseekmath: Pushing the limits of mathematical reasoning in open language models.
+arXiv preprint arXiv:2402.03300, 2024.
+[23] Qianli Shen, Daoyuan Chen, Yilun Huang, Zhenqing Ling, Yaliang Li, Bolin Ding, and Jingren Zhou. Bots: A
+unified framework for bayesian online task selection in llm reinforcement finetuning. In International Conference on
+Learning Representations, volume 2026, pages 99871–99911, 2026.
+[24] Charlie Snell, Jaehoon Lee, Kelvin Xu, and Aviral Kumar. Scaling llm test-time compute optimally can be more
+effective than scaling model parameters. arXiv preprint arXiv:2408.03314, 2024.
+[25] Leandro von Werra, Younes Belkada, Lewis Tunstall, Edward Beeching, Tristan Thrush, Nathan Lambert, Shengyi
+Huang, Kashif Rasul, and Quentin Gallouédec. TRL: Transformers Reinforcement Learning, 2020. URL https:
+//github.com/huggingface/trl.
+[26] Zhenting Wang, Guofeng Cui, Yu-Jhe Li, Kun Wan, and Wentian Zhao. Dump: Automated distribution-level
+curriculum learning for rl-based llm post-training. arXiv preprint arXiv:2504.09710, 2025.
+[27] Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten Bosma, Ed Chi, Quoc Le, and Denny Zhou. Chain-of-thought
+prompting elicits reasoning in large language models. In Advances in Neural Information Processing Systems, 2022.
+[28] Wei Xiong, Chenlu Ye, Baohao Liao, Hanze Dong, Xinxing Xu, Christof Monz, Jiang Bian, Nan Jiang, and
+Tong Zhang. Reinforce-ada: An adaptive sampling framework under non-linear rl objectives. arXiv preprint
+arXiv:2510.04996, 2025.
+[29] An Yang, Baosong Yang, Binyuan Hui, Bo Zheng, Bowen Yu, Chang Zhou, Chengpeng Li, Chengyuan Li, Dayiheng
+Liu, Fei Huang, Guanting Dong, Haoran Wei, Huan Lin, Jialong Tang, Jialin Wang, Jian Yang, Jianhong Tu,
+Jianwei Zhang, Jianxin Yang, Jiaxi Yang, Jingren Zhou, Jinze Bai, Jinzheng He, Junyang Lin, Kai Dang, Keming
+Lu, Keqin Bao, Kexin Yang, Le Yu, Mei Li, Mingfeng Xue, Pei Zhang, Qin Zhu, Rui Men, Runxin Xu, Tianhao Li,
+Tianyu Liu, Wang Fan, Wenbin Ge, Xiaodong Deng, Xiaohuan Zhou, Xingzhang Ren, Xinyu Zhang, Xinyuan Li,
+Yang Fan, Yang Tan, Yu Wan, Yuze Gao, Yuqiang Xie, Zekun Wang, Zengmao Wang, Zhihao Xiang, Zhitang Li,
+Zhiyuan Gao, Zhiyuan Xu, and Zick Ye. Qwen2.5 technical report. arXiv preprint arXiv:2412.15115, 2024. URL
+https://arxiv.org/abs/2412.15115.
+[30] An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu, Chang Gao, Chengen
+Huang, Chenxu Lv, et al. Qwen3 technical report. arXiv preprint arXiv:2505.09388, 2025.
+[31] Qiying Yu, Zheng Zhang, Ruofei Zhu, Yufeng Yuan, Xiaochen Zuo, Yu Yue, Weinan Dai, Tiantian Fan, Gaohong
+Liu, Lingjun Liu, et al. Dapo: An open-source llm reinforcement learning system at scale. arXiv preprint
+arXiv:2503.14476, 2025.
+11
+
+[32] Eric Zelikman, Yuhuai Wu, Jesse Mu, and Noah Goodman. Star: Bootstrapping reasoning with reasoning. In
+Advances in Neural Information Processing Systems, volume 35, pages 15476–15488, 2022.
+
+12
+
+A
+
+Algorithms
+
+Algorithm 1 Goldilocks Selector: Data Selection Policy
+1: Input: Dataset D, Selector network fϕ , Candidate Size K, Exploration ϵ.
+2: Output: Selected question q ∗ .
+3: function SelectQuery(ϕ, D)
+4:
+C ← Sample K random indices from D
+5:
+V←∅
+6:
+for each candidate q ∈ C do
+
+v̂q ← fϕ (q) {Predict learning utility}
+V ← V ∪ {v̂q }
+end for
+r ∼ Uniform(0, 1)
+if r < ϵ then
+12:
+q ∗ ← Uniform(C) {Ensure coverage (ϵ-greedy)}
+13:
+else
+14:
+q ∗ ← arg maxq∈C v̂q {Greedy maximization}
+15:
+end if
+16:
+return q ∗
+17: end function
+7:
+8:
+9:
+10:
+11:
+
+Algorithm 2 Goldilocks Selector: Online Refinement
+1: Input: Question q, Rollouts {o1 , ..., oG }, Selector network fϕ , Replay Buffer Dreplay , Capacity Nreplay .
+2: function Update Selector(q, {oi }G
+i=1 )
+
+PG
+1
+p̂q ← G
+I(o is correct) {Empirical success rate}
+p i=1 i
+4:
+yq ← p̂q (1 − p̂q ) {Compute target utility}
+5:
+Push (q, yq ) to Dreplay
+6:
+if |Dreplay | > Nreplay then
+7:
+Remove oldest sample from Dreplay {Sliding window}
+8:
+end if
+9:
+{Periodic Update Trigger (Step 6)}
+10:
+if Update Condition Met then
+11:
+Shuffle Dreplay and create batches B
+12:
+for epoch 1 to ESelector do
+13:
+for batch BP∈ B do
+1
+2
+14:
+L ← |B|
+(q,y)∈B (fϕ (q) − y)
+15:
+ϕ ← ϕ − η∇ϕ L {Gradient descent step}
+16:
+end for
+17:
+end for
+18:
+end if
+19: end function
+3:
+
+13
+
+B
+
+Generalization to Composite Rewards
+
+Assumption 1 (Convergence of auxiliary reward). Let rtotal = rver +f (t), where f (t) is any reward component depending
+on training step t. There exists an iteration threshold N ∈ N such that for all t ≥ N , f (t) = C for some constant C ∈ R.
+Proposition 1. Under Assumption 1, for sufficiently large t, the GRPO advantage computed from rtotal is identical to
+that computed from rver alone.
+Proof. For t ≥ N , we have rtotal = rver + C. Since rver ∼ Bernoulli(pq ):
+mean(rtotal ) = pq + C,
+
+std(rtotal ) =
+
+q
+
+The advantage is:
+rtotal − mean(rtotal )
+std(rtotal )
+(rver + C) − (pq + C)
+p
+=
+pq (1 − pq )
+rver − pq
+=p
+,
+pq (1 − pq )
+
+Âq =
+
+which is identical to the advantage computed from rver alone.
+
+14
+
+pq (1 − pq ).
+
+C
+
+Proofs for GRPO with Verifiable Reward
+
+In this appendix, we provide the formal derivations and proofs for the policy gradient properties under the GRPO
+framework with binary verifiable rewards. First, we derive the decomposition of the policy gradient norm. Then, we use
+this decomposition to prove the exact scaling identity and the structural upper bound of the gradient signal.
+
+C.1
+
+Derivation of the Gradient Norm Decomposition
+
+Recall that the gradient of the standard policy objective for a fixed prompt q is the expected product of the trajectory
+score Sθ (o) and the sequence-level advantage Âq,o :
+h
+i
+∇θ LPG = −Eo∼πθ Sθ (o)Âq,o ,
+(4)
+where the trajectory score is Sθ (o) =
+
+PT
+
+t=1 ∇θ log πθ (ot | q, o<t ).
+
+As established in Section 3, the advantage is the standardized binary reward. Since rver ∼ Bernoulli(pq ), we substitute
+the advantage:
+rver − pq
+Âq,o = p
+pq (1 − pq )
+Plugging this into the gradient expectation yields:
+"
+∇θ LPG = −Eo∼πθ
+
+rver − pq
+Sθ (o) p
+pq (1 − pq )
+
+#
+
+Because rver ∈ {0, 1}, we apply the law of total expectation to split this into two conditional branches weighted by their
+respective probabilities, pq and (1 − pq ):
+"
+#
+"
+#!
+0 − pq
+1 − pq
+rver = 1 + (1 − pq )E Sθ (o) p
+rver = 0
+∇θ LPG = − pq E Sθ (o) p
+pq (1 − pq )
+pq (1 − pq )
+Since pq is constant with respect to the inner expectation, we can factor the scalars out. Notice that the coefficients for
+both terms evaluate to the exact same magnitude:
+q
+p (1 − pq )
+pq
+= pq (1 − pq )
+pq (1 − pq )
+Substituting this simplified coefficient back into the expression gives:
+q
+
+
+ q
+
+
+∇θ LPG = −
+pq (1 − pq )E Sθ (o) rver = 1 − pq (1 − pq )E Sθ (o) rver = 0
+Factoring out the
+
+p
+
+pq (1 − pq ) scalar and taking the norm of both sides yields the gradient norm decomposition:
+∥∇θ LPG ∥ =
+
+C.2
+
+q
+
+
+
+
+
+pq (1 − pq ) E Sθ (o) rver = 1 − E Sθ (o) rver = 0
+
+Derivation of the Gradient Upper Bound
+
+Starting from Eq. 5, the policy-gradient norm for a fixed question q can be written as
+q
+∥∇θ LPG ∥ = pq (1 − pq ) ∥E[Sθ (o) | rver = 1] − E[Sθ (o) | rver = 0]∥ ,
+where
+Sθ (o) =
+
+T
+X
+
+∇θ log πθ (ot | q, o<t )
+
+t=1
+
+15
+
+(5)
+
+is the trajectory score.
+Assume that the per-token score is uniformly bounded by a constant B,
+∥∇θ log πθ (ot | q, o<t )∥ ≤ B.
+By the triangle inequality, the norm of the trajectory score is then bounded by
+∥Sθ (o)∥ ≤
+
+T
+X
+
+∥∇θ log πθ (ot | q, o<t )∥ ≤ BT.
+
+t=1
+
+The same bound therefore holds for the conditional expectations,
+∥E[Sθ (o) | rver = 1]∥ ≤ BT,
+
+∥E[Sθ (o) | rver = 0]∥ ≤ BT.
+
+Applying the triangle inequality once more gives
+q
+∥∇θ LPG ∥ ≤ pq (1 − pq ) (∥E[Sθ (o) | rver = 1]∥ + ∥E[Sθ (o) | rver = 0]∥)
+q
+≤ 2BT pq (1 − pq ).
+
+(6)
+(7)
+
+Thus,
+p under a uniform bound on the per-token score, the policy-gradient norm is upper bounded by a term proportional
+to pq (1 − pq ). This bound vanishes as pq → 0 or pq → 1 and is largest at pq = 1/2, providing the intuition behind
+prioritizing questions of intermediate difficulty.
+
+16
+
+D
+
+Dataset Details
+
+For evaluation, we construct fixed validation sets of 5,000 problems for both OpenMathReasoning and Polaris, sampled
+randomly from their respective datasets and kept strictly disjoint from the corresponding training sets. The same validation
+subset is used across all methods and runs for each dataset to ensure consistent and comparable evaluation.
+
+17
+
+E
+
+Hyperparameter Selection and Implementation
+
+E.1
+
+Model Configuration
+
+For each Model–dataset pair, we tune GRPO over batch sizes {256, 512, 768, 1024, 2048} and learning rates {10−5 , 10−6 , 3.33×
+10−6 , 6.66 × 10−6 }, and select the best-performing configuration using validation accuracy on same wall time. The
+selected settings depend on both the Model and the training dataset. We then use the selected Model learning rate,
+per-device batch size, and gradient-accumulation factor for Goldilocks and the corresponding curriculum baselines, with
+the effective batch adjusted for the allocation of GPUs between Selector network and model described below. Table 4
+summarizes the search space, and Table 5 reports the selected GRPO settings for every Model–dataset pair.
+Table 4: GRPO hyperparameter search and shared Model configuration. Batch size and learning rate are
+tuned separately for each Model–dataset pair. Batch sizes count generated completions per optimization step.
+Setting
+
+Value
+
+Batch-size search space
+Learning-rate search space
+Selection criterion
+Generations per question G
+
+256, 512, 768, 1,024, 2,048
+10−5 , 10−6 , 3.33 × 10−6 , 6.66 × 10−6
+Validation accuracy
+16
+
+Table 5: Selected GRPO Model hyperparameters. Batch size is the total number of completions per optimization
+step across all eight Model GPUs. All compared methods use the listed Model learning rate; Goldilocks and PCL use
+7/8 of the listed batch size when one GPU is reserved for the Selector.
+OpenMathReasoning
+Model
+
+Batch size
+
+OLMo2-1B
+Qwen2.5-1.5B
+Qwen3-4B-Base
+Phi-4-mini-Instruct
+Qwen2.5-7B
+
+768
+1,024
+256
+256
+256
+
+Polaris
+
+Learning rate
+
+Batch size
+
+Learning rate
+
+1,024
+1,024
+256
+256
+256
+
+10−5
+10−5
+3.33 × 10−6
+10−5
+3.33 × 10−6
+
+−5
+
+10
+10−5
+3.33 × 10−6
+10−5
+3.33 × 10−6
+
+The effective completion batch is Bcomp = nGPU bdevice aaccum , where nGPU is the number of Model GPUs, bdevice is the
+per-device completion batch, and aaccum is the gradient-accumulation factor. Each update therefore contains Bcomp /G
+prompt groups. The selected GRPO configurations use eight Model GPUs and a per-device batch size of four. Under
+the fixed eight-GPU budget in Section 5.1, Goldilocks and PCL allocate one GPU to the Selector and seven to the
+Model. Keeping the per-device batch and accumulation factor fixed therefore gives these methods 7/8 of the GRPO
+completion batch. This accounts for the Selector’s hardware cost while preserving the selected Model learning rate and
+per-device configuration.
+
+E.2
+
+Selector Architecture
+
+The Selector functions as a value predictor built upon a trainable language model backbone. For a given input question
+q, we extract the final layer embeddings and apply mean pooling to obtain a fixed-size vector representation. This vector
+is then passed through a linear projection layer. To strictly enforce the valid range of the standard deviation term
+(which lies between 0 and 0.5 for a Bernoulli variable), we apply a scaled sigmoid activation, i.e.,
+fϕ (q) = 0.5 · σ(wT · MeanPool(Embed(q)) + b),
+where fϕ (q) represents the predicted utility of question q. The parameters ϕ encompass both the projection head and
+the pretrained language model, allowing the Selector to learn deep semantic features relevant to difficulty estimation. For
+a detailed exploration of alternative Selector backbones and projection strategies, please refer to Appendix E.3.
+
+18
+
+E.3
+
+Selector Configuration
+
+Every learned curriculum predictor uses Qwen3-0.6B, independent of the Model architecture or training dataset.
+Goldilocks fine-tunes this backbone to predict the standard deviation of binary correctness rewards from question text
+(Section E.2). Its Selector configuration is shared across the main experiments (Table 6); the ablations vary only the
+specified component (Appendix H).
+Table 6: Goldilocks Selector configuration.
+Setting
+Backbone
+Representation
+Output
+Adaptation
+Optimizer / learning rate
+Selector minibatch size
+Passes over replay buffer per update
+Replay capacity
+Random warm-up
+Candidate count K
+Exploration probability ϵ
+Prediction target / loss
+
+Value
+Qwen3-0.6B
+Masked mean of final hidden states
+Scaled sigmoid in [0, 1/2]
+Full-parameter fine-tuning
+AdamW / 10−5
+32
+4
+128 questions
+64 question selections
+8
+0.2
+Reward standard deviation / squared error
+
+Selector updates require at least one complete replay minibatch. The bounded buffer emphasizes recent Model behavior
+as the policy improves; all Selector labels come from Model rollouts already used for training. The number of completions
+used to form each Selector target matches the Model’s rollout group size, including in the generation-count ablations
+(Appendix H).
+
+E.4
+
+Baseline Details
+
+GRPO uses the standard sampler over the shuffled training dataset. PCL [9] learns a success-probability predictor with
+the same Qwen3-0.6B backbone as Goldilocks and prioritizes questions near a target success rate of 0.5. MoPPS [21]
+maintains a Beta posterior for each question and selects prompts by posterior sampling.
+For PCL and MoPPS, we use the exact method-specific hyperparameters reported in their original papers, except
+that we additionally tune PCL’s Selector learning rate to ensure a well-tuned baseline implementation. The selected
+Selector learning rate is 10−6 across all Model–dataset pairs; the remaining baseline-specific hyperparameters retain
+their published values. Model optimization follows the GRPO-selected learning rate and batch configuration in Table 5,
+including the GPU-allocation adjustment for learned Selectors.
+
+19
+
+F
+
+Compute and Training Efficiency
+
+To complement the optimization-step comparisons in the main text, we evaluate training efficiency using two additional
+measures: wall-clock time and the number of Model-generated tokens. Wall-clock time captures the end-to-end training
+cost, including Selector scoring and optimization for learned curriculum methods, while generated tokens isolate the
+dominant cost of Model rollout generation. These views allow us to distinguish improvements in sampling efficiency
+from differences in system-level overhead. The following comparisons use Qwen2.5-7B on OpenMathReasoning. GRPO’s
+last available point within that budget defines the reference accuracy.
+
+Validation accuracy
+
+Wall-clock efficiency. Figure 5 reports accuracy as a function of elapsed training time. All methods are evaluated
+under the same hardware allocation described in Section 5.1. For Goldilocks and PCL, the reported time includes
+Selector inference and Selector updates.
+
+0.50
+0.45
+
+46% less time
+
+0.40
+
+Goldilocks
+GRPO
+PCL
+
+0.35
+0.30
+
+0
+
+20
+
+40
+
+60
+
+80
+
+Training time (hours)
+
+100
+
+120
+
+Figure 5: Accuracy versus wall-clock time. Held-out accuracy of Qwen2.5-7B on OpenMathReasoning throughout
+training for GRPO, PCL, and Goldilocks.
+
+Validation accuracy
+
+Generated-token efficiency. Figure 6 reports accuracy against the cumulative number of tokens generated by
+the Model during training. This comparison measures how effectively each method converts rollout generation into
+improvements in held-out performance, independent of Selector-side computational overhead.
+
+0.50
+0.45
+51% fewer tokens
+
+0.40
+
+Goldilocks
+GRPO
+PCL
+
+0.35
+0.30
+
+0
+
+1
+
+2
+
+3
+
+Training tokens (B)
+
+4
+
+Figure 6: Accuracy versus generated-token budget. Held-out accuracy of Qwen2.5-7B on OpenMathReasoning as
+a function of cumulative Model-generated tokens for GRPO, PCL, and Goldilocks.
+Together, the step-, wall-clock-, and token-based evaluations provide complementary measures of efficiency. Optimization
+steps measure learning progress at the algorithmic level, generated tokens capture rollout efficiency, and wall-clock time
+reflects the end-to-end cost of running each method.
+20
+
+G
+
+Selector Training Dynamics
+
+We further analyze the behavior of the Goldilocks Selector during training. In these experiments, each Model optimization
+step corresponds to four Selector optimization steps. Consequently, the Selector-step axis in the following figures spans
+approximately four times as many steps as the Model-training axes reported elsewhere in the paper.
+First, we measure how accurately the Selector tracks the reward variability observed from the Model’s rollouts. For each
+question, the Selector predicts a utility score fϕ (q) before generation. After obtaining the rollout group, we compute the
+realized target
+q
+yq =
+
+p̂q (1 − p̂q ),
+
+and evaluate the absolute prediction error |fϕ (q) − yq |. Figure 7 shows that this error decreases over training, indicating
+that the Selector progressively adapts to the Model’s evolving capabilities. We additionally report the error on zerovariance groups, for which yq = 0, to measure how well the Selector identifies questions expected to provide little relative
+learning signal.
+
+All samples
+Zero advantage samples
+
+1 error
+
+0.15
+0.10
+0.05
+0
+
+10000 20000 30000 40000 50000 60000
+
+Selector step
+
+Figure 7: Selector prediction error on OpenMathReasoning. Absolute error between predicted and realized
+reward-variability targets throughout training. The x-axis reports Selector optimization steps; each Model optimization
+step corresponds to four Selector steps.
+
+Advantage prediction
+
+Diversity of Selector predictions. We also track the distribution of utility scores predicted by the Selector
+throughout training. Figure 8 reports the mean predicted score together with one standard deviation. The persistent
+spread in predicted utilities shows that the Selector does not collapse to a nearly constant scoring function as training
+progresses; instead, it continues to distinguish questions according to their predicted reward variability as the Model
+evolves.
+
+Mean ± std.
+
+0.2
+0.1
+0.0
+0
+
+10000 20000 30000 40000 50000 60000
+
+Selector step
+
+Figure 8: Distribution of Goldilocks Selector scores. Mean predicted utility with ± one standard deviation over
+Selector optimization steps.
+
+21
+
+H
+
+Detailed Ablations
+
+All ablations use Qwen2.5-1.5B on OpenMathReasoning with Qwen3-0.6B as the Selector. Unless varied explicitly, we
+use the reference configuration ϵ = 0.2, K = 8, and G = 16 (Table 6), together with the Model batch size and learning
+rate selected for GRPO (Table 4).
+
+0.45
+
+0.6
+
+0.40
+
+0.5
+
+Fraction of zero var.
+
+Validation accuracy
+
+Optimization objective. We first test whether the benefit of Goldilocks depends on the particular model optimization
+objective. In addition to standard GRPO, we consider a DAPO-style loss [31] and GRPO with entropy regularization
+β = 3 × 10−4 . In each case, GRPO and Goldilocks use the same objective, isolating the effect of adaptive question
+selection. Figure 9 shows the corresponding validation accuracy and zero-variance fraction.
+
+0.35
+0.30
+0.25
+
+Goldilocks
+Goldilocks + Ent.
+Goldilocks DAPO
+
+0.20
+0
+
+GRPO
+GRPO + Ent.
+DAPO
+
+0.4
+0.3
+0.2
+
+Goldilocks
+Goldilocks + Ent.
+Goldilocks DAPO
+
+0.1
+0
+
+2500 5000 7500 10000 12500
+
+Training step
+
+(a) Validation accuracy.
+
+GRPO
+GRPO + Ent.
+DAPO
+
+2500 5000 7500 10000 12500
+
+Training step
+
+(b) Zero-variance fraction.
+
+Figure 9: Optimization-objective ablation. GRPO and Goldilocks under standard GRPO, DAPO, and entropyregularized objectives.
+
+22
+
+Validation accuracy
+
+Exploration probability. We vary ϵ ∈ {0, 0.2, 0.5} to study the role of random exploration in the Selector. Final
+performance is relatively insensitive to moderate changes in ϵ: larger values increase randomness in the selected questions,
+whereas smaller values make the Selector rely more heavily on its own predictions and therefore on the subset of
+questions it already favors. Figure 10 reports validation accuracy together with the corresponding training-reward and
+zero-variance dynamics.
+
+0.4
+28% fewer steps
+
+0.3
+
+Goldilocks = 0
+Goldilocks = 0.2
+Goldilocks = 0.5
+GRPO
+
+0.2
+0
+
+2500 5000 7500 10000 12500
+
+Training step
+
+0.7
+0.6
+0.5
+0.4
+0.3
+0.2
+
+Fraction of zero var.
+
+Training reward
+
+(a) Validation accuracy.
+
+Goldilocks = 0
+Goldilocks = 0.2
+Goldilocks = 0.5
+GRPO
+
+0
+
+2500 5000 7500 10000 12500
+
+0.6
+0.5
+0.4
+0.3
+0.2
+0.1
+
+Goldilocks = 0
+Goldilocks = 0.2
+Goldilocks = 0.5
+GRPO
+
+0
+
+Training step
+
+(b) Average training reward.
+
+2500 5000 7500 10000 12500
+
+Training step
+
+(c) Zero-variance fraction.
+
+Figure 10: Exploration-probability ablation. Training dynamics for ϵ ∈ {0, 0.2, 0.5}.
+
+23
+
+Validation accuracy
+
+Candidate-pool size. We vary K ∈ {8, 16, 32} to study sensitivity to the number of candidate questions scored before
+each selection. Increasing K gives the Selector more opportunities to identify informative questions, while also increasing
+Selector inference cost. Across the tested range, performance changes only moderately, indicating that Goldilocks does
+not rely on a narrowly tuned candidate-pool size. The corresponding learning curves are shown in Figure 11.
+
+0.4
+28% fewer steps
+
+0.3
+
+Goldilocks k = 8
+Goldilocks k = 16
+Goldilocks k = 32
+GRPO
+
+0.2
+0
+
+2500 5000 7500 10000 12500
+
+Training step
+
+0.6
+0.5
+0.4
+0.3
+0.2
+
+Fraction of zero var.
+
+Training reward
+
+(a) Validation accuracy.
+
+Goldilocks k = 8
+Goldilocks k = 16
+Goldilocks k = 32
+GRPO
+
+0
+
+2500 5000 7500 10000 12500
+
+0.6
+0.5
+0.4
+0.3
+0.2
+0.1
+
+Goldilocks k = 8
+Goldilocks k = 16
+Goldilocks k = 32
+GRPO
+
+0
+
+Training step
+
+(b) Average training reward.
+
+2500 5000 7500 10000 12500
+
+Training step
+
+(c) Zero-variance fraction.
+
+Figure 11: Candidate-pool size ablation. Training dynamics for K ∈ {8, 16, 32}.
+
+24
+
+Validation accuracy
+
+Generations per question. We compare GRPO and Goldilocks at G ∈ {8, 16, 32} while keeping the global batch size
+fixed. Increasing G therefore allocates more generations to each question while reducing the number of distinct prompt
+groups in an update. It also changes both the noise in the Selector target and the probability of observing mixed rewards
+within a rollout group. Figure 12 shows that Goldilocks retains its advantage across the tested group sizes.
+
+0.4
+28% fewer steps
+
+0.3
+
+Goldilocks G = 8
+Goldilocks G = 16
+Goldilocks G = 32
+
+0.2
+0
+
+GRPO G = 8
+GRPO G = 16
+GRPO G = 32
+
+2500 5000 7500 10000 12500
+
+Training step
+
+(a) Validation accuracy.
+
+Fraction of zero var.
+
+Training reward
+
+0.6
+0.5
+0.4
+0.3
+
+Goldilocks G = 8
+Goldilocks G = 16
+Goldilocks G = 32
+
+0.2
+0
+
+GRPO G = 8
+GRPO G = 16
+GRPO G = 32
+
+2500 5000 7500 10000 12500
+
+Training step
+
+(b) Average training reward.
+
+0.6
+0.4
+0.2
+0.0
+
+Goldilocks G = 8
+Goldilocks G = 16
+Goldilocks G = 32
+
+0
+
+GRPO G = 8
+GRPO G = 16
+GRPO G = 32
+
+2500 5000 7500 10000 12500
+
+Training step
+
+(c) Zero-variance fraction.
+
+Figure 12: Rollout-group-size ablation. GRPO and Goldilocks with G ∈ {8, 16, 32} at a fixed global batch size.
+
+25
+
+Validation accuracy
+
+Robustness across seeds. Finally, we repeat the standard GRPO–Goldilocks comparison across four Model seeds.
+Figure 13 shows the mean learning trajectories and their variation across seeds.
+
+Goldilocks
+GRPO
+
+0.4
+0.3
+0.2
+0
+
+2500 5000 7500 10000 12500
+
+Training step
+
+Figure 13: Seed robustness. Validation accuracy for GRPO and Goldilocks across four Model seeds.
+
+26
+
+I
+
+Additional Validation and Training Dynamics
+
+We provide additional validation and training-dynamics curves for all Models on OpenMathReasoning and Polaris. For
+each model, we report validation accuracy throughout training, the average training reward of the selected questions,
+and the fraction of rollout groups with zero reward variance. Validation accuracy characterizes learning progress, while
+the latter two metrics characterize the distribution and informativeness of the questions selected by each sampling
+strategy. In particular, the zero-variance fraction directly measures how often all generations for a selected question
+receive the same reward and therefore provide no relative reward signal.
+
+I.1
+
+OpenMathReasoning
+
+0.20
+
+Goldilocks
+GRPO
+PCL
+
+0.15
+0.10
+
+Training reward
+
+Validation accuracy
+
+Figures 14–18 report the corresponding curves for all Models on OpenMathReasoning. These results complement Table 1
+by showing how validation performance and the training distribution evolve over the full optimization horizon.
+
+64% fewer steps
+
+0.05
+0
+
+10000
+
+20000
+
+30000
+
+Training step
+
+0.5
+0.4
+0.3
+0.2
+0.1
+
+Goldilocks
+GRPO
+PCL
+
+0
+
+40000
+
+10000
+
+Fraction of zero var.
+
+(a) Validation accuracy.
+
+1.0
+0.8
+0.6
+0.4
+0.2
+0.0
+
+20000
+
+30000
+
+Training step
+
+40000
+
+(b) Average training reward.
+
+Goldilocks
+GRPO
+PCL
+
+0
+
+10000
+
+20000
+
+30000
+
+Training step
+
+40000
+
+(c) Zero-variance fraction.
+
+Figure 14: OLMo2-1B on OpenMathReasoning. Validation performance and training dynamics throughout
+optimization.
+
+27
+
+0.4
+
+Training reward
+
+Validation accuracy
+
+0.6
+
+Goldilocks
+GRPO
+PCL
+
+28% fewer steps
+
+0.3
+0.2
+0
+
+0.5
+0.4
+0.3
+0
+
+2500 5000 7500 10000 12500
+
+Training step
+
+(a) Validation accuracy.
+
+Fraction of zero var.
+
+Goldilocks
+GRPO
+PCL
+
+0.2
+
+2500 5000 7500 10000 12500
+
+Training step
+
+(b) Average training reward.
+
+0.6
+0.4
+Goldilocks
+GRPO
+PCL
+
+0.2
+0
+
+2500 5000 7500 10000 12500
+
+Training step
+
+(c) Zero-variance fraction.
+
+Figure 15: Qwen2.5-1.5B on OpenMathReasoning. Validation performance and training dynamics throughout
+optimization.
+
+28
+
+0.50
+
+Training reward
+
+Validation accuracy
+
+0.55
+42% fewer steps
+
+0.45
+
+Goldilocks
+GRPO
+PCL
+
+0.40
+0
+
+5000
+
+10000
+
+15000
+
+Training step
+
+0.55
+0.50
+0.45
+0.40
+0.35
+
+20000
+
+Goldilocks
+GRPO
+PCL
+
+0
+
+Fraction of zero var.
+
+(a) Validation accuracy.
+
+5000
+
+10000
+
+15000
+
+Training step
+
+20000
+
+(b) Average training reward.
+
+0.4
+Goldilocks
+GRPO
+PCL
+
+0.3
+0.2
+0
+
+5000
+
+10000
+
+15000
+
+Training step
+
+20000
+
+(c) Zero-variance fraction.
+
+Figure 16: Qwen3-4B on OpenMathReasoning. Validation performance and training dynamics throughout
+optimization.
+
+29
+
+Goldilocks
+GRPO
+PCL
+
+0.40
+0.35
+
+Training reward
+
+Validation accuracy
+
+0.45
+
+49% fewer steps
+
+0.30
+0
+
+5000
+
+10000
+
+Training step
+
+0.5
+0.4
+
+0
+
+15000
+
+(a) Validation accuracy.
+
+Fraction of zero var.
+
+Goldilocks
+GRPO
+PCL
+
+0.3
+5000
+
+10000
+
+Training step
+
+15000
+
+(b) Average training reward.
+
+0.4
+0.3
+0.2
+Goldilocks
+GRPO
+PCL
+
+0.1
+0.0
+
+0
+
+5000
+
+10000
+
+Training step
+
+15000
+
+(c) Zero-variance fraction.
+
+Figure 17: Phi-4-mini-Instruct on OpenMathReasoning. Validation performance and training dynamics throughout
+optimization.
+
+30
+
+0.45
+
+Training reward
+
+Validation accuracy
+
+Goldilocks
+GRPO
+PCL
+
+0.50
+
+49% fewer steps
+
+0.40
+0.35
+0.30
+
+0
+
+5000
+
+10000
+
+0.5
+0.4
+
+0
+
+15000
+
+Training step
+
+(a) Validation accuracy.
+
+Fraction of zero var.
+
+Goldilocks
+GRPO
+PCL
+
+0.3
+5000
+
+10000
+
+Training step
+
+15000
+
+(b) Average training reward.
+
+0.5
+0.4
+
+Goldilocks
+GRPO
+PCL
+
+0.3
+0.2
+0.1
+
+0
+
+5000
+
+10000
+
+Training step
+
+15000
+
+(c) Zero-variance fraction.
+
+Figure 18: Qwen2.5-7B on OpenMathReasoning. Validation performance and training dynamics throughout
+optimization.
+
+31
+
+I.2
+
+Polaris
+
+0.15
+Goldilocks
+GRPO
+PCL
+MoPPS
+
+0.10
+0.05
+0
+
+Training reward
+
+0.20
+52% fewer steps
+
+Goldilocks
+GRPO
+PCL
+MoPPS
+
+0.8
+0.6
+0.4
+0.2
+0.0
+
+5000 10000 15000 20000 25000 30000
+
+Training step
+
+(a) Validation accuracy.
+
+Fraction of zero var.
+
+Validation accuracy
+
+Figures 19–23 report the same diagnostics on Polaris. The smaller training pool produces more frequent question
+revisitation, allowing history-based methods such as MoPPS to accumulate increasingly informative question-specific
+estimates. These curves complement Table 2 by showing how the relative performance and selected-question distributions
+evolve throughout training.
+
+0
+
+5000 10000 15000 20000 25000 30000
+
+Training step
+
+(b) Average training reward.
+
+0.8
+0.6
+0.4
+
+Goldilocks
+GRPO
+PCL
+MoPPS
+
+0.2
+0.0
+
+0
+
+5000 10000 15000 20000 25000 30000
+
+Training step
+
+(c) Zero-variance fraction.
+
+Figure 19: OLMo2-1B on Polaris. Validation performance and training dynamics throughout optimization.
+
+32
+
+0.8
+
+Training reward
+
+Validation accuracy
+
+0.225
+0.200
+0.175
+0.150
+0.125
+0.100
+
+40% fewer steps
+Goldilocks
+GRPO
+PCL
+MoPPS
+
+0
+
+Goldilocks
+GRPO
+PCL
+MoPPS
+
+0.6
+0.4
+0.2
+0
+
+1000 2000 3000 4000 5000 6000
+
+Training step
+
+Fraction of zero var.
+
+(a) Validation accuracy.
+
+1000 2000 3000 4000 5000 6000
+
+Training step
+
+(b) Average training reward.
+
+0.8
+0.6
+0.4
+
+Goldilocks
+GRPO
+PCL
+MoPPS
+
+0.2
+0
+
+2000
+
+4000
+
+6000
+
+Training step
+
+8000
+
+(c) Zero-variance fraction.
+
+Figure 20: Qwen2.5-1.5B on Polaris. Validation performance and training dynamics throughout optimization.
+
+33
+
+Training reward
+
+26% fewer steps
+Goldilocks
+GRPO
+PCL
+MoPPS
+
+0
+
+Goldilocks
+GRPO
+PCL
+MoPPS
+
+0.5
+0.4
+0.3
+0.2
+
+2000 4000 6000 8000 10000
+
+Training step
+
+(a) Validation accuracy.
+
+0
+
+2000
+
+4000
+
+6000
+
+Training step
+
+8000 10000
+
+(b) Average training reward.
+
+0.5
+
+Fraction of zero var.
+
+Validation accuracy
+
+0.32
+0.30
+0.28
+0.26
+0.24
+0.22
+
+0.4
+0.3
+0.2
+Goldilocks
+GRPO
+PCL
+MoPPS
+
+0.1
+0
+
+2000
+
+4000
+
+6000
+
+Training step
+
+8000
+
+10000
+
+(c) Zero-variance fraction.
+
+Figure 21: Qwen3-4B on Polaris. Validation performance and training dynamics throughout optimization.
+
+34
+
+Goldilocks
+GRPO
+PCL
+MoPPS
+
+0
+
+Training reward
+
+Validation accuracy
+
+0.26
+0.24
+0.22
+0.20
+0.18
+0.16
+
+78% fewer steps
+2000 4000 6000 8000 10000
+
+0.4
+0.3
+0.2
+0
+
+Training step
+
+Fraction of zero var.
+
+(a) Validation accuracy.
+
+0.5
+0.4
+0.3
+0.2
+0.1
+0.0
+
+Goldilocks
+GRPO
+PCL
+MoPPS
+
+0.5
+
+2000
+
+4000
+
+6000
+
+Training step
+
+8000 10000
+
+(b) Average training reward.
+
+Goldilocks
+GRPO
+PCL
+MoPPS
+
+0
+
+2000
+
+4000
+
+6000
+
+Training step
+
+8000 10000
+
+(c) Zero-variance fraction.
+
+Figure 22: Phi-4-mini-Instruct on Polaris. Validation performance and training dynamics throughout optimization.
+
+35
+
+0.35
+0.30
+
+Training reward
+
+Validation accuracy
+
+Goldilocks
+GRPO
+PCL
+MoPPS
+
+43% fewer steps
+
+0.25
+0
+
+5000
+
+10000
+
+15000
+
+Training step
+
+0.6
+0.4
+0.2
+
+(a) Validation accuracy.
+
+Fraction of zero var.
+
+Goldilocks
+GRPO
+PCL
+MoPPS
+
+0
+
+5000
+
+10000
+
+Training step
+
+15000
+
+(b) Average training reward.
+
+Goldilocks
+GRPO
+PCL
+MoPPS
+
+0.4
+0.3
+0.2
+0.1
+0
+
+5000
+
+10000
+
+Training step
+
+15000
+
+(c) Zero-variance fraction.
+
+Figure 23: Qwen2.5-7B on Polaris. Validation performance and training dynamics throughout optimization.
+
+36
+
+J
+
+Prompts
+
+The final input to the model is constructed by concatenating a fixed header, the specific math problem, and a fixed
+footer:
+Input = PROMPT HEADER + Question + PROMPT FOOTER
+The exact text used for the header and footer is provided below.
+
+Prompt Header
+You are an expert problem solver. Your task is to solve the problem by
+explicitly showing your detailed Chain of Thought.
+You must write out your reasoning step-by-step, explaining your logic
+for every calculation or deduction.
+**Crucially, the final answer must be enclosed in a \boxed{...} command.**
+
+Prompt Footer
+Strictly follow this output format:
+### Step-by-Step Reasoning
+<Write your detailed thought process here. Do not skip steps.>
+### Final Answer
+\boxed{<your final answer>}
+**Important: The \boxed{...} command should only contain the final,
+simplified numerical or symbolic answer, with no extra text or units.**
+
+37
+
+K
+
+Success Probability versus Reward-Variability Targets
+
+If the success probability of everyp
+question were known exactly, a curriculum targeting pq ≈ 1/2 and one maximizing
+the ideal reward-variability score pq (1 − pq ) would favor the same intermediate-difficulty questions. The distinction
+becomes important in practice because pq is not known and must instead be inferred from the question and from finite
+rollout feedback.
+A predicted success probability near 1/2 does not necessarily mean that the underlying question itself has success
+probability near 1/2. For example, the same prediction can arise when the information available to the predictor cannot
+distinguish between questions that are very easy and questions that are very difficult. Goldilocks does not train the
+Selector only to predict mean success probability; instead, it directly predicts the reward variability realized by rollout
+groups.
+
+K.1
+
+Setup
+
+We analyze a fixed Model checkpoint with parameters θ; all quantities below should therefore be understood as
+checkpoint-specific. Let Q ∼ D denote a question drawn from the candidate-question distribution, and let
+H = h(Q)
+denote the representation of that question available to the Selector.
+For a particular question q, define
+pq (θ) =
+
+Pr
+o∼πθ (·|q)
+
+
+rver (o) = 1 ,
+
+the probability that the current Model produces a correct answer under the binary verification reward. We then define
+the random variable
+P = pQ (θ),
+which varies because the randomly drawn question Q varies.
+Conditional on the information available to the Selector, we define
+µ(h) := E[P | H = h],
+
+τ 2 (h) := Var(P | H = h).
+
+(8)
+
+Here, µ(h) is the mean solvability of questions represented by h, while τ 2 (h) measures how much their true success
+probabilities can differ even after conditioning on the representation available to the Selector. Thus, τ 2 (h) captures
+representation-conditional ambiguity rather than finite-sample estimation error.
+For a rollout group of size G, let R1 , . . . , RG ∈ {0, 1} denote the verification rewards of independently sampled Model
+outputs. Conditional on a question with success probability P ,
+Ri | P ∼ Bernoulli(P ).
+Let
+S=
+
+G
+X
+
+Ri ,
+
+S | P ∼ Binomial(G, P ),
+
+i=1
+
+p̂ =
+
+S
+.
+G
+
+We use
+σ(p) =
+
+p
+
+p(1 − p)
+
+for the standard deviation of a Bernoulli variable with success probability p, and define the empirical Goldilocks target
+as
+p
+σ̂ = σ(p̂) = p̂(1 − p̂).
+The Selector is trained to predict σ̂. Notice that σ̂ = 0 exactly when S = 0 or S = G, i.e., when every rollout in the
+group receives the same verification reward. Such groups contain no within-group reward variation and therefore provide
+no relative reward signal to GRPO.
+
+38
+
+We call a rollout group informative when it contains both correct and incorrect responses, i.e., when 0 < S < G.
+Define
+ρ(h) := Pr(0 < S < G | H = h).
+(9)
+Conditioning first on P , the probability of a zero-variance group is P G + (1 − P )G . Averaging over questions represented
+by h therefore gives
+
+
+ρ(h) = 1 − E P G + (1 − P )G | H = h .
+(10)
+Thus, ρ(h) averages over both variation among questions consistent with the representation h and the randomness of
+Model rollouts.
+
+K.2
+
+What the two prediction targets learn
+
+We first consider a predictor trained with squared loss on the empirical success rate p̂. The population minimizer of
+squared-error regression is the conditional expectation of its target. Since
+E[p̂ | P ] = P,
+the tower property gives
+m(h) = E[p̂ | H = h] = E[P | H = h] = µ(h).
+
+(11)
+
+Thus, in the population limit, a success-probability predictor such as that used by PCL estimates the conditional mean
+solvability µ(h). A curriculum targeting success probability 1/2 therefore favors representations for which µ(h) is close
+to 1/2.
+Goldilocks instead trains the Selector on σ̂. Under the same population squared-loss argument, its prediction target
+is
+v(h) = E[σ̂ | H = h].
+(12)
+Hence, v(h) is the expected empirical reward variability of the rollout group that would be generated after selecting a
+question represented by h.
+
+K.3
+
+Why the predicted mean can be misleading
+
+The conditional mean µ(h) does not fully characterize how informative the underlying questions are. To see this, consider
+the expected Bernoulli reward variance:
+E[P (1 − P ) | H = h] = E[P | H = h] − E[P 2 | H = h]
+
+= µ(h) − τ 2 (h) + µ(h)2
+2
+
+= µ(h)(1 − µ(h)) − τ (h).
+
+(13)
+(14)
+(15)
+
+Therefore, the variance obtained by simply applying the Bernoulli formula to the predicted mean, µ(h)(1 − µ(h)), is
+larger than the expected within-question reward variance by exactly τ 2 (h).
+A related consequence follows for the reward standard deviation. Because the square-root function is concave, Jensen’s
+inequality gives
+p
+p
+E[σ(P ) | H = h] ≤ E[P (1 − P ) | H = h] = µ(h)(1 − µ(h)) − τ 2 (h) ≤ σ(µ(h)).
+(16)
+Thus, computing variability from the conditional mean can systematically overstate the reward variability of the
+underlying questions whenever τ 2 (h) > 0.
+The same issue appears directly in the probability of obtaining a zero-variance rollout group. For G ≥ 2, the
+function
+z(p) = pG + (1 − p)G
+is convex on [0, 1]. Jensen’s inequality therefore yields
+Pr(zero variance | H = h) = E[z(P ) | H = h] ≥ z(µ(h)) = µ(h)G + (1 − µ(h))G .
+39
+
+(17)
+
+A mean-based estimate therefore gives a lower bound on the actual zero-variance probability conditional on h.
+Consequently, a predicted mean near 1/2 is not sufficient to guarantee that the selected questions are themselves near
+the Model’s solvability frontier. As an extreme illustration, suppose that conditional on some representation h, half of
+the questions have P = 0 and half have P = 1. Then
+µ(h) =
+
+1
+,
+2
+
+so a mean-based curriculum targeting 1/2 gives this representation its highest possible score. Nevertheless, every
+individual question has deterministic outcomes, and every rollout group is zero-variance.
+This also explains why an average training reward near 1/2 is not, by itself, evidence that the selected questions
+individually have success probability near 1/2. The same aggregate mean can arise from a mixture of questions near the
+two extremes.
+
+K.4
+
+The Goldilocks score and informative rollout groups
+
+The Goldilocks target has a direct relationship to the probability of obtaining an informative rollout group. Define
+  √
+1
+G−1
+=
+.
+cG := σ
+G
+G
+For a zero-variance group, σ̂ = 0. For an informative group, S ∈ {1, . . . , G − 1}, so
+
+
+1
+1
+p̂ ∈
+,1 −
+.
+G
+G
+p
+Since σ(p) = p(1 − p) is symmetric around 1/2, is increasing on [0, 1/2], and has maximum 1/2, every informative
+group satisfies
+1
+cG ≤ σ̂ ≤ .
+2
+Equivalently,
+1
+cG 1{0 < S < G} ≤ σ̂ ≤ 1{0 < S < G}.
+2
+Taking conditional expectations given H = h gives
+cG ρ(h) ≤ v(h) ≤
+
+1
+ρ(h).
+2
+
+(18)
+
+2v(h) ≤ ρ(h) ≤
+
+v(h)
+.
+cG
+
+(19)
+
+Rearranging,
+
+Thus, the quantity predicted by the Goldilocks Selector is directly tied to the probability that a selected question
+produces a mixed-reward rollout group. In particular, a high value of v(h) implies a nontrivial lower bound on the
+probability of obtaining an informative group. The conditional mean µ(h) alone does not provide such a guarantee.
+The connection to representation-conditional heterogeneity is especially transparent if we examine the squared empirical
+variability target. Since
+P (1 − P )
+Var(p̂ | P ) =
+G
+and E[p̂ | P ] = P , we have
+E[p̂(1 − p̂) | P ] = E[p̂ | P ] − E[p̂2 | P ]
+
+
+1
+P (1 − P ).
+= 1−
+G
+
+40
+
+(20)
+(21)
+
+Taking the conditional expectation over P given H = h and applying Eq. 15 gives
+
+
+
+1 
+E[p̂(1 − p̂) | H = h] = 1 −
+µ(h)(1 − µ(h)) − τ 2 (h) .
+G
+
+(22)
+
+Thus, for the squared variability target, the contribution suggested by the mean success probability is reduced exactly
+by the conditional heterogeneity τ 2 (h), up to the finite-group factor 1 − 1/G.
+p
+Goldilocks uses the standard-deviation target σ̂ = p̂(1 − p̂) rather than its square, so Eq. 22 is not itself the exact
+population target learned by Goldilocks. The direct relationship for the actual Goldilocks target is instead given by the
+informative-group bounds in Eq. 18.
+Overall, this analysis predicts that a success-probability curriculum can maintain an average selected reward near 1/2
+while still selecting a heterogeneous mixture of very easy and very difficult questions. Goldilocks instead trains the
+Selector directly on realized within-group reward variability, which is tied to the probability of obtaining mixed-reward
+groups. We therefore expect Goldilocks to produce fewer zero-variance rollout groups even when another curriculum
+maintains an average reward closer to 1/2. This prediction is consistent with the training dynamics in Figure 3.
+
+41
+
+L
+
+Computational Cost of Experiments
+
+All experiments were conducted on 8-GPU nodes, using either H100 80GB or H200 141GB GPUs. For GRPO and
+MoPPS, all eight GPUs are used for model training, whereas Goldilocks and PCL allocate seven GPUs to the model
+and one GPU to the Selector. Across the experiments reported in this work, we ran 66 jobs totaling approximately
+115,099 GPU-hours. This includes 54,891 GPU-hours for the main experiments, 12,103 for seed repetitions, 8,133 for
+objective ablations, 4,159 for the exploration-probability ablation, 8,318 for the rollout-group-size ablation, 4,159 for the
+candidate-pool-size ablation, and 23,336 for batch-size tuning.
+
+42
+
+

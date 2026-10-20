@@ -1,0 +1,55 @@
+---
+description: "Models can recite a concept's definition yet fail quizzes that need it, so recitation is not evidence of application; option-permutation robustness widens the measured gap."
+aliases: ["definition-application gap", "conceptual reasoning gap", "recite-but-not-apply gap", "calculation-conceptualization discrepancy", "calculation-conceptualization gap"]
+sources: ["arxiv-2512-18857", "arxiv-2512-15298", "arxiv-2512-12552"]
+---
+# Definition-application gap
+
+Stating what a concept says and using it to choose a step are two different things, and a language model can pass the first while failing the second. The CORE paper defines conceptual reasoning as "identifying the right concept and applying it in the solution, as opposed to procedural pattern matching"[^c1], and its diagnostic probes the distance between those two abilities.
+
+The sanity check runs on exercises a strong model got wrong for conceptual reasons. After each failure the model is asked to describe the concept behind the exercise, and "in the majority of cases, the model can accurately and comprehensively" recites the definition and properties.[^c2] The qualitative analysis gives no rate, so the paper shows the gap exists, not how often it occurs.[^c3] The clearest case is a question about the Rational Root Theorem. The model restates the theorem correctly, yet after the numerator and denominator in an option are swapped, "the model still follows its ingrained reasoning and makes an incorrect judgment."[^c4] When the theorem is named again in a follow-up prompt, the model rejects that option. The authors read this as a process "locked into a rigid, pattern-matching heuristic, failing to flexibly incorporate or be guided by" explicit concept knowledge that is already available.[^c5]
+
+The quantitative version is a permutation test on about 1,110 synthetic multiple-choice quizzes built from the concept texts. Each quiz is asked again with three random reorderings of its options, and a model counts as having solved it only if all four answers are right. Under this Robust Evaluation, Qwen2-Math-7B's pass@1 falls from 74.33% to 45.92%.[^c6] The authors summarize the drop as showing that success is "shallow heuristics rather than a deep, structural understanding of the underlying concepts."[^c7]
+
+The point the note carries is the separation of the two measurements. A correct recitation says nothing about whether the concept governs the solution, and a correct answer under one option order says nothing about whether it survives a change that leaves the concept untouched. The gap is what remains when the first is high and the second is low. The paper's training recipe is built on this split: it supplies the concept text during rollouts, and it evaluates without that text, "measuring whether concept-aware training translates into genuine conceptual competence rather than reasoning shortcuts."[^c8]
+
+A second study reports the same split on the calculation side, under another name. Its authors code a "Calculation-Conceptualization Discrepancy" in which the model "performed procedural tasks such as calculation but failed to apply the core scientific concepts implied" by the result.[^c14] They call it "a failure type unique to AI," found where "calculation was performed correctly" but "its conceptual meaning could not be connected."[^c15][^c16] This is the procedural counterpart of the gap above: a correct computation that does not carry the concept it implies. The count is qualitative, and the authors leave open whether humans fail the same way: it is "necessary to precisely determine whether human students also exhibit" the pattern.[^c17] The "unique to AI" label is therefore a claim the study does not test. See [[perception-cognition-gap]] for the same split applied to reading figures.
+
+A decision task shows the same split. The newsvendor paper gives its models the optimal formula and still finds the ordering bias, which it reports as "Because these biases persist even when optimal formulas are provided," in its abstract.[^c18] With the formula present, GPT-4 did not reliably follow it: "in Experiment 2 did not guarantee optimality," and its performance "sometimes worsened" under formula guidance.[^c19] The stated rule was available and did not govern the order. The authors read this as architectural rather than a missing rule, a reading the note on [[pull-to-center-ordering-bias]] takes up.
+
+## Limits
+
+- The recitation check is qualitative and runs only on items one model failed. It establishes that recitation without application occurs, not its frequency, and selecting on failures could overstate it.
+- The quantitative probe is a permutation test, not a test of recitation. A drop under reordering can come from option-position sensitivity as well as from a missing concept. The paper reads it as conceptual; that reading is the authors' interpretation, and the probe alone does not separate the two (my inference).
+- The quizzes are generated by Qwen2.5-72B and filtered by GPT-4o, so the probe carries both models' blind spots.[^c9]
+- The corpus is one linear algebra textbook, translated by hand from Chinese, with 140 in-domain multiple-choice exercises.[^c10][^c11] Whether the gap appears in other fields or in open-ended answers is not tested here.
+- The paper's claim that training shifts the mechanism rests on a small diagnostic: 10 of 19 items labeled concept selection.[^c12] The one case where a concept prompt at test time failed to help the untrained model is "a single illustrative case," as the authors say.[^c13]
+
+## Related
+
+- [[knowledge-verbalization-dissociation]] — the same split from the other side: there a fact in hidden state fails to reach the verbalized decision, here a verbalized definition fails to reach the decision.
+- [[definition-blindness]] — a criterion supplied in the prompt can be ignored while the score stays high; both show a stated criterion not governing the answer.
+- [[correct-answer-trap]] — an answer check alone cannot show whether the concept was applied, which is why this gap can stay hidden under correctness scoring.
+- [[perception-cognition-gap]] — the same split for figures: a model reads a diagram's values but not the symbolic rule the diagram encodes; the CSAT study codes this as its own error category
+- [[soft-versus-hard-privileged-information]] — the concept text given during rollouts is privileged information; whether it constrains the answer or only the approach is a question that note frames (my inference, not tested in the CORE paper).
+- [[pull-to-center-ordering-bias]] — the same split in a decision task: an optimal formula supplied in the prompt does not remove the ordering bias, and for one model it sometimes worsens the orders.
+
+[^c1]: arxiv-2512-18857 — "identifying the right concept and applying it in the solution"
+[^c2]: arxiv-2512-18857 — "in the majority of cases, the model can accurately and comprehensively"
+[^c3]: arxiv-2512-18857 — "We perform a qualitative analysis on the multiple-choice exercises"
+[^c4]: arxiv-2512-18857 — "the model still follows its ingrained reasoning and makes an incorrect judgment"
+[^c5]: arxiv-2512-18857 — "to be locked into a rigid, pattern-matching heuristic, failing to flexibly incorporate or be guided by"
+[^c6]: arxiv-2512-18857 — "45.92% -28.4"
+[^c7]: arxiv-2512-18857 — "shallow heuristics rather than a deep, structural understanding of the underlying concepts"
+[^c8]: arxiv-2512-18857 — "measuring whether concept-aware training translates into genuine conceptual competence rather than reasoning shortcuts"
+[^c9]: arxiv-2512-18857 — "rigorous filtering pipeline using a separate, powerful assessor model, GPT-4o"
+[^c10]: arxiv-2512-18857 — "by manually translating this Chinese textbook into English"
+[^c11]: arxiv-2512-18857 — "we use the 140 multiple-choice exercises"
+[^c12]: arxiv-2512-18857 — "10/19 (52.6%) cases are Concept-Selection"
+[^c13]: arxiv-2512-18857 — "While this is a single illustrative case"
+[^c14]: arxiv-2512-15298 — "performed procedural tasks such as calculation but failed to apply the core scientific concepts implied"
+[^c15]: arxiv-2512-15298 — "a failure type unique to AI was captured where calculation was performed"
+[^c16]: arxiv-2512-15298 — "its conceptual meaning could not be connected"
+[^c17]: arxiv-2512-15298 — "it is necessary to precisely determine whether human students also exhibit"
+[^c18]: arxiv-2512-12552 — "Because these biases persist even when optimal formulas are provided,"
+[^c19]: arxiv-2512-12552 — "in Experiment 2 did not guarantee optimality."

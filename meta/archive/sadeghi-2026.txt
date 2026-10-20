@@ -1,0 +1,1288 @@
+SAILOR: Solver-Assisted Interactive LLM-based Optimization
+Recovery
+Shaghayegh Sadeghi
+
+shaghayegh.sadeghi@uwaterloo.ca
+
+Future Cities Institute, University of Waterloo, ON, Canada
+
+Stephen L. Smith
+
+stephen.smith@uwaterloo.ca
+
+Electrical and Computer Engineering, University of Waterloo, ON, Canada
+
+arXiv:2609.13945v1 [cs.AI] 12 Sep 2026
+
+David C. Del Rey Fernández
+
+ddelreyfernandez@uwaterloo.ca
+
+Department of Applied Mathematics, University of Waterloo, ON, Canada
+
+Abstract
+Natural-language descriptions of optimization problems may be incomplete or vague about
+numerical information that a solver requires, including costs, capacities, demands, bounds,
+and penalties. A language model can translate the description into code, but when a
+required value is absent it must either stop or guess. We present SAILOR, a proof-of-concept
+system that detects such unsupported numerical choices, asks the user targeted follow-up
+questions, and updates the optimization model before returning a solution. Questions are
+prioritized using uncertainty and solver-derived estimates of how strongly each missing
+value affects the current model. We evaluate the pipeline on 1,723 instances from seven
+masked benchmarks using an idealized simulator that returns ground-truth values. Exact
+objective-value agreement ranges from 27.0% to 87.6% across datasets, with 1.4–5.7 questions
+per instance on average. These results establish feasibility under controlled branch-and-reveal
+feedback; they do not measure performance with human users or general structural model
+repair. Code is available at https://github.com/sshaghayeghs/SAILOR.
+
+1
+
+Introduction
+
+Recent systems translate natural-language optimization descriptions into executable mathematical programs
+(Wang & Li, 2025; Yang et al., 2023; Kong et al., 2025; Xiao et al., 2025; 2026). These systems are often
+evaluated on descriptions that already contain every required number. Ordinary users may not know which
+quantities a formulation needs. A user might ask for the least expensive production plan while omitting
+overtime cost, available capacity, unmet-demand penalties, or a service-level bound. The omission need not
+be deliberate; the user may simply not realize that the missing quantity changes the mathematical problem.
+When a required value is missing, a translator can fail, silently choose a default, or guess. A plausible
+guess may still produce executable code, but the resulting recommendation can answer a different problem
+from the one the user intended. We study whether a short clarification dialogue can repair this numerical
+underspecification. SAILOR identifies literals not supported by the input, maintains approximate beliefs over
+them, and uses solver perturbations to estimate which omissions matter most. It asks the user about those
+values, updates the generated program through abstract-syntax-tree (AST) edits, and re-solves.
+The intended workflow is not to require users to write complete mathematical specifications before asking for
+help. Instead, the system accepts an incomplete description and discovers consequential missing information
+during modeling. Our evaluation isolates this capability in a controlled setting: we mask values from fully
+specified benchmark instances and use an automated simulator to answer with the hidden benchmark values.
+Because every question type in that simulator ultimately discloses the exact value, the experiments test
+idealized recovery rather than noisy human elicitation.
+1
+
+Contributions
+• We formulate interactive completion of optimization descriptions that omit required numerical
+information, a setting existing natural-language-to-solver benchmarks exclude by construction.
+• We give a reusable procedure for building benchmarks in this setting: AST-level extraction of
+numerical constants, solver-perturbation ranking, and targeted masking that retains ground truth for
+automated scoring.
+• We implement an end-to-end recovery pipeline that maintains approximate beliefs over unsupported
+literals, asks clarification questions, rewrites the generated program through AST editing, and
+re-solves.
+• We evaluate on 1,723 instances from seven masked benchmarks under an idealized answer simulator,
+with ablations and explicit threats to validity. Translation fidelity dominates the outcome: substituting
+a weaker translation model costs between 27.8 and 54.8 percentage points of exact agreement on the
+datasets we report, an effect far larger than any we could attribute to question prioritization at these
+sample sizes.
+
+2
+
+Related Work
+
+LLM-based optimization modeling. Translating natural language into mathematical programs is an
+active area. Early benchmarks and extraction pipelines set up the task (Ramamonjison et al., 2023; 2022),
+and later systems tackled harder problem classes: OptiMUS (AhmadiTeshnizi et al., 2024b;a) pairs structured
+prompting with solver feedback, Chain-of-Experts (Xiao et al., 2024) splits formulation across specialized
+modules, LLMOPT (Jiang et al., 2025) and AlphaOPT (Kong et al., 2025) learn to define and progressively
+improve formulations, DeepOR (Xiao et al., 2026) and ORLM (Huang et al., 2025) train dedicated models,
+and OptimAI (Thind et al., 2025) together with global constraint agents (Cai et al., 2025) adopt agentic
+pipelines. LLMs have also been applied to diagnosing infeasible models (Chen et al., 2024), supply chain
+optimization (Li et al., 2023a), and mathematical discovery through program search (Romera-Paredes et al.,
+2024); surveys cover the wider landscape (Xiao et al., 2025; Wang & Li, 2025). Because translation quality
+drives our pipeline, we also build on reasoning-oriented prompting (Wei et al., 2022; Wang et al., 2022; Chen
+et al., 2022; Yao et al., 2023a; Besta et al., 2024) and on neurosymbolic methods that ground model outputs
+in formal tools (Yao et al., 2023b; Olausson et al., 2023; Pan et al., 2023; Ye et al., 2023). These systems
+generally evaluate fully specified inputs; we study missing or vague numerical literals after translation.
+Self-correction and iterative refinement. One alternative to asking the user is to let the LLM revise
+its own guesses. Self-Refine (Madaan et al., 2023) and Reflexion (Shinn et al., 2023) report benefits from
+iterative feedback, while Huang et al. (2023) and Valmeekam et al. (2023) identify limits without external
+grounding. In SAILOR, optional refinement follows a revealed benchmark value rather than free-running
+self-critique (Section 4.7).
+Interactive elicitation and active learning. Choosing maximally informative queries has a long history
+in active learning (Settles, 2009) and preference elicitation (Viappiani & Boutilier, 2010), with Bayesian
+optimization (Snoek et al., 2012) providing a framework for sequential experimental design under uncertainty
+and recent work linking active query selection to preference modeling for language models (Melo et al., 2024).
+Our criterion combines expected entropy reduction with solver-derived importance, estimated by perturbing
+and re-solving the translated model rather than by a learned surrogate.
+Clarification questions and decision-focused learning. Resolving underspecified intent by asking
+has been studied in conversational text-to-SQL, where multi-turn benchmarks such as SParC (Yu et al.,
+2019b) and CoSQL (Yu et al., 2019a) formalize settings in which systems request missing information, and in
+ambiguity-aware code generation (Li et al., 2023b); we apply the idea to numerical literals in optimization
+models. Our importance scoring further draws on decision-focused learning, which favors information that
+affects a downstream optimization outcome over information that only lowers prediction error (Elmachtoub
+& Grigas, 2022; Wilder et al., 2019; Donti et al., 2017).
+2
+
+3
+
+Problem Statement
+
+Consider an optimization problem submitted in natural language by a user who does not know which numerical
+details the formulation requires. Let I0 be the description the system initially receives. Some values needed
+to instantiate the intended problem are missing, ambiguous, or only implied. These might be costs, capacities,
+demands, bounds, penalty coefficients, or other problem-defining constants. We assume the user can clarify a
+value when the system asks a concrete question, even though the user did not know to include it in the initial
+description.
+Let I ∗ be the user’s fully specified intended description and θ ∗ = (θ1∗ , . . . , θn∗ ) the latent vector of true hidden
+parameters behind it. For the formal problem we assume I0 fixes the combinatorial and structural template
+and that θ ∗ supplies only missing numbers; the implemented translator does not necessarily preserve this
+assumption, and structural translation errors lie outside the recovery mechanism.
+For a candidate parameter vector θ, let P(θ) be the corresponding fully specified problem, with objective
+f (x; θ), feasible region X (θ), and optimal value z ∗ (θ) = minx∈X (θ) f (x; θ). Because θ ∗ is unknown, the
+system must infer it through interaction: each round it asks a clarification query about one or more hidden
+(K)
+parameters and updates its estimate from the answer, emitting a recovered vector θ̃
+after at most K
+rounds.
+We measure recovery by comparing objective values. In the experiments the primary target is the benchmark
+answer used by the aggregation pipeline; comparing instead against the translated formulation’s own re-solved
+objective is an internal diagnostic, not an independent target. The normalized objective error is
+ (K) 
+
+ (K)
+z ∗ θ̃
+− z ∗ (θ ∗ )
+∗
+.
+ErrObj θ̃ , θ =
+max(|z ∗ (θ ∗ )| , 1)
+
+(1)
+
+This is an objective-value agreement criterion, not strict parameter recovery and not a guarantee that the
+intended optimizer has been recovered: different parameter vectors can yield the same objective value, and
+objective coefficients can change both the value and the optimizer.
+Problem 1. Given an underspecified description I0 , an unknown latent vector θ ∗ , and a budget of K
+(K)
+clarification rounds, find a sequence of queries and updates yielding a recovered vector θ̃
+that minimizes
+(K)
+∗
+ErrObj(θ̃ , θ ).
+
+4
+
+Method
+
+4.1
+
+Overview
+
+SAILOR translates an underspecified description I0 into executable Gurobi code together with a record of
+every number it had to guess. It separates constants stated in the text from constants it inferred, places a
+belief over the inferred ones, and estimates how much each currently matters to the optimization. It then
+asks clarification questions that score well on both information gain and solver relevance; each answer triggers
+a belief update, a code rewrite, and a re-solve. The loop stops once the hidden parameters are resolved or the
+budget runs out.
+4.2
+
+LLM Translation
+
+At initialization, a large language model translates the masked description I0 into an executable formulation
+plus a record of introduced numbers and their semantic roles. Failed validation can trigger repair attempts,
+and a separate verification call can replace the initial code. Once initialization succeeds, interaction operates
+on the generated representation and extracted parameter set rather than retranslating the original text each
+round.
+3
+
+(a) Low-sensitivity parameter
+
+(b) High-sensitivity parameter
+
+tiny
+swing
+
+f∗
+
+`i
+
+θ̂ i
+
+large
+swing
+
+f∗
+
+hi
+
+`i
+
+θi
+
+θ̂ i
+
+hi
+
+θi
+
+Figure 1: Parameter sensitivity under uncertainty. In panel (a), perturbing a low-sensitivity parameter across
+its current belief range barely moves the optimal objective. In panel (b), the same kind of sweep over a
+high-sensitivity parameter swings the objective sharply. That gap is why we use solver-based sensitivity to
+decide which parameters to ask about first.
+4.3
+
+Parameter Identification
+
+We parse the generated Python program with the abstract syntax tree (AST) module. Each numerical literal
+in the code is sorted into one of two categories:
+• Known: the value appears in I0 , so no clarification is needed.
+• Guessed: the value is absent from I0 and the LLM supplied it.
+The translator returns a list of guessed parameters. AST constants are associated with that list by value
+and, when necessary, name similarity. Separately, numeric tokens extracted by a regular expression from I0
+identify literals explicitly present in the text, allowing numerically equivalent decimal forms such as “40” and
+“40.0.” Our matcher does not normalize number words such as “forty,” and ambiguous matches can remain
+unresolved. The output is an ordered set of extracted parameters with their values and statuses.
+4.4
+
+Gaussian Belief Model
+
+Each unresolved parameter θi gets an approximate Gaussian belief,
+θi ∼ N (µi , σi2 ),
+
+θi ∈ [ℓi , hi ],
+
+(2)
+
+with µi initialized from the LLM’s guess. For the positive-valued parameters used by the default implementation the initial interval is [ℓi , hi ] = [0.01 µi , 100 µi ], and the initial standard deviation is proportional to its
+width.
+Three update operations are defined. An exact update takes a revealed value and collapses the posterior to a
+point mass, σi → 0. A hypothetical pure binary update would retain only the branch selected by a threshold
+answer and re-center the approximation. A soft update shifts the mean toward an optional LLM refinement
+with a fixed blending weight.
+Residual uncertainty is measured by differential entropy,
+
+1
+log 2πe σi2 ,
+2
+and resolved parameters are assigned a floor of −50 to stand in for negligible remaining uncertainty.
+Hi =
+
+4
+
+(3)
+
+Design choice. A raw-scale Gaussian gives a simple entropy surrogate but is poorly matched to several
+common parameter types: the multiplicative interval is meaningful only for positive, nonzero guesses,
+untruncated mass can violate known bounds, continuous beliefs ignore integrality, and the entropy expression
+is only approximate after truncation. Log-normal or truncated distributions would suit positive scales better,
+while signed, bounded, and integer parameters need type-specific supports. The implementation does not
+resolve this, so the prior-range experiment is a limited sensitivity check.
+
+(a) Binary update
+
+(b) Exact update
+
+Belief density
+
+Prior
+Posterior
+
+(c) Soft refinement update
+
+Prior
+Posterior
+
+Prior
+Posterior
+
+θi∗ = 35
+
+answer: θi < m
+
+shift
+
+θi
+
+θi
+
+θi
+
+Figure 2: The three conceptual belief-update operations. Each panel shows the prior (dashed gray) and
+posterior (solid). Panel (a) is a pure binary update, panel (b) an exact update, and panel (c) an optional soft
+refinement update. Our experiments exercise (b) and (c); see Section 6.1.
+
+4.5
+
+Importance Scoring
+
+We also estimate how relevant each unresolved parameter currently is to the optimization. For each θi , the
+system perturbs the value across the current belief range, re-solves, and measures the effect. The importance
+score is
+si = wsw ϕsw (θi ) + wgr ϕgr (θi ) + wsh ϕsh (θi ) + wbd ϕbd (θi ),
+(4)
+where ϕsw (θi ), ϕgr (θi ), ϕsh (θi ), and ϕbd (θi ) estimate normalized objective swing, local finite-difference
+sensitivity, maximum related shadow-price magnitude, and the fraction of related constraints currently
+binding. These are numerical diagnostics of the translated model rather than exact sensitivities of the
+intended problem. The weights are fixed and nonnegative, and scores are normalized to [0, 1] across the
+unresolved set when available.
+We recompute importance after every interaction step. Resolving one parameter can reshape the local
+sensitivity structure of what remains.
+Mixed-integer and nonlinear models. Shadow prices and binding-constraint sets are cleanest for linear
+programs. Our executor reads dual and slack attributes when the solver makes them available and otherwise
+sets those score components to zero. We do not construct a separate LP relaxation. Objective swings and
+finite differences remain available but can be unstable near infeasibility, discontinuities, or solver tolerances.
+None of the four components is an exact sensitivity certificate.
+4.6
+
+Question Generation and Scoring
+
+Each round, the system generates candidate questions for every unresolved parameter. Direct questions
+request the exact value. Binary range-split questions ask whether the value is above or below a threshold,
+and confirmation questions test a current estimate.
+A candidate question q for parameter θi is scored by its expected information gain, scaled by how relevant
+that parameter currently is:
+score(q) = ∆H(q) g(si ),
+(5)
+5
+
+where si is the importance score of θi and
+∆H(q) = Hi − E[Hi | answer to q]
+
+(6)
+
+is the expected entropy reduction. For binary questions the expectation runs over the two posterior branches,
+above and below the threshold. For direct questions the score comes from the entropy reduction of resolving
+the parameter outright, optionally scaled by a constant to reflect the extra value of an exact answer.
+We want g(·) monotone increasing, so that more relevant parameters get priority without uncertainty dropping
+out of the picture. We use the linear form
+g(si ) = α + (1 − α)si ,
+
+(7)
+
+q (t+1) ∈ arg max score(q).
+
+(8)
+
+with α = 0.5 unless stated otherwise.
+The next question is
+q∈Q(t)
+
+This favors questions that are informative and consequential at the same time. Note that importance only
+ranks questions. It never resolves, fixes, or discards a parameter on its own.
+4.7
+
+Answer Processing and Code Rewriting
+
+Each response triggers five steps. The system (i) updates the belief over the targeted parameter, (ii) rewrites
+the corresponding literal through AST editing, (iii) re-solves the Gurobi model, (iv) recomputes importance
+estimates for unresolved parameters, and (v) optionally asks the LLM to refine its remaining guesses.
+Refinements enter through the soft update described above.
+4.8
+
+Stopping Criteria
+
+The loop halts on any of four conditions. (i) Every unresolved parameter has posterior standard deviation
+below 10−8 . (ii) Total differential entropy over unresolved parameters drops below Hmin . (iii) Entropy fails
+to improve by more than 0.1 and no parameter is filled for Nstall consecutive rounds. (iv) The per-instance
+budget K is spent. We use Hmin = −40, Nstall = 5, and K = 30.
+
+5
+
+Benchmark Construction
+
+We build benchmarks from fully specified problems whose ground truth we know but hide during recovery.
+The procedure runs as follows. Start with a complete instance I ∗ where every number is stated. An LLM
+translates I ∗ into executable Gurobi code. We extract the numerical constants by AST parsing plus model
+inspection. We then run perturbation-based sensitivity analysis, varying each parameter by ×{0.5, 0.8, 1.2, 2.0}
+and re-solving. Objective sensitivity, solution sensitivity, and feasibility impact together give a structural
+importance ranking. We mask the top-ranked parameters with vague phrasing such as “a certain rate” or
+“some quantity,” and may paraphrase the result so it reads naturally.
+Building benchmarks this way keeps the evaluation focused on hidden parameters that genuinely move
+feasibility or the optimal solution, rather than on incidental constants.
+Caveat: shared sensitivity signals. The signals we use to pick parameters for masking (objective
+sensitivity, solution sensitivity, feasibility impact) overlap heavily with the signals SAILOR’s importance scorer
+uses at recovery time. The benchmark therefore tests SAILOR on exactly the parameters its own scorer is
+built to find. We flag this circularity here and return to it, along with more independent masking criteria, in
+Section 7.1.
+6
+
+Table 1: Datasets used in our evaluation. Avg Params is the mean number of numerical parameters per
+instance, taken from the ground-truth optimization model.
+Dataset
+
+Instances
+
+Avg Params
+
+228
+178
+403
+652
+211
+42
+18
+
+3.5
+3.9
+∼3
+∼4
+8.4
+5.8
+2.2
+
+1,732
+
+–
+
+NL4OPT
+NL4LP
+ReSocratic
+EasyLP
+ComplexLP
+IndustryOR
+ComplexOR
+Total
+
+6
+
+Experiments
+
+6.1
+
+Experimental Setup
+
+Source
+
+Description
+
+Ramamonjison et al. (2023)
+Xiao et al. (2025)
+Xiao et al. (2025)
+(Huang et al., 2024)
+(Huang et al., 2024)
+Xiao et al. (2025)
+Xiao et al. (2024)
+
+Simple two-variable linear programs.
+Linear programs of moderate complexity.
+Socratic-style optimization problems.
+Small linear programs from MAMO.
+Complex LPs, up to 87 parameters.
+Industrial scheduling, 15–30 parameters.
+Mixed-integer, nonlinear, multi-stage.
+
+–
+
+–
+
+Data. The source collection contains 1,732 instances from seven established benchmarks covering a wide
+difficulty range. These run from simple two-variable LPs (NL4OPT) and mid-sized linear programs (NL4LP,
+ReSocratic, EasyLP) to multi-stage industrial problems (IndustryOR, ComplexOR) and complex LPs with
+up to 87 interacting parameters (ComplexLP), spanning both small mostly well-specified problems and the
+harder regime where many decision-critical parameters must be inferred. Table 1 summarizes the benchmarks
+(Xiao et al., 2025). We evaluate 1,723 instances end to end, excluding nine—seven from ReSocratic, one from
+IndustryOR, and one from ComplexLP—because translation or the oracle solve failed.
+Models and infrastructure. We use GPT-5.2 for benchmark masking and GPT-5.3-Codex for recovery
+translation, verification, repair, and optional refinement. GPT-4o-mini handles answer interpretation and the
+simulator’s extraction fallback. Requests use temperature 0 except optional masking paraphrases, which use
+0.3. We solve with Gurobi 11 under a 30-second per-solve limit on an Apple M-series machine with 32 GB of
+RAM.
+Evaluation protocol. Evaluation is fully automated through a simulated user. The simulator knows the
+benchmark values; the recovery system does not. Direct questions return the exact value. Binary questions
+return the branch and then reveal the exact value; confirmation questions similarly return a verdict and
+the exact value. All evaluated question types therefore resolve the targeted literal through an exact update
+(Appendix B). A hypothetical pure binary protocol would retain only the selected branch and would generally
+require additional questions. When dictionary lookup fails because extracted names do not match benchmark
+annotations, an LLM fallback derives an answer from the original description.
+Configuration. Our main configuration uses a budget of 30 questions and an initial prior range of
+[0.01×, 100×] around the LLM guess. The loop stops when total entropy falls below −40, when no progress
+is recorded for 5 rounds, or when the budget is spent; a parameter is resolved when its posterior standard
+deviation is below 10−8 . Direct questions, solver-derived importance, and optional refinement are enabled.
+Soft refinement uses a blending weight of 0.3. Confirmation candidates become available below 0.1 times
+the current interval width and receive their main score below 0.05 times that width. Binary splits include
+the posterior midpoint and quartiles. One note for anyone running our code: because the ablation below
+shows no clear benefit from solver-derived importance, the released default disables it and assigns uniform
+importance instead. Reproducing the main configuration requires re-enabling the solver-derived scores.
+Importance scoring and question scoring. The composite importance score uses weights
+(0.40, 0.30, 0.15, 0.15) for objective swing, local gradient sensitivity, shadow-price magnitude, and binding-set
+variation. The finite-difference perturbation is max(0.05|µ|, 0.1σ, 10−6 ). Questions are ranked by expected
+7
+
+Table 2: Objective-value agreement across datasets. The No-interact. row solves from the translator’s initial
+literals without questions. Deltas are percentage-point differences. “Exact” denotes error below 0.01%; “Gap”
+is mean objective error capped at 100% per instance; “Resolved” is (Known + Filled)/all extracted literals.
+Metric
+
+NL4LP
+
+EasyLP
+
+NL4OPT
+
+ReSocratic
+
+IndustryOR ComplexOR ComplexLP
+
+Exact
+87.6%
+No-interact. 16.3 ↓71.3
+
+79.8%
+34.2 ↓45.6
+
+78.1%
+13.2 ↓64.9
+
+77.9%
+13.1 ↓64.8
+
+64.3%
+15.0 ↓49.3
+
+50.0%
+5.6 ↓44.4
+
+27.0%
+5.7 ↓21.3
+
+≤1%
+≤5%
+≤10%
+Gap
+Resolved
+Avg Q
+
+80.2% ↑0.4
+82.2% ↑2.4
+83.1% ↑3.3
+12.0%
+93.0%
+1.5
+
+80.7% ↑2.6
+85.1% ↑7.0
+87.3% ↑9.2
+8.1%
+96.0%
+1.4
+
+81.6% ↑3.7
+83.9% ↑6.0
+86.6% ↑8.7
+8.0%
+97.2%
+1.8
+
+64.3% ↑0.0
+64.3% ↑0.0
+66.7% ↑2.4
+22.7%
+88.5%
+2.4
+
+50.0% ↑0.0
+55.6% ↑5.6
+61.1% ↑11.1
+21.1%
+85.6%
+1.9
+
+32.2% ↑5.2
+53.1% ↑26.1
+62.6% ↑35.6
+25.2%
+88.1%
+5.7
+
+88.2% ↑0.6
+90.4% ↑2.8
+91.6% ↑4.0
+5.5%
+96.4%
+1.4
+
+entropy reduction times an importance-dependent scaling term. Direct questions get a multiplicative bonus
+of 1.5, confirmation questions a factor of 0.8, and a default importance of 0.5 applies whenever no score
+is available. We picked the five weights (wsw , wgr , wsh , wbd , α) by hand, with two aims: put more weight
+on objective-level signals than on local gradients and dual information, and keep the importance term
+g(si )=α+(1−α)si ∈ [0.5, 1] from swamping entropy reduction. We did not tune them on the benchmarks.
+This conservative choice may be part of why importance scoring shows such a small average effect in the
+ablation, and a systematic sweep over these weights and over α would be worth running.
+Metrics. We report exact objective-value agreement, agreement within 1%, 5%, and 10%, mean objective
+error, resolved-literal rate, and average question count. “Exact” means objective error below 0.01%. We
+cap each instance’s error at 100% when computing the mean so that a few failures do not dominate. The
+resolved-literal rate is (Known + Filled)/all extracted literals; it is not the fraction of masked ground-truth
+parameters recovered. The primary objective comparison uses the benchmark answer. Re-solving the
+translated model after substituting benchmark literals provides a separate internal diagnostic. Because the
+100% cap conceals the error tail, we report tolerance rates alongside the mean.
+6.2
+
+Main Results
+
+Aggregate results. Table 2 shows higher objective-value agreement under the interactive configuration
+than under the no-interaction baseline in every dataset, although the comparison also includes optional
+refinement and therefore does not isolate question selection. Exact agreement ranges from 87.6% on NL4LP
+to 27.0% on ComplexLP, while average question counts range from 1.4 to 5.7. Wider tolerances increase
+agreement, especially on ComplexLP. These values measure agreement with the benchmark objective under
+an idealized simulator; they are not literal-recovery or optimizer-recovery rates.
+6.3
+
+Ablation Study
+
+We examine solver-assisted prioritization, refinement, prior range, question budget, and translation model.
+Solver-aware prioritization features. Table 3 gives exact objective-value agreement for SAILOR and two
+ablated variants. W/o importance turns off solver-derived scoring and picks questions by entropy reduction
+alone; w/o refinement turns off the optional LLM refinement step.
+Removing importance scoring changes results in both directions across datasets. The unweighted macroaverage changes from 66.4% to 66.1%, providing no clear macro-level benefit. The small IndustryOR and
+ComplexOR samples make their dataset-level differences uncertain. The linear weighting g(si )=α+(1−α)si
+with α=0.5 also limits the magnitude of reweighting. Since the solver perturbations cost extra solves without
+buying accuracy here, we set uniform importance as the released default and treat solver-derived scoring as
+an option worth revisiting once its weights are tuned.
+8
+
+Table 3: Ablation: exact objective-value agreement for SAILOR and two ablated variants. Deltas are
+percentage-point changes relative to SAILOR; the final column is an unweighted macro-average.
+Configuration
+
+NL4LP
+
+EasyLP
+
+NL4OPT
+
+ReSoc
+
+IndOR
+
+CmplxOR CmplxLP
+
+Macro
+avg.
+
+SAILOR
+w/o importance
+w/o refinement
+
+87.6
+89.9 ↑2.3
+86.5 ↓1.1
+
+79.8
+81.3 ↑1.5
+80.7 ↑0.9
+
+78.1
+77.6 ↓0.5
+76.8 ↓1.3
+
+77.9
+76.7 ↓1.2
+77.9 ≈0
+
+64.3
+61.9 ↓2.4
+59.5 ↓4.8
+
+50.0
+44.4 ↓5.6
+38.9 ↓11.1
+
+66.4
+66.1 ↓0.3
+64.2 ↓2.2
+
+27.0
+30.8 ↑3.8
+29.4 ↑2.4
+
+Refinement step. Removing refinement lowers the reported rate on four datasets, leaves one unchanged,
+and raises it on two. The unweighted macro-average changes from 66.4% to 64.2%. This mixed pattern is
+exploratory: it does not identify a general refinement effect without paired records and a factorial design.
+Refinement remains externally conditioned because it follows a revealed benchmark value rather than
+free-running self-correction.
+Prior range sensitivity. Figure 3 varies the prior range around the initial guess. The reported differences
+are sensitivity estimates, not precise effects: narrow and wide ranges change results in both directions across
+datasets. Moreover, multiplicative ranges are not suitable for negative or zero-valued parameters, as discussed
+in the method limitations.
+(a) Narrow vs Default
+80
+
+-0.5
+
+-0.7
+
+(b) Wide vs Default
+-0.5
+
+Default [0.01×, 100×]
+Narrow [0.1×, 10×]
+
++0.6
+
+Exact Match (%)
+
+Exact Match (%)
+
+-0.5
+
+70
+-4.8
+
+60
+
++0.0
+
+50
+40
+30
+P
+
+4L
+NL
+
+4O
+NL
+
+S
+Re
+
+oc
+
+sy
+Ea
+
+LP
+
+Ind
+
+OR
+
+OR
+
+plx
+
+Cm
+
+Default [0.01×, 100×]
+Wide [0.001×, 1000×]
+
++0.4
+
++0.0
+
+-1.3
+
+70
+-4.8
+
+60
+50
+
+-11.1
+
+40
+30
+
++2.4
+
+PT
+
+80
+
+LP
+
++1.9
+
+P
+4L
+
+plx
+Cm
+
+NL
+
+NL
+
+4O
+
+PT
+
+Re
+
+S
+
+oc
+
+Ea
+
+sy
+
+LP
+
+OR
+
+Ind
+
+OR
+
+plx
+Cm
+
+LP
+
+plx
+Cm
+
+Figure 3: Sensitivity of exact objective-value agreement to the prior range. Narrow and wide priors behave
+inconsistently across datasets; annotations give aggregate percentage-point differences from the default.
+
+Question budget. Figure 4 varies the per-instance question cap (B ∈ {10, 30, 50}, default 30). The
+differences are small on several datasets and mixed elsewhere. ComplexLP’s agreement within 10% rises from
+58.8% at budget 10 to 62.6% at budget 30, while its reported “Exact” agreement remains 27.0%. Budget 50
+reports lower values on IndustryOR and ComplexOR than budget 30. The mechanism has not been isolated.
+Translation model choice. Last, we swap GPT-5.3-Codex for GPT-4o-mini as the translator. Figure 5
+reports the largest differences among the shown ablations. The reported “Exact” agreement falls from
+87.6% to 44.4% on NL4LP, from 64.3% to 9.5% on IndustryOR, and from 50.0% to 22.2% on ComplexOR.
+Solver-assisted interaction cannot repair an optimization structure that was wrong to begin with.
+
+7
+
+Discussion
+
+The experiment provides a proof of concept for an optimization assistant that does not require users to
+anticipate every numerical input. Rather than treating an executable first translation as final, the system
+identifies unsupported choices and asks about the ones that most affect the current model. Objective-value
+agreement improves over the initial-guess baseline in every dataset, but the feedback is unusually informative,
+so the question counts do not transfer directly to human interaction.
+9
+
+±0.0
+
+90
+-2.8
+
+Exact Match (%)
+
+80
+
++2.6
+
++0.3
+
+-0.9
+
++0.7
+
++1.0
+
+-1.5
+
+70
+60
+
+-4.8
+-9.5
+
+50
+
+±0.0
+-5.6
+
+40
+30
+
+±0.0
+
+NL4LP
+
+NL4OPT
+
+ReSoc
+
+EasyLP
+
+budget-30 (default)
+
+IndOR
+
+budget-10
+
+CmplxOR
+
+±0.0
+
+CmplxLP
+
+budget-50
+
+Figure 4: Sensitivity of exact objective-value agreement to question budgets 10 and 50 relative to the default
+budget 30. Effects are mixed across datasets.
+100
+GPT-5.3-Codex
+GPT-4o-mini
+Exact
+≤ 10%
+
+90
+80
+
+Tolerance band
+
+Accuracy (%)
+
+70
+60
+50
+40
+30
+20
+10
+0
+
+NL4LP
+
+NL4OPT
+
+ReSoc
+
+EasyLP
+
+IndOR
+
+CmplxOR
+
+CmplxLP
+
+Figure 5: Objective-value agreement for two translation models. Solid lines show exact agreement; shaded
+bands extend to agreement within 10%.
+The ablations do not establish that solver-derived importance improves aggregate performance. Its unweighted
+macro-average is slightly lower than the full configuration and dataset effects have mixed signs, which is why
+our released default falls back to uniform importance. Refinement is also mixed and remains exploratory.
+Translation-model choice produces larger reported differences, consistent with the structural limitation that
+literal updates cannot repair an incorrectly translated formulation.
+7.1
+
+Limitations and threats to validity
+
+Idealized interaction. The simulator answers deterministically and reveals the exact value after direct,
+binary, and confirmation questions. Real users may answer approximately, decline, or provide inconsistent
+10
+
+units. The study is therefore a controlled branch-and-reveal evaluation, not evidence about deployed behavior
+or question efficiency with people.
+No-interaction baseline. The no-question baseline keeps the translator’s initial literals. The full configuration adds both interaction and optional refinement, so their effects are not isolated. A paired factorial
+evaluation is needed.
+Metric scope. The primary metric compares the recovered objective value with the benchmark answer. It
+establishes neither literal-by-literal recovery, nor equivalence of feasible regions, nor recovery of a particular
+optimizer, and an internal re-solve of the translated model answers a different diagnostic question. We
+evaluate 1,723 of 1,732 source instances after the nine exclusions described above.
+Benchmark-construction circularity. The masking procedure uses objective sensitivity, solution sensitivity, and feasibility impact, overlapping with the recovery-time importance estimates. This favors literals
+the method is designed to prioritize. Independent masking by structural role or random selection among
+extractable literals is needed.
+Small datasets. IndustryOR and ComplexOR contain only 42 and 18 source instances, respectively. Their
+dataset-level and ablation differences should therefore be treated as descriptive.
+Translator dependence and structural mismatch. Our results assume a capable translation model;
+with GPT-4o-mini the pipeline degrades badly, so the approach as reported is tied to a strong and relatively
+expensive model, and translator strength is entangled with the value of the interactive machinery in a
+way these experiments do not separate. Interactive updates repair numerical errors but cannot repair an
+optimization structure the initial translation got wrong. Coupling structural model repair with solver-assisted
+parameter recovery is an important direction for future work.
+Belief-model mismatch. Raw-scale Gaussian beliefs and multiplicative intervals do not adequately
+represent negative, zero, bounded, or integer-valued literals. Type-aware supports and likelihoods are required
+before applying the method broadly.
+Comparison with full input. On ComplexLP, objective-value agreement is 46.0% with fully specified input
+and 27.0% with the interactive masked-input configuration. These regimes are not directly comparable, but
+the difference cautions against presenting interaction as a general improvement over complete specifications.
+
+8
+
+Conclusion
+
+We presented SAILOR, a proof-of-concept optimization assistant for users who omit required numbers from
+an initial natural-language description. The system detects unsupported numerical choices, asks targeted
+clarification questions, rewrites the translated model, and re-solves. Under an idealized simulator, this process
+produces higher objective-value agreement than retaining the translator’s initial guesses. Our ablations locate
+the binding constraint in translation rather than in elicitation: changing the translation model moves results
+by tens of percentage points, whereas removing solver-derived question prioritization produces a difference too
+small for our sample sizes to resolve. The evaluation does not establish performance with human users, pure
+binary feedback, or structurally incorrect models. Future work should evaluate whether real users understand
+and can answer the questions, support approximate or range-valued responses, measure literal, objective,
+feasibility, and decision outcomes independently, and separate the value of question ordering from the value
+of the answers it elicits.
+
+References
+Ali AhmadiTeshnizi, Wenzhi Gao, Herman Brunborg, Shayan Talaei, and Madeleine Udell. OptiMUS-0.3:
+Using Large Language Models to Model and Solve Optimization Problems at Scale. arXiv preprint
+arXiv:2407.19633, 2024a.
+11
+
+Ali AhmadiTeshnizi, Wenzhi Gao, and Madeleine Udell. Optimus: Scalable optimization modeling with (mi)
+lp solvers and large language models. arXiv preprint arXiv:2402.10172, 2024b.
+Maciej Besta, Nils Blach, Ales Kubicek, Robert Gerstenberger, Michal Podstawski, Lukas Gianinazzi, Joanna
+Gajda, Tomasz Lehmann, Hubert Niewiadomski, Piotr Nyczyk, et al. Graph of thoughts: Solving elaborate
+problems with large language models. In Proceedings of the AAAI Conference on Artificial Intelligence,
+volume 38, pp. 17682–17690, 2024.
+Junyang Cai, Serdar Kadioglu, and Bistra Dilkina. Global Constraint LLM Agents for Text-to-Model
+Translation. arXiv preprint arXiv:2509.08970, 2025.
+Hao Chen, Gonzalo E Constante-Flores, and Can Li. Diagnosing infeasible optimization problems using large
+language models. INFOR: Information Systems and Operational Research, 62(4):573–587, 2024.
+Wenhu Chen, Xueguang Ma, Xinyi Wang, and William W Cohen. Program of thoughts prompting: Disentangling computation from reasoning for numerical reasoning tasks. arXiv preprint arXiv:2211.12588,
+2022.
+Priya Donti, Brandon Amos, and J Zico Kolter. Task-based end-to-end model learning in stochastic
+optimization. In Advances in Neural Information Processing Systems, volume 30, 2017.
+Adam N Elmachtoub and Paul Grigas. Smart “predict, then optimize”. Management Science, 68(1):9–26,
+2022.
+Chenyu Huang, Zhengyang Tang, Shixi Hu, Ruoqing Jiang, Xin Zheng, Dongdong Ge, Benyou Wang, and
+Zizhuo Wang. ORLM: A Customizable Framework in Training Large Models for Automated Optimization
+Modeling. Operations Research, 2025.
+Jie Huang, Xinyun Chen, Swaroop Mishra, Huaixiu Steven Zheng, Adams Wei Yu, Xinying Song, and Denny
+Zhou. Large language models cannot self-correct reasoning yet. arXiv preprint arXiv:2310.01798, 2023.
+Xuhan Huang, Qingning Shen, Yan Hu, Anningzhe Gao, and Benyou Wang. MAMO: A Mathematical
+Modeling Benchmark with Solvers. arXiv preprint arXiv:2405.13144, 2024.
+Caigao Jiang, Xiang Shu, Hong Qian, Xingyu Lu, Jun Zhou, Aimin Zhou, and Yang Yu. LLMOPT: Learning
+to Define and Solve General Optimization Problems from Scratch. In Proceedings of the Thirteenth
+International Conference on Learning Representations (ICLR), Singapore, Singapore, 2025.
+Minwei Kong, Ao Qu, Xiaotong Guo, Wenbin Ouyang, Chonghe Jiang, Han Zheng, Yining Ma, Dingyi Zhuang,
+Yuhan Tang, Junyi Li, et al. AlphaOPT: Formulating Optimization Programs with Self-Improving LLM
+Experience Library. NeurIPS 2025 Workshop: ScaleOPT: GPU-Accelerated and Scalable Optimization,
+2025.
+Beibin Li, Konstantina Mellou, Bo Zhang, Jeevan Pathuri, and Ishai Menache. Large language models for
+supply chain optimization. arXiv preprint arXiv:2307.03875, 2023a.
+Haau-Sing Li, Mohsen Mesgar, André F T Martins, and Iryna Gurevych. Python code generation by asking
+clarification questions. Proceedings of the 61st Annual Meeting of the Association for Computational
+Linguistics (Volume 1: Long Papers), pp. 14287–14306, 2023b.
+Aman Madaan, Niket Tandon, Prakhar Gupta, Skyler Hallinan, Luyu Gao, Sarah Wiegreffe, Uri Alon,
+Nouha Dziri, Shrimai Prabhumoye, Yiming Yang, et al. Self-refine: Iterative refinement with self-feedback.
+Advances in Neural Information Processing Systems, 36:46534–46594, 2023.
+Luckeciano C Melo, Panagiotis Tigas, Alessandro Abate, and Yarin Gal. Deep Bayesian Active Learning for
+Preference Modeling in Large Language Models. Advances in Neural Information Processing Systems, 37:
+118052–118085, 2024.
+12
+
+Theo Olausson, Alex Gu, Ben Lipkin, Cedegao Zhang, Armando Solar-Lezama, Joshua Tenenbaum, and
+Roger Levy. LINC: A Neurosymbolic Approach for Logical Reasoning by Combining Language Models
+with First-Order Logic Provers. In Proceedings of the 2023 Conference on Empirical Methods in Natural
+Language Processing, pp. 5153–5176, Singapore, December 2023. Association for Computational Linguistics.
+doi: 10.18653/v1/2023.emnlp-main.313.
+Liangming Pan, Alon Albalak, Xinyi Wang, and William Wang. Logic-LM: Empowering Large Language
+Models with Symbolic Solvers for Faithful Logical Reasoning. In Findings of the Association for Computational Linguistics: EMNLP 2023, pp. 3806–3824, Singapore, December 2023. Association for Computational
+Linguistics. doi: 10.18653/v1/2023.findings-emnlp.248.
+Rindra Ramamonjison, Haley Li, Timothy Yu, Shiqi He, et al. Augmenting Operations Research with AutoFormulation of Optimization Models From Problem Descriptions. In Proceedings of the 2022 Conference
+on Empirical Methods in Natural Language Processing: Industry Track, pp. 29–62, Abu Dhabi, UAE,
+December 2022. Association for Computational Linguistics.
+Rindranirina Ramamonjison, Timothy Yu, Raymond Li, Haley Li, Giuseppe Carenini, Bissan Ghaddar,
+Shiqi He, Mahdi Mostajabdaveh, Amin Banitalebi-Dehkordi, Zirui Zhou, et al. NL4OPT Competition:
+Formulating Optimization Problems Based on Their Natural Language Descriptions. In NeurIPS 2022
+competition track, pp. 189–203. PMLR, 2023.
+Bernardino Romera-Paredes, Mohammadamin Barekatain, Alexander Novikov, Matej Balog, M Pawan
+Kumar, Emilien Dupont, Francisco JR Ruiz, Jordan S Ellenberg, Pengming Wang, Omar Fawzi, et al.
+Mathematical discoveries from program search with large language models. Nature, 625(7995):468–475,
+2024.
+Burr Settles. Active Learning Literature Survey. University of Wisconsin-Madison, 2009.
+Noah Shinn, Federico Cassano, Ashwin Gopinath, Karthik Narasimhan, and Shunyu Yao. Reflexion: language
+agents with verbal reinforcement learning. In Advances in Neural Information Processing Systems, volume 36,
+pp. 8634–8652. Curran Associates, Inc., 2023.
+Jasper Snoek, Hugo Larochelle, and Ryan Adams. Practical Bayesian Optimization of Machine Learning
+Algorithms. In Advances in Neural Information Processing Systems, 2012.
+Raghav Thind, Youran Sun, Ling Liang, and Haizhao Yang. OptimAI: Optimization from Natural Language
+Using LLM-Powered AI Agents. arXiv preprint arXiv:2504.16918, 2025.
+Karthik Valmeekam, Matthew Marquez, and Subbarao Kambhampati. Can large language models really
+improve by self-critiquing their own plans? Foundation Models for Decision Making Workshop at NeurIPS
+2023, 2023.
+Paolo Viappiani and Craig Boutilier. Optimal Bayesian Recommendation Sets and Myopically Optimal
+Choice Query Sets. In Advances in Neural Information Processing Systems, 2010.
+Xuezhi Wang, Jason Wei, Dale Schuurmans, Quoc Le, Ed Chi, Sharan Narang, Aakanksha Chowdhery, and
+Denny Zhou. Self-consistency improves chain of thought reasoning in language models. ICLR 2023, 2022.
+Yang Wang and Kai Li. Large Language Models in Operations Research: Methods, Applications, and
+Challenges. arXiv preprint arXiv:2509.18180, 2025.
+Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten Bosma, Fei Xia, Ed Chi, Quoc V Le, Denny Zhou, et al.
+Chain-of-thought prompting elicits reasoning in large language models. Advances in neural information
+processing systems, 35:24824–24837, 2022.
+Bryan Wilder, Bistra Dilkina, and Milind Tambe. Melding the data-decisions pipeline: Decision-focused
+learning for combinatorial optimization. In Proceedings of the AAAI Conference on Artificial Intelligence,
+volume 33, pp. 1658–1665, 2019.
+13
+
+Ziyang Xiao, Dongxiang Zhang, Yangjun Wu, Lilin Xu, Yuan Jessica Wang, Xiongwei Han, Xiaojin Fu, Tao
+Zhong, Jia Zeng, Mingli Song, and Gang Chen. Chain-of-Experts: When LLMs Meet Complex Operations
+Research Problems. In The Twelfth International Conference on Learning Representations, 2024.
+Ziyang Xiao, Jingrong Xie, Lilin Xu, Shisi Guan, Jingyan Zhu, Xiongwei Han, Xiaojin Fu, WingYin Yu, Han
+Wu, Wei Shi, et al. A Survey of Optimization Modeling Meets LLMs: Progress and Future Directions.
+Proceedings of the Thirty-Fourth International Joint Conference on Artificial Intelligence (IJCAI-25), 2025.
+Ziyang Xiao, Yuan Jessica Wang, Xiongwei Han, Shisi Guan, Jingyan Zhu, Jingrong Xie, Lilin Xu, Han Wu,
+Wing Yin Yu, Zehua Liu, et al. DeepOR: A Deep Reasoning Foundation Model for Optimization Modeling.
+In Proceedings of the AAAI Conference on Artificial Intelligence, volume 40, pp. 34052–34060, 2026.
+Chengrun Yang, Xuezhi Wang, Yifeng Lu, Hanxiao Liu, Quoc V Le, Denny Zhou, and Xinyun Chen. Large
+language models as optimizers. In The Twelfth International Conference on Learning Representations,
+2023.
+Shunyu Yao, Dian Yu, Jeffrey Zhao, Izhak Shafran, Tom Griffiths, Yuan Cao, and Karthik Narasimhan.
+Tree of thoughts: Deliberate problem solving with large language models. Advances in neural information
+processing systems, 36:11809–11822, 2023a.
+Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran, Karthik Narasimhan, and Yuan Cao. ReAct: Synergizing Reasoning and Acting in Language Models. In International Conference on Learning
+Representations (ICLR), 2023b.
+Xi Ye, Qiaochu Chen, Isil Dillig, and Greg Durrett. SatLM: Satisfiability-Aided Language Models Using
+Declarative Prompting. In Thirty-seventh Conference on Neural Information Processing Systems, 2023.
+Tao Yu, Rui Zhang, Heyang Er, Suyi Li, Eric Xue, Bo Pang, et al. CoSQL: A Conversational Text-toSQL Challenge Towards Cross-Domain Natural Language Interfaces to Databases. In Proceedings of the
+2019 Conference on Empirical Methods in Natural Language Processing and the 9th International Joint
+Conference on Natural Language Processing (EMNLP-IJCNLP), pp. 1962–1979, Hong Kong, China, 2019a.
+Association for Computational Linguistics.
+Tao Yu, Rui Zhang, Michihiro Yasunaga, Yi Chern Tan, et al. SParC: Cross-Domain Semantic Parsing in
+Context. In Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics, pp.
+4511–4523, Florence, Italy, 2019b. Association for Computational Linguistics.
+
+14
+
+A
+
+Masking Implementation Details
+Original problem description
+A factory produces two types of food, I and II, and currently has 50 skilled workers. One skilled worker
+can produce 10 kg/h of food I or 6 kg/h of food II. A worker works 40 h per week. The weekly wage
+of a skilled worker is 360 yuan. Workers assigned to overtime work 60 h per week with a weekly wage
+of 540 yuan. If food cannot be delivered on time, the delay penalty is 0.5 yuan/kg for food I and 0.6
+yuan/kg for food II.
+
+Masked version
+A factory produces two types of food, I and II, and currently has some quantity skilled workers. One
+skilled worker can produce a given rate of food I or a given rate of food II. A worker works some
+value per week. The weekly wage of a skilled worker is a certain wage. Workers assigned to overtime
+work some value per week with a weekly wage of a certain wage. If food cannot be delivered on time,
+the delay penalty is 0.5 yuan/kg for food I and some for food II.
+
+Rephrased masked version
+A factory produces two types of food, I and II, and currently has skilled workers on staff . One skilled
+worker can produce food I at a rate measured in kg/h or food II at another rate measured in
+kg/h. Each worker has a fixed weekly number of working hours. The weekly wage of a skilled
+worker is specified in yuan. Some workers may also be assigned to overtime, with a longer weekly
+schedule and a corresponding weekly wage. If food cannot be delivered on time, the delay penalty
+is 0.5 yuan/kg for food I and a stated amount for food II.
+Figure 6: Our masking pipeline. We take the original description, hide the decision-critical numbers, and
+optionally paraphrase the result so the underspecified version reads naturally.
+This appendix gives implementation details for the masking procedure that turns fully specified problems
+into underspecified ones. The aim is to produce challenging, meaningful instances by hiding numbers that are
+both structurally important and consequential for the outcome.
+A.1
+
+Code-Level Parameter Extraction via AST
+
+Given a fully specified model P(θ ∗ ), we first get an executable form, for instance Python code using Gurobi.
+We then parse it with an abstract syntax tree and pull out every numerical constant.
+Each constant carries:
+• its variable name,
+• its location in the code,
+• its role in the model, such as objective coefficient, constraint bound, or penalty,
+• its structural context, meaning whether it sits in the objective, a constraint, or an auxiliary expression.
+Structured constants such as lists, arrays, and dictionaries are flattened into individual scalars, which lets us
+mask at a fine grain.
+The result is a candidate parameter set
+
+θ ∗ = (θ1∗ , . . . , θn∗ ),
+15
+
+plus metadata describing each parameter’s structural role.
+A.2
+
+Structural Classification of Parameters
+
+We sort extracted parameters by their role in the model:
+• Objective coefficients, appearing in f (x; θ),
+• Constraint bounds, including right-hand sides and limits defining X (θ),
+• Capacity and demand parameters, which drive feasibility in many structured problems,
+• Auxiliary constants, such as big-M values, scaling factors, or numerical stabilizers.
+This keeps masking diverse and steers effort away from literals estimated to have little effect on the translated
+model. Because objective coefficients can change both the objective value and the selected optimizer, their
+effects must be checked rather than inferred from structural role alone.
+A.3
+
+Solver-Based Importance Estimation for Masking
+
+To keep the masked instances nontrivial, we estimate each parameter’s importance by solver-based perturbation.
+The analysis perturbs each parameter by the same multiplicative factors ×{0.5, 0.8, 1.2, 2.0} used in the
+main text, then folds objective sensitivity, solution sensitivity, and feasibility impact into a single score. The
+expressions below spell out the objective-sensitivity part.
+For each θi , we measure the effect on the optimal objective by perturbing and re-solving:
+gi =
+
+|z ∗ (θ ∗ + δi ei ) − z ∗ (θ ∗ − δi ei )|
+,
+2δi
+
+(9)
+
+where δi > 0 is a small perturbation and ei the ith standard basis vector.
+We also look at objective variation over a wider range:
+
+
+∆i = z ∗ θ ∗i←ℓi − z ∗ θ ∗i←ui ,
+
+(10)
+
+where [ℓi , ui ] is a plausible range around θi∗ .
+Finally we check whether θi shows up in active or binding constraints, and whether those constraints carry
+significant dual values. Parameters touching binding constraints or feasibility get higher importance.
+These signals combine into a score Impi , used only to guide masking during benchmark construction.
+A.4
+
+Masking Policy
+
+The masking operator picks which parameters to hide, based on importance scores and structural roles.
+We do not mask uniformly at random. In our ratio-based policy, candidates with text spans are ranked by
+sensitivity score, with qualitative importance as a fallback, and the top fraction is selected:
+• Importance driven selection: higher Impi means more likely to be masked.
+• Nontriviality: parameters with negligible impact are left alone.
+Formally, the operator produces
+
+θ ∗ → (θ obs , θ hidden ),
+
+where θ hidden holds the parameters removed from the observed description.
+16
+
+(11)
+
+A.5
+
+Generation of Underspecified Instances
+
+Once the hidden set is chosen, we edit the description to remove or obscure the corresponding values. The
+result is an underspecified description I0 that keeps the structural template but drops the key numbers.
+We pair each instance with its ground truth vector θ ∗ , which is what makes controlled evaluation through
+ErrObj(·, ·) possible.
+A.6
+
+Discussion
+
+The masking procedure pairs code-level analysis with solver perturbations to avoid masking only inert literals.
+Section 7.1 discusses the circularity this shares with the recovery-time importance scorer.
+
+B
+
+Automated User Simulator
+
+We evaluate SAILOR with an automated simulator standing in for the human user. The simulator holds
+the ground-truth vector θ ∗ ; the recovery system does not. This supports controlled evaluation of question
+selection, belief updates, and solver-assisted recovery.
+B.1
+
+Simulator Protocol
+
+At each step the system picks a question q for an unresolved parameter θi . The simulator answers from the
+ground-truth value θi∗ , after which the pipeline updates the belief, rewrites the AST, and re-solves.
+The simulator handles three question types. For direct value questions it returns the exact value of θi∗ .
+For binary range questions it reports whether θi∗ ≤ m or θi∗ > m and then reveals θi∗ ; the implementation
+therefore applies an exact update rather than retaining a truncated branch. For confirmation questions it
+checks whether the proposed value v falls within
+ϵ = 0.1 × max(|v|, 1.0)
+of the truth. Either way, yes or no, it reveals the exact value and the parameter is resolved.
+B.2
+
+Ground Truth Lookup
+
+LLM-generated parameter names often differ from the benchmark annotations, so lookup runs in three stages.
+First, an exact dictionary match. If that fails, fuzzy matching on name similarity, description similarity, token
+overlap, and numerical consistency with the LLM’s initial guess. If neither gives a confident match, an LLM
+fallback gets the original unmasked description and extracts the value.
+If all three fail, the question is marked unanswerable. After three consecutive failures on the same parameter,
+the system locks it at its current best estimate and moves on. This failure-driven fallback is separate from
+the solver-importance-based automatic locking, which is off in our main configuration.
+B.3
+
+Fidelity and Limitations
+
+The simulator provides a controlled exact-feedback reference point. Unlike a real user, it has perfect recall,
+answers deterministically, and returns structured numbers. Real users give approximate, incomplete, or
+inconsistent responses. The protocol simplifies answer interpretation but does not isolate all error sources:
+translation, parameter matching, the LLM fallback, belief modeling, and code rewriting can all affect the
+outcome. A real user might also volunteer information that the simulator withholds.
+
+17
+
+

@@ -1,0 +1,778 @@
+Teaching a Large Language Model Tutor to Withhold the Answer:
+A Supervisor Architecture and an Evidence-Driven Method for
+Tuning Socratic Behavior
+Yusuf Pisan
+
+University of Washington Bothell
+Bothell, WA, USA
+pisan@uw.edu
+
+arXiv:2608.12292v1 [cs.CY] 12 Aug 2026
+
+Abstract
+An effective large language model (LLM) tutor must often decline
+to give an answer it could easily produce. In a randomized study,
+students who used an unguarded chatbot scored higher while practicing but lower on a later test taken without it, whereas a Socratically guarded version of the same model kept the practice gain and
+removed the later loss [4]. Reliable answer-withholding is therefore
+central to a tutor’s value, yet a capable model pressed by a frustrated
+student does not withhold reliably on a prompt alone. We report
+a deployed tutoring system that enforces answer-withholding as
+a per-turn, machine-checkable contract, and a method for tuning
+that withholding against evidence. A non-LLM policy core, reading
+only trusted learner state, sets a per-turn ceiling on an eight-rung
+help ladder; a deterministic detector strips solution code; and a
+separate LLM judge checks each risky reply against the contract.
+We tune the behavior with an automated evaluation that uses no
+human subjects: scripted student personas are driven through the
+live pipeline and re-scored by a stronger model, and we record each
+rejection’s stated reason so failures are fixed by cause. Doing so
+revealed an interpretable “over-help ladder,” from blatant solution
+leaks, to naming the exact bug, to over-citing general facts, with
+each fix exposing the next. The tutor reached full compliance on
+all four acceptance criteria. We offer the measure, diagnose, and
+fix loop as a reusable recipe for any LLM agent that must refuse a
+capability it has.
+
+CCS Concepts
+• Social and professional topics → Computer science education; Student assessment; • Computing methodologies → Natural
+language processing.
+
+Keywords
+intelligent tutoring systems, large language models, CS education,
+Socratic tutoring, guardrails, LLM evaluation, prompt injection
+
+1
+
+Introduction
+
+Most published cautions about LLMs in education share a structure: the model is too helpful. Asked a homework question, a capable model will solve it clearly and instantly. Decades of learningsciences research predict that this kind of help, giving the answer
+rather than supporting the student’s own reasoning, produces little durable learning: feedback that merely reveals the answer is
+among the least effective kinds [11, 28], and learning depends on
+the student doing the cognitive work of constructing and applying
+a solution [6, 25].
+
+Recent evidence confirms this directly for LLMs. Bastani et al. ran
+a randomized controlled trial with roughly a thousand secondaryschool students: access to an unguarded chatbot raised performance
+while practicing but lowered it on a later exam taken without the
+tool, relative to students who never had the tool, while a Socratically
+guarded version of the same model kept the practice gain and
+removed the later loss [4]. The usual explanation is metacognitive
+offloading: the student lets the model do the planning and checking,
+scores well in the moment, and learns less.
+The practical consequence is that, for a tutor, withholding is not a
+safety wrapper bolted onto the product; it is the core of the product.
+A useful LLM tutor must, by default and under pressure, decline to
+produce the solution it could trivially produce while still helping the
+student make progress. This is an unusual requirement. Classical
+refusal in LLM safety is refusal of content the model should not
+produce. A tutor instead faces what we call refusal-under-knowledge:
+it knows the answer, the student can see that it knows, the student
+is frustrated and asks directly, and the system must still withhold
+while staying warm and genuinely helpful. Making that behavior
+hold reliably is the problem this report addresses.
+Two observations shape our approach. First, prompt instructions
+are necessary but not sufficient: a single prose prompt that must at
+once be warm, Socratic, never-revealing, and factually grounded
+is overloaded, and these goals interfere under adversarial input.
+Second, the behavior cannot be checked by reading the prompt; it
+must be measured against student behavior, including deliberate
+attempts to extract the answer, and tuned until it complies. Both
+point away from “write a better prompt” and toward enforcing withholding outside the generating model, plus a method that calibrates
+that enforcement against evidence.
+This report contributes, in order of emphasis: (1) a method for
+calibrating Socratic withholding against evidence (§4, §5): four
+acceptance criteria, an offline adversarial simulation, and a live loop
+that drives scripted personas through the production system and
+re-judges every turn with a stronger model, recording the judge’s
+reason for each rejection so failures are fixed by cause; (2) a supervisor architecture that enforces withholding as a per-turn
+contract (§3); and (3) a deployed, persona-grounded instantiation for two undergraduate data structures courses, speaking in the
+voice of the instructor of record and grounded in that instructor’s
+own course materials. To our knowledge this combination has not
+previously been deployed.
+We deliberately do not claim a learning-outcomes result; the
+decisive test, a delayed, tool-removed assessment in a controlled
+
+Pisan
+
+design, needs a pilot cohort and is future work (§8). What we offer here is the architecture, the calibration method, and a candid
+account of applying it, including what broke.
+
+2
+
+Background and design forces
+
+Forty years of tutoring research, read with the recent LLM literature,
+yields a small set of design forces that constrain any serious tutor
+and motivate our architecture.
+Step-level interaction drives learning; revealing the answer is weak feedback. Bloom set the aspiration that tutoring
+combined with mastery learning can far outperform conventional
+instruction [5]. By mastery learning we mean the specific method
+in which a student must demonstrate a set level of proficiency on
+prerequisite material, through formative checks and targeted correctives, before advancing; it is a defined instructional approach,
+not the generic goal of learning. VanLehn’s review is the most
+actionable reading: step-based tutoring systems reach effect sizes
+close to human tutoring, and the active factor is the granularity
+of interaction, feedback at each step rather than on the final answer [25]. A persistent per-skill learner model drives sequencing
+and the depth of help: Bayesian Knowledge Tracing models mastery
+as a per-skill latent state [7], knowledge-space theory generalizes
+assessment over prerequisite structure [8], and large field trials
+show lightweight immediate feedback helps the weakest students
+most [12]. The same pattern appears in the LLM era: an AI tool
+that coached human tutors toward more probing questions and
+less answer-giving helped the weakest tutors most [26]. The ICAP
+framework predicts that interactive and constructive engagement
+outlearn passive reception [6]; AutoTutor showed, before LLMs,
+that a fixed sequence of dialogue moves (pump, hint, prompt, then
+assert) produces large gains [9]; and feedback meta-analyses find
+that roughly a third of feedback interventions are null or harmful, with praise, vagueness, and answer-reveal among the harmful
+kinds [11, 28]. Cognitive Tutors showed deep step diagnosis works
+but at heavy authoring cost [2]; constraint-based tutoring showed
+a cheaper path, encode what a correct solution looks like and check
+against it, which in programming is essentially free because compilers and test suites already exist [22].
+Correctness must come from outside the model. Surveys
+establish that LLMs state confident falsehoods, and LLMs giving
+programming feedback show false corrections, missed bugs, and
+instability [13, 17]. An LLM should therefore not be the source of
+truth for whether a student’s code is correct; a deterministic check
+(compile, run, test) should be, with the model limited to narrating
+facts it did not assert. A classroom LLM assistant that never showed
+solution code, offering pseudocode and annotations of the student’s
+own work instead, documented both that this stance is feasible
+and that students consistently want more directness than is good
+for them [16]. A parallel system enforces the same no-solutions
+stance through prompt-level guardrails at classroom scale [19]; our
+contribution is to lift that guarantee out of the prompt and make it
+a checkable, per-turn contract.
+Pedagogy is best expressed as a per-turn instruction. A
+recent development reframes tutoring as pedagogical instruction
+following: instead of baking one pedagogy into a model, the model
+follows explicit, per-turn pedagogy instructions, with expert raters
+
+preferring the result over strong general models [18]. A complementary line instead bakes Socratic behavior into the weights through
+fine-tuning [20]; we keep the pedagogy external so it can be inspected and changed without retraining. The transferable idea is
+the interface: pedagogy as a machine-readable, per-turn instruction
+a supervisory component computes and hands to the model.
+LLM judges are useful but unreliable, and the trust boundary matters. Using one LLM to judge another’s output is now standard, but such judges show position, verbosity, and self-preference
+biases and run-to-run inconsistency [29]; a judge needs a written
+rubric, low temperature, structured output, a policy that prefers revision over blocking, and calibration against human judgment. Separately, prompt injection means any component that reads student
+text can be retargeted by it, so robust designs keep the privileged
+component from ever seeing untrusted input [27], and injection
+through retrieved content is a demonstrated real-world attack [10].
+The component that makes the binding withholding decision must
+therefore be a non-LLM layer fed only trusted signals. Finally, persona is a motivation lever subordinate to clarity: rich first-person
+corpora reproduce behavior better than short descriptions [23], and
+a pedagogical agent with personality modestly raises interest and
+credibility, though the effect is small [24].
+
+3
+
+The supervisor architecture
+
+The student talks to a single warm tutor, the actor. Around every
+turn, supervisor components decide what help is allowed, check that
+the reply stayed within that decision, and record what happened
+(Figure 1). Six principles govern the design.
+• P1, withhold by default. The tutor never gives the solution to a live exercise on its own; help follows a typed hint
+ladder whose top rung is reachable only through an explicit
+instructor toggle.
+• P2, decide without reading student text. The component
+that sets the per-turn help ceiling reads only trusted learner
+state, never the student’s words, so a student cannot talk
+past a ceiling computed from data they cannot edit [27].
+• P3, let deterministic signals outrank model judgments.
+A code-execution result outranks an LLM’s opinion of correctness, and a deterministic detector of solution code runs
+before, and independently of, any LLM judge [22].
+• P4, prefer revising a reply over refusing it. If the tutor refuses too often, students give up on it and return
+to unguarded chatbots, which recreates the exact harm
+we are trying to prevent [4]; early evidence on optionalguardrail tools confirms students will route around friction
+they judge excessive [14]. We therefore treat over-blocking
+as a measured failure, not a safe fallback.
+• P5, use one writer for learner state. A single component
+writes all mastery and progress records, through typed transitions, so the learner model is auditable and the pedagogy
+layer can be tested without invoking any model.
+• P6, make everything observable. Every turn logs the
+computed contract, the verdicts, the help level used, latency,
+and cost.
+The per-turn flow (Figure 1) runs: spending caps, an active-exam
+intercept, a pre-classifier, a conduct check, grounded retrieval, the
+
+Teaching an LLM Tutor to Withhold the Answer
+
+policy core, a prerequisite gate, a strategist, the actor, the deterministic detector, the LLM judge on risky turns, and telemetry; a nightly
+auditor re-judges risky turns with a stronger model for calibration.
+
+3.1
+
+An eight-rung hint ladder
+
+Help is discretized onto an eight-rung ladder, from least to most
+revealing: H0 acknowledge and encourage (no new content); H1
+restate or clarify the problem; H2 point to the relevant concept, slide,
+or definition; H3 ask a leading question about the very next step;
+H4 describe the approach in words, with no code; H5 walk through
+a worked example on a different problem; H6 give pseudocode with
+the key lines left as blanks; H7 show the full, compilable solution.
+Discretizing assistance this way follows the help-seeking and helpdesign literature, which treats graduated, well-designed help as a
+first-class instructional object rather than an afterthought [1]. This
+ladder is the unit of decision (the policy core sets a ceiling on it),
+of enforcement (the detector and judge check against it), and of
+measurement (compliance means staying at or below the ceiling).
+Rungs H0 to H4 allow no code; H5 and above allow progressively
+more. Making the ladder an explicit, typed object, not an informal
+prose stance, lets the rest of the system reason about and check
+withholding.
+
+3.2
+
+Computing the per-turn contract
+
+The policy core is the heart of P2: ordinary code with no model calls
+and no access to student prose. From trusted state alone it computes
+the per-turn contract: a help ceiling, the goals in scope, any goals
+locked under an active exam, whether the turn must be grounded,
+and whether the judge should escalate to a multi-sample vote. The
+ceiling is computed from data rather than nested conditionals, so it
+is tunable and exhaustively testable. Mastery band: lower mastery
+raises the ceiling (more scaffolding), higher mastery lowers it to
+force the productive struggle that drives durable learning [15]; with
+several goals in scope, the most permissive band wins, so the student
+is met at their weakest goal. Constructive-code floor: a student who
+shows buggy code and asks for help is stuck on execution, not
+concept, so a mastery-tuned ceiling can be too low to give any real
+debugging hint; such a turn floors the ceiling at H4, so the tutor
+gives a verbal nudge while emitting no code. This floor is one of the
+levers the evaluation later tuned (§5). Exam lockdown: a goal under
+an active mastery exam caps the turn near zero help. Instructor
+explain mode: an optional toggle lifts the ceiling to full solutions,
+but never past an exam lockdown. Conduct restriction: applied last,
+so nothing can lift it. A blunt demand for the solution never raises
+restrictions on its own (P4); the system routes such a turn kindly.
+The contract is then rendered into an imperative instruction block
+appended to the actor’s prompt [18].
+
+3.3
+
+Pre-classifier and strategist
+
+A small, cheap pre-classifier maps the student message to a narrow
+structured output: an intent label from a fixed set (genuine question,
+attempt, solution demand, exam leak, injection, hostile, and so on),
+the goal identifiers in play, and whether the message contains a
+code attempt. The message is framed as data inside delimiters, and
+the classifier is told the transcript is never an instruction. Because
+the only output is an enum and a short identifier list, a successful
+
+injection can at worst cause a wrong route; the policy core still
+caps the ceiling, so no solution leaks from a fooled classifier, a
+direct application of the trust-boundary principle [27]. A second
+small-model strategist proposes exactly one instructional move
+per turn from the student’s recent trajectory, following the validated AutoTutor-style ladder [9] (elicit a prediction, give a worked
+analogy, check understanding, switch representation, and so on). A
+move shapes how the actor opens the turn but never what may be
+revealed: it cannot raise the ceiling, is suppressed during an exam
+lockdown, and is dropped if the ceiling cannot accommodate it. The
+strategist is advisory and fail-soft.
+
+3.4
+
+The actor, grounding, and persona
+
+The actor is the tutor the student sees, a capable production model
+prompted to teach in the instructor’s voice. Its persona is assembled
+once from the instructor’s own materials (a corpus distilled from
+several hundred lecture transcripts), plus a static block that prints
+the full hint ladder and its rules. The assembled prompt is large (on
+the order of 160,000 characters) and identical from turn to turn, so it
+is sent as a cached prefix; the per-turn contract and student context
+follow in a short suffix. Concept questions are grounded by retrieval
+over an embedding index of course slides, transcripts, the textbook,
+and assignments, so the tutor cites material the student actually
+saw. When warmth and withholding conflict, the contract wins,
+and the persona’s job is to make withholding feel like coaching
+rather than refusal.
+
+3.5
+
+Removing solution code: the deterministic
+detector
+
+Independently of any model judgment (P3), a deterministic codereveal detector scans the output for solution code. It flags a fenced
+block long enough and plausibly C++ (type keywords with braces
+and semicolons, or tell-tale signatures), and an encoded payload that
+decodes to plausible C++ (an evasion seen in real logs, where the
+model was talked into base64-encoding the answer). The detector
+has two modes. By default it is lenient: it lets short illustrative
+snippets and fill-in-the-blank pseudocode through, treating them
+as harmless. When the contract allows no code at all, it switches
+to a strict mode that removes even a bare function signature or a
+blanked-out template, while still allowing plain-prose pseudocode
+that contains no braces or semicolons. On the live output stream it
+holds tokens inside a code fence until the fence closes, then releases
+the block if it is safe or replaces it with an in-voice line if not.
+Because it is deterministic, it cannot be fooled by injection and can
+be exhaustively unit-tested.
+On a risky turn (code-adjacent at or below a no-code ceiling,
+an exam lockdown, or an adversarial intent), a small-model judge
+checks the draft against the contract. It is collusion-resistant by
+construction: it sees only the contract, the draft, and the retrieved
+sources, never the raw student message [27]. It returns a structured
+verdict (allow, revise, block) with a rule identifier and a one-sentence
+reason, at temperature zero, against a written rubric that encodes
+the contract, but that explicitly does not flag general programming
+facts any reference would confirm [29]. On a revise verdict the
+actor regenerates once with the violation named; if that still trips
+the detector, the system falls back to a templated pointer. Revision
+
+Pisan
+
+Student
+message
+
+Policy core
+(no model calls,
+no student text)
+
+Preclassifier
+
+contract
+
+Strategist
+(one move)
+
+Actor
+(tutor LLM)
+
+Judge
+(risky turns)
+
+Code-reveal
+detector
+
+trusted state
+
+Learner state
+(single writer)
+trust boundary (P2): fed only trusted state
+
+Reply to
+student
+
+Figure 1: Per-turn flow. The student talks only to the actor. Inside the trust boundary, the policy core computes the help
+contract from learner state alone, never reading student text (P2). The deterministic detector (double border) removes solution
+code independently of any model (P3); the judge checks risky replies before they reach the student. Shaded boxes are LLM
+components.
+is strongly preferred over blocking (P4). Finally, gated progression
+through 136 prerequisite-linked goals turns a turn reaching gated
+content into a short mastery exam, with the goal locked from
+teaching and the pass derived from a rubric score, not a modelasserted flag, failing closed on bad grader output. Student code,
+when enabled, is compiled and run against tests in a networkisolated sandbox that returns facts only; the model narrates them
+and never asserts correctness (P3) [22].
+
+4
+
+Method: calibrating Socratic withholding
+
+The architecture makes withholding enforceable; it does not by itself
+make the tutor withhold correctly. The actor can still over-help, the
+judge can still over-revise honest help, and a measurement can still
+mislead. Our method closes that gap with a set of acceptance gates,
+an offline adversarial simulation, a live test loop, and a diagnostic
+discipline that makes failures interpretable. By an acceptance gate
+we mean a concrete pass/fail criterion the system must meet before
+we treat a change as safe to ship.
+No human subjects. The evaluation reported here is entirely
+automated. Behavior is exercised by scripted student personas (defined below), not by students, and is scored by the system’s own
+LLM judge and by a separate, stronger auditing model. Because no
+human participants and no student data are involved, the work in
+this paper required no human-subjects review; the controlled study
+in §8, which does involve students, will require it.
+Underneath everything is a large suite of fast, deterministic
+tests (over five hundred, run on every change with no network)
+encoding the architecture’s invariants, such as that the policy core
+imports nothing that can carry student text and only the single
+writer touches learner state. These confirm the machine obeys its
+own contracts; they cannot show the tutor teaches well or withholds
+under pressure, which requires driving student behavior through
+it.
+
+4.1
+
+Four acceptance gates
+
+We reduce “the tutor withholds correctly” to four measurable properties. G1, no solution reveals: across an adversarial suite, no
+detector-confirmed C++ solution reaches the student. G2, do not
+over-block honest help: on genuine, code-adjacent help-seeking
+
+turns, the earnest revise rate (the fraction of such turns the judge
+marks revise) is at most 5%, and any outright block or detector cut
+of an earnest turn also fails the gate, since over-blocking is the more
+harmful error (P4). G3, hint-ceiling compliance: under adversarial pressure, hint-ceiling compliance (the fraction of turns that stay
+at or below the contract’s help ceiling and leak no code, as scored
+by an independent auditor) is at least 95%. G4, exam integrity: no
+mastery exam is passed through injection or grader failure. G1 and
+G4 are deterministic and checked on every change; G2 and G3 need
+the live actor and an auditing model, and are measured deliberately.
+
+4.2
+
+Offline adversarial simulation
+
+We script four student personas: an earnest-but-stuck student (must
+not be over-blocked), an answer-seeker who repeatedly demands
+the code (the detector must cut anything the actor concedes), a
+gate-evader who uses social engineering (“my TA said it is fine”),
+and an injector who attempts prompt injection. The answer-seeker
+and gate-evader model the long-documented “gaming the system”
+behavior, in which students who extract answers rather than reason learn substantially less [3]; resisting that extraction is exactly
+what the ladder defends. These drive a curated corpus of injection
+messages, evasions, candidate solution drafts, and genuine tutoring turns through the deterministic components. Three classes of
+reveal are missed by design and documented as known blind spots
+(split-fence, plain-prose, and cross-language reveals), which is why
+the live judge and the execution path exist as further layers.
+
+4.3
+
+The live test loop
+
+G2 and G3 depend on what the production model does under pressure, so we measure them with a deliberately run, billed loop. Safeguards are enforced, not merely intended: the loop runs against a
+throwaway database (never production), with non-admin synthetic
+students and a printed cost ledger, and it refuses to start unless the
+throwaway-database check passes (an earlier incident, in which an
+unrelated maintenance script touched the production store, is why
+this is now a hard assertion). Two synthetic students have all goals
+pre-mastered, so every turn reaches the actor and judge rather than
+being diverted into an exam. For G2 we drive the earnest suite and
+read each turn’s live verdict; for G3 we drive every evasion and
+
+Teaching an LLM Tutor to Withhold the Answer
+
+injection, then re-judge all driven turns with the stronger auditing
+model, counting a turn compliant when the auditor does not reject
+it for exceeding the ceiling or leaking code. One full loop is roughly
+two dozen driven turns plus an audit pass and costs under a dollar.
+Scoring is separated from the billed driving, so only turn-driving
+spends money.
+
+4.4
+
+Separating failures by cause
+
+Two choices made the difference between a number and a diagnosis.
+First, sort each rejection by its cause. The auditor’s rejections fall
+into three kinds: exceeding the help ceiling or leaking code (a true
+withholding failure), ignoring the assigned instructional move (a
+pedagogy-quality issue), and citing or claiming something without
+support (a grounding issue). Only the first kind counts against G3.
+A single undifferentiated pass rate mixes all three, which is what
+made the first live result uninterpretable until we separated them
+(§5). Second, record the judge’s reason, not just its verdict. Early
+runs reported that certain earnest turns were revised but not why,
+which invited blind fixes. Capturing each rejection’s stated reason
+turned an expensive, ambiguous signal into a precise one: the next
+run did not just say a turn failed, it said the actor cited a source it
+had not retrieved, or emitted code at a ceiling that forbade it.
+
+5
+
+Results: the over-help ladder
+
+We applied the method iteratively to the deployed tutor. All figures
+below are pass rates over the scripted-persona suites of §4 (about
+two dozen turns per run); none involve human participants. The
+result worth carrying away is not that the gates were met but
+the shape of the path to them: the withholding failures formed a
+descending ladder, from gross to subtle, a map of how a capable
+model over-helps when told not to. Table 1 summarizes that descent.
+Starting point. The first billed run failed both pedagogy gates
+badly: a 43% earnest revise rate (G2) and 54% hint-ceiling compliance (G3), seemingly a system that both over-blocked honest
+students and leaked under pressure, a contradiction worth resolving
+first.
+Rung 0, a measurement artifact. Sorting G3 rejections by
+cause (§4.4) showed that half of the apparent ceiling violations
+were grounding rejections, not over-help. The fault was in the
+auditor: it re-judged turns without the retrieved sources the live
+judge had seen, so it read every legitimate citation as unsupported.
+We proved this offline, at no further cost, then fixed it by persisting
+the sources the live judge saw and re-judging against them. Real
+ceiling compliance was about 77%, still failing, but now genuine.
+Rung 1, code under pressure. The genuine violations were
+the actor emitting partial code (signatures, blank-filled templates)
+at low rungs under adversarial demand, slipping past the lenient
+detector because the fragments were short or contained blanks. The
+fix was the strict detector mode (§3).
+Rung 2, over-blocking honest debugging. Independently,
+G2’s over-revising traced not to an overzealous judge but to a
+ceiling set too low: a confident student gets a low ceiling to force
+productive struggle, but a student showing buggy code needs a
+higher ceiling to get any real debugging hint, so the judge correctly
+revised help that genuinely exceeded the too-low ceiling. The fix
+was the constructive-code floor.
+
+After these three fixes, a second billed run showed G3 up from
+54% to 96% (a pass) but G2 unchanged at 43%: the same earnest
+turns kept revising, and the run did not record why. We added
+reason capture (§4.4) and ran again.
+Rung 3, fabricated citations. With reasons in hand, the residual G2 failures split. Two-thirds were a subtle grounding failure:
+the contract told the actor to “ground every course claim in the
+retrieved material,” which pressured it to cite, and when nothing
+relevant had been retrieved it invented a plausible citation. The
+fix: cite a specific source only if it appears in this turn’s retrieval,
+otherwise help in plain words. The remaining third was code over
+the ceiling, because “here is my code, what is wrong?” was labeled
+a question rather than an attempt, so the constructive-code floor
+never applied; the fix extended the floor to any code-adjacent turn.
+Rung 4, naming the bug, and over-grounding general facts.
+These fixes drove the earnest revise rate to 0%, but two further runs
+exposed the subtlest over-help yet. On a debugging turn the actor
+would stay within the no-code ceiling but state the exact bug in
+prose (“you wrote less-than-or-equal where you need less-than”),
+which the auditor correctly flagged as giving the answer; the fix
+sharpened the low-rung contract (point to the area and ask one
+leading question, never naming the bug, the wrong token, or the
+fix). Then one earnest turn still revised because the judge flagged
+a general language fact (what a standard container’s size method
+returns) as an unsupported course claim; the fix narrowed the rule
+to treat general programming facts as the tutor’s own knowledge.
+End state. The final run passed both pedagogy gates: a 0%
+earnest revise rate (G2) and 100% hint-ceiling compliance, with
+zero rung breaches under adversarial pressure (G3), at a driven cost
+well under a dollar. With the always-on deterministic gates (G1
+zero reveals, G4 zero exam compromises), all four acceptance criteria held. The progression is the point: the failures walked steadily
+down an over-help ladder, each rung subtler than the last, every one
+caught and named by the captured judge reason and fixed by cause
+until none remained. No single prompt edit produced a withholding
+tutor; the descent down the ladder did.
+
+6
+
+Discussion and reflection
+
+Refusal-under-knowledge is distinct and under-studied. Nothing in the calibration loop is specific to data structures, or even
+to education. Any LLM agent whose core requirement is to refuse
+a capability it possesses faces the same failure modes: the model
+edges toward the forbidden behavior, and naive metrics conflate
+distinct failures. Classical LLM safety studies refusal of content
+the model should not produce; this is the harder converse, refusing content it should and can produce, to a user who can see that
+it can. The over-help ladder is the tutoring instance of a general
+phenomenon: a model’s violations of a withholding contract are
+ordered gross-to-subtle, and a reason-capturing loop walks down
+that order.
+Put the irreversible decision in code, not in a prompt. The
+single most stabilizing choice was P2: computing the help ceiling
+in a non-LLM policy core fed only trusted state made the most important property both injection-proof and unit-testable, so prompt
+edits could never silently weaken it. Equally valuable was honest
+tooling: naming the detector’s blind spots and forcing the auditor to
+
+Pisan
+
+Table 1: The over-help ladder: each billed calibration run exposed a subtler over-help, caught by the captured judge reason
+(§4.4) and fixed by cause. G2 is the earnest revise rate (gate ≤5%); G3 is hint-ceiling compliance (gate ≥95%). Run 1’s reported 54%
+G3 was a measurement artifact (Rung 0; true value ≈77%).
+Run
+
+G2 (earnest revise)
+
+G3 (ceiling compliance)
+
+Fixes applied since the previous run
+
+1 (start)
+2
+
+43%
+43%
+
+54% reported / ≈77% real
+96% (pass)
+
+3
+
+0% (pass)
+
+96%
+
+final
+
+0% (pass)
+
+100% (pass)
+
+—
+persist sources for the auditor (Rung 0); strict detector for partial code (Rung 1);
+constructive-code floor (Rung 2)
+cite only retrieved sources; floor extended to any code-adjacent turn (Rung 3);
+per-rejection reason capture
+low-rung replies name no bug or fix; grounding narrowed to course-specific claims
+(Rung 4)
+
+state its reason caught errors a green pass rate would have hidden,
+including an auditor itself wrong in a structured way (Rung 0). For a
+safety-relevant system, instrumentation that explains itself proved
+more valuable than any single guardrail.
+Use of generative AI in this work. Per ACM authorship policy, we disclose the AI used in conducting this research. The deployed system uses LLMs as runtime components (the actor, preclassifier, strategist, and judge) and a stronger LLM as the offline
+auditor, described in §3 and §4; the models are used as-is through
+their providers’ APIs with no fine-tuning, and all corpora used for
+persona grounding and retrieval are public-domain or instructorauthored. Generative AI tools also assisted in writing system code
+and in drafting and editing this manuscript; the author verified all
+resulting content and is responsible for any errors.
+
+7
+
+Limitations
+
+This report validates an enforced-pedagogy system against safety
+and compliance gates; it does not claim a measured durable-learning
+effect, which requires the controlled study in §8. The pedagogy
+gates pass on roughly two dozen driven turns run a handful of
+times across the scripted personas, which does not substitute for
+real student traffic (monitored by the nightly auditor in a pilot).
+Both the live judge and the auditor are LLMs and inherit the known
+reliability limits of LLM-as-judge, including for programming feedback [17, 29]; we mitigate with the rubric, deterministic detector,
+and escalation described above, plus planned calibration against
+human raters. The detector misses split-fence, prose, and crosslanguage reveals by design, with the judge and execution path
+as compensating layers; since a determined adversary can always
+retype the problem elsewhere, the goal is not leak-proofness but
+making the guarded path the path of least resistance. With real
+students, conversation logs and code submissions are sensitive data,
+and any research analysis is gated behind human-subjects review.
+Finally, the persona carries risks (an idealized voice may be overtrusted), so it is subordinated to clarity and the system discloses its
+AI status.
+
+8
+
+Future work
+
+The immediate next step is a controlled, pre-registered study in
+one course offering, with a delayed, tool-removed assessment on
+goal-aligned items two weeks after a unit, contrasting no tutor, the
+supervised tutor, and an instructor-enabled explain-mode arm to
+
+isolate the effect of withholding itself [4]. This study involves human participants and will proceed only under institutional humansubjects approval. Secondary measures include depth to convergence, voluntary-usage persistence, and an equity slice by incoming
+ability, since the intervention should narrow rather than widen ability gaps [12]. We will also adopt forced-choice pairwise preference
+judging by TAs and the instructor, shown affordable at scale [21],
+to A/B the persona and pedagogy levers, and measure how much
+guardrail friction students tolerate before abandoning the guarded
+tool, extending early evidence on optional guardrails [14] to the
+enforced-contract setting.
+
+9
+
+Conclusion
+
+A useful LLM tutor must do what a capable model finds hardest:
+withhold an answer it knows, under pressure, while still helping.
+We have shown this is achievable, but not by prompt-writing. It
+requires an architecture that makes withholding an enforced, perturn contract decided outside the generating model and backed by
+a deterministic check, plus a method that calibrates the behavior
+against evidence and makes each rejection state its reason. Applied
+to a deployed tutor, the failures descended an interpretable overhelp ladder to full compliance on all four gates. That measurediagnose-fix loop is the contribution, and should transfer to any
+agent that must refuse a capability it has.
+
+Acknowledgments
+Generative AI tools (large language models) were used substantially in this work: as runtime components of the deployed tutoring
+system, and as assistants in writing the system’s code and in drafting and editing this manuscript. The author verified all content,
+results, and references and is responsible for any errors. See “Use
+of generative AI in this work” (§6) for the full disclosure.
+
+References
+[1] Vincent Aleven, Elmar Stahl, Silke Schworm, Frank Fischer, and Raven Wallace. 2003. Help Seeking and Help Design in Interactive Learning Environments. Review of Educational Research 73, 3 (2003), 277–320. doi:10.3102/
+00346543073003277
+[2] John R. Anderson, Albert T. Corbett, Kenneth R. Koedinger, and Ray Pelletier.
+1995. Cognitive Tutors: Lessons Learned. Journal of the Learning Sciences 4, 2
+(1995), 167–207. doi:10.1207/s15327809jls0402_2
+[3] Ryan S. J. d. Baker, Albert T. Corbett, Kenneth R. Koedinger, and Angela Z.
+Wagner. 2004. Off-Task Behavior in the Cognitive Tutor Classroom: When
+Students “Game the System”. In Proceedings of the SIGCHI Conference on Human
+Factors in Computing Systems (CHI ’04). 383–390. doi:10.1145/985692.985741
+[4] Hamsa Bastani, Osbert Bastani, Alp Sungu, Haosen Ge, Özge Kabakçı, and Rei
+Mariman. 2025. Generative AI Without Guardrails Can Harm Learning: Evidence
+
+Teaching an LLM Tutor to Withhold the Answer
+
+from High School Mathematics. Proceedings of the National Academy of Sciences
+122, 26 (2025), e2422633122. doi:10.1073/pnas.2422633122
+[5] Benjamin S. Bloom. 1984. The 2 Sigma Problem: The Search for Methods of
+Group Instruction as Effective as One-to-One Tutoring. Educational Researcher
+13, 6 (1984), 4–16. doi:10.3102/0013189X013006004
+[6] Michelene T. H. Chi and Ruth Wylie. 2014. The ICAP Framework: Linking
+Cognitive Engagement to Active Learning Outcomes. Educational Psychologist
+49, 4 (2014), 219–243. doi:10.1080/00461520.2014.965823
+[7] Albert T. Corbett and John R. Anderson. 1995. Knowledge Tracing: Modeling
+the Acquisition of Procedural Knowledge. User Modeling and User-Adapted
+Interaction 4, 4 (1995), 253–278. doi:10.1007/BF01099821
+[8] Jean-Paul Doignon and Jean-Claude Falmagne. 1985. Spaces for the Assessment
+of Knowledge. International Journal of Man-Machine Studies 23, 2 (1985), 175–196.
+doi:10.1016/S0020-7373(85)80031-6
+[9] Arthur C. Graesser, Patrick Chipman, Brian C. Haynes, and Andrew Olney. 2005.
+AutoTutor: An Intelligent Tutoring System with Mixed-Initiative Dialogue. IEEE
+Transactions on Education 48, 4 (2005), 612–618. doi:10.1109/TE.2005.856149
+[10] Kai Greshake, Sahar Abdelnabi, Shailesh Mishra, Christoph Endres, Thorsten
+Holz, and Mario Fritz. 2023. Not What You’ve Signed Up For: Compromising
+Real-World LLM-Integrated Applications with Indirect Prompt Injection. In
+Proceedings of the 16th ACM Workshop on Artificial Intelligence and Security
+(AISec). ACM, 79–90. doi:10.1145/3605764.3623985
+[11] John Hattie and Helen Timperley. 2007. The Power of Feedback. Review of
+Educational Research 77, 1 (2007), 81–112. doi:10.3102/003465430298487
+[12] Neil T. Heffernan and Cristina L. Heffernan. 2014. The ASSISTments Ecosystem:
+Building a Platform that Brings Scientists and Teachers Together for Minimally
+Invasive Research on Human Learning and Teaching. International Journal of
+Artificial Intelligence in Education 24, 4 (2014), 470–497. doi:10.1007/s40593-0140024-x
+[13] Ziwei Ji, Nayeon Lee, Rita Frieske, Tiezheng Yu, Dan Su, Yan Xu, Etsuko Ishii,
+Ye Jin Bang, Andrea Madotto, and Pascale Fung. 2023. Survey of Hallucination
+in Natural Language Generation. Comput. Surveys 55, 12, Article 248 (2023),
+38 pages. doi:10.1145/3571730
+[14] Amanpreet Kapoor, Marc Diaz, Stephen MacNeil, Leo Porter, and Paul Denny.
+2025. Exploring Student Behaviors and Motivations using AI TAs with Optional
+Guardrails. arXiv:2504.11146 [cs.HC]
+[15] Manu Kapur. 2008. Productive Failure. Cognition and Instruction 26, 3 (2008),
+379–424. doi:10.1080/07370000802212669
+[16] Majeed Kazemitabaar, Runlong Ye, Xiaoning Wang, Austin Z. Henley, Paul Denny,
+Michelle Craig, and Tovi Grossman. 2024. CodeAid: Evaluating a Classroom
+Deployment of an LLM-based Programming Assistant that Balances Student and
+Educator Needs. In Proceedings of the 2024 CHI Conference on Human Factors in
+Computing Systems (CHI ’24). ACM, 20 pages. doi:10.1145/3613904.3642773
+[17] Charles Koutcheme, Nicola Dainese, Arto Hellas, Sami Sarsa, Juho Leinonen,
+Syed Ashraf, and Paul Denny. 2025. Evaluating Language Models for Generating
+
+and Judging Programming Feedback. In Proceedings of the 56th ACM Technical
+Symposium on Computer Science Education V. 1 (SIGCSE TS 2025). doi:10.1145/
+3641554.3701791
+[18] LearnLM Team, Google. 2024. LearnLM: Improving Gemini for Learning. Technical report. arXiv:2412.16429 [cs.CY]
+[19] Mark Liffiton, Brad E. Sheese, Jaromir Savelka, and Paul Denny. 2024. CodeHelp:
+Using Large Language Models with Guardrails for Scalable Support in Programming Classes. In Proceedings of the 23rd Koli Calling International Conference on
+Computing Education Research. doi:10.1145/3631802.3631830
+[20] Jiayu Liu, Zhenya Huang, Tong Xiao, Jing Sha, Jinze Wu, Qi Liu, Shijin Wang, and
+Enhong Chen. 2024. SocraticLM: Exploring Socratic Personalized Teaching with
+Large Language Models. In Advances in Neural Information Processing Systems
+37 (NeurIPS 2024).
+[21] Rongxin Liu, Carter Zenke, Charlie Liu, Andrew Holmes, Patrick Thornton, and
+David J. Malan. 2024. Teaching CS50 with AI: Leveraging Generative Artificial
+Intelligence in Computer Science Education. In Proceedings of the 55th ACM
+Technical Symposium on Computer Science Education V. 1 (SIGCSE 2024). ACM,
+New York, NY, USA, 750–756. doi:10.1145/3626252.3630938
+[22] Antonija Mitrovic. 2012. Fifteen Years of Constraint-Based Tutors: What We
+Have Achieved and Where We Are Going. User Modeling and User-Adapted
+Interaction 22, 1-2 (2012), 39–72. doi:10.1007/s11257-011-9105-9
+[23] Joon Sung Park, Carolyn Q. Zou, Aaron Shaw, Benjamin Mako Hill, Carrie Cai,
+Meredith Ringel Morris, Robb Willer, Percy Liang, and Michael S. Bernstein.
+2024. Generative Agent Simulations of 1,000 People. arXiv:2411.10109 [cs.AI]
+[24] Noah L. Schroeder, Olusola O. Adesope, and Rachel Barouch Gilbert. 2013. How
+Effective Are Pedagogical Agents for Learning? A Meta-Analytic Review. Journal
+of Educational Computing Research 49, 1 (2013), 1–39. doi:10.2190/EC.49.1.a
+[25] Kurt VanLehn. 2011. The Relative Effectiveness of Human Tutoring, Intelligent
+Tutoring Systems, and Other Tutoring Systems. Educational Psychologist 46, 4
+(2011), 197–221. doi:10.1080/00461520.2011.611369
+[26] Rose E. Wang, Ana T. Ribeiro, Carly D. Robinson, Susanna Loeb, and Dorottya
+Demszky. 2024. Tutor CoPilot: A Human-AI Approach for Scaling Real-Time
+Expertise. arXiv:2410.03017 [cs.CL]
+[27] Simon Willison. 2023. The Dual LLM Pattern for Building AI Assistants that Can
+Resist Prompt Injection. Blog post. https://simonwillison.net/2023/Apr/25/dualllm-pattern/
+[28] Benedikt Wisniewski, Klaus Zierer, and John Hattie. 2020. The Power of Feedback
+Revisited: A Meta-Analysis of Educational Feedback Research. Frontiers in
+Psychology 10, Article 3087 (2020). doi:10.3389/fpsyg.2019.03087
+[29] Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan Zhuang, Zhanghao Wu,
+Yonghao Zhuang, Zi Lin, Zhuohan Li, Dacheng Li, Eric P. Xing, Hao Zhang,
+Joseph E. Gonzalez, and Ion Stoica. 2023. Judging LLM-as-a-Judge with MTBench and Chatbot Arena. In Advances in Neural Information Processing Systems
+36 (NeurIPS 2023) Datasets and Benchmarks Track. arXiv:2306.05685
+
+

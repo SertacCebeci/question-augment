@@ -1,0 +1,1345 @@
+arXiv:2604.04593v2 [cs.IR] 17 Jul 2026
+
+Ruling Out to Rule In: Contrastive Hypothesis Retrieval for
+Medical Question Answering
+Byeolhee Kim
+
+Min-Kyung Kim
+
+Department of Information Medicine
+Asan Medical Center
+Seoul, Republic of Korea
+
+Department of Computer Science
+Yonsei University
+Seoul, Republic of Korea
+INMED DATA
+Seoul, Republic of Korea
+
+Young-Hak Kim
+
+Tae-Joon Jeon∗
+
+Division of Cardiology, Department of Information
+Medicine
+Asan Medical Center, University of Ulsan College of
+Medicine
+Seoul, Republic of Korea
+
+Department of Information Medicine
+Asan Medical Center, University of Ulsan College of
+Medicine
+Seoul, Republic of Korea
+
+Abstract
+Retrieval-augmented generation (RAG) grounds large language models in external medical knowledge, yet standard retrievers frequently
+surface hard negatives that are semantically close to the query
+but describe clinically distinct conditions. While existing queryexpansion methods improve query representation to mitigate ambiguity, they typically focus on enriching target-relevant semantics without an explicit mechanism to selectively suppress specific,
+clinically plausible hard negatives. This leaves the system prone to
+retrieving plausible mimics that overshadow the actual diagnosis,
+particularly when such mimics are dominant within the corpus.
+We propose Contrastive Hypothesis Retrieval (CHR), a framework
+inspired by the process of clinical differential diagnosis. CHR generates a target hypothesis 𝐻 + for the likely correct answer and a
+mimic hypothesis 𝐻 − for the most plausible incorrect alternative,
+then scores documents by promoting 𝐻 + -aligned evidence while
+penalizing 𝐻 − -aligned content. To prevent the penalty from erasing target-relevant evidence when the two hypotheses semantically overlap, we further introduce an adaptive contrastive weight
+that modulates the penalty as a function of the cosine similarity between 𝐻 + and 𝐻 − . Across three medical QA benchmarks,
+four retrievers spanning dense (MedCPT, BGE-large-en-v1.5, E5large-v2) and sparse (BM25) families, and three answer generators,
+CHR outperforms all five query-expansion baselines and generalizes across retriever families. On the 𝑛 = 587 pooled cases where
+CHR answers correctly while embedded hypothetical-document
+query expansion does not, 85.2% have no shared documents between the top-5 retrieval lists of the two methods, consistent with
+substantive retrieval redirection rather than light re-ranking of the
+same candidates. Adaptive weighting further improves accuracy
+by up to 4.8 percentage points on average over the fixed weight,
+confirming that dynamically modulating the mimic penalty resolves
+the semantic co-occurrence collapse we previously identified as a
+failure mode. By explicitly modeling what to avoid alongside what
+to find, CHR bridges clinical reasoning with retrieval mechanism
+∗ Corresponding author.
+
+design and offers a practical path to reducing hard-negative contamination in medical RAG systems.
+
+CCS Concepts
+• Information systems → Question answering; Information retrieval; • Computing methodologies → Natural language processing.
+
+Keywords
+medical question answering, retrieval-augmented generation, contrastive retrieval, hard negatives, differential diagnosis, adaptive
+weighting
+
+1
+
+Introduction
+
+Retrieval-augmented generation (RAG) has become the dominant
+paradigm for grounding large language models (LLMs) in external knowledge, particularly in high-stakes medical domains where
+factual accuracy is critical [3, 5, 11]. However, standard RAG pipelines
+are systematically vulnerable to hard negatives—documents that
+share surface-level similarity with the query but describe clinically distinct conditions—in medical question answering. Previous
+work has documented retrieval relevance as low as 22% on medical benchmarks [19], indicating that the main bottleneck lies in
+retrieval rather than generation.
+Query-expansion methods such as HyDE [4], Query2Doc [17],
+CSQE [9], and ThinkQE [10] bridge the query-document semantic
+gap by generating hypothetical or augmented content. While these
+methods enrich the query representation, they share a fundamental limitation. They model only what to find without any mechanism to explicitly suppress what to avoid. When the generated
+content converges toward a plausible but incorrect interpretation,
+which is common in medical differential diagnosis, the expanded
+query remains biased toward the wrong semantic region.
+We propose Contrastive Hypothesis Retrieval (CHR), a framework inspired by clinical differential diagnosis that operationalizes this principle at inference time. CHR produces a contrastive
+pair consisting of a target hypothesis (𝐻 + ) describing the likely
+
+Kim et al.
+
+correct answer and a mimic hypothesis (𝐻 − ) describing the most
+plausible incorrect alternative. The retriever scores documents by
+promoting 𝐻 + -aligned content while penalizing 𝐻 − -aligned content, steering the query away from the hard-negative region and
+surfacing documents that conventional methods fail to reach.
+A naive fixed penalty is not always safe: when the mimic hypothesis semantically overlaps the target hypothesis, subtracting
+its embedding erases target-relevant signals as well. To address
+this, we introduce an adaptive contrastive weight that dampens
+the penalty as the cosine similarity between 𝐻®+ and 𝐻®− increases,
+so that highly separable hypotheses receive full contrastive filtering while near-collapse pairs revert to 𝐻 + -driven retrieval. Empirically, adaptive weighting recovers accuracy on the failure cases we
+previously attributed to semantic co-occurrence collapse without
+sacrificing performance elsewhere.
+We evaluate CHR under a broader empirical protocol than prior
+work. Beyond three medical QA benchmarks and three answer
+generators, we test CHR across four retrievers spanning both dense
+(MedCPT, BGE-large-en-v1.5, E5-large-v2) and sparse (BM25) families, and against five query-expansion baselines. Across all configurations, CHR outperforms every baseline in aggregate, and retrieval shift analysis on the 𝑛 = 587 pooled cases where CHR answers correctly but HyDE does not shows that 85.2% have zero
+top-5 overlap, confirming that CHR redirects retrieval to different
+evidence rather than incrementally re-ranking the same candidate
+pool.
+Our contributions are as follows.
+• We identify a systematic failure mode shared by existing queryexpansion methods for medical QA. They model only what to
+find, leaving the retriever vulnerable to hard negatives when
+the dominant corpus pattern favors a clinically plausible mimic.
+• We propose CHR, a contrastive retrieval method that generates a hypothesis pair (𝐻 + and 𝐻 − ) and retrieves documents
+through explicit contrast, mirroring clinical differential diagnosis. We also introduce an adaptive contrastive weight that softens the mimic penalty when 𝐻 + and 𝐻 − semantically overlap,
+mitigating semantic co-occurrence collapse.
+• We demonstrate consistent improvements over five baselines
+across three medical QA benchmarks and three generators, and
+establish that CHR generalizes across four retrievers spanning
+dense and sparse families. Retrieval shift analysis confirms that
+CHR redirects retrieval toward fundamentally different semantic regions rather than re-ranking a shared candidate pool.
+
+2 Related Work
+2.1 Retrieval-Augmented Generation
+Retrieval-augmented generation (RAG) conditions language model
+outputs on documents retrieved from an external corpus, reducing hallucination and enabling access to specialized knowledge beyond the model’s parametric memory [5, 11]. In medicine, RAG
+has been widely adopted to ground clinical question answering
+in biomedical literature [3]. However, Xiong et al. [19] show that
+retrieval relevance on medical benchmarks can be as low as 22%,
+indicating that the primary bottleneck lies not in generation but in
+retrieval quality. Domain-specific retrievers such as MedCPT [8],
+
+pretrained on PubMed search logs, improve biomedical retrieval
+but do not explicitly address the hard-negative problem where clinically distinct conditions share similar surface features. Alongside
+domain-specific retrievers, strong general-purpose dense encoders
+such as BGE [18] and E5 [16] and classical sparse retrievers such as
+BM25 remain competitive baselines in medical settings, and a robust retrieval framework should generalize across all three families
+rather than being tuned to a single retriever. A complementary line
+of work focuses on post-retrieval refinement or iterative feedback
+loops to improve document quality. These approaches range from
+rationale-based filtering of medical snippets [14] and iterative selfreflection for clinical QA [13] to critique-gated document selection in adaptive RAG systems [1]. While such techniques enhance
+downstream grounding, they operate on a pre-defined candidate
+pool and cannot rectify fundamentally misdirected searches. In
+contrast, CHR addresses this bottleneck at the query construction
+stage, reshaping the initial retrieval vector to preemptively steer
+away from anticipated hard negatives.
+
+2.2
+
+Query Expansion for Retrieval
+
+Query expansion methods bridge the semantic gap between short
+queries and long documents by augmenting the original query with
+LLM-generated content. HyDE [4] generates multiple hypothetical answer documents and averages their embeddings as the retrieval query, relying on noise dilution to filter spurious directions.
+Query2Doc [17] appends a generated pseudo-document directly to
+the query for sparse or dense retrieval. CSQE [9] combines corpusoriginated pivotal sentences with LLM-generated expansions via
+a two-stage pipeline, while ThinkQE [10] introduces an iterative
+thinking-based process to refine queries using retrieval feedback.
+Although these methods effectively enrich query semantics, they
+share a fundamental limitation. They lack a dedicated mechanism
+to counteract misleading retrieval directions. This absence of negative constraints leaves the retriever vulnerable to hard negatives,
+particularly when an expanded query converges toward a plausible but incorrect interpretation—a frequent challenge in medical differential diagnosis. This necessitates a retrieval framework
+that can explicitly counteract these biases at the query construction stage.
+
+3
+
+Methodology
+
+Given a clinical query 𝑄 and candidate options 𝑂
+= {𝑜 1, 𝑜 2, . . . , 𝑜𝑛 }, the objective is to identify the correct answer.
+As illustrated in Figure 1, CHR operates in three stages. (1) Contrastive Hypothesis Generation. Given 𝑄 and 𝑂, an LLM produces a target hypothesis 𝐻 + describing the likely correct answer
+and a mimic hypothesis 𝐻 − describing the most plausible incorrect
+alternative, both in a single structured call. (2) Contrastive Document Scoring. Each candidate document is scored by 𝑆 (𝑑) =
+Sim(𝑑, 𝐻 + ) − 𝜆 · Sim(𝑑, 𝐻 − ), promoting target-aligned evidence
+while suppressing mimic-aligned hard negatives. The top-𝐾 documents are returned. (3) Answer Generation. The retrieved documents are provided to an answer generator along with the original
+question to produce the final answer.
+
+Ruling Out to Rule In: Contrastive Hypothesis Retrieval for Medical Question Answering
+
+System Prompt
+You are a medical specialist assisting with complex clinical decisionmaking. Your goal is to generate precise diagnostic hypotheses to
+guide an evidence-based search engine. Ensure all outputs are in strict
+JSON format.
+
+User Prompt
+Analyze the clinical scenario below and generate two conflicting hypotheses for retrieval:
+1. H_plus (Target Hypothesis): Describe the pathophysiology, distinct symptoms, or gold-standard treatment for the CORRECT diagnosis. Focus on specific details that differentiate it from other conditions.
+2. H_minus (Mimic Hypothesis): Describe the primary differential
+diagnosis or closest mimic that is INCORRECT. Explain why a clinician might mistakenly consider this condition due to overlapping
+symptoms, but specify the subtle features that rule it out.
+Question: {question}
+Options: {options}
+
+Figure 1: Overview of Contrastive Hypothesis Retrieval
+(CHR). Given a clinical question, CHR generates a contrastive hypothesis pair consisting of a target hypothesis
+(𝐻 + ) and a mimic hypothesis (𝐻 − ), retrieves documents using contrastive scoring that promotes target-aligned content
+while penalizing mimic-aligned content, and generates the
+final answer from the retrieved evidence.
+
+3.1
+
+Contrastive Hypothesis Generation
+
+The core idea of CHR is that suppressing hard negatives requires
+explicit knowledge of what makes them misleading. We instantiate
+this principle through a contrastive hypothesis pair that captures
+both the target and its closest mimic.
+The target hypothesis 𝐻 + describes the clinical reasoning and
+distinguishing features of the likely correct diagnosis. It captures
+the pathophysiology, characteristic symptoms, and gold-standard
+treatment that differentiate the target condition from alternatives.
+This hypothesis guides the retriever toward documents containing
+target-relevant evidence.
+The mimic hypothesis 𝐻 − describes the most plausible incorrect alternative that shares surface-level similarities with the correct answer. It articulates why a clinician might mistakenly consider this condition while specifying the subtle features that rule it
+out. By explicitly modeling the mimic, CHR enables the retriever to
+identify and down-weight documents that would otherwise rank
+highly due to superficial similarity. This mirrors clinical differential diagnosis, where physicians consider and exclude similar conditions before confirming a diagnosis.
+Both hypotheses are generated in a single LLM call using a structured prompt that requests a JSON-formatted output containing
+𝐻 + and 𝐻 − . The prompt instructs the model to analyze the clinical
+scenario and generate two conflicting hypotheses for retrieval, as
+shown in Figure 2.
+
+Output Requirement:
+Return ONLY a JSON object with keys “H_plus” and “H_minus”.
+{“H_plus”: “...”, “H_minus”: “...”}
+
+Figure 2: Prompt template for contrastive hypothesis generation. The system prompt establishes the role of a medical
+specialist, and the user prompt instructs the model to generate a target hypothesis (𝐻 + ) for the likely correct diagnosis
+and a mimic hypothesis (𝐻 − ) for the most plausible incorrect alternative.
+
+3.2
+
+Contrastive Document Scoring
+
+Given the hypothesis pair (𝐻 +, 𝐻 − ), we score each candidate document 𝑑 using a contrastive scoring function:
+𝑆 (𝑑) = Sim(𝑑, 𝐻 + ) − 𝜆 · Sim(𝑑, 𝐻 − )
+
+(1)
+
+where Sim(·, ·) denotes cosine similarity between document and
+hypothesis embeddings, and 𝜆 ≥ 0 controls the penalty weight
+for mimic-aligned documents. The first term promotes documents
+relevant to the target diagnosis, while the second term penalizes
+documents that align with the mimic. Documents that are similar
+to 𝐻 + but dissimilar to 𝐻 − receive the highest scores, effectively
+filtering out hard negatives that would mislead the answer generator. Unless otherwise noted, we use the fixed value 𝜆 = 1.0;
+sensitivity to this choice is analyzed in the supplementary material, and the adaptive variant introduced below removes the need
+for dataset-specific tuning.
+This scoring function admits a geometric interpretation. Since
+cosine similarity is equivalent to a dot product for normalized vectors, Equation 1 can be rewritten as Equation 2.
+𝑆 (𝑑) = 𝑑® · (𝐻®+ − 𝜆𝐻®− )
+
+(2)
+
+This reveals that contrastive scoring is equivalent to retrieving
+with a shifted query vector (𝐻®+ − 𝜆𝐻®− ). Subtracting the mimic
+
+Kim et al.
+
+direction steers the query away from the semantic region dominated by hard negatives and toward the region containing targetrelevant documents. Documents are ranked by 𝑆 (𝑑), and the top-𝐾
+results are returned.
+For sparse retrievers such as BM25, cosine geometry does not
+apply, but the contrastive score in Equation 1 remains well defined
+at the score level. We compute BM25 scores against 𝐻 + and 𝐻 −
+independently over a shared candidate pool obtained by unioning
+the top-𝑃 hits of each query, and rank documents by the difference
+BM25(𝑑, 𝐻 + ) − 𝜆 · BM25(𝑑, 𝐻 − ). This allows CHR to be dropped
+into existing sparse or hybrid retrieval pipelines without altering
+the underlying index.
+
+3.3
+
+Adaptive Contrastive Weighting
+
+The fixed penalty 𝜆 implicitly assumes that 𝐻®+ and 𝐻®− point in
+sufficiently different semantic directions. When this assumption
+fails—for instance, when the target and mimic concepts are discussed almost interchangeably in the corpus (§ 5)—the contrastive
+vector 𝐻®+ − 𝜆𝐻®− becomes small and non-informative, and CHR
+discards target-relevant evidence together with the intended hard
+negatives. We refer to this failure mode as semantic co-occurrence
+collapse.
+To mitigate this pathology automatically, we replace the fixed 𝜆
+with an adaptive weight 𝜆eff that depends on the observed cosine
+similarity between the two hypothesis embeddings,
+
+𝑐=
+
+𝐻®+ · 𝐻®−
+,
+∥ 𝐻®+ ∥ ∥𝐻®− ∥
+
+𝜆eff = 𝑓𝜙 (𝑐) · 𝜆max,
+
+(3)
+
+3.4
+
+4
+
+Experiments
+
+We evaluate Contrastive Hypothesis Retrieval (CHR) on three medical question answering benchmarks, comparing it against five queryexpansion baselines across three answer generators under a controlled retrieval pipeline (§ 4.3). We further test whether CHR’s
+gains generalize across retrievers spanning dense and sparse families (§ 4.4), and whether the adaptive weighting scheme introduced
+in § 3.3 improves upon the fixed-𝜆 variant (§ 4.5).
+
+4.1
+
+Evaluation Datasets
+
+We use three representative datasets to assess different aspects of
+medical knowledge. MMLU-Med [6] consists of six medical subsets (1,089 questions) from the Massive Multitask Language Understanding benchmark, covering clinical knowledge, medical genetics, anatomy, professional medicine, college biology, and college medicine. MedQA [7] provides 1,273 United States Medical Licensing Examination (USMLE) style questions that require multistep clinical reasoning. BioASQ [15] includes 618 yes/no questions
+derived from biomedical literature, testing factual knowledge retrieval. All datasets are evaluated using the standardized test splits
+and multiple-choice formatting provided by the MedRAG benchmark [19].
+
+4.2
+where 𝜆max is a hyperparameter that upper-bounds the penalty
+(set to 1.0 in our experiments) and 𝑓𝜙 ∈ [0, 1] is a monotonically non-increasing schedule chosen so that near-orthogonal hypotheses receive full contrastive filtering while highly overlapping
+hypotheses receive a softened or vanishing penalty. We consider
+three schedules:
+• Linear. 𝑓 (𝑐) = max(0, 1 − 𝑐). The penalty scales linearly with
+hypothesis separation and vanishes only when 𝑐 = 1.
+• Threshold. 𝑓 (𝑐) = 1[𝑐 < 𝜏]. The penalty is fully applied while
+the hypotheses remain sufficiently separated and is switched off
+at a corpus-specific similarity threshold 𝜏.
+
+• Sigmoid. 𝑓 (𝑐) = 𝜎 𝛼 (𝜏 − 𝑐) with slope 𝛼. A smooth transition
+between the two regimes.
+Because 𝜆eff enters only Equation 1, adaptive weighting does not
+change the retrieval pipeline or add any additional LLM calls; it
+introduces two similarity evaluations against a single scalar and
+preserves the geometric interpretation in Equation 2. In § 4.5, we
+show that adaptive weighting improves accuracy over the fixed 𝜆 =
+1.0 variant across all three benchmarks and both dense retrievers
+we test.
+
+Answer Generation
+
+The retrieved documents are concatenated into a context string
+and provided to the answer generator along with the original question and options. The generator produces the final answer conditioned on this evidence. This step follows standard RAG practice and is agnostic to the specific generator architecture, allowing
+CHR to be combined with any LLM.
+
+Implementation Details
+
+For our primary experiments, we use MedCPT [8] as the dense
+retriever, which is pre-trained on PubMed search logs. To assess
+retriever-agnosticism, we additionally evaluate CHR with two mainstream general-domain dense encoders (BGE-large-en-v1.5 [18] and
+E5-large-v2 [16]) and a classical sparse retriever (BM25) under the
+same corpus and hypothesis-generator settings (§ 4.4). The retrieval
+corpus is MedCorp [19], a comprehensive medical database aggregating approximately 5.8 million text chunks from PubMed abstracts, StatPearls, medical textbooks, and Wikipedia health articles. To ensure a rigorous and fair comparison, we fix the LLM used
+for all query-expansion methods (including CHR) to Qwen2.5-72BInstruct [20]. For answer generation, we evaluate three diverse
+models: Llama-3-8B-Instruct [2], Qwen2.5-7B-Instruct [20], and Gemma2-9B-It [12]. Across all experiments we retrieve 𝐾 = 5 documents.
+Standard RAG serves as the primary baseline, retrieving evidence
+using the original query without any expansion or hypothetical
+content.
+
+4.3
+
+Overall Performance
+
+We compare CHR against five baselines: Standard RAG (original
+query retrieval), HyDE [4] (hypothetic document embedding averaging), Query2Doc [17] (pseudo-document augmentation), CSQE
+
+Ruling Out to Rule In: Contrastive Hypothesis Retrieval for Medical Question Answering
+
+Generator
+
+Method
+
+MMLU-Med
+
+MedQA-US
+
+BioASQ-Y/N
+
+Avg.
+
+Llama-3-8B-Instruct
+
+Standard RAG
+HyDE (𝐻 + only)
+Query2doc
+CSQE
+ThinkQE
+CHR (Ours)
+
+36.8
+47.2
+49.1
+49.7
+41.3
+50.4
+
+36.1
+44.6
+46.2
+46.5
+45.6
+51.5
+
+41.8
+51.3
+46.9
+56.5
+52.1
+63.1
+
+38.2
+47.7
+47.4
+50.9
+46.3
+55.0
+
+Qwen2.5-7B-Instruct
+
+Standard RAG
+HyDE (𝐻 + only)
+Query2doc
+CSQE
+ThinkQE
+CHR (Ours)
+
+58.8
+56.0
+52.8
+54.9
+55.7
+59.4
+
+39.7
+46.0
+41.5
+42.2
+43.0
+49.2
+
+60.5
+42.2
+65.2
+44.8
+43.4
+75.6
+
+53.0
+48.1
+53.2
+47.3
+47.4
+61.4
+
+Gemma-2-9B-It
+
+Standard RAG
+HyDE (𝐻 + only)
+Query2doc
+CSQE
+ThinkQE
+CHR (Ours)
+
+62.4
+64.2
+61.2
+69.7
+60.5
+70.3
+
+46.0
+51.6
+46.9
+49.6
+52.2
+53.1
+
+74.3
+48.4
+58.6
+72.2
+44.5
+80.7
+
+60.9
+54.7
+55.6
+63.8
+52.4
+68.1
+
+Table 1: Accuracy (%) across three medical QA benchmarks. All query-expansion baselines use the same hypothesis generator
+(Qwen2.5-72B-Instruct), retriever (MedCPT), and corpus (MedCorp). CHR consistently achieves the highest accuracy across
+all settings.
+
+[9] (corpus-steered query expansion), and ThinkQE [10] (thinkingbased iterative expansion). Table 1 presents the end-to-end QA accuracy across nine independent settings (three datasets × three
+generators). Following the MedRAG evaluation protocol [19], we
+adopt end-to-end QA accuracy as the primary metric. However, by
+fixing the retriever, corpus, and answer generator as constants, we
+ensure that any systematic difference in accuracy is directly attributable to the quality of the retrieved evidence. The consistency of
+improvements across various architectures reinforces end-to-end
+accuracy as a reliable proxy for retrieval quality in this controlled
+setup.
+CHR consistently achieves the highest accuracy in all 18 headto-head comparisons. The performance gain is most pronounced
+on BioASQ, where CHR achieves 75.6% accuracy with Qwen2.57B, outperforming the next-best method (Query2Doc) by 10.4 percentage points. On MedQA, which requires multi-step clinical reasoning, CHR with Llama-3-8B reaches 51.5%, leading all baselines
+by at least 5.0 percentage points.
+A critical observation is that several query-expansion baselines
+occasionally underperform Standard RAG. For instance, on BioASQ
+with Qwen2.5-7B, HyDE drops to 42.2% and ThinkQE to 43.4%,
+whereas Standard RAG maintains 60.5%. This confirms that augmenting a query without an explicit mechanism to suppress misleading directions can actively harm performance when generated
+content converges toward a hard negative. CHR effectively avoids
+this failure mode by using the mimic hypothesis 𝐻 − to steer retrieval away from such regions, ensuring robust improvements regardless of the dataset or generator architecture.
+For a controlled comparison with the baselines, all CHR results
+in Table 1 use the fixed 𝜆 = 1.0 variant. The adaptive weighting
+scheme of § 3.3 improves further on top of these numbers rather
+than replacing them; § 4.5 (Table 3) quantifies the additional gain.
+
+4.4
+
+Retriever Generalization
+
+To test whether CHR is a property of MedCPT’s specific pre-training
+or a property of the contrastive vector shift itself, we hold the
+corpus (MedCorp), hypothesis generator (Qwen2.5-72B-Instruct),
+and answer generator (Llama-3-8B-Instruct) fixed while swapping
+the retriever across four representative choices: MedCPT (domainspecific dense), BGE-large-en-v1.5 [18] (general-domain dense), E5large-v2 [16] (general-domain dense with contrastive pre-training
+on query–passage pairs), and BM25 (sparse). Because BM25 is scorebased rather than vector-based, we implement contrastive scoring
+as described in § 3.3, unioning the top-𝑃 candidates from 𝐻 + and
+𝐻 − and re-ranking by BM25(𝑑, 𝐻 + ) − 𝜆 · BM25(𝑑, 𝐻 − ).
+Table 2 shows that CHR is the top-performing method in 11 of
+12 (retriever, dataset) cells, and that its aggregate ranking is robust across retriever families. On MedQA and MMLU-Med—the
+two benchmarks where the query cannot be resolved from surface
+keywords alone and where hard negatives dominate—CHR wins
+across all four retrievers, including the sparse BM25 backbone. The
+only loss occurs on BioASQ with BM25, where HyDE reaches 65.2%
+and narrowly exceeds CHR’s 63.4%. This is consistent with the
+structure of BioASQ, whose questions closely paraphrase specific
+PubMed abstracts; for sparse lexical matching, a generated hypothetical document can sometimes add exactly the terms needed to
+anchor the correct passage, whereas the contrastive penalty may
+also downweight useful co-occurring biomedical terms. Nevertheless, CHR remains the best BioASQ method for the three dense
+retrievers and the best method in every MedQA and MMLU-Med
+setting.
+We also observe that the strongest single retriever configuration is not MedCPT but BM25 (row average 55.3% across all nine
+method–benchmark scores), followed by BGE-large-en-v1.5 (51.7%),
+
+Kim et al.
+
+MedQA
+Retriever
+
+BioASQ
+
+MMLU-Med
+
+Std RAG
+
+HyDE
+
+CHR
+
+Std RAG
+
+HyDE
+
+CHR
+
+Std RAG
+
+HyDE
+
+CHR
+
+Avg.
+
+36.1
+41.8
+40.2
+40.1
+
+44.6
+52.4
+50.6
+51.5
+
+51.5
+52.8
+52.3
+53.3
+
+41.8
+41.8
+45.5
+46.8
+
+51.3
+53.1
+40.5
+65.2
+
+63.1
+60.2
+62.6
+63.4
+
+36.8
+52.3
+51.7
+57.9
+
+47.2
+54.5
+55.2
+59.3
+
+50.4
+56.6
+57.7
+59.9
+
+47.0
+51.7
+50.7
+55.3
+
+MedCPT
+BGE-large-en-v1.5
+E5-large-v2
+BM25
+
+Table 2: Retriever-agnosticism. Accuracy (%) on three medical QA benchmarks with Llama-3-8B-Instruct as the answer generator and Qwen2.5-72B-Instruct as the hypothesis generator, sweeping four retrievers spanning dense (MedCPT, BGE, E5) and
+sparse (BM25) families. Bold marks the best method within each (retriever, dataset) triple. The Avg. column averages all nine
+method–benchmark scores within each retriever row. CHR wins on MedQA and MMLU-Med across all four retrievers and on
+BioASQ for three of four retrievers; the only exception is BM25, where HyDE is slightly higher.
+
+Retriever
+
+𝜆 schedule
+
+MedQA
+
+BioASQ
+
+MMLU
+
+Avg.
+
+MedCPT
+
+Fixed (𝜆=1.0)
+Adaptive (linear)
+Adaptive (threshold)
+Adaptive (sigmoid)
+
+51.5
+51.7
+50.3
+53.3
+
+63.1
+69.4
+70.4
+68.8
+
+50.4
+56.1
+57.2
+57.2
+
+55.0
+59.1
+59.3
+59.8
+
+BGE
+
+Fixed (𝜆=1.0)
+Adaptive (linear)
+Adaptive (threshold)
+Adaptive (sigmoid)
+
+52.8
+55.5
+53.7
+55.2
+
+60.2
+65.7
+63.1
+65.0
+
+56.6
+58.4
+60.0
+57.5
+
+56.5
+59.9
+58.9
+59.3
+
+Table 3: Adaptive contrastive weighting versus fixed 𝜆. Accuracy (%) with Llama-3-8B-Instruct as the answer generator
+and Qwen2.5-72B-Instruct as the hypothesis generator. All
+three adaptive schedules outperform the fixed weight on average for both retrievers, with a best-schedule improvement
+of +4.8 pp on MedCPT and +3.4 pp on BGE.
+
+largest single improvement on BioASQ (threshold, +7.3 pp) where
+fixed weighting had already been the strongest paper baseline. On
+BGE, the linear schedule is best (59.9% average, +3.4 pp over fixed),
+and no adaptive schedule ever loses to fixed on any of the three
+benchmarks. Consistent with the analysis in § 5, the improvement
+is concentrated on the benchmarks where the mimic hypothesis
+is most likely to converge onto the target—the BioASQ +7.3 pp
+jump for MedCPT/threshold and the MMLU +6.8 pp jump for MedCPT/sigmoid both reflect cases where softening the penalty avoids
+erasing target-relevant evidence. Which schedule wins depends on
+the retriever: MedCPT prefers sigmoid, while BGE prefers linear,
+indicating that the optimal similarity–penalty curve is a property
+of the embedding space, not of the task.
+
+4.6
+E5-large-v2 (50.7%), and MedCPT (47.0%). This indicates that under this evaluation protocol the choice of retriever matters more
+than domain-specific pre-training alone, and that CHR provides
+consistent gains over the retriever’s own Standard RAG baseline
+regardless of that choice. MedCPT anchors our primary experiments (Tables 1 and 4) because it is the standard domain-specific
+retriever in prior medical RAG work [8, 19], ensuring direct comparability. Although the improvement is largest on MedCPT, CHR
+still gains substantially over Standard RAG on the stronger BGE
+and BM25 backbones (e.g., +10.6 pp on BM25), indicating that its
+benefit is not merely an artifact of a weak retriever.
+
+4.5
+
+Adaptive Contrastive Weighting
+
+Section 3.3 predicts that fixing 𝜆 = 1.0 should hurt CHR on questions where 𝐻®+ and 𝐻®− are near-parallel, and that a data-dependent
+schedule should recover accuracy there without harming easy cases.
+Table 3 tests this prediction by comparing the three adaptive schedules from § 3.3 against the fixed baseline, holding the answer generator (Llama-3-8B-Instruct) and hypothesis generator (Qwen2.572B-Instruct) constant and reporting results on both MedCPT and
+BGE.
+Every adaptive schedule improves the average over fixed 𝜆 on
+both retrievers. On MedCPT, the best schedule (sigmoid) reaches
+59.8% average accuracy, a +4.8 pp gain over fixed 𝜆 = 1.0, with the
+
+Retrieval Shift Analysis
+
+To understand how CHR improves upon prior methods, we analyze the 𝑛 = 587 cases where CHR answers correctly but HyDE
+fails. We specifically compare CHR against HyDE because both
+methods rely on LLM-generated hypotheses, yet they differ in how
+they operationalize them: HyDE focuses solely on the target-aligned
+direction, whereas CHR incorporates a contrastive mimic. For each
+case, we measure the overlap between the top-5 documents retrieved by CHR and those retrieved by HyDE. If CHR’s gains were
+derived from marginal re-ranking—promoting existing candidates
+to higher positions—one would expect substantial document overlap. Conversely, low overlap would indicate that CHR surfaces fundamentally different evidence from distinct semantic regions.
+Table 4 summarizes this comparative analysis. In these cases,
+there is zero document overlap between the top-5 results of CHR
+and HyDE in 85.2% of the instances, and the mean overlap ratio is
+only 0.18. This near-total lack of overlap confirms that CHR does
+not merely re-rank the same candidate pool. Instead, it redirects
+the retrieval process to an entirely different set of evidence. The
+contrastive subtraction of 𝐻® − effectively shifts the query vector
+away from the mimic-dominated region, enabling the retriever to
+access informative documents that hypothesis averaging systematically overlooks. These results provide direct empirical evidence
+that CHR’s accuracy gains stem from retrieving qualitatively superior evidence rather than incremental ranking improvements.
+
+Ruling Out to Rule In: Contrastive Hypothesis Retrieval for Medical Question Answering
+
+Dataset
+
+n
+
+Zero Overlap
+
+Mean Overlap
+
+MMLU-Med
+MedQA
+BioASQ
+
+172
+249
+166
+
+78.5%
+80.3%
+99.4%
+
+0.25
+0.25
+0.01
+
+Combined
+
+587
+
+85.2%
+
+0.18
+
+Table 4: Retrieval divergence analysis for cases where CHR succeeds but HyDE fails (𝑛 = 587). Zero Overlap indicates the
+percentage of cases with no shared documents in top-5 results. Mean Overlap is the average overlap ratio of top-5 results
+between CHR and HyDE.
+
+Method
+
+LLM Calls
+
+Output Tokens
+
+Token Reduction
+
+Standard RAG
+Query2Doc
+CSQE
+ThinkQE
+HyDE
+CHR (Ours)
+
+0
+1
+1 + retrieval
+≥3
+∼8
+1
+
+0
+∼512
+∼480
+∼1,500
+∼2,926
+∼303
+
+N/A
+5.7×
+6.1×
+2.0×
+1.0×
+9.7×
+
+Table 5: Query-expansion cost per sample, averaged across
+MedQA and MMLU-Med. Output token counts are estimated
+from generated text length. Token Reduction is relative to
+HyDE (most expensive). CHR achieves the lowest cost while
+consistently achieving the highest accuracy.
+
+𝐻 − Quality
+
+𝑛
+
+Correct
+
+Accuracy
+
+Excellent
+Good
+Poor
+
+9
+30
+8
+
+6
+12
+3
+
+66.7%
+40.0%
+37.5%
+
+Table 6: CHR accuracy stratified by physician-rated mimic
+hypothesis quality. Samples where 𝐻 + was factually incorrect are excluded (𝑛=47).
+
+4.7
+
+Efficiency Analysis
+
+Beyond accuracy, CHR offers a practical efficiency advantage in
+terms of hypothesis generation cost. Table 5 compares the queryexpansion cost per sample across all evaluated methods. HyDE requires approximately eight separate LLM calls to generate hypothetical documents for embedding averaging, while ThinkQE performs multiple iterative expansion–retrieval rounds. Query2Doc
+and CSQE each require only one LLM call, they typically generate
+significantly longer pseudo-documents. In contrast, CHR produces
+both 𝐻 + and 𝐻 − in a single structured LLM call, yielding a compact JSON object containing two targeted hypotheses. This efficiency stems from CHR’s design principle, which explicitly models
+the contrastive direction with only two focused hypotheses rather
+than averaging over multiple noisy ones. As a result, CHR achieves
+a 9.7× reduction in output tokens relative to HyDE, making it the
+most cost-effective strategy among all query-expansion baselines.
+Adaptive weighting adds no additional LLM calls. The extra cost
+is a single scalar-valued cosine similarity computed from cached
+hypothesis embeddings.
+
+4.8
+
+Mimic Hypothesis Quality Analysis
+
+Earlier sections demonstrate that CHR effectively redirects retrieval
+and improves accuracy relative to strong baselines. We next strengthen
+the plausibility of the contrastive mechanism by analyzing the quality of the generated hypotheses. Hard negatives in biomedical retrieval often share significant surface-level cues with the target answer. Therefore, the penalty term should be most effective when
+𝐻 − accurately approximates the clinical mimic that typically pollutes retrieval. We investigate whether end-to-end CHR performance co-varies with the clinical validity of 𝐻 − , specifically its
+ability to capture the intended confounder.
+To this end, a board-certified physician reviewed 50 randomly
+sampled CHR outputs from MedQA and MMLU-Med, with items
+stratified to represent all three answer generators equally. Each
+item was assigned an 𝐻 − rating of Excellent, Good, or Poor
+based on the following criteria. Excellent: 𝐻 − identifies the most
+clinically plausible alternative for the stem—the primary differential diagnosis a clinician must rule out. Good: 𝐻 − identifies a plausible mimic but not the most challenging one for the given scenario. Poor: 𝐻 − either (i) collapses into the same semantic frame
+as 𝐻 + through paraphrasing, or (ii) fails as a mimic by focusing on
+content irrelevant to the provided options. Three cases were excluded due to clinically invalid 𝐻 + outputs, leaving a total of 47
+evaluated samples.
+Table 6 aligns with the expectation that high-quality mimic hypotheses track CHR success. Accuracy increases from Poor (37.5%)
+to Good (40.0%) and reaches 66.7% for Excellent ratings. Given the
+small sample sizes in the Excellent and Poor tiers, we treat this
+trend as qualitative support rather than a precise estimate of the
+performance gap. When 𝐻 − describes the same misleading clinical
+narrative emphasized by incorrect passages, the penalty effectively
+pushes retrieval away from that region. Conversely, when 𝐻 − repeats the logic of 𝐻 + , the contrast fades and the system’s behavior
+converges toward using 𝐻 + alone.
+
+Excellent-rated mimic (MRKH versus AIS).. The stem describes
+a patient with primary amenorrhea and a 46,XX karyotype, but
+with normal breast development and absent uterus. 𝐻 + correctly
+identifies Müllerian agenesis (MRKH), emphasizing the typical female testosterone levels. 𝐻 − identifies Androgen Insensitivity Syndrome (AIS), which presents with nearly identical surface features
+but typically involves elevated testosterone. Because MRKH and
+AIS share significant literature (e.g., “primary amenorrhea absent
+uterus”), they frequently surface as hard negatives for one another.
+
+Kim et al.
+
+By subtracting the AIS-aligned direction, CHR surfaces MRKHspecific evidence, leading to the correct diagnosis.
+Poor-rated collapse (Starling forces). In a question regarding Starling forces and efferent arteriole constriction, 𝐻 + correctly identifies increased glomerular hydrostatic pressure. The rated-Poor
+𝐻 − fails to provide a distinct alternative; instead, it replicates the
+mechanism of 𝐻 + while merely adding a warning about vessel
+misidentification. Because their texts overlap almost entirely, their
+embeddings are nearly parallel, making the difference vector H+ −
+𝜆H− negligible. Consequently, the retriever fails to isolate discriminative evidence, returning broad renal physiology content instead
+of specific evidence for the keyed choice. This is precisely the failure mode that adaptive weighting (§ 3.3, § 4.5) is designed to address, and the empirical gains in Table 3 on MMLU and BioASQ
+are consistent with mitigating such collapse in aggregate.
+In summary, tier-wise accuracies and these vignettes provide
+qualitative support for the necessity of a confounder-specific mimic.
+The observed patterns confirm that the contrastive penalty is most
+informative when 𝐻 − targets the misleading document neighborhood rather than merely paraphrasing the target hypothesis.
+
+4.9
+
+Case Study: The Discriminative Role of the
+Mimic Hypothesis
+
+To investigate the impact of 𝐻 − on retrieval dynamics, we conduct
+a qualitative comparison between 𝐻 + -only retrieval and 𝐻 + −𝜆𝐻 −
+retrieval using an MMLU-Med case study (Figure 3). Since 𝐻 + -only
+retrieval omits the contrastive subtraction of 𝐻 − , this comparison
+serves as a qualitative ablation that isolates the contribution of the
+mimic hypothesis.
+The question describes a patient with parkinsonian symptoms
+whose condition improves after receiving an antiviral drug. The
+correct answer is “amantadine,” a drug originally developed as an
+antiviral but repurposed for Parkinson’s disease due to its dopaminergic mechanisms. The reasoning challenge lies in resolving a crossdomain link between an antiviral agent and a neurodegenerative
+disorder.
+𝐻 + frames idiopathic Parkinson’s disease and correctly steers
+retrieval toward anti-parkinsonian pharmacotherapy. However, it
+fails to capture the stem’s distinguishing detail regarding the antiviral class, nor does it foreground amantadine’s dual role. While
+𝐻 + encodes the correct clinical axis (treating parkinsonism), it is
+insufficient to bridge the gap to the specific evidence required. This
+gap is closed once 𝐻 − down-weights the misleading infection-toneurological-complication narrative, allowing re-ranked passages
+to explicitly link amantadine to both roles.
+Retrieving with 𝐻 + alone yields documents where “antiviral”
+and “parkinsonism” co-occur in the wrong causal direction. In the
+medical corpus, these terms appear far more frequently in the context of drug-induced parkinsonism side effects than in the context
+of treatment. All three top-ranked documents for 𝐻 + -only retrieval
+describe cases where medications caused parkinsonian symptoms
+rather than alleviating them (Figure 3, left). Consequently, the generator defaults to ribavirin, the most prototypical antiviral among
+the provided choices, which leads to an incorrect answer.
+The mimic hypothesis 𝐻 − models the anticipated misinterpretation where viral encephalitis presents with parkinsonian features.
+
+Subtracting 𝜆H− from H+ suppresses documents aligned with this
+infection-centric narrative. As shown in the right box of Figure 3,
+CHR instead surfaces documents that explicitly describe amantadine’s repurposed role, providing the generator with the direct evidence necessary for a correct answer.
+
+5
+
+Limitations and Discussion
+
+CHR’s performance is inherently tied to the separability of the hypothesis embeddings. When 𝐻 + and 𝐻 − overlap extensively in the
+corpus narrative, a phenomenon we term semantic co-occurrence
+collapse, a fixed subtraction 𝜆H− may inadvertently suppress targetrelevant evidence. Our error analysis on the fixed-𝜆 variant showed
+that such collapse accounted for approximately 23% of failure cases,
+occurring primarily when 𝐻 − closely paraphrases 𝐻 + instead of
+identifying a distinct clinical mimic. The adaptive weighting scheme
+in § 3.3 directly targets this failure mode by dampening the penalty
+as the cosine similarity between 𝐻®+ and 𝐻®− approaches one, and
+Table 3 shows that all three schedules recover accuracy over the
+fixed baseline on both MedCPT and BGE without requiring datasetspecific tuning. Nevertheless, adaptive weighting cannot manufacture a discriminative signal that the hypothesis pair does not encode: when 𝐻 + and 𝐻 − describe genuinely interchangeable concepts in the corpus (e.g., IL-4 versus IL-13 in Th2-mediated inflammation), the effective penalty tends to zero and CHR gracefully
+degrades toward 𝐻 + -only retrieval rather than actively harming
+the retrieval.
+The present evaluation is limited to multiple-choice benchmarks.
+Extending CHR to open-ended medical QA, where the mimic hypothesis must be generated without answer options, remains future work. We also fix the hypothesis generator to Qwen2.5-72BInstruct to isolate the retrieval effect, leaving the cost–accuracy
+trade-off of smaller generators for future study.
+
+6
+
+Conclusion
+
+We presented Contrastive Hypothesis Retrieval (CHR), a framework that bridges clinical differential diagnosis with retrieval mechanism design. By explicitly modeling what to avoid through a mimic
+hypothesis 𝐻 − , CHR addresses the systematic vulnerability of existing query-expansion methods to hard-negative contamination.
+An adaptive contrastive weight that responds to the cosine similarity between the two hypotheses further removes the semantic cooccurrence collapse failure mode we previously identified, without
+adding any additional LLM calls. Experiments across three medical
+benchmarks, four retrievers spanning dense and sparse families,
+and three answer generators demonstrate that CHR consistently
+outperforms state-of-the-art baselines, and retrieval shift analysis
+confirms that its gains stem from a fundamental redirection of retrieval toward qualitatively superior evidence rather than incremental re-ranking. CHR offers a practical and efficient approach
+to enhancing the reliability of medical RAG systems, providing a
+robust foundation for AI-assisted clinical decision-making.
+
+Ruling Out to Rule In: Contrastive Hypothesis Retrieval for Medical Question Answering
+
+Clinical Question
+A 65-year-old man presents with gradually worsening rigidity of his arms and legs and slowness in performing tasks. He says he has also noticed
+hand tremors, which increase at rest and decrease with focused movements. On examination, the patient does not swing his arms while walking and
+has a shortened, shuffling gait. An antiviral drug is prescribed which alleviates the patient’s symptoms. Which of the following drugs was most likely
+prescribed?
+(A) Amantadine
+
+(B) Ribavirin
+
+(C) Levodopa
+
+(D) Zidovudine
+
+𝐻 + (Target Hypothesis)
+Parkinson’s disease is characterized by bradykinesia, resting tremor, rigidity, and postural instability due to dopaminergic neuron loss in the substantia
+nigra pars compacta; the gold-standard treatment is levodopa, which crosses the blood-brain barrier and is converted to dopamine, directly replenishing
+depleted neurotransmitter levels and significantly improving motor symptoms such as rigidity, tremor, and gait disturbances.
+
+𝐻 − (Mimic Hypothesis)
+Viral encephalitis, particularly from herpes simplex or other neurotropic viruses, can present with parkinsonian features such as rigidity and bradykinesia due to inflammation in basal ganglia regions; however, it is typically accompanied by fever, altered mental status, seizures, or CSF pleocytosis, and
+is treated with antivirals like acyclovir or ribavirin, but these do not reliably improve core motor symptoms of Parkinson’s, and the patient’s chronic,
+progressive course without systemic signs makes this unlikely despite transient symptom overlap.
+
+𝐻 + only → (B) Ribavirin
+
+𝐻 + − 𝜆𝐻 − → (A) Amantadine ✓
+
+Retrieved Documents (Top-3):
+(1) “To report a case of Parkinson-like symptoms appearing in a patient after introduction of the anxiolytic buspirone to a treatment regimen that
+included the protease inhibitor ritonavir. A 54-year-old white man infected with human immunodeficiency virus was taking ritonavir, zidovudine, and lamivudine when buspirone was added for anxiety. Within
+days, he developed severe rigidity, bradykinesia, and tremor resembling idiopathic Parkinson’s disease...”
+
+Retrieved Documents (Top-3):
+(1) “Parkinson’s disease is a disorder of decreased dopamine-secreting neurons
+of the substantia nigra. The gold standard treatment is levodopa (L-DOPA),
+a dopamine precursor that crosses the blood-brain barrier and is converted
+to dopamine in the brain. However, levodopa is also converted to dopamine
+in peripheral tissues, causing side effects like nausea and hypotension. Carbidopa inhibits peripheral decarboxylase, allowing more levodopa to reach
+the brain...”
+
+(2) “We present the case of a 78-year-old male who, 16 years ago, was diagnosed with Parkinson’s disease. His initial symptoms included resting tremor, bradykinesia, and rigidity. He was treated with standard
+dopaminergic therapy including levodopa and dopamine agonists
+with good response. Approximately 5 years ago, the patient reported gradual improvement in his motor symptoms despite reduction in his medications...”
+
+(2) “L-DOPA has a counterpart with opposite chirality, D-DOPA. As is true
+for many molecules, the human body produces and uses only one of these
+enantiomers (in this case, the L-form). L-DOPA crosses the blood-brain barrier, whereas dopamine itself cannot. Once in the brain, it is converted to
+dopamine by aromatic L-amino acid decarboxylase. Amantadine is also
+used in Parkinson’s disease as it increases dopamine release and
+blocks NMDA receptors...”
+
+(3) “Trazodone is prescribed off-label to treat insomnia, especially in older,
+not demented patients. We present a case of trazodone-induced parkinsonism in a 68-year-old woman who developed progressive rigidity,
+bradykinesia, and resting tremor two weeks after initiating trazodone
+50 mg at bedtime for insomnia. The parkinsonian symptoms resolved completely within three weeks of discontinuing trazodone...”
+
+(3) “Medications: Levodopa is the mainstay of treatment for motor symptoms of PD. It is combined with carbidopa to prevent peripheral breakdown. Other medications include dopamine agonists (pramipexole, ropinirole), MAO-B inhibitors (selegiline, rasagiline), and amantadine. Amantadine was originally developed as an antiviral medication but was
+found to improve motor symptoms in Parkinson’s disease through
+dopaminergic effects and NMDA receptor antagonism...”
+
+Figure 3: Case study showing why the negative (mimic) hypothesis 𝐻 − is essential for discriminative retrieval. In the left box,
+bolded text highlights misleading co-occurrences of antivirals with parkinsonian symptoms (as side effects, not treatments),
+which led to the incorrect answer. In the right box, bolded text highlights the key sentences identifying amantadine as an
+antiviral repurposed for Parkinson’s disease, directly leading to the correct answer.
+
+Acknowledgments
+
+References
+
+This research was supported by a grant of the Korea Health Technology R&D Project through the Korea Health Industry Development Institute (KHIDI), funded by the Ministry of Health & Welfare, Republic of Korea (grant number: RS-2025-02213061).
+This work was supported by the Starting growth Technological
+R&D Program (TIPS Program,(No. RS-2024-00508828)) funded by
+the Ministry of SMEs and Startups(MSS, Korea) in 2024.
+
+[1] Akari Asai, Zeqiu Wu, Yizhong Wang, Avirup Sil, and Hannaneh Hajishirzi.
+2024. Self-RAG: Learning to Retrieve, Generate, and Critique through SelfReflection. In Proceedings of the Twelfth International Conference on Learning
+Representations. https://openreview.net/forum?id=hSyW5go0v8
+[2] Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, et al. 2024. The Llama 3
+Herd of Models. arXiv preprint arXiv:2407.21783 (2024).
+[3] Wenqi Fan, Yujuan Ding, Liangbo Ning, Shijie Wang, Hengyun Li, Dawei Yin,
+Tat-Seng Chua, and Qing Li. 2024. A Survey on RAG Meeting LLMs: Towards Retrieval-Augmented Large Language Models. In Proceedings of the 30th
+
+Kim et al.
+
+ACM SIGKDD Conference on Knowledge Discovery and Data Mining. 4854–4865.
+doi:10.1145/3637528.3671470
+[4] Luyu Gao, Xueguang Ma, Jimmy Lin, and Jamie Callan. 2023. Precise ZeroShot Dense Retrieval without Relevance Labels. In Proceedings of the 61st Annual
+Meeting of the Association for Computational Linguistics (Volume 1: Long Papers).
+Association for Computational Linguistics, 1762–1777.
+[5] Kelvin Guu, Kenton Lee, Zora Tung, Panupong Pasupat, and Ming-Wei Chang.
+2020. REALM: Retrieval-Augmented Language Model Pre-Training. In Proceedings of the 37th International Conference on Machine Learning (PMLR, Vol. 119).
+3929–3938.
+[6] Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn
+Song, and Jacob Steinhardt. 2021. Measuring Massive Multitask Language Understanding. In Proceedings of the International Conference on Learning Representations.
+[7] Di Jin, Eileen Pan, Nassim Oufattole, Wei-Hung Weng, Hanyi Fang, and Peter
+Szolovits. 2021. What Disease Does This Patient Have? A Large-Scale Open
+Domain Question Answering Dataset from Medical Exams. Applied Sciences 11,
+14 (2021), 6421. doi:10.3390/app11146421
+[8] Qiao Jin, Won Kim, Qingyu Chen, Donald C. Comeau, Lana Yeganova, W. John
+Wilbur, and Zhiyong Lu. 2023. MedCPT: Contrastive Pre-trained Transformers with Large-Scale PubMed Search Logs for Zero-Shot Biomedical Information Retrieval. Bioinformatics 39, 11 (2023), btad651. doi:10.1093/bioinformatics/
+btad651
+[9] Yibin Lei, Yu Cao, Tianyi Zhou, Tao Shen, and Andrew Yates. 2024. CorpusSteered Query Expansion with Large Language Models. In Proceedings of the
+18th Conference of the European Chapter of the Association for Computational
+Linguistics (Volume 2: Short Papers). Association for Computational Linguistics,
+393–401. doi:10.18653/v1/2024.eacl-short.34
+[10] Yibin Lei, Tao Shen, and Andrew Yates. 2025. ThinkQE: Query Expansion via an
+Evolving Thinking Process. In Findings of the Association for Computational Linguistics: EMNLP 2025. 17772–17781. doi:10.18653/v1/2025.findings-emnlp.965
+[11] Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir
+Karpukhin, Naman Goyal, Heinrich Küttler, Mike Lewis, Wen-tau Yih, Tim
+Rocktäschel, Sebastian Riedel, and Douwe Kiela. 2020. Retrieval-Augmented
+Generation for Knowledge-Intensive NLP Tasks. In Advances in Neural Information Processing Systems, Vol. 33. 9459–9474.
+[12] Morgane Riviere, Shreya Pathak, Pier Giuseppe Sessa, et al. 2024. Gemma
+2: Improving Open Language Models at a Practical Size. arXiv preprint
+arXiv:2408.00118 (2024).
+[13] Jessica Ryan, Alexander I. Gumilang, Robert Wiliam, and Derwin Suhartono.
+2026. Self-MedRAG: A Self-Reflective Hybrid Retrieval-Augmented Generation Framework for Reliable Medical Question Answering. arXiv preprint
+arXiv:2601.04531 (2026).
+[14] Jiwoong Sohn, Yein Park, Chanwoong Yoon, Sihyeon Park, Hyeon Hwang, Mujeen Sung, Hyunjae Kim, and Jaewoo Kang. 2025. Rationale-Guided Retrieval
+Augmented Generation for Medical Question Answering. In Proceedings of the
+2025 Conference of the North American Chapter of the Association for Computational Linguistics. 12739–12753. doi:10.18653/v1/2025.naacl-long.635
+[15] George Tsatsaronis, Georgios Balikas, Prodromos Malakasiotis, Ioannis Partalas, Matthias Zschunke, Michael R. Albers, Dirk Akkermans, Paul Backfried,
+Sanne Hage, Anastasia Krithara, Georgios Paliouras, et al. 2015. An Overview
+of the BIOASQ Large-Scale Biomedical Semantic Indexing and Question Answering Competition. BMC Bioinformatics 16 (2015), 138. doi:10.1186/s12859015-0564-6
+[16] Liang Wang, Nan Yang, Xiaolong Huang, Binxing Jiao, Linjun Yang, Daxin Jiang,
+Rangan Majumder, and Furu Wei. 2022. Text Embeddings by Weakly-Supervised
+Contrastive Pre-training. arXiv preprint arXiv:2212.03533 (2022). E5 model
+family; large-v2 checkpoint used in this paper..
+[17] Liang Wang, Nan Yang, and Furu Wei. 2023. Query2doc: Query Expansion with
+Large Language Models. In Proceedings of the 2023 Conference on Empirical Methods in Natural Language Processing. Association for Computational Linguistics,
+9414–9423. doi:10.18653/v1/2023.emnlp-main.585
+[18] Shitao Xiao, Zheng Liu, Peitian Zhang, Niklas Muennighoff, Defu Lian, and JianYun Nie. 2023. C-Pack: Packed Resources for General Chinese Embeddings.
+arXiv preprint arXiv:2309.07597 (2023). BGE embedding family; version 1.5
+checkpoint used in this paper..
+[19] Guangzhi Xiong, Qiao Jin, Zhiyong Lu, and Aidong Zhang. 2024. Benchmarking
+Retrieval-Augmented Generation for Medicine. In Findings of the Association for
+Computational Linguistics: ACL 2024. doi:10.18653/v1/2024.findings-acl.372
+[20] An Yang, Baosong Yang, Beichen Zhang, et al. 2024. Qwen2.5 Technical Report.
+arXiv preprint arXiv:2412.15115 (2024).
+
+Ruling Out to Rule In: Contrastive Hypothesis Retrieval for Medical Question Answering
+
+Additional Case Study
+
+Figure 4 presents an additional case study from MedQA, demonstrating that CHR’s discriminative mechanism generalizes effectively across different clinical domains.
+The question examines the complications associated with tamoxifen therapy in a postmenopausal breast cancer patient. The
+correct answer is “deep venous thrombosis,” a risk driven by tamoxifen’s estrogen-agonist effects in the liver, which increase the
+synthesis of clotting factors. The retrieval challenge stems from
+the fact that tamoxifen’s most frequently documented complications in medical literature involve gynecologic bleeding and endometrial hyperplasia, which act as a dominant retrieval attractor
+toward the incorrect answer.
+As with the amantadine case discussed in § 4.9, H+ does not
+identify the correct answer directly. Instead, it incorrectly describes
+tamoxifen’s effects on bone density, claiming it reduces mineral
+density in postmenopausal women when it actually helps preserve
+it. Despite this factual inaccuracy in the target hypothesis, CHR
+successfully produces the correct answer.
+When retrieving with 𝐻 + alone, the broad “tamoxifen in breast
+cancer“ semantics dominate the search, and the corpus-prevalent
+narrative of uterine bleeding overwhelms the bone-specific content. As shown in the left box of Figure 4, two of the top three
+retrieved documents focus on abnormal uterine bleeding, leading
+the generator to incorrectly select “Increased bleeding.“
+The mimic hypothesis 𝐻 − explicitly models this bleeding-related
+misinterpretation. By subtracting this direction, CHR suppresses
+the uterine bleeding literature and surfaces documents focused on
+systemic SERM pharmacology. As shown in the right box, all three
+re-ranked documents explicitly describe tamoxifen’s hepatic estrogenagonist effects on coagulation factor production, directly identifying venous thromboembolism as the primary risk. This case highlights the robustness of CHR: even when 𝐻 + is factually flawed,
+𝐻 − correctly identifies the misleading retrieval direction, and the
+contrastive mechanism steers the retriever toward discriminative
+evidence.
+
+B
+
+Sensitivity Analysis of 𝜆
+56
+CHR
+
+54
+
+53.1
+
+HyDE
+Std. RAG
+
+52
+Accuracy (%)
+
+A
+
+50
+48
+46
+44
+42
+40
+
+0.2
+
+0.4
+
+0.6
+
+0.8
+𝜆
+
+1
+
+1.2
+
+1.4
+
+Figure 5: Sensitivity of CHR accuracy to the contrastive
+weight 𝜆 on MedQA (Gemma-2-9B-It). The dashed red lines
+indicate the robust plateau region 𝜆 ∈ [0.6, 1.2] where
+CHR consistently outperforms both baselines. Performance
+peaks at 𝜆 = 1.0.
+The contrastive scoring function (Equation 1) introduces a single hyperparameter 𝜆 that controls the penalty weight for mimicaligned documents. We analyze the sensitivity of CHR to varying 𝜆
+values on the MedQA dataset, using Gemma-2-9B-It as the answer
+generator.
+Figure 5 reports the QA accuracy across a range of 𝜆 ∈
+{0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4}. The results exhibit a clear inverted-U
+pattern. At low values (𝜆 ≤ 0.4), the mimic penalty is insufficient
+to suppress hard negatives, leaving performance below the HyDE
+baseline. Performance peaks at 𝜆 = 1.0, where the contrastive vector effectively steers retrieval away from the mimic-dominated region while preserving alignment with target-relevant documents,
+achieving 53.1% accuracy.
+Beyond 𝜆 = 1.2, over-penalization begins to distort the query
+vector, causing accuracy to drop sharply to 43.1% at 𝜆 = 1.4. Notably, CHR maintains accuracy above 50.4% across a broad plateau
+(𝜆 ∈ [0.6, 1.2]), consistently outperforming both Standard RAG
+and HyDE. This stability suggests that CHR is robust to moderate variations in 𝜆 and does not require extensive dataset-specific
+tuning. Based on these findings, we utilize 𝜆 = 1.0 for all primary
+experiments reported in this paper.
+
+C
+
+Failure Case: Semantic Co-occurrence
+Collapse
+
+Table 7 illustrates a specific failure mode where CHR’s contrastive
+mechanism becomes counterproductive due to heavy semantic cooccurrence between the target and mimic concepts within the corpus.
+The question concerns IL-4, the primary cytokine responsible
+for IgE class switching in the context of allergic asthma. CHR correctly identifies IL-13 as the most plausible mimic for 𝐻 − , as both
+cytokines are central to Th2-mediated inflammation. However, in
+
+Kim et al.
+
+Clinical Question
+A 55-year-old woman is found to have an abnormal mass on routine mammography. The mass is biopsied and cytology results are diagnostic for
+invasive ductal adenocarcinoma that is estrogen receptor positive. The patient is started on chemotherapy and ultimately has the mass resected. She
+is taking tamoxifen and has tolerated the treatment well. Which complication is she now at increased risk for?
+(A) Deep venous thrombosis ✓
+
+(B) Seborrheic keratoses
+
+(C) Increased bleeding
+
+(D) Osteoporosis
+
+𝐻 + (Target Hypothesis)
+Tamoxifen, a selective estrogen receptor modulator (SERM) used in estrogen receptor-positive breast cancer, acts as an estrogen antagonist in breast
+tissue but as a partial agonist in bone, leading to reduced bone mineral density over time; this increases the risk of osteoporosis and fragility fractures,
+particularly in postmenopausal women who already have low estrogen levels, as in this patient who has undergone chemotherapy and may have
+treatment-induced menopause.
+
+𝐻 − (Mimic Hypothesis)
+Tamoxifen is associated with an increased risk of endometrial hyperplasia and endometrial cancer due to its estrogen-agonist effects on the uterus.
+However, this patient had a previously treated uterine leiomyoma and no current gynecologic symptoms or abnormal uterine bleeding, making endometrial malignancy an unlikely complication here, and while bleeding could theoretically occur, it is not a direct complication of tamoxifen therapy
+in this context.
+
+𝐻 + only → (C) Increased bleeding
+
+𝐻 + − 𝜆𝐻 − → (A) Deep venous thrombosis ✓
+
+Retrieved Documents (Top-3):
+(1) “We present a case of adenomatous polyp with degenerative changes causing abnormal uterine bleeding in a 62-year-old woman undergoing tamoxifen therapy for breast cancer. The patient developed vaginal bleeding 18 months after initiating tamoxifen 20 mg daily. Endometrial biopsy revealed an adenomatous polyp with hemorrhagic degeneration. This case highlights that tamoxifen’s estrogenic effects on the endometrium can lead to polyp formation and subsequent bleeding...”
+
+Retrieved Documents (Top-3):
+(1) “Recent data indicate that women with breast cancer receiving aromatase
+inhibitor (AI) therapy experience accelerated bone loss and increased fracture risk compared to those on selective estrogen receptor modulators
+(SERMs) like tamoxifen. However, tamoxifen itself has complex skeletal effects: while it acts as an estrogen agonist in postmenopausal women, preserving bone density, it also increases the risk of venous thromboembolism (VTE) including deep vein thrombosis and pulmonary embolism through pro-coagulant effects...”
+
+(2) “Benign metastasizing leiomyoma (BML) is a rare disease that occurs in
+middle-aged women with a history of uterine leiomyoma. We report a case
+of a 54-year-old woman with a history of hysterectomy for uterine fibroids
+who presented with multiple pulmonary nodules. The nodules were found
+to be histologically identical to her previous uterine leiomyomas. The patient was treated with aromatase inhibitor therapy given the hormoneresponsive nature of the lesions...”
+(3) “We report a case of a 58-year-old woman with a history of invasive lobular carcinoma of the breast who presented with postmenopausal vaginal
+bleeding. Endometrial curettage revealed metastatic lobular carcinoma.
+This case illustrates that in breast cancer patients on tamoxifen who
+present with abnormal bleeding, metastatic disease should be considered in the differential diagnosis...”
+
+(2) “Selective estrogen receptor modulators (SERMs) represent a class with a
+growing number of available agents for osteoporosis prevention and treatment. These drugs have tissue-selective estrogen agonist or antagonist effects. In bone, SERMs like raloxifene and tamoxifen act as estrogen agonists,
+reducing bone resorption and maintaining bone mineral density. However,
+their estrogen-agonist effects in the liver lead to increased production of clotting factors, elevating the risk of venous thromboembolism, particularly in the first two years of treatment...”
+(3) “Prevention of osteopenia/osteoporosis in postmenopausal patients can reduce fracture risk and improve quality of life. SERMs like tamoxifen and
+raloxifene have been shown to maintain bone density in postmenopausal
+women. The primary concern with SERM therapy is the increased
+risk of thromboembolic events, including deep vein thrombosis and
+pulmonary embolism, which occurs due to hepatic estrogen-agonist effects that alter coagulation factor synthesis and increase fibrinogen levels...”
+
+Figure 4: Additional case study from MedQA (oncology domain). In the left box, bolded text highlights how retrieved documents focus on tamoxifen-related gynecologic bleeding, the dominant complication in the tamoxifen safety literature, which
+led to the incorrect answer. In the right box, bolded text highlights evidence describing tamoxifen’s pro-coagulant effects via
+hepatic estrogen agonism, directly supporting deep venous thrombosis as the correct answer.
+
+Ruling Out to Rule In: Contrastive Hypothesis Retrieval for Medical Question Answering
+
+Question (MedQA #16): A 7-year-old boy with seasonal allergic asthma is being considered for an experimental therapy targeting a mediator of
+antibody class switching. Which mediator is described?
+Options: (A) IL-2 (B) IL-10 (C) IL-13 (D) IL-4 ✓
+𝐻 + : IL-4 is the key cytokine driving Th2 differentiation and B-cell class switching to IgE.
+𝐻 − : IL-13 overlaps functionally with IL-4 but does not directly drive B-cell class switching to IgE.
+Prediction: CHR → (C) IL-13 (Incorrect); HyDE → (D) IL-4 (Correct)
+CHR top evidence:
+(1) Co-occurring IL-4 and IL-13 with IgE switching.
+
+HyDE top evidence:
+(1) “B cells are switched to IgE by IL-4. . . ”
+
+(2) “IL-13, another switch factor for IgE. . . ”
+(3) “Both IL13 and IL4 are capable of inducing class switching. . . ”
+
+(2) Th2-focused evidence emphasizing IL-4-targeted interventions.
+(3) Receptor-level discussion (IL-4/IL-13 axis) with clearer IL-4 role.
+
+Analysis: Strong IL-4/IL-13 co-occurrence causes partial overlap between target and mimic directions; subtracting 𝜆H − can therefore suppress IL-4relevant evidence and make CHR’s context more ambiguous than HyDE’s.
+
+Table 7: Failure case of semantic co-occurrence collapse. CHR correctly identifies IL-13 as the mimic for IL-4, but heavy corpus
+co-occurrence of these cytokines in the same Th2 pathway causes the contrastive subtraction to suppress some target-relevant
+evidence.
+
+the biomedical literature, IL-4 and IL-13 are discussed almost interchangeably or as a single functional axis because they share signaling components and biological pathways.
+Consequently, the contrastive vector H+ − 𝜆H− suppresses not
+only the IL-13-specific documents but also many of the high-quality
+documents that discuss IL-4 in conjunction with IL-13. This oversuppression leaves the generator with ambiguous or diluted evidence, whereas a positive-only approach like HyDE succeeds by
+
+focusing strictly on the target keyword without regard for the mimicaligned noise. This failure case underscores the challenge of applying contrastive retrieval when the target and mimic are fundamentally inseparable within the existing corpus narrative.
+Connection to adaptive weighting. This case also motivates the
+adaptive weighting strategy introduced in § 3.3. Because the IL4 and IL-13 hypotheses are highly similar, reducing the effective
+mimic penalty can prevent over-suppression of target-relevant evidence and make CHR behave closer to 𝐻 + -only retrieval in such
+near-collapse cases.
+
+

@@ -1,0 +1,2587 @@
+Towards Generation-Efficient Uncertainty Estimation
+in Large Language Models
+
+arXiv:2605.06053v1 [cs.LG] 7 May 2026
+
+Mingcheng Zhu
+University of Oxford
+mingcheng.zhu@eng.ox.ac.uk
+
+Yu Liu
+University of Oxford
+yu.liu@eng.ox.ac.uk
+
+Tingting Zhu
+University of Oxford
+tingting.zhu@eng.ox.ac.uk
+
+Abstract
+Uncertainty estimation is important for deploying large language models (LLMs)
+in high-stakes applications such as healthcare and finance, where hallucinations
+can appear fluent and plausible while being factually incorrect, making it difficult
+for users to judge whether an output should be trusted. Existing methods typically
+require one or more full autoregressive generations to estimate uncertainty, which
+introduces substantial inference cost and often delays uncertainty assessment until
+generation completes. In this paper, we investigate whether effective uncertainty
+estimation can be achieved with partial generation or even input-only information.
+Specifically, we first develop a unified framework that formulates uncertainty estimation as an early estimation problem over the autoregressive generation process
+of LLMs. This framework organises existing and proposed estimators by the information they observe, ranging from multi-generation to input-only prediction, and
+clarifies the performance-cost trade-off underlying different uncertainty estimation
+methods. Building on this view, we study two largely underexplored low-cost settings: estimating uncertainty with part of the generation, and predicting uncertainty
+directly from the input prompt. We address these settings by proposing two estimators: Logit Magnitude, which uses top-M logit evidence to estimate uncertainty
+from an early-stopped generation prefix, and MetaUE, which distils generationbased uncertainty into a lightweight input-only estimator trained with uncertainty
+scores. Extensive experiments on general and domain-specific benchmarks show
+that Logit Magnitude achieves strong performance across LLM families, scales,
+and architectures, including dense and MoE models, and partial generations of
+LLMs are often sufficient for effective uncertainty estimation. MetaUE further
+provides a competitive input-only approximation in several settings. These findings
+suggest that effective uncertainty estimation requires less generation than commonly assumed, enabling unreliable responses to be identified earlier. Code is
+available in the GitHub repository1 .
+
+1
+
+Introduction
+
+Large language models (LLMs) have demonstrated strong capabilities across diverse tasks, including
+open-ended generation [1], question answering [2], and domain-specific reasoning [3], motivating
+their deployment in broad real-world applications. However, LLMs can hallucinate during their
+autoregressive generation, producing fluent and plausible outputs that are factually incorrect or
+1 https://github.com/JasonZuu/Gen-Efficient_UE
+
+Preprint.
+
+inconsistent with the preceding context [4, 5]. Such failures are especially concerning in high-stakes
+domains such as healthcare and finance, where overconfident errors can lead to misleading documentation [6], inappropriate communication [7], or unreliable decision support [8]. Therefore, reliable
+deployment requires not only generating useful responses but also estimating when those responses
+should not be trusted. To evaluate the reliability of LLMs, various uncertainty estimation methods
+have been proposed [4]. These methods can be distinguished by how much of the autoregressive generation of the LLMs they observe, as illustrated in Figure 1. Specifically, multi-generation methods
+sample multiple generation sequences and estimate uncertainty from disagreement or inconsistency
+across generations [9, 10] (Figure 1(a)). Although effective, their inference cost scales with the
+number of generations, leading to significantly higher latency and impractical for deployment [11].
+Single-generation methods reduce this overhead by estimating uncertainty from one full sequence,
+using signals such as sequence entropy [12], evidence score [13], or hidden-state dynamics [14]
+(Figure 1(b)). However, such methods still require a full autoregressive generation before uncertainty
+can be assessed, creating an efficiency bottleneck for long-form generation and latency-sensitive
+applications, where token-by-token decoding often dominates inference latency [15]. These limitations motivate an important underexplored question: How much autoregressive generation is actually
+needed for effective LLM uncertainty estimation?
+Highest
+
+(a) Multi-Generation Estimation
+
+Multi-Round Token Sequences
+
+Cost: R
+
+Pretrained
+LLM
+
+Generation
+
+Uncertainty
+Estimator
+
+Uncertainty Estimation Cost
+
+Input
+
+(b) Single-Generation Estimation
+
+Cost: 1
+
+Full Sequence
+
+Pretrained
+LLM
+Input
+
+Uncertainty
+Estimator
+Full States
+
+Cut Off
+
+(c) Partial-Generation Estimation
+Partial Sequence
+
+Pretrained
+LLM
+Input
+
+Cost: N/T
+
+Generation
+
+Uncertainty
+Estimator
+Partial States
+
+(d) Input-Only Estimation
+Pretrained
+LLM
+
+Lowest
+
+Generation
+
+Cost:
+
+One-time Training
+
+Generation
+
+Uncertainty
+Estimator
+
+Meta Model
+
+Input
+
+Figure 1: Taxonomy of LLM uncertainty estimation methods, ordered by estimation cost. The
+methods are defined by the portion of the generation sequence the estimator observes. (a) Estimating
+based on R independent full generation sequences. (b) Observes one full generation sequence and the
+corresponding internal states. (c) Observes the first N tokens of the generation sequence. (d) Skips
+autoregressive generation entirely, estimating uncertainty from the input prompt via a meta-model.
+To address this question, we formalise LLM uncertainty estimation as an early estimation problem
+over the autoregressive generation process. As the model generates a response, each token and its
+associated internal status, such as probabilities, logits, or hidden representations, provide evidence
+about the reliability of the final answer [13]. This view naturally organises uncertainty estimators
+according to how much of the generation they observe, ranging from multi-generation and singlesequence estimation to partial-generation and input-only estimation. It also motivates our central
+hypothesis: reliable uncertainty estimation may not require observing the complete response if the
+most informative uncertainty signals are concentrated in an early or compact subset of the generation.
+Motivated by this hypothesis, this paper focuses on two low-cost uncertainty estimation methods
+shown in Figure 1(c)-(d): partial-generation estimation and input-only prediction. For the partialgeneration setting, we propose Logit Magnitude. At each generation step, an LLM produces logits,
+which are unnormalised internal features over candidate next tokens before the softmax operation.
+2
+
+While softmax converts these scores into relative probabilities, the raw logits can retain information
+about the strength of the model’s evidence [13]. Logit Magnitude extracts the magnitude of logits
+with L2 Norm as a token-level uncertainty score and aggregates the top-M highest-scoring tokens in
+the observed prefix, allowing the sequence-level estimate to focus on the most informative uncertainty
+signals. For the input-only setting, we introduce MetaUE, a lightweight meta-model that predicts the
+Logit Magnitude uncertainty score directly from the prompt using a frozen pretrained encoder and a
+small trainable MLP head. In this way, the generation-based estimator provides pseudo-labels for
+MetaUE training, enabling uncertainty estimation before any response is generated.
+Our contributions are threefold: (i) We present a taxonomy of uncertainty estimation methods
+for autoregressive LLM generation, organising existing and proposed approaches according to the
+amount of generation information they observe, from multi-generation to input-only estimation. (ii)
+We propose a generation-efficient uncertainty estimation framework that progresses from partial
+generation to zero generation. Our proposed Logit Magnitude with adaptive early-stop mechanism
+and top-M aggregation estimates uncertainty from partial-generation and uses it as a generation-based
+pseudo-label to train MetaUE for input-only uncertainty estimation. (iii) We provide a systematic
+empirical study across general-domain and medical-domain datasets, multiple LLM families and
+model sizes, and MoE architectures, showing that informative partial-generation and input-only
+estimators can provide competitive uncertainty estimates at lower generation cost.
+
+2
+
+Related Works
+
+2.1
+
+Multi-Generation Uncertainty Estimation
+
+Multi-generation uncertainty estimation methods evaluate reliability by sampling several responses
+from the same input prompt and measuring disagreement or consistency across generations [10]. Selfchecking methods treat inconsistency across sampled responses as evidence that a generation may be
+unsupported by the model’s own distribution [10, 16]. Building on this intuition, sample-consistency
+methods use agreement among multiple sampled generations as a signal for calibrating LLM confidence [17, 18]. Semantic Entropy adapts this idea by grouping sampled responses into semantic
+equivalence clusters and quantifying uncertainty based on the differences among these clusters [9].
+Another work improves this semantic view by encouraging semantically diverse generations, so that
+sampling can expose alternative meanings needed for reliable uncertainty estimation [19, 20]. Recent
+work improves efficiency by replacing expensive sequence-level sampling with token-level sampling
+via low-rank weight perturbations [21]. The main limitation of these methods is computational
+cost. Since each uncertainty estimate requires multiple full generations, the inference cost grows
+approximately linearly with the number of generations. Moreover, the multi-generation uncertainty
+score is for a set of sampled outputs rather than a single output. As a result, the score does not specify
+which candidate should be selected or whether any individual candidate is reliable enough to use [22].
+2.2
+
+Single-Generation Uncertainty Estimation
+
+Single-generation methods reduce the cost of generation by estimating uncertainty from one full
+generation. Among them, probability-based approaches use the predictive distribution over generated
+tokens as a confidence signal for the final answer. For example, sequence probabilities are used
+to compute length-normalised metrics, which aggregate individual token likelihoods into a single
+measure of the model’s overall certainty [12, 23, 24]. Since free-text answers contain semantically
+redundant tokens, the relevance-aware or modality-aware method further reweights token-level
+uncertainty according to each token’s contribution to the final answer [25, 26]. Other approaches
+exploit richer model-internal signals. Evidence-based uncertainty estimation treats logits as tokenlevel evidence and maps them into Dirichlet-inspired scores [13]. Hidden-state approaches instead
+estimate reliability from representation dynamics across layers and generation steps, using signals
+from the hidden state of LLMs [14, 27]. Training-based variants include learning uncertainty from
+internal states to output its uncertainty during the autoregressive generation [28]. Recent work
+improves the reliability of the confidence provided in the generation of LLMs through prompt design
+or post-training [29, 30]. However, single-generation estimation still requires the model to generate
+a full sequence before the uncertainty becomes available. This is inefficient when the answer is
+long, and it is undesirable when the goal is to detect unreliable outputs as early as possible [31]. In
+addition, many sequence-level estimators aggregate information across all generated tokens, which
+3
+
+can dilute the effect of a small number of correctness-relevant tokens [27]. Rather than assuming the
+full generation sequence is required, we examine whether uncertainty can be reliably estimated from
+a short generation prefix and a sparse subset of high-uncertainty tokens, and whether these signals
+can be predicted directly from the input.
+
+3
+
+Problem Formulation
+
+Autoregressive Generation Let θ denote a pretrained conditional generative model, z be an input
+prompt, and Y = (y1 , . . . , yT ) the generated response, where T is the stopping length induced by an
+end-of-sequence token or a maximum generating budget. The conditional generation distribution
+pθ (y | z) =
+
+T
+Y
+
+pθ (yt | z, y<t ).
+
+(1)
+
+t=1
+
+At each generation step t, before sampling the next token, the model produces a vector of logits
+ℓt ∈ R|V| over the vocabulary V. Each logit is an unnormalised score assigned to candidate token v,
+and the next-token probability distribution pθ (Y = y | z, y<t ) is obtained by applying the softmax
+function. In this work, the observable internal state st is the logit vector ℓt , from which we construct
+the token-level uncertainty score. We will use st to stand for the logit vector in the following content.
+Uncertainty Estimation For a generated response Y, let y⋆ denote the reference answer or
+task-specific evaluation target. We define the unreliability variable as
+U = 1 − C = 1 − f (y, y⋆ ),
+
+f (y, y⋆ ) ∈ [0, 1],
+
+(2)
+
+where f is a task-specific correctness function, such as exact match, token-level similarity, semantic
+similarity, or another evaluation metric. Larger values of f (y, y⋆ ) indicate more reliable generations,
+while larger values of U indicate greater unreliability.
+Let I denote the information available to the estimator, such as the input prompt, the logits, or the
+multi-generation. An uncertainty estimator is a scoring function uψ (I), where a larger value indicates
+that the response is predicted to be less reliable. Ideally, this score should approximate the expected
+unreliability conditioned on the available information:
+u⋆ (I) = E[U | I].
+
+(3)
+
+⋆
+
+Let u (I) is the optimal estimator of U under the mean-squared error objective:
+h
+i
+2
+u⋆ = arg min E (U − u(I)) .
+u
+
+(4)
+
+When correctness is binary, u⋆ (I) becomes the conditional probability that the response is incorrect. In practice, we evaluate uncertainty scores by whether they assign higher values to incorrect
+generations than to correct ones, since this ranking determines the usefulness for uncertainty detection.
+Observed Information
+generation
+F0 = σ(z),
+
+We use the filtration [32] to define the information available during
+
+Ft = σ(z, Y1:t , s1:t ) with 1 ≤ t ≤ T,
+
+(R)
+
+FT
+
+
+
+(r)
+(r)
+= σ z, {Y1:Tr , s1:Tr }R
+r=1 , (5)
+
+where F0 contains only the input prompt z, Ft contains the information available after observing
+(R)
+the first t generated tokens Y1:t and their associated states s1:t , and FT contains the information
+from R independently sampled full generations. This filtration provides a unified way to describe
+uncertainty estimators according to the amount of generation information they are allowed to observe.
+Estimation Cost In this formulation, the existing and proposed uncertainty estimation methods can
+(R)
+be organised into four settings, as illustrated in Figure 1. Multi-generation estimation observes FT
+by sampling multiple generations and estimating uncertainty from disagreement or inconsistency
+across responses. Its generation cost is O(R · Cgen ), where Cgen denotes the cost of one full
+autoregressive generation. Single-generation estimation observes FT , using one full generation and
+its associated states, with cost O(Cgen ). Partial-generation estimation observes Fτ , where τ ≤ T
+is an adaptive stopping time determined by the information available up to that point. Its expected
+generation cost is approximately O((τ /T ) · Cgen ). Finally, the input-only estimation observes only
+F0 and predicts the uncertainty directly from the prompt before the autoregressive generation begins.
+It therefore replaces the autoregressive generation with a single forward pass of the meta model.
+4
+
+4
+
+Methodology
+(a) Logits Magnitude
+
+Partial Sequence
+
+Patience Window
+for Early Stop
+
+Adaptive Early Stopping
+
+Softmax
+
+Logits
+
+Pretrained
+LLM Layers
+
+Sequence-level
+Uncertainty Score
+
+L2 Norm
+Input
+Per-token Uncertainty Score
+
+TopAggregation
+Pesudo Label
+
+(b) MetaUE
+
+Legend
+Frozen Component
+
+Pretrained
+Encoder
+
+Trainable Component
+
+MLP Head
+Sequence-level
+Uncertainty Score
+
+Input
+
+Uncertainty Score
+Token
+
+Figure 2: Overview of the proposed generation-efficient uncertainty estimation framework. (a) Logit
+Magnitude: Given an input prompt, the frozen LLM generates a partial sequence and exposes the
+logits at each generation step. The logits are converted into token-level uncertainty scores using
+L2 -norm of logits. An adaptive early-stopping rule monitors whether the top-scoring tokens remain
+unchanged within a patience window, and the retained token-level scores are aggregated with top-M
+aggregation to produce the sequence-level uncertainty score. (b) MetaUE: A frozen pretrained
+encoder maps the input prompt into a representation, and a lightweight trainable MLP head predicts
+the sequence-level uncertainty score before generation. MetaUE is trained using the sequence-level
+Logit Magnitude scores as the pseudo-labels.
+4.1
+
+Logit Magnitude for Partial-Generation Uncertainty Estimation
+
+Probability-based uncertainty scores, such as sequence entropy [12], normalise logits into relative
+probabilities with softmax and may discard the absolute strength of model evidence. Recent work
+suggests that raw logits retain useful information about evidence strength and model reliability [13,
+27]. We therefore use the positive Logit Magnitude as a token-level signal for uncertainty estimation.
+Intuitively, tokens with strong positive evidence can have a large influence on the final response, so
+their reliability is especially important for sequence-level uncertainty. Formally, for generation step t,
+(K)
+(1)
+(K)
+let ℓt = (ℓt , . . . , ℓt ) denote the top-K logits emitted by the model. We therefore compute the
+magnitude using positive logits and define the token-level score for the t-th generated token as
+r
+K
+2
+X
+(k)
+ut =
+max
+ℓt , 0 .
+(6)
+k=1
+
+We use an adaptive stopping strategy based on the token-level uncertainty scores. For each prompt zi ,
+generation proceeds token by token. At generation step t, let Ht denote the indices of the current
+min(M, t) largest token-level scores among u1:t = (u1 , . . . , ut ). We maintain a patience counter nt ,
+which records the number of consecutive generation steps since Ht was last updated. If the newly
+generated token has a score ut that enters the current top-M set, we update Ht and reset nt = 0.
+Otherwise, Ht remains unchanged and the patience counter increases. Generation stops at τi = t if
+the LLM generates an end-of-sequence token, or if the top-M set has remained unchanged for W
+consecutive steps. After stopping, we compute the sequence-level uncertainty score using the final
+top-M set Hτi . Formally,
+1 X
+U τi =
+ut .
+(7)
+|Hτi |
+t∈Hτi
+
+To reduce sensitivity to the raw scale of Uτi , we apply min-max normalisation over the training set
+and map the score to [0, 1]. The detailed algorithm is illustrated in the Appendix A.
+5
+
+The motivation for early stopping is that the gap between single-generation and partial-generation
+uncertainty estimation depends on the amount of correctness-relevant information remaining after the
+stopping time, rather than simply on the number of unobserved tokens. In Appendix C, we prove
+that when the unobserved tail has small conditional update energy, the estimation error introduced by
+stopping early admits an upper bound. The patience rule provides an empirical realisation of this
+condition: if no new token enters the current top-M set for W consecutive steps, the recent updates
+to the sequence-level uncertainty estimate are likely to be small, suggesting that further generation is
+unlikely to substantially change the estimate.
+4.2
+
+Meta Model for Input-Only Uncertainty Estimation
+
+Despite Logit Magnitude reducing the amount of generation required for uncertainty estimation,
+it still depends on τ -step autoregressive generation. To further reduce the cost of autoregressive
+generation, we introduce MetaUE, an input-only meta-model that predicts uncertainty directly from
+the prompt. MetaUE consists of a frozen pretrained text encoder ϕ and a trainable two-layer MLP
+head gω . Given an input prompt z, the MetaUE is defined as
+fω (z) = gω (ϕ(z)),
+
+(8)
+
+where fω (z) is the predicted uncertainty score. Since ϕ is frozen and only gω is trained, MetaUE
+introduces only a few trainable parameters ω, and avoids generation cost at inference. To train
+MetaUE without ground-truth correctness labels, we use the early-stopped Logit Magnitude score
+as a label-free distillation target. This allows MetaUE to distil generation-based uncertainty into an
+input-only estimator without requiring task-specific annotations. Specifically, MetaUE is trained
+by minimising the mean squared error between the score predicted from the input prompt and the
+uncertainty score produced by the early-stopped Logit Magnitude estimator. To avoid reliance on
+ground-truth correctness labels, which can be costly to obtain [33], we use the proposed uncertainty
+score as a pseudo-label. Formally, for each training prompt zi , we compute the Logit Magnitude
+score Uτi , which is used to train MetaUE with an MSE loss:
+n
+
+J (ω) =
+
+1X
+2
+(fω (zi ) − Uτi ) .
+n i=1
+
+(9)
+
+The detailed training process of the MetaUE is illustrated in the Appendix B.
+
+5
+
+Experiments
+
+5.1
+
+Experiment Setup
+
+Datasets We evaluate the proposed framework on three free-text question-answering datasets
+spanning general and medical domains: COQA [34], NewsQA [35], and emrQA [36]. COQA
+and NewsQA are widely used benchmarks for evaluating uncertainty estimation in general-domain
+generation [37, 14]. We additionally use emrQA to assess reliability in a high-stakes clinical setting
+based on electronic medical records. Further dataset details are provided in Appendix D.1.
+LLM Evaluation Three LLM families, Qwen3.5 [38], Gemma4 [39], and Llama3 [40] are
+evaluated. Each model uses identical sampling parameters for all uncertainty estimators.
+Baseline Methods For multi-generation estimation baselines, we include the most representative
+methods, Semantic Entropy [9] and Self-Consistency [10]. For single-generation baselines, we
+include the representative methods entropy [12] and LogTokU [13], and the latest methods hiddenstate score [14] and self-certainty [41].
+Evaluation Metrics To evaluate the performance and efficiency of the uncertainty estimation
+methods, we report AUROC, AURAC, balanced accuracy (Bal. Acc), and the averaged number of
+tokens used for uncertainty estimation (N-tok). Details of metrics are provided in Appendix D.3.
+5.2
+
+Comparative Performance of Logit Magnitude and MetaUE
+
+This experiment compares uncertainty estimation methods across datasets and LLMs, assessing
+whether low-cost estimators can approach the performance of more expensive generation-based
+6
+
+baselines. In particular, we compare full-generation Logit Magnitude, Logit Magnitude with adaptive early-stop, and the input-only MetaUE model against multi-generation and single-generation
+uncertainty estimation baselines. As shown in Table 1, Logit Magnitude is an effective uncertainty
+estimator across both general-domain and medical-domain tasks. In the full-generation setting
+(τ = T ), it achieves the best or highly competitive performance on most LLM-dataset combinations,
+indicating that the raw Logit Magnitude provides a strong signal for distinguishing reliable and unreliable generations. The early-stopped variant preserves most of this performance while using fewer
+generated tokens. For example, on Qwen3.5-4B, Logit Magnitude achieves an AUROC of 0.791 on
+COQA compared with 0.793 for full generation, and 0.750 on NewsQA compared with 0.751, while
+reducing the average token budget from 19.4 to 16.3 and from 15.7 to 11.7, respectively. Similar
+behaviour is observed on Gemma4-4B. These results suggest that reliable uncertainty estimation
+does not always require observing the full sequence. Finally, MetaUE provides a zero-generation
+alternative, achieving performance comparable to several generation-based baselines, showing that
+useful uncertainty information can also be distilled into an input-only estimator.
+Table 1: Assessment of uncertainty estimation methods. For each LLM, methods are grouped into
+multi-generation baselines, single-generation baselines, and our proposed methods. Bold values
+indicate the best performance within each LLM-dataset combination, and underlined values indicate
+the second-best performance within each combination.
+UE
+Method
+
+LLM
+
+emrQA
+
+173.0
+173.0
+
+0.612.009 0.583.009 0.585.007
+0.612.009 0.585.009 0.577.008
+
+209.7
+209.7
+
+0.671.003 0.708.003 0.627.003
+0.655.003 0.703.003 0.615.003
+
+216.1
+216.1
+
+Sequence Entropy
+LogTokU
+Hidden-State Score
+Self-Certainty
+
+0.649.006
+0.723.006
+0.654.006
+0.660.006
+
+0.605.006
+0.681.005
+0.665.005
+0.661.005
+
+17.4
+17.4
+17.4
+17.4
+
+0.462.009
+0.711.008
+0.696.008
+0.511.010
+
+0.511.003
+0.640.007
+0.643.008
+0.535.006
+
+20.8
+20.8
+20.8
+20.8
+
+0.745.003
+0.524.004
+0.373.004
+0.768.003
+
+0.689.003
+0.544.002
+0.506.001
+0.708.003
+
+21.5
+21.5
+21.5
+21.5
+
+Logit Magnitude (τ = T ) 0.733.006 0.488.007 0.682.005
+Logit Magnitude
+0.730.006 0.486.005 0.675.005
+MetaUE
+0.709.004 0.475.003 0.656.003
+
+17.4
+15.0
+0
+
+0.704.008 0.656.008 0.655.007
+0.699.008 0.652.008 0.648.007
+0.617.003 0.599.002 0.579.004
+
+20.8
+16.0
+0
+
+0.775.003 0.764.002 0.711.003
+0.740.003 0.750.003 0.687.003
+0.733.004 0.588.002 0.667.003
+
+21.5
+17.8
+0
+
+Gemma4-4B
+
+0.676.006 0.443.007 0.638.006
+0.667.006 0.445.007 0.620.005
+0.436.007
+0.484.007
+0.445.007
+0.445.007
+
+0.505.001
+0.650.008
+0.656.008
+0.542.009
+
+0.745.003
+0.607.003
+0.515.004
+0.755.006
+
+0.754.005 0.575.007 0.702.005
+0.714.006 0.561.007 0.651.005
+
+195.9
+195.9
+
+0.761.009 0.798.006 0.714.008
+0.766.009 0.807.006 0.702.008
+
+161.1
+161.1
+
+0.667.003 0.547.003 0.618.003
+0.601.003 0.506.003 0.567.003
+
+430.2
+430.2
+
+Sequence Entropy
+LogTokU
+Hidden-State Score
+Self-Certainty
+
+0.680.006 0.542.007
+0.771.005 0.587.006
+0.704.006 0.543.007
+0.651.006 0.52.007
+
+0.631.005
+0.694.005
+0.658.005
+0.614.005
+
+19.4
+19.4
+19.4
+19.4
+
+0.648.010
+0.742.005
+0.651.010
+0.566.010
+
+0.605.008
+0.696.008
+0.598.009
+0.548.009
+
+15.7
+15.7
+15.7
+15.7
+
+0.765.003
+0.718.003
+0.719.003
+0.771.003
+
+0.698.002
+0.670.002
+0.671.003
+0.707.003
+
+43.3
+43.3
+43.3
+43.3
+
+Logit Magnitude (τ = T ) 0.793.005 0.604.006 0.728.005
+Logit Magnitude
+0.791.005 0.603.005 0.727.005
+MetaUE
+0.724.003 0.564.001 0.673.004
+
+19.4
+16.3
+0
+
+0.751.009 0.794.007 0.705.008
+0.750.009 0.794.007 0.699.008
+0.717.002 0.788.001 0.656.008
+
+15.7
+11.7
+0
+
+0.775.008 0.605.008 0.713.002
+0.770.003 0.604.003 0.711.002
+0.733.004 0.588.002 0.667.003
+
+43.3
+38.2
+0
+
+Qwen3.5-4B
+
+Semantic Entropy
+Self-Consistency
+
+0.756.007
+0.779.006
+0.745.008
+0.713.008
+
+0.600.003
+0.565.003
+0.569.003
+0.603.003
+
+(a) COQA, Qwen3.5
+
+(b) NewsQA, Qwen3.5
+
+0.7
+0.7
+
+%
+90
+%
+10
+0%
+
+%
+
+0.8
+
+80
+
+%
+
+70
+
+%
+
+60
+
+%
+
+50
+
+%
+
+40
+
+%
+
+30
+
+Top-M Worst Aggregation
+
+all 200 100 50 20 10 5 3 1
+
+0.6
+
+%
+
+0.6
+
+0.69 0.68 0.69 0.70 0.71 0.71 0.71 0.71 0.71 0.70
+0.69 0.71 0.72 0.72 0.73 0.73 0.73 0.73 0.73 0.72
+0.67 0.71 0.72 0.73 0.73 0.73 0.74 0.74 0.74 0.73
+0.63 0.70 0.74 0.74 0.74 0.74 0.74 0.74 0.74 0.74
+0.62 0.66 0.71 0.74 0.75 0.76 0.76 0.76 0.76 0.75
+0.62 0.65 0.69 0.70 0.72 0.74 0.75 0.76 0.77 0.77
+0.62 0.65 0.68 0.69 0.70 0.72 0.73 0.74 0.75 0.75
+0.62 0.65 0.68 0.69 0.70 0.71 0.72 0.73 0.74 0.73
+0.62 0.65 0.68 0.69 0.70 0.71 0.72 0.73 0.73 0.73
+
+20
+
+Generation Sequence Fraction
+
+0.7
+
+10
+
+%
+90
+%
+10
+0%
+
+%
+
+80
+
+%
+
+70
+
+%
+
+60
+
+%
+
+50
+
+%
+
+40
+
+%
+
+30
+
+20
+
+0.6
+
+Top-M Worst Aggregation
+
+0.6
+
+%
+
+0.7
+
+0.63 0.70 0.71 0.71 0.72 0.71 0.70 0.72 0.73 0.75
+0.59 0.66 0.70 0.71 0.72 0.72 0.72 0.73 0.74 0.75
+0.56 0.64 0.68 0.69 0.71 0.72 0.72 0.73 0.74 0.75
+0.54 0.61 0.65 0.66 0.69 0.70 0.70 0.72 0.73 0.74
+0.53 0.60 0.63 0.64 0.66 0.67 0.68 0.69 0.71 0.72
+0.53 0.60 0.62 0.63 0.65 0.66 0.66 0.67 0.68 0.69
+0.53 0.60 0.62 0.63 0.65 0.66 0.66 0.66 0.67 0.69
+0.53 0.60 0.62 0.63 0.65 0.65 0.65 0.66 0.67 0.68
+0.53 0.60 0.62 0.63 0.65 0.65 0.65 0.66 0.67 0.68
+
+10
+
+%
+90
+%
+10
+0%
+
+%
+
+80
+
+%
+
+70
+
+%
+
+60
+
+%
+
+50
+
+%
+
+40
+
+%
+
+30
+
+Generation Sequence Fraction
+
+0.8
+
+all 200 100 50 20 10 5 3 1
+
+Dynamics of Logit Magnitude for Partial-Generation Estimation
+
+20
+
+10
+
+NewsQA
+
+Semantic Entropy
+Self-Consistency
+
+0.61 0.70 0.74 0.75 0.75 0.76 0.76 0.76 0.76 0.77
+0.56 0.67 0.73 0.75 0.76 0.77 0.78 0.77 0.78 0.79
+0.53 0.63 0.70 0.73 0.75 0.77 0.78 0.78 0.79 0.79
+0.52 0.60 0.66 0.69 0.72 0.74 0.75 0.76 0.77 0.79
+0.51 0.59 0.63 0.66 0.68 0.70 0.71 0.72 0.73 0.75
+0.51 0.58 0.63 0.65 0.66 0.67 0.68 0.68 0.69 0.71
+0.51 0.58 0.63 0.64 0.66 0.67 0.68 0.68 0.68 0.70
+0.51 0.58 0.63 0.64 0.66 0.67 0.68 0.67 0.67 0.70
+0.51 0.58 0.63 0.64 0.66 0.67 0.68 0.67 0.67 0.70
+
+%
+
+Top-M Worst Aggregation
+
+all 200 100 50 20 10 5 3 1
+
+5.3
+
+COQA
+
+AUROC ↑ AURAC ↑ Bal. Acc ↑ N-tok ↓ AUROC ↑ AURAC ↑ Bal. Acc ↑ N-tok ↓ AUROC ↑ AURAC ↑ Bal. Acc ↑ N-tok ↓
+
+Generation Sequence Fraction
+
+(c) emrQA, Qwen3.5
+
+Figure 3: Partial-generation dynamics of Logit Magnitude uncertainty estimation. AUROC is reported
+under different observed generation fractions and top-M worst-token aggregation choices.
+We next examine how the reliability of Logit Magnitude changes as more of the generation is observed.
+For each generated answer, we recompute the sequence-level uncertainty score Uτ using only the
+token-level scores u1:τ available up to stopping time τ . To analyse the effect of partial observation,
+we set τ to fixed fractions of the full generation length T , ranging from 10% to 100%, and vary the
+top-M aggregation parameter. This experiment studies how the observed generation fraction and the
+number of selected high-uncertainty tokens jointly affect uncertainty estimation performance.
+7
+
+Figure 3 shows that reliable uncertainty estimation can often be achieved before observing the full
+response, but the required stopping time and aggregation size vary across datasets. On COQA and
+NewsQA, strong AUROC is obtained from relatively short prefixes, especially when using sparse
+top-M aggregation. COQA performs well with small values such as M = 3 to 10, while NewsQA
+favours even smaller values such as M = 1 to 5. In contrast, emrQA benefits from larger aggregation
+windows, especially around M = 20 to 50, and its performance improves more gradually as the
+observed generation fraction increases. This suggests that medical-domain uncertainty is distributed
+across a broader set of specialised tokens, whereas general-domain uncertainty is often concentrated
+in a smaller subset of high-impact tokens. Overall, the results empirically support the use of earlystopped uncertainty estimation, and also show that the optimal stopping behaviour and top-M choice
+are domain-dependent. Appendix F provides a sensitivity analysis of the hyperparameters (M and
+W ) of Logit Magnitude, showing that M ∈ {5, 10} gives a good default when no validation data is
+available, and W ≈ 2M provides a practical balance between estimation performance and cost.
+5.4
+
+Sensitivity of MetaUE Encoder and Training Label Selection
+Table 2: MetaUE encoder comparison with Logit Magnitude as training label.
+CoQA
+
+LLM Encoder
+
+NewsQA
+
+emrQA
+
+AUROC ↑ AURAC ↑ Bal. Acc ↑ AUROC ↑ AURAC ↑ Bal. Acc ↑ AUROC ↑ AURAC ↑ Bal. Acc ↑
+
+Qwen3.5-4B
+
+Gemma4-4B
+
+BGE-M3
+
+0.634.004 0.424.002 0.597.010 0.561.003 0.566.002 0.541.009 0.700.003 0.732.002 0.647.003
+
+Qwen3-Emb-0.6B 0.660.003 0.444.002 0.617.004 0.574.003 0.574.002 0.548.004 0.714.001 0.739.001 0.658.001
+Qwen3-Emb-4B 0.629.003 0.423.002 0.596.002 0.562.002 0.563.002 0.543.011 0.710.005 0.738.003 0.654.004
+Qwen3-Emb-8B 0.689.004 0.461.002 0.640.003 0.605.007 0.589.004 0.571.004 0.716.002 0.741.001 0.659.002
+Qwen3-VL-2B
+Qwen3-VL-8B
+
+0.709.004 0.475.003 0.656.003 0.617.003 0.599.002 0.579.005 0.719.003 0.742.002 0.663.002
+0.726.003 0.483.002 0.668.003 0.636.003 0.613.002 0.606.004 0.716.003 0.741.001 0.661.003
+
+BGE-M3
+
+0.673.002 0.530.001 0.630.002 0.632.006 0.749.002 0.595.006 0.702.005 0.570.003 0.642.005
+
+Qwen3-Emb-0.6B 0.688.002 0.542.000 0.641.002 0.650.006 0.757.003 0.612.005 0.726.002 0.585.001 0.659.002
+Qwen3-Emb-4B 0.661.002 0.525.001 0.616.003 0.618.002 0.740.001 0.581.003 0.722.007 0.583.004 0.657.005
+Qwen3-Emb-8B 0.716.001 0.560.001 0.661.003 0.688.004 0.774.002 0.638.004 0.730.006 0.588.004 0.667.005
+Qwen3-VL-2B
+Qwen3-VL-8B
+
+1.0
+
+Ground Truth
+Logit Magnitude
+
+0.724.003 0.564.001 0.673.004 0.717.002 0.788.001 0.656.008 0.733.004 0.588.002 0.667.003
+0.733.003 0.568.002 0.680.003 0.736.003 0.797.001 0.679.004 0.733.001 0.590.001 0.668.002
+
+LogTokU
+Self Certainty
+
+1.0
+
+Ground Truth
+Logit Magnitude
+
+LogTokU
+Self Certainty
+
+1.0
+
+0.6
+
+0.4
+
+0.4
+
+0.2
+0.0
+
+0.4
+
+0.2
+AUROC
+
+AURAC
+
+Bal.Acc
+
+(a) COQA, Qwen3.5
+
+0.0
+
+LogTokU
+Self Certainty
+
+Score
+
+0.8
+
+0.6
+
+Score
+
+0.8
+
+0.6
+
+Score
+
+0.8
+
+Ground Truth
+Logit Magnitude
+
+0.2
+AUROC
+
+AURAC
+
+Bal.Acc
+
+(b) NewsQA, Qwen3.5
+
+0.0
+
+AUROC
+
+AURAC
+
+Bal.Acc
+
+(c) emrQA, Qwen3.5
+
+Figure 4: MetaUE design analysis on Qwen3.5-4B. Figure (a-c) compares different training signals
+with Qwen3-VL-Embedding-2B fixed as the encoder.
+This experiment investigates two design factors for MetaUE. First, we fix the training label to Logit
+Magnitude and vary the frozen encoder backbone, including BGE-M3 [42], Qwen3-Embedding [43],
+and Qwen3-VL-Embedding [44] at different model scales. Second, we fix the encoder to Qwen3VL-Embedding-2B and compare four training signals, including ground-truth correctness, Logit
+Magnitude, LogTokU, and self-certainty. As shown in Table 2, Qwen3-VL-Embedding provides
+consistently strong performance across both LLMs and all three datasets. Although Qwen3-VLEmbedding-8B often gives the highest scores in most settings, the 2B model already achieves
+competitive performance, making it a practical trade-off between estimation quality and computational
+cost. We therefore use Qwen3-VL-Embedding-2B as the default encoder for MetaUE. As shown
+in Figure 4(a-c), the ground-truth label gives the strongest reference performance, since it directly
+uses dataset correctness supervision. Among uncertainty-derived pseudo-labels, Logit Magnitude
+8
+
+achieves the best overall performance across all datasets, consistently outperforming LogTokU
+and self-certainty. This suggests that generation-level logit evidence provides a more effective
+supervision target for input-only uncertainty prediction than probability-based or self-evaluation
+signals. Beyond design analyses, Appendix G evaluates MetaUE’s transferability across datasets and
+LLM architectures, providing evidence on the robustness of the MetaUE when transferring.
+5.5
+
+Generalisation of Logit Magnitude and MetaUE
+
+Table 3: Assessment of uncertainty estimation methods across LLM families and sizes. The ∗ symbol
+indicates a Mixture-of-Experts model. Bold values indicate the best performance.
+LLM Size Method
+
+COQA
+
+NewsQA
+
+emrQA
+
+AUROC ↑ AURAC ↑ Bal. Acc ↑ N-tok ↓ AUROC ↑ AURAC ↑ Bal. Acc ↑ N-tok ↓ AUROC ↑ AURAC ↑ Bal. Acc ↑ N-tok ↓
+
+Gemma4
+
+26B∗
+
+31B
+
+Qwen3.5
+
+9B
+
+35B∗
+
+LogTokU
+Self-Certainty
+
+0.822.005 0.695.006 0.736.005
+0.675.006 0.599.007 0.625.005
+
+13.8
+13.8
+
+0.719.010 0.817.006 0.657.009
+0.632.011 0.782.007 0.592.008
+
+9.7
+9.7
+
+0.672.003 0.671.003 0.658.003
+0.729.003 0.714.003 0.687.003
+
+21.5
+21.5
+
+Logit Magnitude 0.830.005 0.699.006 0.756.005
+MetaUE
+0.794.003 0.676.001 0.722.005
+
+13.8
+0
+
+0.755.009 0.833.005 0.692.008
+0.714.004 0.822.002 0.648.007
+
+9.7
+0
+
+0.731.003 0.722.003 0.675.003
+0.696.007 0.707.004 0.648.005
+
+21.5
+0
+
+LogTokU
+Self-Certainty
+
+0.819.005 0.704.005 0.735.005
+0.710.006 0.627.006 0.649.005
+
+13.5
+13.5
+
+0.694.011 0.823.006 0.647.010
+0.663.011 0.813.006 0.608.010
+
+8.9
+8.9
+
+0.512.003 0.514.003 0.572.002
+0.753.003 0.705.003 0.714.002
+
+19.5
+19.5
+
+Logit Magnitude 0.855.004 0.721.005 0.781.004
+MetaUE
+0.807.004 0.692.002 0.739.005
+
+13.5
+0
+
+0.759.009 0.846.005 0.697.008
+0.717.002 0.836.001 0.659.004
+
+8.9
+0
+
+0.761.003 0.710.003 0.703.002
+0.717.001 0.685.001 0.662.001
+
+19.5
+0
+
+LogTokU
+Self-Certainty
+
+0.781.005 0.652.006 0.704.005
+0.608.006 0.544.007 0.578.005
+
+18.6
+18.6
+
+0.749.008 0.744.006 0.689.008
+0.548.010 0.669.008 0.534.008
+
+24.1
+24.1
+
+0.696.003 0.612.003 0.664.003
+0.729.003 0.638.003 0.680.003
+
+41.1
+41.1
+
+Logit Magnitude 0.791.005 0.656.006 0.723.005
+MetaUE
+0.701.004 0.601.002 0.652.004
+
+18.6
+0
+
+0.753.009 0.772.007 0.686.008
+0.679.002 0.742.002 0.630.002
+
+24.1
+0
+
+0.733.003 0.641.003 0.683.004
+0.710.003 0.642.002 0.648.002
+
+41.1
+0
+
+0.816.005 0.663.006 0.735.005
+0.591.006 0.528.007 0.563.005
+
+24.4
+24.4
+
+0.727.008 0.751.006 0.667.008
+0.553.010 0.692.008 0.534.007
+
+16.3
+16.3
+
+0.583.003 0.430.004 0.613.002
+0.715.003 0.558.003 0.682.002
+
+38.0
+38.0
+
+Logit Magnitude 0.857.004 0.685.006 0.785.004
+MetaUE
+0.765.002 0.638.001 0.701.003
+
+24.4
+0
+
+0.722.009 0.774.007 0.671.008
+0.686.001 0.763.001 0.637.003
+
+16.3
+0
+
+0.720.003 0.554.003 0.687.003
+0.702.003 0.551.001 0.646.002
+
+38.0
+0
+
+LogTokU
+Self-Certainty
+
+To evaluate whether the proposed methods generalise beyond the 4B models, we extend the comparison to larger LLMs from Gemma4 and Qwen3.5. We also include Mixture-of-Experts (MoE)
+models [45] to test whether the proposed methods remain effective under different architectural
+designs. As shown in Table 3, Logit Magnitude achieves the best or near-best AUROC and AURAC
+across most Gemma4 and Qwen3.5 settings. The gains are consistent across both general-domain
+and medical-domain datasets, indicating that positive logit evidence remains a strong uncertainty
+signal for larger dense and MoE models. MetaUE also generalises well across these model families,
+often approaching generation-based baselines while requiring zero generated tokens. On Qwen3.5,
+MetaUE is particularly competitive on emrQA, where it achieves AURAC 0.642 for the 9B model
+and 0.551 for the 35B MoE model. These results suggest that both proposed methods scale beyond
+the main 4B setting. Additional results on Llama3 are provided in Appendix H.
+
+6
+
+Conclusion
+
+In this paper, we investigated how much generation is needed for effective LLM uncertainty estimation.
+By formulating uncertainty estimation as an early estimation problem over the generation process,
+we proposed Logit Magnitude with top-M aggregation and an early-stop mechanism and MetaUE
+for input-only uncertainty estimation. Across general-domain and medical-domain benchmarks, as
+well as larger dense and MoE models, Logit Magnitude achieves strong performance, and MetaUE
+provides a useful zero-generation approximation. These results suggest that uncertainty estimation
+should focus on compact, informative signals of unreliability rather than exhaustive generation.
+This work has several limitations. First, our evaluation focuses on open-answer question generation,
+following the common evaluation protocol in LLM uncertainty estimation. Other task formats, such
+as multiple-choice question answering, multi-selection question answering, and long-form generation,
+remain underexplored. Second, we observe a failure mode of Logit Magnitude on Llama3 in the
+emrQA setting and attribute it to poorly calibrated logit distributions. Although this issue does not
+appear on the latest LLMs with well-designed calibration during post-training, the current study
+does not provide a comprehensive analysis of when this failure mode occurs. Future work should
+extend evaluation to broader generation tasks and systematically study the relationship between logit
+calibration, domain shift, and uncertainty estimation performance.
+9
+
+References
+[1] Haw-Shiuan Chang, Nanyun Peng, Mohit Bansal, Anil Ramakrishna, and Tagyoung Chung.
+Real sampling: Boosting factuality and diversity of open-ended generation by extrapolating the
+entropy of an infinitely large lm. Transactions of the Association for Computational Linguistics,
+13:760–783, 2025.
+[2] Hanzhu Chen, Xu Shen, Jie Wang, Zehao Wang, Qitan Lv, Junjie He, Rong Wu, Feng Wu, and
+Jieping Ye. Knowledge graph finetuning enhances knowledge manipulation in large language
+models. In The Thirteenth International Conference on Learning Representations, 2025.
+[3] Mingcheng Zhu, Zhiyao Luo, Yu Liu, and Tingting Zhu. Medtpe: Compressing long ehr
+sequence for llm-based clinical prediction with token-pair encoding. In Proceedings of the 11th
+Mining and Learning from Time Series Workshop@ KDD, volume 2025, 2025.
+[4] Lei Huang, Weijiang Yu, Weitao Ma, Weihong Zhong, Zhangyin Feng, Haotian Wang, Qianglong Chen, Weihua Peng, Xiaocheng Feng, Bing Qin, et al. A survey on hallucination in large
+language models: Principles, taxonomy, challenges, and open questions. ACM Transactions on
+Information Systems, 43(2):1–55, 2025.
+[5] pragatheeswaran vipulanandan, Kamal Premaratne, and Dilip Sarkar. Semantic uncertainty
+quantification of hallucinations in LLMs: A quantum tensor network based method. In The
+Fourteenth International Conference on Learning Representations, 2026.
+[6] Elham Asgari, Nina Montaña-Brown, Magda Dubois, Saleh Khalil, Jasmine Balloch, Joshua Au
+Yeung, and Dominic Pimenta. A framework to assess clinical safety and hallucination rates of
+llms for medical text summarisation. NPJ digital medicine, 8(1):274, 2025.
+[7] Soumik Mandal, Batia M Wiesenfeld, Adam C Szerencsy, William R Small, Vincent Major,
+Safiya Richardson, Antoinette Schoenthaler, Devin Mann, and Oded Nov. Utilization of
+generative ai-drafted responses for managing patient-provider communication. npj Digital
+Medicine, 8(1):591, 2025.
+[8] Ambrose Agweyu, Paul Mwaniki, Wilkister Musau, Robert Korom, Lynda Isaaka, Conrad
+Wanyama, Sarah Kiptinness, Najib Adan, Mira Emmanuel-Fabula, and Bilal A Mateen. Safety
+of a large language model-based clinical decision support system in african primary healthcare.
+Nature Health, pages 1–12, 2026.
+[9] Sebastian Farquhar, Jannik Kossen, Lorenz Kuhn, and Yarin Gal. Detecting hallucinations in
+large language models using semantic entropy. Nature, 630(8017):625–630, 2024.
+[10] Potsawee Manakul, Adian Liusie, and Mark Gales. Selfcheckgpt: Zero-resource black-box
+hallucination detection for generative large language models. In Proceedings of the 2023
+conference on empirical methods in natural language processing, pages 9004–9017, 2023.
+[11] Ruihan Yang, Caiqi Zhang, Zhisong Zhang, Xinting Huang, Sen Yang, Nigel Collier, Dong Yu,
+and Deqing Yang. Logu: Long-form generation with uncertainty expressions. In Proceedings
+of the 63rd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long
+Papers), pages 18947–18968, 2025.
+[12] Aman Sharma and Paras Chopra. Think just enough: Sequence-level entropy as a confidence
+signal for llm reasoning. In First Workshop on Foundations of Reasoning in Language Models,
+2025.
+[13] Huan Ma, Jingdong Chen, Joey Tianyi Zhou, Guangyu Wang, and Changqing Zhang. Estimating
+llm uncertainty with evidence. arXiv preprint arXiv:2502.00290, 2025.
+[14] Yixin Bu, Guanyun Zou, Renzhi Wang, Runze Xia, Cunjun Wang, Hongliang Dai, Xiaoqing
+Ma, and Piji Li. Sampling-free uncertainty quantification via hidden state dynamics in language
+models. In Proceedings of the AAAI Conference on Artificial Intelligence, volume 40, pages
+30104–30111, 2026.
+10
+
+[15] Hao Mark Chen, Fuwen Tan, Alexandros Kouris, Royson Lee, Hongxiang Fan, and Stylianos
+Venieris. Progressive mixed-precision decoding for efficient llm inference. In The Thirteenth
+International Conference on Learning Representations, 2025.
+[16] Brendan Leigh Ross, Noël Vouitsis, Atiyeh Ashari Ghomi, Rasa Hosseinzadeh, Ji Xin, Zhaoyan
+Liu, Yi Sui, Shiyi Hou, Kin Kwan Leung, Gabriel Loaiza-Ganem, and Jesse C. Cresswell.
+Textual bayes: Quantifying prompt uncertainty in LLM-based systems. In The Fourteenth
+International Conference on Learning Representations, 2026.
+[17] Qing Lyu, Kumar Shridhar, Chaitanya Malaviya, Li Zhang, Yanai Elazar, Niket Tandon, Marianna Apidianaki, Mrinmaya Sachan, and Chris Callison-Burch. Calibrating large language
+models with sample consistency. In Proceedings of the AAAI Conference on Artificial Intelligence, volume 39, pages 19260–19268, 2025.
+[18] Debargha Ganguly, Vikash Singh, Sreehari Sankar, Biyao Zhang, Xuecen Zhang, Srinivasan
+Iyengar, Xiaotian Han, Amit Sharma, Shivkumar Kalyanaraman, and Vipin Chaudhary. Grammars of formal uncertainty: When to trust llms in automated reasoning tasks. In The Thirty-ninth
+Annual Conference on Neural Information Processing Systems, 2025.
+[19] Lukas Aichberger, Kajetan Schweighofer, Mykyta Ielanskyi, and Sepp Hochreiter. Improving
+uncertainty estimation through semantically diverse language generation. In The Thirteenth
+International Conference on Learning Representations, 2025.
+[20] Roman Vashurin, Maiya Goloburda, Albina Ilina, Aleksandr Rubashevskii, Preslav Nakov,
+Artem Shelmanov, and Maxim Panov. Cocoa: A minimum bayes risk framework bridging
+confidence and consistency for uncertainty quantification in llms. In The Thirty-ninth Annual
+Conference on Neural Information Processing Systems, 2025.
+[21] Tunyu Zhang, Haizhou Shi, Yibin Wang, Hengyi Wang, Xiaoxiao He, Zhuowei Li, Haoxian
+Chen, Ligong Han, Kai Xu, Huan Zhang, et al. Tokur: Token-level uncertainty estimation
+for large language model reasoning. In The Fourteenth International Conference on Learning
+Representations, 2026.
+[22] Aakriti Agrawal, Rohith Aralikatti, Anirudh Satheesh, Souradip Chakraborty, Amrit Singh Bedi,
+and Furong Huang. Uncertainty-aware answer selection for improved reasoning in multi-llm
+systems. In Findings of the Association for Computational Linguistics: EMNLP 2025, pages
+25090–25098, 2025.
+[23] Lukas Aichberger, Kajetan Schweighofer, and Sepp Hochreiter. Rethinking uncertainty estimation in LLMs: A principled single-sequence measure. In The Fourteenth International
+Conference on Learning Representations, 2026.
+[24] Yavuz Faruk Bakman, Sungmin Kang, Zhiqi Huang, Duygu Nur Yaldiz, Catarina G Belém,
+Chenyang Zhu, Anoop Kumar, Alfy Samuel, Daben Liu, Salman Avestimehr, and Sai Praneeth
+Karimireddy. Uncertainty as feature gaps: Epistemic uncertainty quantification of LLMs
+in contextual question-answering. In The Fourteenth International Conference on Learning
+Representations, 2026.
+[25] Jinhao Duan, Hao Cheng, Shiqi Wang, Alex Zavalny, Chenan Wang, Renjing Xu, Bhavya
+Kailkhura, and Kaidi Xu. Shifting attention to relevance: Towards the predictive uncertainty
+quantification of free-form large language models. In Proceedings of the 62nd Annual Meeting
+of the Association for Computational Linguistics (Volume 1: Long Papers), pages 5050–5063,
+2024.
+[26] Li Ju, Max Andersson, Stina Fredriksson, Edward Glöckner, Andreas Hellander, Ekta Vats, and
+Prashant Singh. Exploiting the asymmetric uncertainty structure of pre-trained vlms on the
+unit hypersphere. In The Thirty-ninth Annual Conference on Neural Information Processing
+Systems, 2025.
+[27] Tianyi Zhou, Johanne Medina, and Sanjay Chawla. Can llms detect their confabulations?
+estimating reliability in uncertainty-aware language models. In Proceedings of the AAAI
+Conference on Artificial Intelligence, volume 40, pages 38164–38172, 2026.
+11
+
+[28] Artem Vazhentsev, Ekaterina Fadeeva, Rui Xing, Gleb Kuzmin, Ivan Lazichny, Alexander
+Panchenko, Preslav Nakov, Timothy Baldwin, Maxim Panov, and Artem Shelmanov. Unconditional truthfulness: Learning unconditional uncertainty of large language models. In
+Proceedings of the 2025 Conference on Empirical Methods in Natural Language Processing,
+pages 35661–35682, 2025.
+[29] Ziang Zhou, Tianyuan Jin, Jieming Shi, and Li Qing. Steerconf: Steering llms for confidence
+elicitation. In The Thirty-ninth Annual Conference on Neural Information Processing Systems,
+2025.
+[30] Mehul Damani, Isha Puri, Stewart Slocum, Idan Shenfeld, Leshem Choshen, Yoon Kim, and
+Jacob Andreas. Beyond binary rewards: Training lms to reason about their uncertainty. In The
+Fourteenth International Conference on Learning Representations, 2026.
+[31] Xin Liu and Lu Wang. Answer convergence as a signal for early stopping in reasoning. In
+Proceedings of the 2025 Conference on Empirical Methods in Natural Language Processing,
+pages 17907–17918, 2025.
+[32] David Williams. Probability with martingales. Cambridge university press, 1991.
+[33] Cheng Zhen, Ervine Zheng, Jilong Kuang, and Geoffrey Jay Tso. Enhancing llm-as-a-judge
+through active-sampling-based prompt optimization. In Proceedings of the 63rd Annual Meeting
+of the Association for Computational Linguistics (Volume 6: Industry Track), pages 960–970,
+2025.
+[34] Siva Reddy, Danqi Chen, and Christopher D Manning. Coqa: A conversational question
+answering challenge. Transactions of the Association for Computational Linguistics, 7:249–266,
+2019.
+[35] Adam Trischler, Tong Wang, Xingdi Yuan, Justin Harris, Alessandro Sordoni, Philip Bachman,
+and Kaheer Suleman. Newsqa: A machine comprehension dataset. In Proceedings of the 2nd
+Workshop on Representation Learning for NLP, pages 191–200, 2017.
+[36] Anusri Pampari, Preethi Raghavan, Jennifer Liang, and Jian Peng. emrqa: A large corpus for
+question answering on electronic medical records. In Proceedings of the 2018 conference on
+empirical methods in natural language processing, pages 2357–2368, 2018.
+[37] Lorenz Kuhn, Yarin Gal, and Sebastian Farquhar. Semantic uncertainty: Linguistic invariances
+for uncertainty estimation in natural language generation. In The Eleventh International
+Conference on Learning Representations, 2023.
+[38] Qwen Team. Qwen3. 5-omni technical report. arXiv preprint arXiv:2604.15804, 2026.
+[39] Gemma Team, Morgane Riviere, Shreya Pathak, Pier Giuseppe Sessa, Cassidy Hardin,
+Surya Bhupatiraju, Léonard Hussenot, Thomas Mesnard, Bobak Shahriari, Alexandre Ramé,
+et al. Gemma 2: Improving open language models at a practical size. arXiv preprint
+arXiv:2408.00118, 2024.
+[40] Aaron Grattafiori, Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian,
+Ahmad Al-Dahle, Aiesha Letman, Akhil Mathur, Alan Schelten, Alex Vaughan, et al. The llama
+3 herd of models. arXiv preprint arXiv:2407.21783, 2024.
+[41] Zhewei Kang, Xuandong Zhao, and Dawn Song. Scalable best-of-n selection for large language
+models via self-certainty. In The Thirty-ninth Annual Conference on Neural Information
+Processing Systems, 2025.
+[42] Jianlyu Chen, Shitao Xiao, Peitian Zhang, Kun Luo, Defu Lian, and Zheng Liu. M3-embedding:
+Multi-linguality, multi-functionality, multi-granularity text embeddings through self-knowledge
+distillation. In Findings of the association for computational linguistics: ACL 2024, pages
+2318–2335, 2024.
+[43] Yanzhao Zhang, Mingxin Li, Dingkun Long, Xin Zhang, Huan Lin, Baosong Yang, Pengjun
+Xie, An Yang, Dayiheng Liu, Junyang Lin, et al. Qwen3 embedding: Advancing text embedding
+and reranking through foundation models. arXiv preprint arXiv:2506.05176, 2025.
+12
+
+[44] Mingxin Li, Yanzhao Zhang, Dingkun Long, Keqin Chen, Sibo Song, Shuai Bai, Zhibo Yang,
+Pengjun Xie, An Yang, Dayiheng Liu, et al. Qwen3-vl-embedding and qwen3-vl-reranker:
+A unified framework for state-of-the-art multimodal retrieval and ranking. arXiv preprint
+arXiv:2601.04720, 2026.
+[45] Weilin Cai, Juyong Jiang, Fan Wang, Jing Tang, Sunghun Kim, and Jiayi Huang. A survey
+on mixture of experts in large language models. IEEE Transactions on Knowledge and Data
+Engineering, 2025.
+[46] Marcus D Ruopp, Neil J Perkins, Brian W Whitcomb, and Enrique F Schisterman. Youden
+index and optimal cut-point estimated from observations affected by a lower limit of detection.
+Biometrical Journal: Journal of Mathematical Methods in Biosciences, 50(3):419–430, 2008.
+[47] Raphaël Bentegeac, Bastien Le Guellec, Grégory Kuchcinski, Philippe Amouyel, and Aghiles
+Hamroun. Token probabilities to mitigate large language models overconfidence in answering
+medical questions: quantitative study. Journal of medical Internet research, 27:e64348, 2025.
+
+13
+
+A
+
+Algorithm for Logit Magnitude with Adaptive Early Stopping
+
+Algorithm 1 summarises the proposed Logit Magnitude estimator with top-M aggregation and
+adaptive early stopping.
+Algorithm 1 Logit Magnitude with Top-M Aggregation and Early Stopping
+Input: LLM θ, input prompt z, top-logit size K, aggregation size M , patience window W .
+eτ .
+Output: Logit Magnitude score U
+1: Initialise generated prefix y1:0 ← ∅, top-M score set H ← ∅, patience counter n ← 0, and time
+step t ← 0.
+2: while true do
+3:
+t←t+1
+4:
+Obtain logits ℓt from θ(z, y<t )
+5:
+Generate next token yt using the decoding strategy
+6:
+Append yt to the generated prefix y1:t
+7:
+Compute the token-level Logit Magnitude score with Eq 6.
+8:
+if |H| < M then
+9:
+Add (t, ut ) to H
+10:
+n←0
+11:
+else if ut > min(j,uj )∈H uj then
+12:
+Remove arg min(j,uj )∈H uj from H
+13:
+Add (t, ut ) to H
+14:
+n←0
+15:
+else
+16:
+n←n+1
+17:
+end if
+18:
+if yt is an end-of-sequence token or (|H| = M and n ≥ W ) then
+19:
+break
+20:
+end if
+21: end while
+eτ with Eq 7.
+22: Compute the sequence-level uncertainty score U
+23: Apply min-max normalisation using training-set statistics.
+eτ
+24: return U
+
+Algorithm 2 MetaUE Training
+Input: Training prompts Dtrain = {zi }ni=1 , frozen LLM θ, frozen encoder ϕ, trainable MLP head
+gω , learning rate α, Logit Magnitude scores Uτi collected using Algorithm 1.
+Output: Trained MetaUE model fω (z) = gω (ϕ(z))
+1: for e = 1, . . . , E do
+2:
+for each mini-batch B ⊆ S with size B do
+3:
+Encode prompts with the frozen encoder:
+hi = ϕ(zi ),
+4:
+5:
+6:
+
+zi ∈ B.
+
+Predict input-only uncertainty scores with Eq 8.
+Compute the mean squared error loss J (ω) with Uτi using Eq 9.
+Update only the MLP parameters ω
+ω ← ω − α∇ω J (ω),
+
+7:
+end for
+8: end for
+9: return trained MetaUE predictor fω
+
+14
+
+B
+
+Algorithm for MetaUE Training
+
+Algorithm 2 summarises the training procedure for MetaUE. The key idea is to first compute
+generation-based uncertainty scores using the Logit Magnitude, and then use the scores as pseudolabels to train an input-only estimator.
+
+C
+
+Derivation for the Error of Partial-Generation Uncertainty Estimation
+
+Let X ∈ L2 denote the scalar target to be estimated, such as final unreliability. Let (Ft )Tt=0 be
+the filtration generated by the prompt and the observed generation trajectory up to step t. The best
+estimate of X after observing Ft is the conditional expectation
+Mt = E[X | Ft ].
+
+(10)
+
+By the tower property of conditional expectation, (Mt )Tt=0 is a Doob martingale [32]. Define the
+martingale increment
+∆t = Mt − Mt−1 .
+(11)
+Then E[∆t | Ft−1 ] = 0.
+Let τ ≤ T be a stopping time. In our setting, τ corresponds to the time at which generation is stopped
+for uncertainty estimation. The penalty of stopping at τ , relative to observing the full trajectory up to
+T , is
+
+
+E(τ ) = E (MT − Mτ )2 .
+(12)
+Since T is finite, the difference between the full-sequence estimate and the early-stopped estimate
+can be written as the sum of the increments that are not observed:
+MT − M τ =
+
+T
+X
+
+∆t 1{t>τ } .
+
+(13)
+
+X
+
+(14)
+
+t=1
+
+Squaring this expression gives
+(MT − Mτ )2 =
+
+T
+X
+
+∆2t 1{t>τ } + 2
+
+t=1
+
+∆s ∆t 1{s>τ } 1{t>τ } .
+
+1≤s<t≤T
+
+For s < t, the term ∆s 1{s>τ } 1{t>τ } is Ft−1 -measurable. First, because s < t (and thus s ≤ t − 1),
+the prior increment ∆s is already observed by time t − 1 and is therefore Ft−1 -measurable. Second,
+the event {t > τ } is logically equivalent to {τ ≤ t − 1}. By the strict definition of a stopping time,
+the event that stopping occurs at or before step t − 1 is entirely determined by the filtration Ft−1 .
+Consequently, the indicator function 1{t>τ } is Ft−1 -measurable. Similarly, since s − 1 < t − 1, the
+indicator 1{s>τ } is also Ft−1 -measurable.
+Since the entire product ∆s 1{s>τ } 1{t>τ } is Ft−1 -measurable, it can be factored out of the inner
+conditional expectation. Applying the tower property of conditional expectation, we have:
+
+
+ 
+
+E ∆s ∆t 1{s>τ } 1{t>τ } = E E ∆s ∆t 1{s>τ } 1{t>τ } | Ft−1
+
+
+= E ∆s 1{s>τ } 1{t>τ } E[∆t | Ft−1 ] .
+(15)
+By the martingale property, the expected forward increment given the current history is exactly zero,
+i.e., E[∆t | Ft−1 ] = 0. Substituting this into the expression naturally eliminates the entire term:
+
+
+E ∆s 1{s>τ } 1{t>τ } · 0 = 0.
+(16)
+Thus, only the squared increments remain:
+" T
+#
+" T
+#
+X
+X
+2
+2
+E(τ ) = E
+∆t 1{t>τ } = E
+∆t .
+t=1
+
+t=τ +1
+
+15
+
+(17)
+
+This identity shows that the early-stopping penalty is exactly the expected residual quadratic variation
+of the martingale after stopping. To obtain a simple bound, assume that the stopping rule is calibrated
+so that the unobserved tail has small conditional update energy:
+E[∆2t | Ft−1 ] ≤ ϵ
+
+on the event {t > τ }.
+
+(18)
+
+Since 1{t>τ } is Ft−1 -measurable, we have
+" T
+#
+X
+2
+E(τ ) = E
+1{t>τ } E[∆t | Ft−1 ]
+t=1
+
+" T
+#
+X
+≤E
+ϵ 1{t>τ }
+t=1
+
+= ϵ E[T − τ ] ≤ ϵT.
+
+D
+
+Experiment Setup Details
+
+D.1
+
+Dataset Details
+
+(19)
+
+In this section, we provide detailed descriptions of the three datasets utilised to evaluate our uncertainty
+estimation methods. The datasets were selected to cover a diverse range of domains (general
+news/conversational, and specialised medical data).
+COQA (Conversational Question Answering) [34]: A large-scale dataset for building conversational question-answering systems. It contains text passages from seven diverse domains alongside
+conversational questions and answers. COQA requires models to understand the pragmatics of
+conversation and correctly resolve coreferences across multiple turns of free-text generation.
+NewsQA [35]: A challenging machine comprehension dataset containing over 100,000 humangenerated question-answer pairs. The questions are based on CNN and Daily Mail news articles. It is
+designed to test a model’s ability to perform complex reasoning, such as synthesising information
+from multiple sentences and handling lexical variations, making it an excellent benchmark for
+general-domain free-text uncertainty.
+emrQA [36]: A large-scale medical question-answering dataset constructed from electronic medical
+records (EMRs). The input contexts are clinical notes that frequently contain fragmented, complex,
+or contradictory patient histories. The model is required to generate free-text answers. This dataset is
+uniquely suited for evaluating uncertainty estimation, as the underlying EMR data accurately reflects
+the noisy, ambiguous nature of real-world clinical decision-making.
+Table 4: Dataset statistics for train/validation/test splits.
+Dataset
+Domain
+Train Validation
+Test
+CoQA
+NewsQA
+emrQA
+D.2
+
+General
+General
+Healthcare
+
+108,647
+92,549
+320,142
+
+7,983
+5,166
+40,017
+
+4,541
+5,126
+40,018
+
+LLM Sampling Parameters
+
+To ensure a fair comparison across LLMs and uncertainty estimation methods, we use the same
+decoding configuration for all models and datasets. Specifically, generation is performed with the
+configuration of temperature 1.0, top-K = 20, and top-p = 1.0.
+D.3
+
+Evaluation Metrics
+
+In this section, we provide the formal definitions for the metrics used to evaluate uncertainty estimation
+methods. Let D = {(zi , yi )}N
+i=1 be an evaluation dataset of size N , where each sample is associated
+with a continuous uncertainty score ui ∈ R and a binary correctness label ci ∈ {0, 1}. Here, ci = 1
+indicates that the generated answer is correct, while ci = 0 indicates that it is incorrect. We define
+16
+
+the subset of correct generations as Dc = {i | ci = 1} and the subset of incorrect generations as
+Dw = {i | ci = 0}.
+AUROC AUROC evaluates the threshold-independent discriminative power of an uncertainty estimator. Since higher uncertainty should correspond to lower correctness, AUROC represents the
+probability that a randomly selected incorrect generation is assigned a higher uncertainty score than a
+randomly selected correct generation:
+X X
+1
+AUROC =
+I[uj > ui ],
+(20)
+|Dc ||Dw |
+i∈Dc j∈Dw
+
+where I[·] is the indicator function. An AUROC of 0.5 corresponds to random ranking, while an
+AUROC of 1.0 corresponds to perfect separation between correct and incorrect responses.
+AURAC AURAC assesses the practical utility of uncertainty scores for selective prediction. It
+measures how the accuracy of the retained predictions changes as the most uncertain samples
+are progressively rejected. Let the dataset be sorted in ascending order of uncertainty, such that
+u(1) ≤ u(2) ≤ · · · ≤ u(N ) , with corresponding correctness labels c(i) . If we reject the k most
+uncertain samples, where k ∈ {0, 1, . . . , N − 1}, the accuracy on the remaining accepted samples is
+A(k) =
+
+N
+−k
+X
+1
+c(i) .
+N − k i=1
+
+(21)
+
+The AURAC is then defined as the empirical area under this rejection accuracy curve:
+N −1
+
+AURAC =
+
+1 X
+A(k).
+N
+
+(22)
+
+k=0
+
+A higher AURAC indicates that the estimator assigns high uncertainty to incorrect predictions, so
+that rejecting uncertain samples improves the accuracy of the retained subset.
+Balanced Accuracy We also report balanced accuracy for binary uncertainty detection. Since the
+uncertainty score ui is continuous, we first select a threshold τ ∗ on the validation set using the ROC
+curve. In practice, we choose the operating point that maximises Youden’s index [46]:
+∗
+τyou
+= arg max (TPRval (τ ) − FPRval (τ )) ,
+τyou
+
+(23)
+
+where incorrect generations are treated as the positive class. The same threshold τ ∗ is then applied to
+the test set. A test example is predicted to be incorrect if its uncertainty score is above the threshold:
+∗
+ŵi = I[ui ≥ τyou
+],
+
+(24)
+
+where ŵi = 1 denotes a predicted unreliable generation. Let wi = 1 − ci denote the ground-truth
+unreliability label. Balanced accuracy is then defined as the average of the true positive rate and true
+negative rate:
+!
+PN
+PN
+1
+i=1 I[ŵi = 0]I[wi = 0]
+i=1 I[ŵi = 1]I[wi = 1]
+Bal. Acc =
++
+,
+(25)
+PN
+PN
+2
+i=1 I[wi = 1]
+i=1 I[wi = 0]
+where I[·] denotes the indicator function, which equals 1 if the condition inside the brackets is true
+and 0 otherwise. Balanced accuracy accounts for class imbalance cases.
+D.4
+
+Evaluation Settings
+
+We evaluate on three extractive question-answering benchmarks: CoQA, NewsQA, and emrQA. Each
+dataset is partitioned into training, validation, and test splits. When there is no predefined validation
+set, 10% of the available training data is held out and used exclusively for hyperparameter selection
+and early stopping.
+The MetaUE model consists of a frozen encoder followed by a two-layer MLP classifier with hidden
+dimension 256, SiLU activation, and a configurable dropout rate. Qwen3-VL-Embedding-2B [44] is
+used as the default encoder. Models are trained using the AdamW optimiser with a linear warmup
+17
+
+over the first 10% of training steps, followed by cosine annealing decay. We perform a grid search
+over learning rate ∈ {3 × 10−3 , 1 × 10−3 , 3 × 10−4 } and batch size ∈ {64, 128, 256}, selecting
+the configuration that maximises validation AUROC. Training runs for up to 100 epochs with early
+stopping triggered if validation AUROC does not improve within 10% of the total training steps.
+MetaUE is trained and evaluated over five independent runs with different seeds.
+All primary results are reported as mean ± standard deviation, which is estimated via 1000 bootstrap
+samples drawn from the test set predictions of each trained model, with the reported standard deviation
+reflecting variability across both seeds and bootstrap resamples. Evaluation metrics include AUROC,
+AURAC, and balanced accuracy computed on ground-truth correctness labels. Following the criterion
+in [37], we treat a generated answer as correct if its ROUGE-L score against the reference answer
+exceeds 0.3. The main experiments are conducted on an NVIDIA RTX 6000 Ada GPU with 48GB
+VRAM, while experiments involving Gemma4-26B, Gemma4-31B, and Qwen3.5-35B are conducted
+on an NVIDIA RTX 6000 Pro GPU with 96GB VRAM. All the computing resources have 256GB
+RAM and an Intel Xeon w7-2575X CPU.
+
+E
+
+Notations
+
+The notation used throughout the paper is illustrated in Table 5.
+
+F
+
+Hyperparameter Sensitivity of the Logit Magnitude
+
+We evaluate how the top-M aggregation and the patience window W of the patience rule affect
+the logit-magnitude uncertainty estimation. We sweep M ∈ {1, 3, 5, 10, 20, 50, 100} and W ∈
+{1, 3, 5, 10, 20, 50, 100} on the validation splits of CoQA, NewsQA, and EmrQA for Qwen3.5-4B,
+reporting AUROC as the performance metric and the token-consumption ratio τ /T as the efficiency
+metric. Figure 5 reveals that the optimal (M, W ) configuration varies across datasets. On CoQA
+and NewsQA, where mean generation lengths are modest (∼17–21 tokens), an M = 5 achieves
+near-peak AUROC across both models with windows W ≥ 10. On EmrQA, where Qwen3.5-4B
+generates substantially longer sequences (∼42 tokens on average), larger M = 50 are needed to
+capture a sufficient uncertainty signal. While calibration on held-out validation data is desirable in
+practice, when no data is available, M ∈ {5, 10} provides a robust starting point, with W ≈ 2M
+offering a reasonable patience window.
+
+G
+
+Transferability of MetaUE
+
+In this experiment, we evaluate the transferability of MetaUE under two conditions: (i) dataset
+transferability, where a model trained on one dataset is applied to a different dataset using the same
+LLM; and (ii) model transferability, where a model trained on one LLM is applied to a different
+LLM on the same dataset. All configurations use the logit-magnitude label function with Qwen3-VLEmbedding-2B embeddings and are evaluated with AUROC and AURAC.
+MetaUE shows strong transferability in several settings, with cross-condition performance often
+approaching the in-domain baseline. For dataset transfer (Table 6), transfer between the two
+general-domain datasets, COQA and NewsQA, is particularly stable. For example, on Qwen3.5-4B,
+COQA→NewsQA achieves an AUROC of 0.715, compared with 0.717 for in-domain training. In
+contrast, transfer involving emrQA leads to larger degradation, reflecting the stronger domain shift
+introduced by clinical text. For instance, on Gemma4-4B, transferring from emrQA to COQA reduces
+AURAC to 0.392. For model transfer (Table 7), Gemma4-4B→Qwen3.5-4B is highly effective,
+achieving AUROC within 0.01 of Qwen’s in-domain baseline across all datasets (0.705-0.723 versus
+0.717-0.733). By comparison, Qwen3.5-4B→Gemma4-4B shows a larger gap (0.576-0.675 versus
+0.617-0.719), suggesting that transferability is asymmetric and depends on how well the source
+model’s uncertainty behaviour matches that of the target model.
+
+H
+
+Evaluation of Logit Magnitude and MetaUE on Llama3
+
+As shown in Table 8, Logit Magnitude underperforms Self-Certainty with Llama3 on emrQA. A
+potential reason is that RLHF-trained Llama3 models exhibit sharpened probability distributions on
+18
+
+Table 5: Notations used throughout the paper.
+Notation
+
+Meaning
+
+θ
+z
+zi
+Y = (y1 , . . . , yT )
+yt
+T
+V
+pθ (y | z)
+pθ (yt | z, y<t )
+ℓt ∈ R|V|
+ℓt,v
+st
+y⋆
+f (Y, y⋆ )
+C
+U
+I
+uψ (I)
+
+Pretrained conditional generative model, i.e., the LLM.
+Input prompt.
+The i-th training prompt.
+Generated response sequence.
+Token generated at step t.
+Full generation length.
+Vocabulary of the LLM.
+Conditional probability of generating response y given prompt z.
+Next-token distribution at generation step t.
+Logit vector over the vocabulary before softmax at step t.
+Logit assigned to candidate token v at step t.
+Observable internal state at step t. In this work, st is the logit vector ℓt .
+Reference answer or task-specific evaluation target.
+Task-specific correctness function, with value in [0, 1].
+Correctness variable, C = f (Y, y⋆ ).
+Unreliability variable, U = 1 − C = 1 − f (Y, y⋆ ).
+Information available to an uncertainty estimator.
+Uncertainty estimator parameterised by ψ. Larger values indicate greater predicted
+unreliability.
+Ideal uncertainty estimator, u⋆ (I) = E[U | I].
+Information available before generation, F0 = σ(z).
+Information available after observing the first t generated tokens and states.
+Information from R independently sampled full generations.
+Number of sampled generations used by multi-generation estimation.
+Computational cost of one full autoregressive generation.
+Fixed prefix length used in partial-generation analysis or illustration.
+Adaptive stopping time for partial-generation uncertainty estimation, with τ ≤ T .
+Sample-dependent stopping time for the i-th prompt.
+Frozen pretrained text encoder used by MetaUE.
+Trainable two-layer MLP head in MetaUE.
+Trainable parameters of the MetaUE prediction head.
+MetaUE prediction for prompt z, defined as fω (z) = gω (ϕ(z)).
+Number of training prompts used to train MetaUE.
+Early-stopped Logit Magnitude score used as the pseudo-label for prompt zi .
+Mean-squared error training objective for MetaUE.
+Scalar target to be estimated, such as final unreliability.
+Doob martingale estimate after observing Ft , Mt = E[X | Ft ].
+Martingale increment at step t, ∆t = Mt − Mt−1 .
+Error penalty of stopping at τ rather than observing the full trajectory.
+Upper bound on the conditional update energy in the unobserved tail.
+Indicator that token t lies in the unobserved tail after stopping.
+Expectation.
+Sigma-algebra generated by the enclosed random variables.
+
+u⋆ (I)
+F0
+Ft
+(R)
+FT
+R
+Cgen
+N
+τ
+τi
+ϕ
+gω
+ω
+fω (z)
+n
+Uτi
+J (ω)
+X ∈ L2
+Mt
+∆t
+E(τ )
+ϵ
+1{t>τ }
+E[·]
+σ(·)
+
+both correct and incorrect answers in the medical context [47]. This sharpened distribution makes
+logit norms saturate and lose the capabilities in estimating uncertainty. Figure 6 shows per-token
+Logit Magnitude for the top and bottom 10% of emrQA samples ordered by ROUGE-L, which is
+used to determine the correctness [37]. For Gemma and Qwen, the bottom-10% curve lies above the
+top-10%, providing a clear discriminative signal. For Llama3-3B, the two curves nearly coincide
+with overlapping standard-deviation bands, leaving the logit magnitude with little discriminative
+signal. The plot shows the severe logit saturation caused by RLHF [47]. Future work will explore
+19
+
+0.72
+0.64
+0.56
+
+50
+10
+0
+
+20
+
+5
+10
+
+1
+
+0.53 0.63 0.66 0.67 0.68 0.69 0.70
+0.63 0.68 0.69 0.70 0.72 0.72 0.73
+0.67 0.70 0.70 0.71 0.73 0.74 0.74
+0.70 0.70 0.72 0.73 0.74 0.75 0.75
+0.71 0.74 0.74 0.75 0.76 0.76 0.76
+0.76 0.77 0.77 0.77 0.77 0.77 0.77
+0.74 0.74 0.75 0.75 0.75 0.75 0.75
+
+3
+
+0.60
+
+Heap Size M
+
+0.66
+
+100 50 20 10 5 3 1
+
+0.72
+
+50
+10
+0
+
+20
+
+5
+10
+
+3
+
+Heap Size M
+
+1
+
+0.56
+
+100 50 20 10 5 3 1
+
+0.64
+
+50
+10
+0
+
+20
+
+5
+10
+
+3
+
+0.72
+
+0.56 0.67 0.70 0.72 0.74 0.74 0.74
+0.65 0.72 0.73 0.74 0.74 0.75 0.75
+0.69 0.73 0.74 0.74 0.75 0.75 0.75
+0.71 0.73 0.74 0.74 0.74 0.74 0.74
+0.71 0.72 0.72 0.72 0.72 0.72 0.72
+0.69 0.69 0.69 0.69 0.69 0.69 0.69
+0.68 0.68 0.69 0.69 0.69 0.69 0.69
+
+0.75
+0.50
+0.25
+
+50
+10
+0
+
+20
+
+5
+10
+
+0.25
+
+Heap Size M
+
+0.50
+
+1
+
+50
+10
+0
+
+1
+
+0.25
+
+0.75
+
+50
+10
+0
+
+0.50
+
+Heap Size M
+
+0.75
+
+3
+
+0.06 0.18 0.27 0.45 0.69 0.91 0.97
+0.15 0.28 0.40 0.60 0.81 0.95 0.99
+0.20 0.35 0.48 0.68 0.86 0.97 0.99
+0.32 0.48 0.62 0.80 0.93 0.98 1.00
+0.53 0.69 0.79 0.90 0.97 1.00 1.00
+0.84 0.90 0.94 0.98 0.99 1.00 1.00
+0.95 0.97 0.98 0.99 1.00 1.00 1.00
+
+100 50 20 10 5 3 1
+
+0.17 0.34 0.44 0.59 0.75 0.91 0.97
+0.31 0.46 0.56 0.70 0.83 0.95 0.99
+0.39 0.53 0.62 0.76 0.88 0.97 0.99
+0.52 0.65 0.73 0.84 0.93 0.99 1.00
+0.67 0.77 0.83 0.91 0.97 1.00 1.00
+0.84 0.90 0.93 0.97 0.99 1.00 1.00
+0.94 0.96 0.98 0.99 1.00 1.00 1.00
+
+20
+
+0.13 0.31 0.44 0.63 0.79 0.93 0.97
+0.27 0.47 0.59 0.75 0.87 0.95 0.98
+0.36 0.56 0.67 0.81 0.90 0.97 0.98
+0.53 0.69 0.78 0.88 0.94 0.98 0.99
+0.71 0.81 0.87 0.93 0.97 0.99 0.99
+0.89 0.93 0.95 0.97 0.98 0.99 1.00
+0.96 0.97 0.98 0.99 0.99 0.99 1.00
+
+5
+10
+
+(c) EmrQA, Qwen (AUROC)
+
+3
+
+(b) NewsQA, Qwen (AUROC)
+100 50 20 10 5 3 1
+
+(a) CoQA, Qwen (AUROC)
+
+20
+
+Patience Window W
+
+5
+10
+
+Patience Window W
+
+3
+
+Heap Size M
+
+100 50 20 10 5 3 1
+
+0.80
+
+Patience Window W
+
+1
+
+Heap Size M
+
+100 50 20 10 5 3 1
+
+1
+
+0.51 0.65 0.71 0.75 0.76 0.77 0.77
+0.64 0.73 0.76 0.78 0.78 0.79 0.79
+0.69 0.76 0.78 0.79 0.79 0.79 0.79
+0.74 0.78 0.78 0.79 0.79 0.79 0.79
+0.74 0.76 0.76 0.76 0.76 0.76 0.76
+0.71 0.72 0.72 0.72 0.72 0.72 0.72
+0.71 0.71 0.71 0.71 0.71 0.71 0.71
+
+Patience Window W
+
+Patience Window W
+
+Patience Window W
+
+(d) CoQA, Qwen (τ /T )
+
+(e) NewsQA, Qwen (τ /T )
+
+(f) EmrQA, Qwen (τ /T )
+
+Figure 5: Plots (a)-(c) shows heatmaps of AUROC and Plots (d)-(f) shows mean token-consumption
+ratio (τ /T ) on the validation set. Each cell corresponds to a patience-rule configuration (M, W ),
+with M (top-M for token-level score aggregation) on the vertical axis and W (patience window) on
+the horizontal axis.
+
+Table 6: Dataset transferability of MetaUE. Diagonal entries are in-domain results included as a
+reference upper bound. Each metric is reported in the meanstd format.
+(a) Gemma4-4B
+Target →
+
+CoQA
+
+NewsQA
+
+emrQA
+
+Source ↓
+
+AUROC
+
+AURAC
+
+AUROC
+
+AURAC
+
+AUROC
+
+AURAC
+
+CoQA
+NewsQA
+emrQA
+
+0.709.004
+0.647.014
+0.567.004
+
+0.475.003
+0.439.009
+0.392.003
+
+0.613.002
+0.617.003
+0.563.005
+
+0.592.002
+0.599.002
+0.559.003
+
+0.598.003
+0.580.011
+0.719.003
+
+0.678.003
+0.661.008
+0.742.002
+
+(b) Qwen3.5-4B
+Target →
+
+CoQA
+
+NewsQA
+
+emrQA
+
+Source ↓
+
+AUROC
+
+AURAC
+
+AUROC
+
+AURAC
+
+AUROC
+
+AURAC
+
+CoQA
+NewsQA
+emrQA
+
+0.724.003
+0.719.008
+0.584.008
+
+0.564.001
+0.555.006
+0.486.005
+
+0.715.004
+0.717.002
+0.636.007
+
+0.789.002
+0.788.001
+0.750.004
+
+0.618.006
+0.545.004
+0.733.004
+
+0.518.004
+0.480.004
+0.588.002
+
+whether applying post-hoc temperature scaling to soften the logit-level distributions can restore the
+gap between these curves and recover the uncertainty signal.
+MetaUE degrades on Llama3, most notably on NewsQA. This drop is not simply inherited from a
+weaker teacher, since Logit Magnitude itself remains competitive there. We hypothesise two factors.
+(i) the frozen Qwen3-VL encoder may emphasise semantic features aligned with the latest LLMs
+rather than the Llama3; and (ii) NewsQA’s long passages induce generation-based uncertainty that
+the prompt embedding cannot recover.
+20
+
+Table 7: Model transferability of MetaUE. Rows are grouped by target LLM with the in-domain
+baseline and the target model. Each metric is reported in the meanstd format. Gemma denotes
+Gemma4-4B; Qwen denotes Qwen3.5-4B.
+CoQA
+
+NewsQA
+
+emrQA
+
+AUROC
+
+AURAC
+
+AUROC
+
+AURAC
+
+AUROC
+
+AURAC
+
+Qwen (in-domain)
+Gemma → Qwen
+
+0.724.003
+0.719.003
+
+0.564.001
+0.566.002
+
+0.717.002
+0.705.004
+
+0.788.001
+0.784.002
+
+0.733.004
+0.723.003
+
+0.588.002
+0.584.003
+
+Gemma (in-domain)
+Qwen → Gemma
+
+0.709.004
+0.675.004
+
+0.475.003
+0.450.002
+
+0.617.003
+0.576.004
+
+0.599.002
+0.574.003
+
+0.719.003
+0.657.004
+
+0.742.002
+0.710.002
+
+Table 8: Assessment of uncertainty estimation methods on Llama3. Bold values indicate the best
+performance.
+COQA
+
+LLM Size Method
+
+NewsQA
+
+emrQA
+
+AUROC ↑ AURAC ↑ Bal. Acc ↑ N-tok ↓ AUROC ↑ AURAC ↑ Bal. Acc ↑ N-tok ↓ AUROC ↑ AURAC ↑ Bal. Acc ↑ N-tok ↓
+
+8B
+
+0.751.005 0.499.007 0.675.005
+0.703.006 0.471.007 0.647.006
+
+18.9
+18.9
+
+0.728.008 0.532.010 0.666.007
+0.603.009 0.452.010 0.572.007
+
+29.0
+29.0
+
+0.616.003 0.518.003 0.600.003
+0.725.003 0.600.003 0.666.003
+
+27.4
+27.4
+
+Logit Magnitude 0.731.006 0.482.007 0.677.005
+MetaUE
+0.656.006 0.430.004 0.624.005
+
+18.9
+0
+
+0.727.008 0.530.010 0.673.007
+0.577.002 0.438.002 0.551.004
+
+29.0
+0
+
+0.655.003 0.552.003 0.618.003
+0.609.004 0.531.003 0.577.001
+
+27.4
+0
+
+0.773.005 0.516.007 0.696.005
+0.717.006 0.474.007 0.658.005
+
+23.1
+23.1
+
+0.757.007 0.633.008 0.683.007
+0.634.009 0.562.010 0.590.008
+
+27.2
+27.2
+
+0.631.003 0.518.003 0.607.003
+0.742.003 0.602.003 0.681.003
+
+20.4
+20.4
+
+Logit Magnitude 0.756.005 0.504.007 0.703.005
+MetaUE
+0.679.005 0.453.003 0.635.005
+
+23.1
+0
+
+0.739.008 0.634.007 0.687.007
+0.582.002 0.529.002 0.557.002
+
+23.1
+0
+
+0.651.003 0.548.003 0.612.003
+0.643.004 0.541.003 0.602.003
+
+20.4
+0
+
+LogTokU
+Self-Certainty
+
+LogTokU
+Self-Certainty
+
+Top 10% ROUGE-L
+
+Bottom 10% ROUGE-L
+
+Logit Magnitude
+
+Logit Magnitude
+
+80
+
+100
+
+70
+60
+0.0
+
+0.2 0.4 0.6 0.8
+Relative Token Position
+(a) Llama3-3B
+
+1.0
+
+Top 10% ROUGE-L
+
+Bottom 10% ROUGE-L
+
+Bottom 10% ROUGE-L
+
+80
+
+80
+
+75
+
+60
+
+70
+
+40
+20
+
+Top 10% ROUGE-L
+
+85
+Logit Magnitude
+
+Llama3
+
+3B
+
+65
+
+0.0
+
+0.2 0.4 0.6 0.8
+Relative Token Position
+
+(b) Gemma4-4B
+
+1.0
+
+0.0
+
+0.2 0.4 0.6 0.8
+Relative Token Position
+
+1.0
+
+(c) Qwen3.5-4B
+
+Figure 6: Token-level Logit Magnitude (mean ± std) at different relative token positions on emrQA.
+A larger separation between the two curves indicates a stronger discriminative signal.
+
+Broader Impacts
+This work contributes to more efficient assessment for LLM generation by reducing the amount of
+generation needed for uncertainty estimation. Earlier uncertainty signals may help users identify
+potentially unreliable outputs before they are acted upon, which is especially valuable in latencysensitive or high-stakes applications such as clinical decision support. More broadly, the proposed
+methods could support selective prediction, human-in-the-loop review, and resource-aware deployment by prioritising which generations require additional verification. At the same time, uncertainty
+scores should be interpreted as decision-support signals rather than guarantees of correctness. Responsible use requires clear communication of uncertainty, appropriate domain-specific calibration,
+and integration with human oversight when decisions may affect safety, health, or access to services.
+
+21
+
+

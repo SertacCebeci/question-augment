@@ -1,0 +1,48 @@
+---
+description: "When training traces contain the model's own wrong answers as examples, masking only the hallucinated stages from the loss keeps verification supervision without teaching the false facts."
+aliases: ["stage-level loss masking", "minimal masking", "span masking", "VeriFY", "step-level error masking"]
+sources: ["arxiv-2602-02018", "arxiv-2601-01426"]
+---
+# Stage-level hallucination loss masking
+
+A self-verification training trace has to show the model a wrong answer in order to teach it to catch one. Fine-tuning on the whole trace then also trains the model to produce that wrong answer. Altinisik et al. (2026) separate the two: every stage of the trace is labelled hallucinated or not, and hallucinated stages stay in the context but leave the loss.
+
+## Mechanism
+
+Each trace has an ordered set of stages: an initial answer, a verification question, an independent verification answer, a revised answer, and a consistency judgment that yields either the final answer or an abstention.[^c1] Hallucination flags come from gold labels for the original-query answers and from two judge models' consensus for the verification answer. These flags are not training targets.[^c2]
+
+Three regimes were compared. No Masking (NM) supervises the whole trace. Minimal Masking (MM) drops only the stages flagged hallucinated, so verification questions and consistency judgments stay supervised even when the first answer was wrong.[^c3] Span Masking (SM) drops the whole prefix up to the last hallucinated stage, which gives up more supervision for more safety.[^c4] The flagged stages "remain in the input context", so the model still learns to react to hallucinated content.[^c5]
+
+Measured on TriviaQA across Gemma, Llama and Qwen models: NM already recovers much of the recall that refusal training loses, but it shows elevated unnecessary abstention, especially for small models. The authors read that as evidence that unmasked supervision reinforces hallucinated content. MM and SM both beat NM across all families. SM tends to give slightly higher recall, MM slightly higher precision.[^c6] For example, Qwen2.5-3B's F1 was 81.3 under NM, 82.0 under MM and 80.7 under SM, so the ordering is not uniform in every cell (a count from the paper's Table 1, my reading).
+
+Traces were also filtered to those where correctness and consistency agree: a correct first answer judged consistent, or an incorrect one judged inconsistent. Conflicting traces were discarded.[^c7]
+
+The same mechanism appears in agent trajectories, where the flag is not a gold label or a judge but an error message from the execution environment. In SWE-Lego the agent response that an environment error follows is masked from the loss, using a regular expression over terminal output, while the full trajectory stays in context.[^c8] Errors from reproducing a bug or running test files are exempt from masking.[^c9] The authors credit step-level masking with more than two points of gain on SWE-bench Verified.[^c10] The text does not say why the exemption is needed; my guess is that a failing reproduction is the agent doing the task rather than erring at it (my inference). What transfers is the exclusion of flagged steps from the loss and the retained context; what does not is the claim that the flagged steps are factual errors, since a regex flag marks tool misuse, not wrong content. The flag's error rate is not measured in the text read.
+
+## Limits
+
+- Only factoid QA with gold answers was tested, mainly TriviaQA training, with HotpotQA, NQ-Open and FreshQA as transfer. The authors say the framework is not inherently restricted to factoid data, but that is not shown.
+- The NM versus masked gap is read by the authors as reinforcement of hallucinations. No direct measurement of reinforcement, such as the rate of reproducing the specific wrong facts, was seen in the slices I read.
+- Gaps between MM and SM are small and mixed across models.
+- The hallucination flags rely on judge models for the verification answers. Judge error is not analysed here.
+- The abstract says the code and checkpoints are released only on acceptance, so replication was not possible.
+- In the agent setting the masking gain is one row of a training-strategy ablation on SWE-bench Verified (Table 6), with no variance shown in the slices read. The paper's own table layout was hard to read in the text extraction, so the exact per-row numbers are not quoted here.
+
+## Related
+
+- [[selective-abstraction]] — the answer-or-abstain decision the consistency judgment feeds
+- [[abstention]] — what the trained model does when the judgment is inconsistent
+- [[refusal-shortcut-learning]] — a related failure of training models to refuse
+- [[process-outcome-consistency-verification]] — consistency between process and outcome as a check
+- [[unnecessary-abstention-aware-recall]] — the metric on which the masking regimes were compared
+
+[^c1]: arxiv-2602-02018 — "a verification question qv is generated by a more capable model, applying a controlled semantic transformation to the original query conditioned on a0"
+[^c2]: arxiv-2602-02018 — "Note that these hallucination signals are not used as direct supervision targets."
+[^c3]: arxiv-2602-02018 — "In particular, verification questions and consistency judgments remain fully supervised, even when the initial response is incorrect."
+[^c4]: arxiv-2602-02018 — "This regime prioritizes robustness to incorrect content at the cost of discarding additional supervision."
+[^c5]: arxiv-2602-02018 — "stages marked as hallucinated are excluded from the loss but remain in the input context"
+[^c6]: arxiv-2602-02018 — "Span Masking (SM) typically achieves slightly higher recall, while Minimal Masking (MM) attains marginally higher precision."
+[^c7]: arxiv-2602-02018 — "Traces that violate these conditions are discarded to avoid conflicting supervision."
+[^c8]: arxiv-2601-01426 — "we use regular expression to identify error messages provided by the terminal environment, and apply error masking to the corresponding agent response"
+[^c9]: arxiv-2601-01426 — "Crucially, errors stemming from reproducing bugs or executing test files are excluded from this masking process."
+[^c10]: arxiv-2601-01426 — "Empirical results in Table 6 demonstrate that step-level error masking improves model performance by over 2 points."

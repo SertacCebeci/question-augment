@@ -1,0 +1,1084 @@
+PersonalQ: Select, Quantize, and Serve Personalized
+Diffusion Models for Efficient Inference
+Qirui Wang1∗ , Qi Guo1∗ , Yiding Sun1 , Junkai Yang1 , Dongxu Zhang1 , Shanmin Pang1† , Qing Guo2†
+
+arXiv:2603.22943v1 [cs.AI] 24 Mar 2026
+
+1
+
+School of Software Engineering, Xi’an Jiaotong University, China
+2
+Nankai University, China
+
+Abstract—Personalized text-to-image generation lets users finetune diffusion models into repositories of concept-specific checkpoints, but serving these repositories efficiently is difficult for two
+reasons: natural-language requests are often ambiguous and can
+be misrouted to visually similar checkpoints, and standard posttraining quantization can distort the fragile representations that
+encode personalized concepts. We present PersonalQ, a unified
+framework that connects checkpoint selection and quantization
+through a shared signal—the checkpoint’s trigger token. Checkin performs intent-aligned selection by combining intent-aware
+hybrid retrieval with LLM-based reranking over checkpoint
+context and asks a brief clarification question only when multiple intents remain plausible; it then rewrites the prompt by
+inserting the selected checkpoint’s canonical trigger. Complementing this, Trigger-Aware Quantization (TAQ) applies triggeraware mixed precision in cross-attention, preserving triggerconditioned key/value rows (and their attention weights) while
+aggressively quantizing the remaining pathways for memoryefficient inference. Experiments show that PersonalQ improves
+intent alignment over retrieval and reranking baselines, while
+TAQ consistently offers a stronger compression–quality trade-off
+than prior diffusion PTQ methods, enabling scalable serving of
+personalized checkpoints without sacrificing fidelity.
+Index Terms—Personalized text-to-image generation, diffusion
+models, model serving, quantization.
+
+I. I NTRODUCTION
+Diffusion-based [1] text-to-image models [2] are commonly
+personalized via DreamBooth [3] and LoRA [4]. They produce
+personalized checkpoints: weights that respond to trigger tokens and reproduce a specific object, character, or style (e.g.,
+a user’s teddy bear bound to <bear-v4>).
+As users keep fine-tuning, they accumulate repositories with
+many checkpoints, including multiple versions and temporally
+separated variants of the same concept. At inference, users
+refer to these latent choices in natural language (e.g., “my most
+realistic, recently created bear on forest grass”). Selection is
+often manual or based on non-personalized retrieval [5], which
+can misroute prompts when concepts are visually similar or
+descriptions overlap (Figure 1a). Q1: How can we reliably
+map a user prompt to the intended checkpoint in a large
+repository?
+Even with the correct checkpoint, serving many personalized models is memory-intensive: each request may require
+loading its checkpoint weights onto the GPU, quickly exhausting capacity under concurrency (e.g., ∼4 GB GPU memory per
+* Equal contribution.
+† Corresponding authors.
+
+(a) Q1: No personalized checkpoint selection.
+My most realistic,
+recently created
+bear on forest
+grass.
+
+Global repository
+(all users contribute)
+bear bear bear bear
+-v1 -v2 -v3 -v4
+
+...
+
+Non-personalized selection methods
+Direct
+retrieval
+
+Inconsistent
+textual alignment.
+
+Reranker
+selection
+
+Poor intent
+match.
+
+(b) Q2: Existing quantization hurts personalization.
+DGQ (ICML 2025)
+
+SD 1.5
+General
+checkpoint
+
+(i.e., Stable
+Diffusion 1.5)
+
+<bear-v4>
+
+Personalized
+checkpoint
+
+TFMQ-DM (TPAMI 2025)
+
+Preserved
+“Original tokens”
+
+Prompt: bear on forest grass
+
+Degraded
+
+“Trigger tokens”
+
+Prompt: <bear-v4> on forest grass
+
+Fig. 1. Problem and overview. (a) Natural-language prompts must be
+routed to the correct personalized checkpoint; existing methods often misroute queries. (b) Standard post-training quantization degrades personalized
+concepts.
+
+model). Quantization helps, but standard PTQ methods [6]–
+[8] can disrupt the delicate pathways encoding personalized
+concepts, harming text–image alignment and identity fidelity
+(Figure 1b). Q2: How can we reduce GPU memory for serving
+personalized diffusion models while preserving personalization quality?
+We view these questions as two facets of a single problem: intent-aligned, memory-efficient serving of personalized
+diffusion repositories. We introduce PersonalQ, a unified
+framework that links checkpoint selection and quantization
+through a shared signal: trigger tokens. In PersonalQ, trigger
+tokens simultaneously (i) define the personalized concepts
+needed by our selection module, Check-in, and (ii) identify the
+most fragile pathways under quantization, which our TriggerAware Quantization (TAQ) module explicitly protects. In this
+way, the same signals that specify which checkpoint to serve
+guide what information must be preserved.
+We further introduce R EPO -P ROMPTS, a benchmark that
+mixes natural content descriptions with repository context cues
+to evaluate checkpoint selection in large personalized repositories. We construct a repository of 1,000 personalized textto-image checkpoints spanning 20 concept categories with 50
+temporal versions each, and curate R EPO -P ROMPTS with 500
+user-like queries, including single-match requests, ambiguous
+prompts that require clarification, and no-match cases. On
+this setup, Check-in achieves the highest LLM-judge Intent
+Score of 4.42 ± 0.51 and is consistently preferred by human
+raters, winning 89.1%, 85.7%, and 82.1% of pairwise comparisons against Random, Reranker, and Stylus, respectively. On
+automatic benchmarks (MS-COCO and PartiPrompts) across
+Stable Diffusion v1.5 and SDXL-Turbo, Trigger-Aware Quan-
+
+reranking approaches [14] use language model reasoning,
+our Check-in uniquely combines prompt understanding with
+personalized reasoning over checkpoint context to resolve
+ambiguous requests within resource constraints.
+Full Precision
+
+a
+
+sks
+
+sitting
+
+in
+
+the
+
+park
+
+(a) Token-wise sensitivity. Only the indicated token is quantized; all others stay full precision.
+
+(b) Averaged MSE error when quantizing each token.
+
+(c) Averaged CLIP-score drop when quantizing each token.
+
+Fig. 2. Trigger token (e.g., <sks>) is vulnerable under quantization.
+Following the token-specific sensitivity test in Sec. III-B, we quantize only
+the cross-attention Key/Value rows of the trigger token while keeping all other
+rows in full precision. Under 4-bit quantization, the trigger token exhibits
+much larger degradation than ordinary words, motivating our TAQ method.
+
+B. Post-training Quantization of Diffusion Models
+Post-training quantization (PTQ) reduces model size by
+using low-bit representations (e.g., 4-8 bits). Diffusion models
+are challenging to quantize because activation ranges vary
+significantly across timesteps [15]. Existing PTQ methods use
+timestep-adaptive strategies [6], [7], preserve outliers [8], or
+more broadly adapt computation across inputs [16]. Our TAQ
+method specifically targets personalization by maintaining
+high precision for trigger-token pathways while aggressively
+quantizing other components, preserving personalization quality under memory constraints.
+III. M ETHODOLOGY
+
+tization (TAQ) yields the strongest compression–quality tradeoff: it stays close to full precision in the 8-bit setting and
+remains robust under more aggressive activation quantization,
+while substantially reducing inference memory (4–8×) and
+computation in bit-operations (16–32×).
+In summary, this paper makes the following contributions:
+• We introduce Check-in, a module that selects a personalized checkpoint from a large repository using a naturallanguage request. It jointly reasons over visual descriptors
+and metadata (e.g., style cues and temporal/version references), supports clarification for ambiguous intents, and
+outputs a trigger-tokenized prompt targeted to the selected
+checkpoint.
+• We present Trigger-Aware Quantization (TAQ), a posttraining quantization method that preserves precision
+along trigger-token cross-attention pathways while aggressively quantizing remaining components, enabling
+smaller inference memory and 16–32× fewer bitoperations with strong fidelity under low-bit inference.
+• We release a 1,000-checkpoint personalized repository
+and the R EPO -P ROMPTS benchmark for context-aware
+selection. Together, they provide a controlled testbed for
+large-scale personalized checkpoint retrieval, clarification, and efficient serving under quantization.
+II. R ELATED WORK
+A. Checkpoint Selection and Management
+Existing selection methods like Stylus [5] match artistic
+styles for LoRA selection, while Mix-of-Show [9] merges
+adapters; broader efforts on efficient adaptation and multimodal visual representation learning [10], [11] likewise improve transferable. However, these methods assume users specify exact needs and ignore practical constraints like version
+history and memory limits. Standard retrieval methods (RAG
+[12], rerankers [13]) handle text well but struggle to reason
+over checkpoint context attributes and ambiguous requests
+like ”use the latest cat version with artistic style.” While
+
+We propose a two-part system for accurate selection and
+efficient, fidelity-preserving inference over repositories of personalized checkpoints: (A) Check-in reasons in a personalized
+checkpoint attribute space built from repository context and
+prompt semantics, maps generic nouns to trigger tokens,
+and resolves ambiguity (Sec.III-A); and (B) TAQ—TriggerAware quantization that preserves identity-critical pathways
+while quantizing the rest (Sec.III-B). Together, the components
+preserve user intent in checkpoint selection, maintain subject
+fidelity under quantization, and meet throughput and memory targets, enabling scalable personalized image generation.
+Figure 3 illustrates our pipeline.
+A. Check-in: Intent-aligned personalized checkpoint selection
+We assume a repository of pre-trained personalized checkpoints C = {c1 , . . . , cn }. Users provide a text-only prompt
+p (e.g., “my most realistic, recently created bear on forest
+grass”). The system internally selects a checkpoint c⋆ ∈ C
+that best matches the user’s intent, then rewrites the prompt
+to include the corresponding trigger token for downstream
+quantized inference (see Sec. III-B).
+For each checkpoint, the training pipeline renders a small
+set of visual previews. A vision–language model summarizes
+these previews into a text description Di . We encode Di into
+an embedding ei = E(Di ) and store {ei }ni=1 for candidate
+retrieval in Step 1.
+Accordingly, each checkpoint ci is represented as a context
+tuple ci = (Ti , Sisubj , Sistyle , Di , Mi ):
+• Ti : trigger tokens (e.g., <bear-v4>).
+subj
+• Si : subject types (e.g., bear).
+style
+• Si
+: style tags (e.g., realistic).
+• Di : a natural-language description summarizing the visual previews.
+• Mi : context attributes such as created_at and optional version identifiers.
+Step 1: Intent-aware hybrid retrieval. We build a sparse
+“checkpoint card” Xi = concat(Sisubj , Sistyle ), which provides
+
+(a) Check-in: Intent-aligned personalized checkpoint selection.
+
+Checkpoint repository
+
+v1
+
+v2
+
+v3
+
+...
+
+Personalized Reasoning
+
+{
+
+v4
+
+VLM
+
+“Checkpoint image shows [XXX...].”
+
+(b) TAQ: Cross-attention in quantization.
+
+"trigger_tokens": ["<bear-v4>"],
+"created_date": "2025-11-20T21:11:00",
+// Parsed intent from the user query and conversation
+"user_intent_parsing": {
+"style": "realistic",
+"checkpoint_preference": "recently_created"
+},
+// Simulated system-level defaults (used only for serving)
+"user_system_context": {
+"preferred_latency": "fast_preview",
+"preferred_quantization": "INT8_weights_INT8_activations"
+}
+
+Query
+
+Retrieve
+candidates
+
+Personalized
+reasoning
+
+...
+
+<v3>
+<v4>
+
+Clarify
+intent
+
+v1
+
+v3
+
+v4
+
+Final
+select “trigger tokens”
+<bear-v4>
+
+v4
+
+v_INT8: Values
+
+A_INT8:
+Attention weights
+
+Map
+tokens
+
+<v1>
+<v2>
+
+Q_INT8: Queries
+(from noisy latent)
+
+(from prompt)
+
+(from prompt)
+
+Encoder
+
+Description embeddings
+
+K_INT8: Keys
+
+Trigger
+tokens
+activates
+TAQ path
+
+v1
+
+fast_preview_quantized ✓
+
+...
+
+Quantized
+tokens (INT8)
+
+Prompt
+embedding
+
+Encoder
+
+“Original tokens”
+
+Prompt: “My most realistic, recently created bear on forest grass”
+
+Unquantized
+tokens (FP32)
+
+Fig. 3. PersonalQ. Input: prompt p and a personalized checkpoint repository. Output: image ŷ from low-bit inference. (a) Check-in selects a checkpoint
+c⋆ using prompt semantics and metadata, then rewrites p into p′ by inserting the checkpoint’s trigger (e.g., bear→<bear-v4>). (b) TAQ quantizes
+cross-attention with trigger-aware mixed precision: it keeps trigger-conditioned K/V rows (and their attention pathways) in higher precision and quantizes the
+remaining activations for efficient inference with preserved personalization.
+
+exact noun and style anchors. Given a user prompt p, we
+compute dense and sparse similarities jointly:
+#
+
+ " E(p)·ei
+simdense (p, ci )
+∥E(p)∥
+∥e
+∥
+i
+.
+=
+simsparse (p, ci )
+BM25(p, Xi )
+We then fuse the dense and sparse rankings with Reciprocal
+Rank Fusion (RRF) [17]:
+X
+1
+score(p, ci ) =
+,
+κ + rm (ci )
+m∈{dense,sparse}
+
+where rm (ci ) denotes the rank of ci under modality m and we
+use κ=60. We keep the top-K checkpoints (we use K=10)
+as candidates CK .
+From p and user-preferred inference settings, we construct
+a compact intent record that contains (i) user intent inferred
+from the current query and (ii) system context inferred from
+the user’s prior history. In our experiments, we do not use
+real user histories; instead, we simulate a fixed system context
+by assigning default values to each user, and use it only
+to configure serving behavior after checkpoint selection. If
+multiple plausible intents would lead to different checkpoints,
+we ask a short clarification using the most discriminative
+attribute(s), e.g., “Do you want a cute stuffed teddy bear,
+or a realistic brown bear?” The answer updates the intent
+record and resolves ambiguity without exposing checkpoint
+identifiers.
+Step 2: Personalized reasoning for reranking and serving. Given the intent record, we rerank the candidate set
+CK using only the user-intent fields: semantic/style match
+against each checkpoint description (Di ) and recency signals
+
+from Mi (e.g., created_at combined with query cues such
+as recently_created). The system-default fields are not
+used as selection constraints; instead, they determine how to
+serve the chosen checkpoint, such as selecting a fast-preview
+quantization setting. We implement this step with Gemini 2.5
+Flash [18].
+Step 3: Map original tokens to trigger tokens. After
+selecting checkpoint c⋆ , we rewrite the prompt to include its
+canonical trigger token. For each noun w in p that matches
+′
+the selected subject types Scsubj
+⋆ , we apply p = map(p, w, tc⋆ ),
+where tc⋆ ∈ Tc⋆ is the canonical token. For example, mapping
+bear to <bear-v4> yields “my most realistic, recently
+created <bear-v4> on forest grass”. We pass p′ to the
+downstream inference pipeline.
+B. Trigger-Aware Quantization: Addressing the Challenge
+Why personalized diffusion models are different. A
+personalized checkpoint binds a learned trigger token (e.g.,
+<sks>) to a user-specific concept. Depending on the tokenizer, this trigger may be represented by a contiguous span of
+sub-tokens with indices Isks (span S); all remaining text-token
+indices are Iother .
+In each cross-attention head, queries Q attend to text
+keys/values K, V (one row per text token), with attention
+
+√ 
+A = softmax QK⊤ / d ,
+where d is the key dimension. Therefore, the trigger influences
+the image only through the Isks rows of K and V (and the
+corresponding columns of A); distorting these rows directly
+degrades how the personalized concept is rendered.
+
+Token-specific quantization sensitivity. To isolate which
+tokens are most vulnerable, we run a surgical experiment:
+instead of quantizing the entire model, we quantize only the
+K and V rows corresponding to a chosen token (or trigger
+span) S to b bits (using a standard affine quantizer Qb ), while
+keeping all other parameters and activations in full precision.
+For each token i, we run inference with only token i quantized
+and obtain an output y(i,b) .
+Given a dissimilarity metric L (smaller is better), we define
+the per-token sensitivity as
+
+∆i (b) = L y(i,b) , y⋆ ,
+b ∈ {8, 4},
+(1)
+where y⋆ is the full-precision output. We use two complementary metrics: (1) image MSE to capture visible degradations
+(blur, artifacts), and (2) CLIP score [19] to detect semantic
+drift. Finally, we aggregate ∆i (b) over i ∈ Isks and i ∈ Iother .
+This reveals that trigger tokens are disproportionately sensitive
+to quantization, and Fig. 2 illustrates the procedure and shows
+that the trigger token <sks> is substantially more fragile than
+common words under 4-bit quantization.
+Trigger-Aware Quantization (TAQ). Motivated by this,
+TAQ adopts a selective strategy: preserve personalized trigger
+pathways in high precision and aggressively quantize the rest.
+We construct binary masks that mark trigger positions. For
+keys and values, MKV ∈ {0, 1}H×T ×1 is broadcast across
+batch, layers, and channels; for attention, MA ∈ {0, 1}B×N ×T
+marks the same token indices. Mask entries are 1 at trigger
+indices (i ∈ Isks ) and 0 elsewhere, and for multi-token triggers
+the entire span S is protected.
+TAQ then applies low-bit quantization Qa (·) only to nontrigger elements:
+
+TABLE I
+Q UANTITATIVE C OMPARISON . R ESULTS OF DIFFERENT QUANTIZATION
+METHODS FOR PERSONALIZED DIFFUSION CHECKPOINTS .
+Checkpoint
+Model
+
+Quantization
+Method
+
+Bit-width
+(W/A)
+
+BOPs
+(T)
+
+MS-COCO
+FID↓ CLIP↑
+
+Full Precision
+
+PartiPrompts
+FID↓ CLIP↑
+
+32/32
+
+893
+
+10.96
+
+0.315
+
+9.77
+
+0.336
+
+Q-Diffusion
+TFMQ-DM
+Stable
+DGQ
+Diffusion-v1-5 TAQ
+
+8/8
+8/8
+8/8
+8/8
+
+56
+56
+56
+56
+
+27.16
+24.34
+15.24
+11.03
+
+0.261
+0.279
+0.291
+0.297
+
+23.44
+21.66
+13.26
+10.49
+
+0.267
+0.299
+0.317
+0.327
+
+Q-Diffusion
+TFMQ-DM
+DGQ
+TAQ
+
+8/4
+8/4
+8/4
+8/4
+
+28
+28
+28
+28
+
+223.11
+167.22
+53.39
+38.84
+
+0.082
+0.138
+0.248
+0.264
+
+218.93
+173.51
+55.13
+36.91
+
+0.084
+0.141
+0.244
+0.265
+
+Full Precision
+
+32/32
+
+6930
+
+15.25
+
+0.305
+
+13.62
+
+0.312
+
+Q-Diffusion
+TFMQ-DM
+DGQ
+TAQ
+
+8/8
+8/8
+8/8
+8/8
+
+433
+433
+433
+433
+
+108.81
+78.63
+33.12
+22.18
+
+0.091
+0.151
+0.252
+0.293
+
+102.54
+72.81
+30.28
+21.37
+
+0.094
+0.164
+0.258
+0.294
+
+Q-Diffusion
+TFMQ-DM
+DGQ
+TAQ
+
+8/4
+8/4
+8/4
+8/4
+
+216
+216
+216
+216
+
+153.35
+111.59
+52.73
+34.15
+
+0.032
+0.145
+0.229
+0.254
+
+147.42
+107.91
+47.58
+30.46
+
+0.043
+0.138
+0.223
+0.227
+
+Stable
+Diffusion-XL
+Turbo
+
+In words, TAQ keeps all trigger-related K/V rows and their
+attention weights in full precision, while quantizing all remaining text and image pathways. This preserves personalized
+concepts with minimal quality loss, yet still achieves substantial memory savings for deployment.
+
+LoRA DreamBooth with AdamW, 1024 resolution, learning
+rate 3 × 10−5 , 400 steps, seed 42, and prior preservation.
+Repo-Prompts dataset. We introduce R EPO -P ROMPTS,
+a dataset of 500 natural-language queries targeting
+specific checkpoints (e.g., “the April dog model”, “latest
+version”, “anime style from last week”). Each instance
+contains instance_id, query, candidate_pool,
+and
+ground_truth
+with
+checkpoint_id,
+requires_clarification, and no_match. The
+dataset contains 350 single-match, 100 ambiguous, and 50
+no-match queries.
+Baselines. For quantization, we compare Q-Diffusion [6],
+TFMQ-DM [7], and DGQ [8]. These baselines do not perform
+intent-aligned checkpoint selection; all methods use the same
+checkpoints and prompts. For selection, we include Random,
+Reranker (Qwen3-Reranker-4B [20]), and Stylus [5].
+Weight quantization. We also evaluate weight PTQ using
+the same pipeline across methods, reporting Adaround [21]
+and BRECQ [22]. All methods use the same 64 MS-COCO
+captions for calibration and reconstruction; block reconstruction is applied to both transformer and residual blocks using
+intermediate outputs from the same set.
+
+C. Experimental Setup
+
+D. Quantitative Results
+
+Personalized checkpoints. We build a repository of
+1,000 personalized Stable Diffusion checkpoints over
+20 concept categories and 50 temporal versions per
+category (v1–v50): <dog>, <cat>, <person>, <bear>,
+<horse>, <car>, <toy>, <watch>, <bag>, <chair>,
+<house>, <building>, <bridge>, <flower>,
+<tree>, <mountain>, <painting>, <drawing>,
+<logo>, and <shoe>. Each checkpoint is tuned from
+3–5 concept images. For SD1.5, we use DreamBooth with
+AdamW, 512 resolution, learning rate 5 × 10−6 , 600 steps,
+seed 42, and prior preservation; for SDXL-Turbo, we use
+
+Automatic Benchmarks. We evaluate on MS-COCO and
+PartiPrompts using CLIP [19] and FID [23]. We also report
+computation via BOPs [24], BOPs = FLOPs · bw · ba ,
+where bw and ba are weight/activation bit-widths. Table I
+shows TAQ achieves the best quality–compression trade-off
+across backbones and datasets: at 8-bit it remains close to full
+precision, and at 4-bit activations it degrades far less than prior
+PTQ baselines. Similar gains hold for SDXL-Turbo, where
+TAQ avoids common failure cases.
+LLM as a Judge. We use an LLM judge to score
+checkpoint–request alignment on subject, style, temporal, and
+
+K̃ = MKV ⊙ K + (1 − MKV ) ⊙ Qa (K),
+Ṽ = MKV ⊙ V + (1 − MKV ) ⊙ Qa (V),
+
+(2)
+
+Q̃ = Qa (Q),
+Â = MA ⊙ A + (1 − MA ) ⊙ Qa (A).
+
+(3)
+
+Fig. 4. Qualitative comparison. (a) SDXL-Turbo with W8A8 (8-bit weights / 8-bit activations). (b) Stable Diffusion v1.5 with W8A8 (8-bit weights / 8-bit
+activations); Each column corresponds to a different personalized checkpoint.
+
+TABLE II
+C HECKPOINT SELECTION . I NTENT S CORE : MEAN±STD LLM- JUDGE
+RATING (1–5; TEMP =0) OVER SUBJECT / STYLE / TEMPORAL / CONTEXT.
+H UMAN P REFERENCE (p): FRACTION OF PAIRWISE VOTES WHERE
+Check-in IS PREFERRED OVER THE METHOD
+(p = Pr(Check-in ≻ METHOD); HIGHER IS BETTER ). W E SET p = 1.00
+FOR Check-in.
+
+Selection Method
+
+Intent Score↑
+
+Human Pref. p ↑
+
+Random
+Reranker
+Stylus
+Check-in
+
+2.14 ± 0.82
+3.21 ± 0.76
+3.68 ± 0.69
+4.42 ± 0.51
+
+0.891
+0.857
+0.821
+1.000
+
+context fit (1–5 Likert each [25]), and report Intent Score as
+their average. To reduce positional bias [26], we also score
+with flipped option orders and keep only consistent outcomes.
+Table II shows Check-in achieves the highest Intent Score.
+Human Evaluations. Using 500 prompts from R EPO P ROMPTS, MS-COCO, and PartiPrompts, we compare Checkin vs each baseline (3 comparisons), totaling 1500 comparisons; each comparison is rated by one rater (randomly assigned), and we report Intent-Alignment Win Rate (preference
+for Check-in). As shown in Table II, Check-in wins 89.1% vs.
+Random, 85.7% vs. Reranker, and 82.1% vs. Stylus.
+E. Ablation Study
+Effect of Check-in. Table III ablates two Check-in modules:
+(1) intent-aware retrieval and (2) personalized reasoning.
+Clarification is constant across all variants and is invoked
+only when the intent parser detects ambiguity. Hybrid retrieval
+combines sparse matches over Si (type constraints) with
+dense similarity from Di , yielding a stronger candidate set.
+Personalized reasoning provides a consistent boost by enforcing temporal preferences and version cues. Image-quality
+metrics change little across variants, since Check-in primarily
+improves checkpoint selection rather than generation quality.
+Effect of trigger-aware quantization (TAQ). Table IV
+shows one clear takeaway: separating trigger tokens matters.
+Without separation, quantization tends to damage fidelity, and
+
+TABLE III
+E FFECT OF Check-in COMPONENTS . R ETR .: INTENT- AWARE RETRIEVAL ;
+R SN .: PERSONALIZED REASONING . C LARIFICATION IS ENABLED
+ON - DEMAND IN ALL VARIANTS ( HELD CONSTANT ).
+
+Retr. Rsn. Intent Score↑ FID↓ CLIP↑
+×
+×
+✓
+✓
+
+×
+✓
+×
+✓
+
+3.21
+3.99
+4.19
+4.42
+
+11.74
+11.61
+11.23
+11.03
+
+0.289
+0.291
+0.293
+0.297
+
+TABLE IV
+E FFECT OF TAQ AND TRIGGER - TOKEN SEPARATION .
+Bits(W/A)
+
+Quantizer
+
+Separate trigger tokens
+
+FID↓
+
+CLIP↑
+
+8/8
+8/8
+8/8
+8/8
+
+Linear
+Linear
+Logarithmic
+Logarithmic
+
+×
+✓
+×
+✓
+
+15.83
+11.04
+17.62
+13.67
+
+0.292
+0.298
+0.287
+0.294
+
+8/4
+8/4
+8/4
+8/4
+
+Linear
+Linear
+Logarithmic
+Logarithmic
+
+×
+✓
+×
+✓
+
+54.12
+44.53
+56.21
+38.22
+
+0.245
+0.262
+0.249
+0.265
+
+the logarithmic quantizer is especially unstable. Once trigger
+tokens are handled separately, quantization becomes much
+more reliable, and at lower precision the logarithmic quantizer
+benefits the most and delivers the best results.
+Component synergy. Table V confirms the two parts
+solve different problems. Check-in primarily improves intent
+alignment by selecting more appropriate checkpoints, while
+TAQ primarily preserves image fidelity under quantization.
+This complementarity becomes most important at aggressive
+compression, where using both is the most robust option.
+MLLM Backbones. To deploy on memory-constrained
+devices, we evaluated all backbones via API, avoiding local
+GPU requirements. We tested Qwen2.5-VL-72B, GPT-4o, and
+Gemini 2.5 Flash. Table VI shows similar intent scores across
+backbones, but latency differs: Gemini 2.5 Flash has the
+lowest end-to-end time, mainly due to faster reasoning and
+clarification, making it our preferred backbone under latency
+constraints.
+
+TABLE V
+E FFECT OF COMPONENT SYNERGY.
+Bits(W/A) Check-in TAQ Intent score↑ FID↓ CLIP↑
+8/8
+
+×
+✓
+×
+✓
+
+×
+×
+✓
+✓
+
+3.22
+4.39
+3.21
+4.42
+
+15.22
+14.81
+11.74
+11.03
+
+0.286
+0.294
+0.289
+0.297
+
+8/4
+
+×
+✓
+×
+✓
+
+×
+×
+✓
+✓
+
+3.21
+4.40
+3.23
+4.41
+
+54.12
+51.31
+39.53
+38.22
+
+0.245
+0.253
+0.261
+0.265
+
+TABLE VI
+MLLM LATENCY ABLATION . AVERAGE NUMBER OF USER TURNS PER
+REQUEST ( INCLUDING THE INITIAL PROMPT ); > 1 IMPLIES
+CLARIFICATION .
+Performance
+Inference time (s)
+Backbone
+Intent Score Retrieve Reason Clarify Generation (W8A8) End-to-End Multi-turn
+GPT-4o (API)
+4.42
+1.3
+20.31
+11.17
+12.31
+45.09
+2.1
+Gemini 2.5 Flash (API)
+4.38
+1.3
+16.54
+8.28
+12.31
+38.43
+2.3
+Qwen2.5-VL-72B (API)
+4.35
+1.3
+25.89
+10.35
+12.31
+49.85
+2.5
+
+IV. C ONCLUSION
+We introduced PersonalQ, a unified system for selecting
+and serving personalized diffusion models under tight memory budgets. Our Check-in performs intent-aligned checkpoint selection by combining hybrid retrieval with personalized reasoning and brief clarification, then rewrites prompts
+with the selected checkpoint’s trigger token. Complementing
+this, TAQ preserves trigger-conditioned cross-attention pathways while quantizing the remaining components, enabling
+memory-efficient inference with strong personalization fidelity.
+Together, these components support scalable deployment of
+large personalized checkpoint repositories without compromising intent alignment or generation quality.
+R EFERENCES
+[1] Jascha Sohl-Dickstein, Eric Weiss, Niru Maheswaranathan, and Surya
+Ganguli, “Deep unsupervised learning using nonequilibrium thermodynamics,” in International conference on machine learning. PMLR, 2015,
+pp. 2256–2265.
+[2] Dustin Podell, Zion English, Kyle Lacey, Andreas Blattmann, Tim
+Dockhorn, Jonas Müller, Joe Penna, and Robin Rombach, “Sdxl:
+Improving latent diffusion models for high-resolution image synthesis,”
+arXiv preprint arXiv:2307.01952, 2023.
+[3] Nataniel Ruiz, Yuanzhen Li, Varun Jampani, Yael Pritch, Michael
+Rubinstein, and Kfir Aberman, “Dreambooth: Fine tuning text-to-image
+diffusion models for subject-driven generation,” in Proceedings of the
+IEEE/CVF conference on computer vision and pattern recognition, 2023,
+pp. 22500–22510.
+[4] Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi
+Li, Shean Wang, Lu Wang, Weizhu Chen, et al., “Lora: Low-rank
+adaptation of large language models.,” ICLR, vol. 1, no. 2, pp. 3, 2022.
+[5] Michael Luo, Justin Wong, Brandon Trabucco, Yanping Huang, Joseph E
+Gonzalez, Zhifeng Chen, Ruslan Salakhutdinov, and Ion Stoica, “Stylus:
+Automatic adapter selection for diffusion models,” Advances in Neural
+Information Processing Systems, vol. 37, pp. 32888–32915, 2024.
+[6] Xiuyu Li, Yijiang Liu, Long Lian, Huanrui Yang, Zhen Dong, Daniel
+Kang, Shanghang Zhang, and Kurt Keutzer, “Q-diffusion: Quantizing
+diffusion models,” in Proceedings of the IEEE/CVF International
+Conference on Computer Vision (ICCV), October 2023, pp. 17535–
+17545.
+[7] Yushi Huang, Ruihao Gong, Jing Liu, Tianlong Chen, and Xianglong
+Liu, “Tfmq-dm: Temporal feature maintenance quantization for diffusion
+models,” in Proceedings of the IEEE/CVF Conference on Computer
+Vision and Pattern Recognition, 2024, pp. 7362–7371.
+
+[8] Hyogon Ryu, NaHyeon Park, and Hyunjung Shim, “Dgq: Distributionaware group quantization for text-to-image diffusion models,” arXiv
+preprint arXiv:2501.04304, 2025.
+[9] Yuchao Gu, Xintao Wang, Jay Zhangjie Wu, Yujun Shi, Yunpeng Chen,
+Zihan Fan, Wuyou Xiao, Rui Zhao, Shuning Chang, Weijia Wu, et al.,
+“Mix-of-show: Decentralized low-rank adaptation for multi-concept
+customization of diffusion models,” Advances in Neural Information
+Processing Systems, vol. 36, pp. 15890–15902, 2023.
+[10] Yiding Sun, Jihua Zhu, Haozhe Cheng, Chaoyi Lu, Zhichuan Yang, Lin
+Chen, and Yaonan Wang, “Align then adapt: Rethinking parameterefficient transfer learning in 4d perception,” IEEE Trans. Multimedia,
+2026.
+[11] Yiding Sun, Haozhe Cheng, Chaoyi Lu, Zhengqiao Li, Minghong Wu,
+Huimin Lu, and Jihua Zhu, “Hyperpoint: Multimodal 3d foundation
+model in hyperbolic space,” Pattern Recognit., vol. 173, pp. 112800,
+2026.
+[12] Yun Zhu, Jia-Chen Gu, Caitlin Sikora, Ho Ko, Yinxiao Liu, Chu-Cheng
+Lin, Lei Shu, Liangchen Luo, Lei Meng, Bang Liu, and Jindong Chen,
+“Accelerating inference of retrieval-augmented generation via sparse
+context selection,” 2024.
+[13] Yubo Ma, Yixin Cao, YongChing Hong, and Aixin Sun, “Large language
+model is not a good few-shot information extractor, but a good reranker
+for hard samples!,” arXiv preprint arXiv:2303.08559, 2023.
+[14] Tong Niu, Shafiq Joty, Ye Liu, Caiming Xiong, Yingbo Zhou, and Semih
+Yavuz, “Judgerank: Leveraging large language models for reasoningintensive reranking,” arXiv preprint arXiv:2411.00142, 2024.
+[15] Changyuan Wang, Ziwei Wang, Xiuwei Xu, Yansong Tang, Jie Zhou,
+and Jiwen Lu, “Towards accurate post-training quantization for diffusion
+models,” in Proceedings of the IEEE/CVF Conference on Computer
+Vision and Pattern Recognition, 2024, pp. 16026–16035.
+[16] Dongxu Zhang, Hongqiang Lin, Yiding Sun, Pengyu Wang, Qirui Wang,
+Ning Yang, and Jihua Zhu, “Not all queries need deep thought:
+Coficot for adaptive coarse-to-fine stateful refinement,” arXiv preprint
+arXiv:2603.08251, 2026.
+[17] Gordon V Cormack, Charles LA Clarke, and Stefan Buettcher, “Reciprocal rank fusion outperforms condorcet and individual rank learning
+methods,” in Proceedings of the 32nd international ACM SIGIR
+conference on Research and development in information retrieval, 2009,
+pp. 758–759.
+[18] Gemini Team, Rohan Anil, Sebastian Borgeaud, Jean-Baptiste Alayrac,
+Jiahui Yu, Radu Soricut, Johan Schalkwyk, Andrew M Dai, Anja Hauth,
+Katie Millican, et al., “Gemini: a family of highly capable multimodal
+models,” arXiv preprint arXiv:2312.11805, 2023.
+[19] Alec Radford, Jong Wook Kim, Chris Hallacy, Aditya Ramesh, Gabriel
+Goh, Sandhini Agarwal, Girish Sastry, Amanda Askell, Pamela Mishkin,
+Jack Clark, et al., “Learning transferable visual models from natural
+language supervision,” in International conference on machine learning.
+PmLR, 2021, pp. 8748–8763.
+[20] Yanzhao Zhang, Mingxin Li, Dingkun Long, Xin Zhang, Huan Lin,
+Baosong Yang, Pengjun Xie, An Yang, Dayiheng Liu, Junyang Lin,
+et al., “Qwen3 embedding: Advancing text embedding and reranking
+through foundation models,” arXiv preprint arXiv:2506.05176, 2025.
+[21] Markus Nagel, Rana Ali Amjad, Mart Van Baalen, Christos Louizos,
+and Tijmen Blankevoort, “Up or down? adaptive rounding for posttraining quantization,” in International Conference on Machine Learning. PMLR, 2020, pp. 7197–7206.
+[22] Yuhang Li, Ruihao Gong, Xu Tan, Yang Yang, Peng Hu, Qi Zhang,
+Fengwei Yu, Wei Wang, and Shi Gu, “Brecq: Pushing the limit of
+post-training quantization by block reconstruction,” arXiv preprint
+arXiv:2102.05426, 2021.
+[23] Maximilian Seitzer, “pytorch-fid: Fid score for pytorch,” 2020.
+[24] Haibao Yu, Qi Han, Jianbo Li, Jianping Shi, Guangliang Cheng, and Bin
+Fan, “Search what you want: Barrier panelty nas for mixed precision
+quantization,” in European Conference on Computer Vision. Springer,
+2020, pp. 1–16.
+[25] Jiawei Gu, Xuhui Jiang, Zhichao Shi, Hexiang Tan, Xuehao Zhai,
+Chengjin Xu, Wei Li, Yinghan Shen, Shengjie Ma, Honghao Liu, et al.,
+“A survey on llm-as-a-judge,” arXiv preprint arXiv:2411.15594, 2024.
+[26] Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan Zhuang, Zhanghao Wu, Yonghao Zhuang, Zi Lin, Zhuohan Li, Dacheng Li, Eric Xing,
+et al., “Judging llm-as-a-judge with mt-bench and chatbot arena,”
+Advances in neural information processing systems, vol. 36, pp. 46595–
+46623, 2023.
+
+

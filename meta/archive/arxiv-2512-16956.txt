@@ -1,0 +1,6877 @@
+SpIDER: Spatially Informed Dense Embedding Retrieval for Software Issue
+Localization
+Shravan Chaudhari1,2
+Jiajun Cao3
+
+Rahul Thomas Jacob3
+Shihab Rashid3
+
+Mononito Goswami3
+
+arXiv:2512.16956v3 [cs.SE] 31 Aug 2026
+
+Christian Bock3
+
+Abstract
+Retrieving code functions, classes or files
+relevant to a user query, bug report or feature request from large codebases is a fundamental challenge for Large Language Model
+(LLM)-based coding agents. Agentic approaches typically employ sparse methods
+like BM25 or dense embedding strategies to
+identify semantically relevant units. While
+dense embedding approaches can outperform
+BM25 by large margins, both ignore the
+graph-structured characteristics of the codebase. To address this, we propose SpIDER
+(Spatially Informed Dense Embedding Retrieval), a dense retrieval approach that integrates LLM-based reasoning with graph-based
+exploration of the codebase. We further introduce SpIDER-Bench4 , a graph-structured
+benchmark curated from SWE-PolyBench,
+SWEBench-Verified and Multi-SWEBench,
+spanning Python, Java, JavaScript and TypeScript repositories. SpIDER’s graph-based candidate expansion attaches a structural reason
+for inclusion to each surfaced function (its seed
+and the edge type linking them), making the
+candidate set auditable while keeping the retrieval budget fixed. The graph is built from
+per-repository syntax trees, so it can be constructed on-demand at the start of a developer
+session rather than precomputed offline. Empirical results show that SpIDER consistently
+improves dense retrieval Recall@20 across every language and benchmark in SpIDER-Bench:
+by at least 13% relative (+0.05 to +0.12 absolute) along containment edges, rising to at least
+1
+
+Department of Computer Science, Johns Hopkins University, Baltimore, MD, USA
+2
+Work done while interning at AWS AI Labs
+3
+AWS AI Labs, Seattle, WA, USA
+4
+Dataset is available at https://huggingface.co/
+datasets/AmazonScience/SpIDER-Bench, and code at
+https://github.com/amazon-science/SpIDER.
+
+27% relative (+0.11 to +0.19 absolute) once
+call edges are explored.
+
+1
+
+Introduction
+
+Recent work has demonstrated the potential
+of agents powered by Large Language Models (LLMs) for automated bug repair and feature
+implementation within large-scale software repositories (Yang et al., 2024; Gauthier, 2024; Xia et al.,
+2024). A critical prerequisite for effective code
+generation is the precise identification of relevant
+code units such as functions, classes, or files. This
+code localization task is a foundational yet difficult
+challenge, particularly at the fine-grained function
+level (Jimenez et al., 2024; Rashid et al., 2025;
+Zan et al., 2025; Chen et al., 2025). Poor retrieval
+directly compromises generated code, leading to
+incorrect or incomplete fixes and increased computational cost. It is therefore essential not only for
+autonomous patch generation but also for developer
+oversight: when retrieval choices are unexplained,
+reviewers cannot verify what the agent considered,
+eroding trust.
+Current approaches to code localization fall into
+two primary categories. Some methods exploit
+graph representations of code repositories alongside the reasoning capabilities of LLMs (Ouyang
+et al., 2025; Chen et al., 2025; Jiang et al., 2025),
+mostly using sparse retrieval such as BM25 (Robertson et al., 1994) to identify relevant graph nodes
+or subgraphs for agent exploration. Others train
+bimodal encoders with a contrastive objective to
+align dense embeddings of code units with issue
+descriptions (Fehr et al., 2025; Reddy et al., 2025),
+ranking units by embedding similarity.
+These existing approaches face three critical limitations. First, contrastive learning-based retrieval
+methods overlook the structural context of code
+
+Figure 1: SpIDER workflow. SpIDER augments standard dense embedding retrieval with graph-aware spatial
+exploration and LLM-based reasoning to improve function-level code localization under a fixed retrieval (K). Given
+an issue description, all functions are first ranked by semantic similarity, and the top-K candidates are retrieved.
+The top-C (C<K) functions serve as centers (func 1) for structured neighborhood exploration along contains edges
+in the code graph, where neighboring functions within d hops are considered if they also rank within the top-N
+semantically (funcs 2,3,4). An LLM then filters these candidates to identify functions that are likely relevant but
+under-ranked by semantic similarity alone (func3). The selected neighbors are inserted immediately below their
+corresponding centers while discarding an equal number of bottom ranked functions in the initial top-K list, thereby
+increasing coverage of structurally related buggy functions without increasing K. Further algorithmic details are
+provided in Section A.4 (Algorithm 1).
+
+modules within a repository when ranking them
+(Reddy et al., 2025; Zhang et al., 2024; Suresh
+et al., 2025). We observe that buggy code modules are often spatially proximate within the codebase (e.g., in the same file or in neighboring functions), and top-ranked entities retrieved via dense
+semantic similarity frequently reside near the actual buggy modules; relying exclusively on semantic similarity may thus overlook relevant candidates
+with marginally lower embedding scores. Second,
+existing methods have been primarily evaluated on
+Python (Chen et al., 2025; Fehr et al., 2025), particularly SWEBench-Lite, SWEBench-Verified, and
+LocBench (Jimenez et al., 2024; Chen et al., 2025),
+leaving their performance on other languages
+largely underexplored. Third, function-level retrieval, the most challenging granularity compared
+to class-level and file-level retrieval (Rashid et al.,
+2025; Reddy et al., 2025; Chen et al., 2025), remains largely understudied.
+These limitations matter most in interactive,
+developer-in-the-loop settings, where retrieval
+must run cheaply on a developer’s active repository at session start and expose its choices to the
+reviewer. Function-level granularity matches how
+developers reason about edits, and SpIDER’s graph-
+
+based candidate expansion attaches a structural reason for inclusion to each surfaced function (its position relative to a top-ranked seed) rather than
+only an embedding score. The code graph is built
+on-demand from per-repository syntax trees, avoiding the offline corpus-wide preprocessing of many
+graph-based pipelines.
+To address these limitations, we introduce
+SpIDER, a simple graph-aware dense retrieval strategy for function-level code localization. SpIDER
+incorporates spatial locality as a complementary signal to semantic similarity, jointly exploiting code content and repository structure within
+a fixed retrieval budget. Our focus is on retrieval methods that augment downstream tasks
+such as precise localization and automated patch
+generation for GitHub-style issues. For evaluation across multiple programming languages, we
+also introduce SpIDER-Bench, covering Python,
+Java, JavaScript, and TypeScript repositories
+from SWEBench-Verified, SWE-PolyBench, and
+Multi-SWEBench.
+Our primary contributions are: (1) We propose SpIDER, a simple graph-aware dense retrieval strategy combining semantic content and
+code structure to identify the most relevant
+
+functions under a fixed retrieval budget. (2)
+We introduce SpIDER-Bench, a heterogeneous
+graph-structured benchmark for multi-language
+code localization, built from GitHub repositories in SWEBench-Verified, SWE-PolyBench,
+and Multi-SWEBench covering Python, Java,
+JavaScript, and TypeScript, with source code as
+node-level features. We validate SpIDER against
+existing dense retrievers and the sparse BM25 baseline across all four languages.
+
+2
+
+Related Work
+
+Code Retrieval and Software Issue Localization Code retrieval refers to identifying code
+locations responsible for a software issue. Classical approaches are rooted in information retrieval,
+leveraging lexical or semantic similarity to rank
+candidate code snippets. Consequently, many existing systems rely on sparse retrievers such as
+BM25 (Robertson et al., 1994). While BM25 indexing is cheaper than dense embedding generation
+and vector similarity search, it typically underperforms when rich semantic representations are available (Reddy et al., 2025; Fehr et al., 2025).
+Recent dense retrieval approaches propose bimodal encoder models to encode both code chunks
+as well as issue embeddings in an aligned latent
+space (Zhang et al., 2024; Suresh et al., 2025; Feng
+et al., 2020; Guo et al., 2021). However, these
+models are typically pretrained on generic natural language–to–code objectives, which leads to
+suboptimal performance for issue-driven code retrieval. To address this gap, Fehr et al. (2025) and
+Reddy et al. (2025) introduce bimodal encoders
+fine-tuned on GitHub-style issue resolution datasets
+such as SWEBench (Jimenez et al., 2024), resulting in improved alignment between issue and code
+representations. Despite these gains, SWEBench
+is limited to Python repositories, and no comparably large multilingual dataset currently exists
+to support training such encoders across diverse
+programming languages. Consequently, as realworld codebases span multiple languages, these
+fine-tuned dense retrievers exhibit degraded performance under domain shifts, reducing their robustness and reliability. We argue that combining LLM-based reasoning with structural signals
+from code graphs complements semantic similarity and reduces sensitivity to surface-level language artifacts. Augmenting dense retrievers with
+these components helps mitigate spurious corre-
+
+lations and improves generalization. We empirically validate this hypothesis on multilingual benchmarks, including SWE-PolyBench (Rashid et al.,
+2025), Multi-SWEBench (Zan et al., 2025), and
+SWEBench-Verified (Jimenez et al., 2024).
+LLM-based retrieval methods Recent work
+has shown that large language models (LLMs) are
+highly effective at localizing and resolving GitHubstyle software issues, largely due to their strong
+reasoning capabilities (Kang et al., 2024; Xia et al.,
+2024; Luo et al., 2024; Örwall, 2024). In the
+context of code retrieval, Xia et al. (2024) introduce a simple hierarchical localization strategy
+driven directly by an LLM, whereas Ouyang et al.
+(2025) employ an intermediate sparse BM25 retrieval stage to identify relevant files prior to code
+generation. Similarly, Chen et al. (2025) leverage
+inverted BM25 indexing to match issue-description
+keywords with node identifiers or code chunks.
+Both Ouyang et al. (2025) and Chen et al. (2025)
+further enable LLM-guided traversal of local subgraphs around the retrieved files or nodes, using
+edges defined by their respective code graph representations. In contrast, Reddy et al. (2025) focus
+on re-ranking densely retrieved code chunks using
+LLMs, with the goal of enhancing semantic retrieval through reasoning. Although this approach
+improves retrieval performance, it does not exploit the structural signals encoded in code graphs.
+We aim to bridge this gap by jointly leveraging
+LLM reasoning, semantic embeddings, and the additional contextual information captured by code
+graphs, thereby improving overall retrieval effectiveness.
+Code Graph Construction Several recent approaches leverage explicit code graph representations to expose structural information that is otherwise difficult to capture with purely textual or
+embedding-based methods. The specific utility
+of such graphs depends critically on how nodes
+and relations are defined. For example, Ouyang
+et al. (2025) construct graphs at the line-of-code
+level, where nodes correspond to variable or module definitions and references, and edges encode
+invokes and contains relationships. While this design enables fine-grained structural reasoning, it
+scales poorly with repository size, leading to dense
+and complex graphs that are challenging for LLMbased agents to traverse at inference time.
+To improve scalability, other works adopt coarser
+graph abstractions. Jiang et al. (2025) propose two
+complementary graph types: a module call graph,
+
+connecting files via imports, and a function call
+graph, linking functions and classes through invokes and inherits relations. More recently, Chen
+et al. (2025) introduce a unified graph formulation in which nodes represent functions, classes,
+files, or directories, and edges capture contains’, invokes’, imports’, and ‘inherits’ relationships. This
+design strikes a balance between expressivity and
+tractability, enabling structural reasoning at multiple hierarchical levels while remaining amenable to
+LLM-guided traversal. Following this line of work,
+we adopt their graph construction, as it naturally
+supports retrieval at the file, class, and function
+levels—granularities that are common across programming languages and well aligned with multilingual code retrieval settings.
+
+3
+
+Problem Definition and Notations
+
+We formalize the function-level code retrieval
+task and its evaluation, applicable to any retrieval
+method operating over structured code representations.
+Given a codebase and an issue description Q, the
+goal is to retrieve the top-K functions that are most
+likely to require edits to resolve the issue. We represent the codebase as a graph G = (V, E) with n
+nodes, where V = {vi }ni=1 denotes the set of code
+entities and E ⊆ V × V encodes structural relations.
+Each node v ∈ V corresponds to a code entity, such
+as a function, class, file, or directory; and edges
+represent relationships of types contains, invokes,
+imports, and inherits. Let V ∗ = {vi∗ }m
+i=1 ⊆ V denote the ground-truth set of m relevant function
+nodes for issue Q.
+Scoring Function A bi-modal encoder F(·)
+maps both code units and issue descriptions to a
+shared embedding space. The relevance score of
+node v for issue Q is:
+sQ (v) = cos F(v), F(Q)
+
+
+
+Baseline Dense Retrieval Standard dense embedding retrieval (DER) ranks all nodes by their
+relevance scores and returns the top-K candidates:
+SK (Q) := arg topK sQ (v)
+v∈V
+
+where arg topK returns K nodes with top-K
+scores sQ (·). We use notation SK and SK (Q) interchangeably.
+
+4
+
+Methodology
+
+4.1
+
+Building Code Graphs
+
+For a given codebase, we construct a code graph
+using only files written in the primary programming
+language (the language comprising the majority
+of the repository). Files in other languages are
+ignored to simplify construction; e.g., in a Python
+repository, we consider only Python source files.
+We follow the graph schema proposed by Chen
+et al. (2025), where each node represents a code entity—function, class, file, or directory—and edges
+encode structural relations of types imports, invokes, contains, and inherits. For Python, we use
+the built-in ast module5 to parse source files and
+extract syntax trees. For Java, JavaScript, and TypeScript, we rely on Tree-sitter6 for syntax parsing.
+Graph construction proceeds by traversing the
+repository hierarchy. Directory nodes are added to
+enable navigation across the project structure. File
+nodes are included only if they contain at least one
+function or class definition; files containing solely
+metadata or configuration are ignored. Function
+and class nodes, along with the edges connecting
+them, are extracted from the corresponding syntax
+trees. While directory nodes do not store code content, all other node types include their associated
+source code.
+Constructing accurate graphs for Java,
+JavaScript and TypeScript presents additional
+challenges due to the flexible ways in which
+functions and classes can be declared/implemented.
+For example, class definitions and method
+implementations may be split across multiple
+locations or files. We explicitly handle such
+language-specific cases using Tree-sitter to ensure
+faithful graph construction. Refer App. A.6.
+Although the graph contains multiple node types,
+we focus on retrieving functions, the most granular and most challenging unit. In SWE-PolyBench,
+67% of instances involve function-level edits
+(avg. 2.78 edits/instance) versus 1.42% class-only
+(Rashid et al., 2025), and accurate function retrieval
+naturally helps file-level localization as well.
+Table 1 reports dataset statistics, including the
+proportion of retained instances per language. For
+function-level retrieval, we exclude instances involving only file- or class-level edits. Similarly, for
+class- and file-level retrieval, we ignore instances
+with edits exclusively at other granularities.
+5
+6
+
+https://docs.python.org/3/library/ast.html
+https://github.com/tree-sitter
+
+Table 1: SpIDER-Bench data statistics after graph construction (GT = ground truth). Function-level edits
+dominate across benchmarks; edit frequency and localization difficulty vary substantially across languages.
+
+4.2
+
+Python
+% Insts. with Avg. GT edits
+GT edits
+per inst.
+
+Java
+% Insts. with Avg. GT edits
+GT edits
+per inst.
+
+JavaScript
+% Insts. with Avg. GT edits
+GT edits
+per inst.
+
+TypeScript
+% Insts. with Avg. GT edits
+GT edits
+per inst.
+
+GT Type
+
+Original Dataset
+
+Function
+
+SWE-PolyBench
+Multi-SWEBench
+SWEBench-Verified
+
+85.93
+N/A
+89.00
+
+3.73
+N/A
+1.82
+
+70.30
+59.54
+N/A
+
+5.52
+2.46
+N/A
+
+53.98
+81.74
+N/A
+
+1.98
+3.88
+N/A
+
+29.63
+27.68
+N/A
+
+2.68
+2.29
+N/A
+
+Class
+
+SWE-PolyBench
+Multi-SWEBench
+SWEBench-Verified
+
+75.38
+N/A
+74.00
+
+2.9
+N/A
+1.40
+
+87.27
+81.68
+N/A
+
+3.07
+1.58
+N/A
+
+20.45
+9.55
+N/A
+
+1.37
+1.06
+N/A
+
+19.07
+3.13
+N/A
+
+1.91
+1.57
+N/A
+
+File
+
+SWE-PolyBench
+Multi-SWEBench
+SWEBench-Verified
+
+99.50
+N/A
+100.00
+
+1.91
+N/A
+1.24
+
+100.00
+97.71
+N/A
+
+3.2
+1.56
+N/A
+
+58.31
+98.60
+N/A
+
+1.68
+2.37
+N/A
+
+55.97
+70.54
+N/A
+
+2.00
+5.08
+N/A
+
+Leveraging Code Graph via SpIDER
+
+Figure 1 provides a high-level overview of SpIDER,
+with algorithmic details in Algorithm 1 (Section A.4). Given an issue description Q and a codebase represented as graph G, SpIDER retrieves the
+top-K functions most likely to require modification. The framework extends to class- and file-level
+retrieval by aggregating code chunks when full contexts exceed the LLM budget (see Section A.7).
+SpIDER’s design is motivated by the observation
+that, in instances requiring multiple edits, relevant
+functions tend to be structurally proximate in the
+graph due to call dependencies and containment
+relationships. Dense semantic retrieval provides
+broad coverage but often misses “near-miss” cases
+where the correct function lies close structurally
+but not semantically to top-ranked candidates.
+Semantic Retrieval We first compute the
+baseline dense retrieval SK (Q) as defined in Section 3. Additionally, we compute SN (Q) containing the top-N nodes (N > K) to constrain neighborhood exploration.
+Seed Selection From SK (Q), we select the
+top-C ranked nodes as seed centers for graph exploration:
+CQ := v ∈ SC (Q)
+
+apart. While we use ‘contains’ edges to capture
+hierarchical structure, the framework can incorporate other edge types like ‘invokes’, ‘imports’, and
+‘inherits’.
+Two-Stage Neighbor Filtering To control
+computational cost while maintaining quality, candidates are filtered in two stages. Stage 1 (Semantic
+Filtering): We restrict neighbors to those also appearing in the top-N candidate pool:
+CˆQ := Γd (CQ ) ∩ SN (Q)
+This ensures exploration remains within semantically relevant regions of the graph. Stage 2 (LLMbased Selection): An LLM selector L evaluates
+each candidate u ∈ CˆQ , receiving the source code
+content and issue description as context; the full
+prompt is in Section A.5. The LLM returns a binary relevance decision L(u) ∈ {0, 1}. Note that
+seed centers CQ are always retained in UQ , where:
+UQ := u ∈ CˆQ | L(u) = 1 ∪ CQ
+
+where C ≤ K. A seed anchors a local neighborhood search.
+Neighborhood Exploration For each seed,
+we perform breadth-first search up to depth d along
+‘contains’ edges, collecting structurally proximate
+function nodes. Formally, the d-hop neighborhood
+is:
+
+Output Construction To maintain a fixed retrieval budget of K, newly selected neighbors replace the lowest-ranked non-center nodes. Only
+candidates the baseline missed consume budget, so
+let P := (Γd (CQ ) ∩ SN (Q)) \ SK be the new proposals and R ⊆ SK the protected items, namely
+the seed centers and any accepted candidate already in SK . Writing A ⊆ P for the set admitted
+after Stage-2 selection, deduplication and capacity truncation, J = |A| ≤ K − |R|, and DJ for
+the J lowest-ranked members of SK \ R, the final
+retrieval set is
+
+Γd (CQ ) := {u ∈ V | distG (u, CQ ) ≤ d}
+
+LLM
+SK
+(Q) := (SK \ DJ ) ∪ A.
+
+where distG (u, CQ ) denotes the shortest-path distance from u to any node in CQ . Two functions
+within the same class are 2 hops apart; functions
+in different classes across separate files are 4 hops
+
+Seed centers already lie in SK and displace nothing.
+Hyperparameters SpIDER introduces four
+hyperparameters: retrieval budget K, number of
+
+(1)
+
+seed centers C, exploration depth d, and semantic
+filtering threshold N . We analyze their effects in
+Section 5.3.
+Let η := E|A ∩ V ∗ |/E|A| denote the admitted
+precision and τ := E|DJ ∩ V ∗ |/E|DJ | the frontier
+relevance, both defined whenever E|A| > 0.
+Proposition 4.1 (Exact exchange). Write
+LLM ) − Rec@K(S ).
+∆Rec@K := Rec@K(SK
+K
+For every realization of Q, the labels and the
+policy,
+|A ∩ V ∗ | − |DJ ∩ V ∗ |
+, (2)
+m
+and hence, at fixed m and with no further assumptions,
+∆Rec@K =
+
+E[∆Rec@K] > 0 ⇐⇒ η > τ.
+
+(3)
+
+SpIDER is therefore a strict exchange. A promotion helps only if the admitted function is more
+likely to be edited than the item it displaces, so
+the comparison is against the eviction frontier τ ,
+the relevance of a rank-K dense hit, not the repository base rate. Graph proximity can clear that
+base rate and still fall below τ . Since Equation (3)
+is an equivalence, neither locality nor a selector
+with α > β implies improvement on its own. The
+selector still governs the outcome, because η is determined by α and β composed with the top-N gate
+(Section A.2.3), but it must move η past τ . Section A.2 proves these statements, treats Acc@K,
+and models how candidate quality decays with distance, yielding conditions for a finite useful radius
+and an LLM-pivotal regime; Section A.9 reports
+edge types where it fails.
+
+5
+
+Experiments and Results
+
+We organize our experiments around three research questions. RQ1 (Exploiting Graph Structure): Can incorporating structural relationships
+between code modules improve retrieval beyond
+what semantic similarity alone achieves? RQ2
+(Cross-Language Robustness): Do graph-aware
+retrieval strategies generalize across programming
+languages and codebases of varying complexity?
+RQ3 (Efficiency and Practicality): Can they
+achieve improved coverage without excessive computational cost or LLM invocations?
+5.1
+
+Experimental Setup
+
+Datasets
+We focus on challenging multifunction edits and evaluate retrieval across multiple languages. We use SWEBench-Verified,
+
+SWE-PolyBench, and Multi-SWEBench, with
+patched functions as ground truth, and following Suresh et al. (2025) exclude instances without
+function-level modifications. The evaluation spans
+Python, Java, TypeScript, and JavaScript repositories, assessing both the robustness of our approach and the generalization of baselines across
+languages and codebase complexities.
+Evaluation Metrics Given a query Q and a
+retrieved set S(Q) of size K, we evaluate retrieval
+quality using Recall@K and Acc@K:
+|V ∗ ∩ S(Q)|
+,
+|V ∗ |
+Acc@K = I[V ∗ ⊆ S(Q)],
+
+Recall@K =
+
+where V ∗ denotes the ground-truth patched functions. Acc@K is the stricter metric, equal to 1 only
+when all of V ∗ is in the top-K set. Both directly
+capture coverage under a fixed retrieval budget; we
+additionally report MRR in App. A.8.
+Hyperparameters We analyze hyperparameters C, d, N , and K in Section 5.3. Following prior work (Reddy et al., 2025; Fehr et al.,
+2025), we fix K = 20 across datasets to ensure
+fair comparison with baselines sensitive to this
+choice (e.g., embedding-based retrieval with LLM
+reranking). The remaining SpIDER hyperparameters are selected via grid search on the Python
+split of SWE-PolyBench, yielding C = 5, d = 4,
+N = 500; we hold these constant across all experiments to avoid overfitting, and App. A.11 verifies
+from the per-language sweeps that this configuration is at or near each language’s optimum. Our
+ablations further examine how these parameters affect performance and practical considerations such
+as LLM context length and invocation budget. We
+use Claude Sonnet 4 with temperature 0.1 for
+consistent and reproducible evaluation; results with
+open-source Qwen-Coder variants as the LLM filter are reported in Table 23.
+Baselines We compare SpIDER against representative state-of-the-art retrieval approaches spanning both dense and sparse methods. For dense
+retrieval, we consider SweRankEmbed-Small ZS
+and CodeSAGE-Small ZS, which are widely used
+embedding-based models for software issue localization and code retrieval (Reddy et al., 2025;
+Zhang et al., 2024). As a sparse retrieval baseline,
+we include BM25 (Robertson et al., 1994).
+Since CodeSAGE-Small ZS is not trained for
+GitHub-style problem-solving tasks, we addition-
+
+JavaScript
+0.6
+Accuracy
+
+0.43
+
+0.4 0.33
+0.37
+
+0.48
+0.41
+
+0.52
+
+0.55
+
+0.56
+
+0.45
+
+0.48
+
+0.49
+
+Python
+
+0.32
+
+0.2 0.27
+
+0.25
+
+0.36
+0.30
+
+0.37
+
+0.39
+
+0.33
+
+0.35
+
+TypeScript
+0.42
+
+0.42
+
+0.37
+
+0.39
+0.22
+
+0.26
+
+0.14
+
+0.29
+
+0.30
+
+0.18
+
+0.21
+
+0.22
+
+0.26 0.18
+0.19
+
+0.32
+
+0.35
+
+0.37
+
+0.38
+
+0.31
+
+0.34 0.25
+0.26
+
+0.15
+0.12
+
+0.28
+
+Java
+
+0.24
+
+0.26
+
+0.26
+
+0.27
+
+0.28
+
+0.22
+
+0.23
+
+0.24
+
+0.25
+
+0.25
+
+0.33
+
+0.35
+
+0.36
+
+0.37
+
+0.38
+
+0.30
+
+0.31
+
+0.33
+
+0.33
+
+10
+20
+K (Top-K Retrieved)
+
+30
+
+0.0
+
+Recall
+
+0.6
+0.4
+
+0.50
+0.39
+
+0.43
+
+0.55
+0.48
+
+0.60
+
+0.63
+
+0.64
+
+0.52
+
+0.55
+
+0.57
+0.39
+
+0.33
+
+0.31
+
+0.2
+0.0
+
+0.43
+0.36
+
+0.47
+0.40
+
+0.48
+0.42
+
+0.51
+
+0.52
+
+0.45
+
+0.47
+0.29
+0.20
+0.16
+
+10
+20
+K (Top-K Retrieved)
+SweRank-SpIDER
+
+30
+
+10
+20
+K (Top-K Retrieved)
+BM25
+
+30
+
+0.20
+
+0.25
+
+0.29
+
+10
+20
+K (Top-K Retrieved)
+
+CodeSage-PEFT
+
+CodeSage
+
+30
+SweRank
+
+0.30
+
+Random
+
+Figure 2: Function-level retrieval performance on SWE-PolyBench. SWERankEmbed-Small+SpIDER consistently
+outperforms dense and sparse baselines in Accuracy and Recall across all languages and retrieval budgets K. Shaded
+envelopes indicate standard deviations estimated via bootstrapping with 1000 draws.
+
+ally evaluate a parameter-efficiently fine-tuned variant using LoRA (Hu et al., 2022) on 2000 instances
+from three repositories in the SWEBench training
+set, denoted as CodeSAGE-Small-PEFT. This adaptation budget is small, so CodeSAGE-Small-PEFT
+remains a comparatively weak dense baseline;
+the load-bearing dense comparison throughout is
+SweRankEmbed-Small ZS, which is trained on
+roughly 3300 repositories. Fehr et al. (2025) did
+not release their model or code, preventing direct
+comparison; LocAgent (Chen et al., 2025) is evaluated only on SWEBench-Verified and the Python
+split of SWE-PolyBench (tables 11 and 12) due to
+its iterative LLM-driven exploration. Beyond these,
+App. A.10 compares SpIDER against a lexical grep
+baseline and the OpenHands agent (Wang et al.,
+2025) at matched K, and App. A.14 explains why
+other graph-based localizers are excluded.
+5.2
+
+Results
+
+Leveraging code graphs improves retrieval
+Table 2 demonstrates the benefit of incorporating code graph structure across Python,
+TypeScript, JavaScript, and Java repositories
+from SWE-PolyBench, Multi-SWEBench, and
+SWEBench-Verified at K = 20. Fig. 2 confirms the trend on SWE-PolyBench as K varies:
+SweRankEmbed-Small + SpIDER consistently outperforms all baselines across languages and K values. The zero-shot SweRankEmbed-Small, trained
+on roughly 3,300 Python repositories, also remains
+competitive on non-Python codebases, outperforming BM25 and CodeSAGE in both zero-shot and
+PEFT settings. Across datasets, SpIDER improves
+
+Recall@20 and Acc@20 of SweRankEmbed-Small
+by at least 13% and 14% relative (minimum over
+language/dataset cells in Table 2; corresponding
+absolute gains range from +0.05 to +0.12 points),
+indicating that graph-aware retrieval yields substantial gains even when paired with already strong
+semantic embeddings. MRR@20 is comparable to
+DER but drops in a few cells where the first groundtruth function is a non-center node; we discuss this
+and the underlying mechanism in App. A.8.
+Which edge types carry the structural signal
+Table 3 ablates the edge type used for
+neighborhood exploration on SWE-PolyBench at
+K = 20, N = 500, C = 5. Expansion along
+‘invokes’ edges outperforms ‘contains’-only expansion in every language, and combining the two
+is best overall, raising the minimum relative Recall@20 gain over DER across the four languages
+from 13% to 27% (Python 0.42 → 0.60, Java
+0.31 → 0.42, JavaScript 0.52 → 0.66, TypeScript 0.29 → 0.48). This ordering follows the
+locality analysis in Table 6: Java combines the
+highest invoke-connectivity (0.63) with the lowest
+dense top-100 coverage (29%), and is correspondingly the split where ‘contains’-only exploration
+cannot structurally reach cross-file ground truth.
+‘imports’ and ‘inherits’, by contrast, add nothing
+over DER outside Python, since no inherits edge
+in our schema is incident to a function node and
+imports edges touch function nodes only in Python.
+The gains are not free: routing through ‘invokes’
+raises per-instance token consumption by roughly
+an order of magnitude. We therefore retain ‘con-
+
+Table 2: Main result. Across all embedding models and languages, SpIDER consistently improves Recall and
+Accuracy over dense retrieval alone; gains are preserved and often amplified after LLM reranking. K = 20,
+N = 500, C = 5, d = 4; best per embedding model in light blue. SpISR is the spatially informed sparse retriever
+analogous to SpIDER. KDE plots in Figs. 4, 5; confidence intervals in Table 13.
+SWE-PolyBench
+Language
+
+Model
+
+Retrieval
+
+SweRankEmbed-Small ZS
+CodeSAGE-Small ZS
+Python
+CodeSAGE-Small-PEFT
+BM25
+
+Retrieval Only
+Recall@20 Accuracy@20
+
+SWEBench-Verified
+
+Retrieval + LLM reranker
+Recall@3 Accuracy@3
+
+Retrieval Only
+Recall@20 Accuracy@20
+
+SpIDER
+DER
+SpIDER
+DER
+SpIDER
+DER
+SpISR
+SR
+
+0.49
+0.42
+0.27
+0.21
+0.37
+0.29
+0.33
+0.31
+
+0.40
+0.35
+0.21
+0.17
+0.27
+0.20
+0.26
+0.24
+
+0.44
+0.38
+0.23
+0.19
+0.32
+0.26
+0.30
+0.27
+
+0.36
+0.31
+0.18
+0.16
+0.25
+0.20
+0.23
+0.22
+
+0.61
+0.54
+0.30
+0.21
+0.55
+0.43
+0.45
+0.38
+
+0.56
+0.49
+0.27
+0.19
+0.49
+0.38
+0.41
+0.34
+
+SpIDER
+DER
+SpIDER
+DER
+SpIDER
+DER
+SpISR
+SR
+
+0.36
+0.31
+0.23
+0.15
+0.28
+0.21
+0.16
+0.15
+
+0.27
+0.24
+0.17
+0.10
+0.18
+0.14
+0.10
+0.10
+
+0.25
+0.24
+0.16
+0.11
+0.20
+0.17
+0.12
+0.12
+
+0.17
+0.16
+0.09
+0.07
+0.14
+0.11
+0.08
+0.09
+
+0.37
+0.32
+0.21
+0.15
+0.31
+0.23
+0.23
+0.22
+
+0.28
+0.24
+0.19
+0.13
+0.25
+0.17
+0.17
+0.17
+
+SpIDER
+DER
+SpIDER
+DER
+SpIDER
+DER
+SpISR
+SR
+
+0.60
+0.52
+0.38
+0.26
+0.55
+0.45
+0.46
+0.36
+
+0.52
+0.45
+0.32
+0.21
+0.48
+0.38
+0.39
+0.29
+
+0.43
+0.41
+0.30
+0.22
+0.41
+0.36
+0.36
+0.31
+
+0.37
+0.34
+0.25
+0.17
+0.35
+0.30
+0.30
+0.25
+
+0.39
+0.31
+0.17
+0.09
+0.32
+0.25
+0.21
+0.14
+
+0.30
+0.23
+0.12
+0.06
+0.24
+0.18
+0.14
+0.10
+
+SpIDER
+DER
+SpIDER
+DER
+SpIDER
+DER
+SpISR
+SR
+
+0.35
+0.29
+0.16
+0.10
+0.25
+0.19
+0.11
+0.07
+
+0.28
+0.21
+0.10
+0.06
+0.18
+0.13
+0.09
+0.05
+
+0.27
+0.25
+0.14
+0.09
+0.22
+0.18
+0.10
+0.07
+
+0.21
+0.19
+0.09
+0.06
+0.16
+0.12
+0.07
+0.05
+
+0.52
+0.40
+0.33
+0.26
+0.30
+0.19
+0.32
+0.24
+
+0.42
+0.32
+0.26
+0.21
+0.26
+0.15
+0.27
+0.21
+
+Multi-SWEBench
+SweRankEmbed-Small ZS
+CodeSAGE-Small ZS
+Java
+CodeSAGE-Small-PEFT
+BM25
+SweRankEmbed-Small ZS
+CodeSAGE-Small ZS
+JavaScript
+CodeSAGE-Small-PEFT
+BM25
+SweRankEmbed-Small ZS
+CodeSAGE-Small ZS
+TypeScript
+CodeSAGE-Small-PEFT
+BM25
+
+Table 3: Ablation on the edge type used for neighborhood exploration, on SWE-PolyBench with
+SweRankEmbed-Small at K = 20, N = 500, C = 5 (single fixed-seed run). “Tok” is the average total (input + output) LLM tokens per instance; DER issues no LLM call, hence 0. Best Recall@20 and Acc@20 per
+language in light blue. For the denser invokes graph we cap exploration at the 100 highest-ranked neighbors per
+query before Stage-2 filtering, to bound the token budget. inherits expansion is degenerate at function granularity:
+no inherits edge in our schema is incident to a function node in any of the four languages, so it can surface no
+function beyond DER. We report the Python run as empirical confirmation, since it returns exactly the DER set, and
+mark the remaining languages N/A, since the configuration is inapplicable rather than unmeasured.
+Recall@20
+
+Python
+Acc@20
+
+Tok
+
+Recall@20
+
+Java
+Acc@20
+
+Tok
+
+DER (no exploration)
+
+0.42
+
+0.35
+
+0
+
+0.31
+
+0.24
+
+0
+
+0.52
+
+0.45
+
+0
+
+0.29
+
+0.21
+
+0
+
+contains / d=4
+invokes / d=2
+imports / d=2
+inherits / d=2
+
+0.49
+0.56
+0.44
+0.42
+
+0.40
+0.50
+0.38
+0.35
+
+12.9K
+109.9K
+7.9K
+6.8K
+
+0.36
+0.42
+0.31
+N/A
+
+0.27
+0.30
+0.24
+N/A
+
+7.8K
+87.4K
+4.6K
+N/A
+
+0.60
+0.65
+0.52
+N/A
+
+0.52
+0.58
+0.45
+N/A
+
+14.9K
+55.5K
+5.2K
+N/A
+
+0.35
+0.47
+0.29
+N/A
+
+0.28
+0.41
+0.21
+N/A
+
+8.3K
+92.7K
+4.9K
+N/A
+
+contains / d=4 + invokes / d=2
+
+0.60
+
+0.52
+
+110.1K
+
+0.42
+
+0.29
+
+90.1K
+
+0.66
+
+0.58
+
+60.8K
+
+0.48
+
+0.42
+
+98.6K
+
+Exploration edges / depth
+
+tains’ as the default configuration reported in Table 2, and treat ‘invokes’ as the setting of choice
+when the token budget allows. Gains from structural edges are significant under paired per-instance
+tests. Paired bootstrap (B=10,000) and two-sided
+paired permutation agree in every cell, giving
+p < 0.01 on Recall@20 in all four languages,
+with Java Acc@20 under ‘contains’ alone the single exception, resolved once ‘invokes’ edges are
+added. Meanwhile ‘imports’ and ‘inherits’ are uniformly non-significant (App. Table 20). App. A.12
+works through cases where each edge type recovers
+
+JavaScript
+Recall@20 Acc@20
+
+Tok
+
+TypeScript
+Recall@20 Acc@20
+
+Tok
+
+ground truth that dense retrieval misses, and where
+the Stage-2 filter errs.
+Retrieval strategy is agnostic to downstream
+rerankers To validate that SpIDER is independent of downstream localization components, we
+pair every retrieval method with an LLM reranker
+following Reddy et al. (2025), which selects the
+top-3 functions from K = 20 candidates. As
+shown in Table 2, the improved top-20 coverage
+from SpIDER consistently translates into higher Recall@3 and Acc@3 after reranking, indicating that
+retrieval-stage gains are preserved and often ampli-
+
+Table 4: Hands-tied downstream code generation.
+mini-swe-agent is restricted to the top-K retrieved
+functions with no open grep, and run once with
+DER and once with SpIDER at the same budget on
+a SWEBench-Verified subset of SpIDER-Bench. Resolve rate is the fraction of instances whose generated
+patch passes; best per K in light blue. Tokens are the
+total per instance for DER and for the better SpIDER variant at that K.
+K
+5
+10
+15
+20
+
+DER
+0.584
+0.611
+0.626
+0.650
+
+Resolve rate ↑
+contains/4 invokes/2
+0.623
+0.681
+0.638
+0.673
+
+0.611
+0.658
+0.646
+0.677
+
+Tokens/inst. ↓
+DER
+best SpIDER
+102.6K
+96.4K
+122.3K
+185.3K
+
+62.2K
+81.5K
+97.6K
+87.6K
+
+fied downstream.
+Improved retrieval translates to better code
+generation We test whether retrieval gains survive to the end task under a hands-tied protocol:
+mini-swe-agent (Yang et al., 2024) is restricted
+to the top-K retrieved functions with no open grep,
+so the retrieved set is the only thing that varies.
+Running it once with DER and once with SpIDER at
+matched budget (Table 4), the better SpIDER variant resolves more instances than DER at every K,
+with the largest margin at K=10 (+7.0 pp, 18 additional resolved instances). The margin compresses
+at larger K, where a wider budget lets DER include
+more of the ground truth on its own. The effect is
+strongest on efficiency: SpIDER with contains expansion at K=10 resolves more than DER at K=20
+(0.681 vs. 0.650) while using 44% of the tokens
+(81.5K vs. 185.3K), because it reaches comparable
+coverage at a smaller budget. App. A.8 reports the
+complementary setting in which the agent keeps
+full tool access.
+5.3
+
+Ablation Experiments
+
+We ablate four hyperparameters of SpIDER to guide
+downstream users: the number of seed centers C,
+the retrieval budget K, the BFS exploration depth
+d, and the primary neighborhood filtering threshold
+N.
+Number of Top C Centers Each center triggers one LLM call, so larger C trades LLM cost
+for broader exploration. App. Table 19 shows performance saturates at C = 5 for N = 500, d = 4,
+K = 20.
+Retrieval Budget K Performance improves
+monotonically with K (Figures 2 and 6), since a
+larger pool raises the chance of including relevant
+
+nodes; K can be selected to match downstream
+task constraints.
+Exploration Depth d Larger d widens the
+candidate neighborhood and improves Recall@20
+and Acc@20 (App. Table 9), at the cost of more
+LLM tokens during filtering. Input tokens grow
+8.2× from d = 4 to d = 8 on Python (App. Table 8), so the deployed d = 4 is a budget
+choice rather than a measured optimum, which
+Section A.2.6 makes precise: pricing inference per
+candidate moves the useful radius inward.
+Primary Neighborhood Filtering Threshold
+N Higher N admits more neighbors before LLM
+refinement, with saturation around N = 300 for
+C = 3, d = 4, K = 20 (Table 14); like d, N can
+be tuned to the LLM token budget.
+Stage-2 Filtering Disabling the selector promotes every Stage-1 neighbor and abandons the
+fixed budget, so its recall bounds the reach of graph
+expansion rather than anything achievable at K.
+SpIDER captures 79–89% of that reach while returning only K functions (App. Table 21), so the
+selector’s admission rate α, not the graph, is what
+limits η. Removing the filter would not help, since
+at fixed K the sign is set by η > τ .
+Takeaways Settings C = 5, d = 4, N =
+500, K = 20 give strong performance across
+SWE-PolyBench at a per-query cost of C=5 LLM
+calls at ∼ 3–6K input tokens each (Tables 8
+and 14); SpIDER sits roughly two orders of magnitude below iterative LLM-agent localization (Table 11) and one LLM round-trip slower than embedding retrieval (App. A.14).
+
+6
+
+Conclusion
+
+We introduced SpIDER, a graph-aware dense retrieval framework that augments embedding similarity with structural neighborhood exploration
+and LLM-based filtering over per-repository code
+graphs. Through rigorous empirical analysis, we
+demonstrated its efficacy and efficiency over existing methods in the challenging setting of functionlevel retrieval. SpIDER’s exploration depth can be
+efficiently controlled by adjusting the subgraph
+size during retrieval, maintaining robust performance even with compact subgraph configurations
+for token-constrained applications. While we pioneer retrieval evaluation for non-Python languages
+such as Java, JavaScript and TypeScript, SpIDER
+can be readily adapted to others as it builds on the
+Tree-sitter library.
+
+Limitations
+SpIDER extracts a graph from the primary language of each repository; files in other languages are ignored, leaving cross-language edits out of reach. Neighborhood exploration is
+configurable over edge types, but the configuration reported throughout Table 2 uses ‘contains’
+edges alone; the edge-type comparison in Table 3,
+which finds ‘invokes’ expansion stronger in every language, was run on SWE-PolyBench only,
+so the SWEBench-Verified and Multi-SWEBench
+cells do not reflect it. Inheritance-based proximity is not exploited at all, since no ‘inherits’
+edge is incident to a function node under our
+schema. Stage 2 filtering depends on an LLM
+selector, so cost and latency are bounded by perinstance LLM invocations (C calls per query), and
+the selector rather than the graph is what now
+bounds achievable recall within the candidate pool:
+SpIDER reaches 79–89% of the unfiltered neighborhood’s recall (Table 21), so the remainder is lost
+to filtering rather than to unreachable structure;
+App. A.12 characterizes the two failure modes,
+an over-restrictive selector that discards ground
+truth reached from a tangential seed and an overpermissive one that lets neighbor flooding evict
+it. For very large K or d, token consumption
+grows accordingly (see Tables 9 and 14). A more
+fundamental ceiling comes from the initial dense
+ranker: 38% of SWEBench-Verified instances and
+51%/62%/22% of SWE-PolyBench Python/Java/JavaScript instances contain at least one groundtruth function ranked beyond the top-500 (Table 6), and these targets fall outside SpIDER’s candidate pool SN (Q) and cannot be recovered regardless of graph structure. Finally, evaluation
+focuses on Python, Java, JavaScript and TypeScript
+from SWE-PolyBench, SWEBench-Verified and
+Multi-SWEBench; performance on other languages
+or proprietary monorepos remains to be characterized.
+
+William Evans, Claire Kenyon, Yuval Peres, and
+Leonard J. Schulman. 2000. Broadcasting on trees
+and the Ising model. The Annals of Applied Probability, 10(2).
+Fabio James Fehr, Prabhu Teja S, Luca Franceschi, and
+Giovanni Zappella. 2025. CoRet: Improved retriever
+for code editing. In Proceedings of the 63rd Annual
+Meeting of the Association for Computational Linguistics (Volume 2: Short Papers), pages 775–789,
+Vienna, Austria. Association for Computational Linguistics.
+Zhangyin Feng, Daya Guo, Duyu Tang, Nan Duan, Xiaocheng Feng, Ming Gong, Linjun Shou, Bing Qin,
+Ting Liu, Daxin Jiang, and Ming Zhou. 2020. CodeBERT: A pre-trained model for programming and
+natural languages. In Findings of the Association
+for Computational Linguistics: EMNLP 2020, pages
+1536–1547, Online. Association for Computational
+Linguistics.
+Paul Gauthier. 2024. Aider is ai pair programming
+in your terminal. https://github.com/Aider-AI/
+aider.
+Daya Guo, Shuo Ren, Shuai Lu, Zhangyin Feng,
+Duyu Tang, Shujie LIU, Long Zhou, Nan Duan,
+Alexey Svyatkovskiy, Shengyu Fu, Michele Tufano,
+Shao Kun Deng, Colin Clement, Dawn Drain, Neel
+Sundaresan, Jian Yin, Daxin Jiang, and Ming Zhou.
+2021. Graphcode{bert}: Pre-training code representations with data flow. In International Conference
+on Learning Representations.
+Edward J Hu, yelong shen, Phillip Wallis, Zeyuan AllenZhu, Yuanzhi Li, Shean Wang, Lu Wang, and Weizhu
+Chen. 2022. LoRA: Low-rank adaptation of large
+language models. In International Conference on
+Learning Representations.
+Zhonghao Jiang, Xiaoxue Ren, Meng Yan, Wei Jiang,
+Yong Li, and Zhongxin Liu. 2025. Issue localization via llm-driven iterative code graph searching.
+Preprint, arXiv:2503.22424.
+Carlos E Jimenez, John Yang, Alexander Wettig,
+Shunyu Yao, Kexin Pei, Ofir Press, and Karthik R
+Narasimhan. 2024. SWE-bench: Can language models resolve real-world github issues? In The Twelfth
+International Conference on Learning Representations.
+
+References
+
+Sungmin Kang, Gabin An, and Shin Yoo. 2024. A quantitative and qualitative evaluation of llm-based explainable fault localization. Proc. ACM Softw. Eng.,
+1(FSE).
+
+Zhaoling Chen, Robert Tang, Gangda Deng, Fang Wu,
+Jialong Wu, Zhiwei Jiang, Viktor Prasanna, Arman
+Cohan, and Xingyao Wang. 2025. LocAgent: Graphguided LLM agents for code localization. In Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long
+Papers), pages 8697–8727, Vienna, Austria. Association for Computational Linguistics.
+
+Qinyu Luo, Yining Ye, Shihao Liang, Zhong Zhang,
+Yujia Qin, Yaxi Lu, Yesai Wu, Xin Cong, Yankai
+Lin, Yingli Zhang, Xiaoyin Che, Zhiyuan Liu, and
+Maosong Sun. 2024. RepoAgent: An LLM-powered
+open-source framework for repository-level code documentation generation. In Proceedings of the 2024
+Conference on Empirical Methods in Natural Language Processing: System Demonstrations, pages
+
+436–464, Miami, Florida, USA. Association for Computational Linguistics.
+Russell Lyons. 1989. The Ising model and percolation
+on trees and tree-like graphs. Communications in
+Mathematical Physics, 125:337–353.
+Zexiong Ma, Chao Peng, Qunhong Zeng, Pengfei Gao,
+Yanzhen Zou, and Bing Xie. 2025. Tool-integrated reinforcement learning for repo deep search. Preprint,
+arXiv:2508.03012.
+Sean MacAvaney, Nicola Tonellotto, and Craig Macdonald. 2022. Adaptive re-ranking with a corpus graph.
+In CIKM, pages 1491–1500.
+Siru Ouyang, Wenhao Yu, Kaixin Ma, Zilin Xiao, Zhihan Zhang, Mengzhao Jia, Jiawei Han, Hongming
+Zhang, and Dong Yu. 2025. Repograph: Enhancing
+AI software engineering with repository-level code
+graph. In The Thirteenth International Conference
+on Learning Representations.
+Muhammad Shihab Rashid, Christian Bock, Yuan
+Zhuang, Alexander Buchholz, Tim Esler, Simon Valentin, Luca Franceschi, Martin Wistuba,
+Prabhu Teja Sivaprasad, Woo Jung Kim, Anoop
+Deoras, Giovanni Zappella, and Laurent Callot.
+2025. Swe-polybench: A multi-language benchmark for repository level evaluation of coding agents.
+Preprint, arXiv:2504.08703.
+Revanth Gangi Reddy, Tarun Suresh, JaeHyeok Doo,
+Ye Liu, Xuan Phi Nguyen, Yingbo Zhou, Semih
+Yavuz, Caiming Xiong, Heng Ji, and Shafiq Joty.
+2025. Swerank: Software issue localization with
+code ranking. Preprint, arXiv:2505.07849.
+Stephen E. Robertson. 1977. The probability ranking principle in IR. Journal of Documentation,
+33(4):294–304.
+Stephen E. Robertson, Steve Walker, Susan Jones,
+Micheline Hancock-Beaulieu, and Mike Gatford.
+1994. Okapi at trec-3. In Text Retrieval Conference.
+M. Shaked and J.G. Shanthikumar. 2007. Stochastic
+Orders. Springer Series in Statistics. Springer New
+York.
+Tarun Suresh, Revanth Gangi Reddy, Yifei Xu, Zach
+Nussbaum, Andriy Mulyar, Brandon Duderstadt, and
+Heng Ji. 2025. CoRNStack: High-quality contrastive
+data for better code retrieval and reranking. In The
+Thirteenth International Conference on Learning
+Representations.
+Steven K. Thompson. 1990. Adaptive cluster sampling. Journal of the American Statistical Association, 85(412):1050–1059.
+Xingyao Wang, Boxuan Li, Yufan Song, Frank F. Xu,
+Xiangru Tang, Mingchen Zhuge, Jiayi Pan, Yueqi
+Song, Bowen Li, Jaskirat Singh, Hoang H. Tran,
+Fuqiang Li, Ren Ma, Mingzhang Zheng, Bill Qian,
+Daniel Shao, Niklas Muennighoff, Yizhe Zhang,
+
+Binyuan Hui, and 5 others. 2025. Openhands: An
+open platform for AI software developers as generalist agents. In The Thirteenth International Conference on Learning Representations.
+Chunqiu Steven Xia, Yinlin Deng, Soren Dunn, and
+Lingming Zhang. 2024. Agentless: Demystifying
+llm-based software engineering agents. Preprint,
+arXiv:2407.01489.
+John Yang, Carlos E. Jimenez, Alexander Wettig, Kilian
+Lieret, Shunyu Yao, Karthik Narasimhan, and Ofir
+Press. 2024. Swe-agent: Agent-computer interfaces
+enable automated software engineering. Preprint,
+arXiv:2405.15793.
+Daoguang Zan, Zhirong Huang, Wei Liu, Hanwu Chen,
+Linhao Zhang, Shulin Xin, Lu Chen, Qi Liu, Xiaojian Zhong, Aoyan Li, Siyao Liu, Yongsheng Xiao,
+Liangqiang Chen, Yuyu Zhang, Jing Su, Tianyu Liu,
+Rui Long, Kai Shen, and Liang Xiang. 2025. Multiswe-bench: A multilingual benchmark for issue resolving. Preprint, arXiv:2504.02605.
+Dejiao Zhang, Wasi Uddin Ahmad, Ming Tan, Hantian Ding, Ramesh Nallapati, Dan Roth, Xiaofei Ma,
+and Bing Xiang. 2024. CODE REPRESENTATION
+LEARNING AT SCALE. In The Twelfth International Conference on Learning Representations.
+Zhaoxi Zhang, Yitong Duan, Yanzhi Zhang, Yiming
+Xu, Zhixiang Wang, Kun Liang, Weikang Li, Jiahui Liang, Deguo Xia, Jizhou Huang, Jiyan He,
+Shuxin Zheng, and Yunfang Wu. 2026. One tool
+is enough: Reinforcement learning of LLM agents
+for repository-level code navigation. In Forty-third
+International Conference on Machine Learning.
+Albert Örwall. 2024. Moatless tools.
+
+A
+
+Appendix
+
+Contents
+A.1
+A.2
+A.3
+A.4
+A.5
+A.6
+A.7
+A.8
+A.9
+
+Notation Summary . . . . . . . . 12
+Theoretical Analysis . . . . . . . 12
+Empirical Support for Graph Locality 18
+Algorithm . . . . . . . . . . . . . 19
+Stage-2 LLM Filter Prompt . . . . 20
+Graph construction details . . . . 20
+Extension to Class-level edits . . . 21
+Additional Experiments . . . . . . 21
+Edge-Type Ablation: Statistical
+Significance . . . . . . . . . . . . 21
+A.10 Comparison with Lexical and
+Agentic Retrieval . . . . . . . . . 25
+A.11 Per-Language Hyperparameter
+Sensitivity . . . . . . . . . . . . . 25
+A.12 Qualitative Analysis . . . . . . . . 26
+A.13 Evaluating Open Source Models . 26
+A.14 Frequently Asked Questions . . . 27
+
+A.1
+
+Notation Summary
+
+Table 5 summarizes the symbols used throughout
+the main paper. Symbols introduced only inside
+proofs (Section A.2) are defined locally there.
+A.2
+A.2.1
+
+Theoretical Analysis
+Setup and exact accounting
+
+Fix an issue Q with edited set V ∗ , m = |V ∗ | ≥ 1.
+Recall P = (Γd (CQ ) ∩ SN (Q)) \ SK , the protected
+baseline set R ⊆ SK (seed centers and accepted
+candidates already in SK ), the admitted set A ⊆ P
+with J = |A| ≤ K − |R|, and the displaced set
+DJ consisting of the J lowest-ranked members of
+LLM = (S \ D ) ∪ A has size
+SK \ R, so that SK
+K
+J
+K.
+Three modelling points deserve emphasis, because the earlier version of this analysis did not
+enforce them. First, the seed centers already belong
+to SK ; treating UQ as new insertions double-counts
+them, and the budget-consuming set is UQ \ SK .
+Second, J is a random quantity determined by the
+query, and cannot be replaced by K. Third, UQ is
+already post-selection, so its counts must not be
+multiplied by α and β a second time. Restricting
+attention to A and DJ removes all three issues.
+Proof of Proposition 4.1. For the first claim, note
+that by construction A ∩ SK = ∅ and DJ ⊆ SK ,
+LLM ∩V ∗ | = |S ∩V ∗ |−|D ∩V ∗ |+|A∩V ∗ |.
+so |SK
+K
+J
+Dividing by m gives Equation (2). For the second,
+take expectations in Equation (2) at fixed m and
+use |DJ | = |A| = J, which
+=
+ gives E[∆Rec@K]
+
+∗
+∗
+E|A ∩ V | − E|DJ ∩ V | /m = η − τ E|A|/m.
+This is positive if and only if η > τ .
+The proof requires neither label independence
+across functions nor any distributional assumption,
+since only linearity of expectation is used.
+The same accounting gives the exact condition
+for full recovery. Writing M := V ∗ \ SK for the
+targets missed by dense retrieval,
+LLM
+Acc@K(SK
+) = 1{M ⊆ A and DJ ∩V ∗ = ∅},
+(4)
+since the output contains all of V ∗ exactly when every baseline miss is admitted and no baseline target
+is displaced. Acc@K is therefore not an averageprecision quantity, and Equation (4) remains the
+exact requirement.
+Nothing above assumes anything about the score
+distribution. The depth analysis in the rest of this
+
+section does, so we restate the paper’s score assumption here; it is used in Remark A.4 and Proposition A.13, not in Proposition 4.1.
+Assumption A.1 (Score distributions). There exist
+distributions F1 , F0 on R with sQ (v) ∼ F1 for v ∈
+V ∗ and sQ (v) ∼ F0 otherwise, such that F1 firstorder stochastically dominates F0 , i.e. F1 (t) ≤
+F0 (t) for all t (Shaked and Shanthikumar, 2007).
+Roadmap for the rest of this section. Proposition 4.1 settles whether an exchange helps, but it is
+silent on the two questions that decide how SpIDER
+should be configured: when η > τ actually holds,
+and how far from a seed it is still worth exploring.
+Both need a model of how candidate quality varies
+with graph distance, and the remainder of this section builds one and then draws its consequences.
+Section A.2.2 derives the model from a latent
+issue-bearing context that propagates along graph
+edges. It yields a shell-prevalence curve ph = π +
+∆λh , and relates the seeding condition it requires to
+the paper’s existing score assumption, while being
+explicit that the two are not equivalent without a
+further condition on the ranking. Section A.2.3
+decomposes the admission rates into the top-N
+gate, the Stage-2 selector, and capacity truncation,
+which is what connects α and β to η.
+Section A.2.4 proves Theorem A.11, the destination of the analysis. It states that a shell is
+profitable exactly when its prevalence exceeds a
+threshold θ determined by τ and the admission
+rates, that deeper shells can expose strictly more
+edited functions even as per-candidate precision
+falls, and that the profitable shells form a prefix,
+so that whenever the threshold sits strictly above
+the background prevalence the useful exploration
+radius d⋆ is finite, and is language-dependent rather
+than universal. When it does not, every shell remains profitable and exploration is bounded by
+token budget instead.
+The three remaining parts qualify that result.
+Section A.2.5 shows the prefix property survives
+when the rates vary with depth, so only the closed
+form for d⋆ depends on holding them constant. Section A.2.6 identifies the regime in which the Stage2 filter is pivotal rather than redundant, and prices
+its token cost. Section A.2.7 states what would have
+to be measured to test the model on held-out repositories and what would falsify it, and Section A.2.8
+bounds where the branching approximation applies.
+We stress throughout that this half of the analysis
+is a falsifiable hypothesis about our data, not some-
+
+thing our experiments establish. Across issues with
+different m, per-issue gains must be weighted by
+1/m before aggregation, which is exactly macroaveraged Recall@K.
+Remark A.2 (Why the base rate is the wrong comparison). The locality analysis of Section A.3 establishes the necessary precondition for SpIDER:
+edited functions are mutually reachable at small
+radius, so a seed landing on one of them can in
+principle reach the others. Proposition 4.1 shows
+what must be added for sufficiency. Because the exchange is against a rank-K dense hit rather than a
+random function, the relevant comparison is η > τ ,
+and τ is far above the repository base rate; establishing πΓ ≥ Pr(u ∈ V ∗ ) therefore does not by
+itself imply improvement. Concretely, two edited
+functions among 100 siblings of one file are 2 hops
+apart, satisfying every locality statistic, yet their
+neighborhood has prevalence 2/100, which may
+lie below τ : reachability between targets does not
+count the non-edited functions in the same ball.
+The two analyses are complementary. Section A.3
+shows the targets are reachable, and Proposition 4.1
+states the precision they must clear once reached.
+A.2.2
+
+A latent-context model for
+Assumption A.8
+
+Equating “the seed is edited” with “the seed is useful” is too restrictive: it cannot explain recovering
+a single edited function from a semantically related
+but unedited seed, which is the regime SpIDER targets. We instead posit a latent regional state.
+Fix the implementation’s distance convention
+and a deterministic BFS parent for every reached
+node, yielding a rooted analysis tree whose geometry is independent of the labels. Let Zv ∈ {0, 1}
+indicate that v lies in an issue-bearing structural
+context (the right class, file, or local dependency
+region). Assume the tree-indexed conditional
+Markov property
+Pr(Zchild =1 | Zparent =1) = ρ1 ,
+
+(5)
+
+Pr(Zchild =1 | Zparent =0) = ρ0 ,
+
+(6)
+
+with 0 ≤ ρ0 < ρ1 ≤ 1 and (ρ0 , ρ1 ) ̸= (0, 1). We
+further assume that the seed-selection event S is
+conditionally independent of a node’s context given
+its parent’s,
+S ⊥ Zchild | Zparent ,
+
+(7)
+
+so that conditioning on S leaves the transition ker-
+
+nel in Equation (5) unchanged. Write
+λ = ρ1 − ρ0 ∈ (0, 1),
+
+ζ=
+
+ρ0
+, (8)
+1 − ρ 1 + ρ0
+
+the per-hop persistence of regional information and
+the stationary probability of the issue-bearing state.
+Edit labels are emissions,
+Pr(v ∈ V ∗ | Zv =1) = r1 ,
+∗
+
+Pr(v ∈ V | Zv =0) = r0 ,
+
+(9)
+r1 > r0 ,
+
+(10)
+
+and are conditionally independent of ancestry and
+of the seed-selection event S given Zv . Let q :=
+Pr(Zseed =1 | S) be the context posterior induced
+by dense retrieval selecting the seed.
+Lemma A.3 (Seeded spatial mixing). Under Equations (5) and (9) with q > ζ, every nonempty shell
+h ≥ 0 satisfies
+
+ph := Pr w ∈ V ∗ | w uniform at distance h, S
+= π + ∆λh ,
+(11)
+where π = r0 + (r1 − r0 )ζ and ∆ = (r1 − r0 )(q −
+ζ) > 0. Hence enrichment above the local background decays geometrically with graph distance.
+Proof. Let zh = Pr(Z=1 | h, S). By Equation (7)
+the transition probabilities are unchanged by conditioning on S, so averaging Equation (5) over the
+parent state gives the affine recurrence zh+1 =
+ρ0 + (ρ1 − ρ0 )zh with z0 = q. Its fixed point is
+ζ from Equation (8), so zh − ζ = λ(zh−1 − ζ)
+and zh = ζ + (q − ζ)λh . Applying Equation (9),
+ph = r0 + (r1 − r0 )zh = π + ∆λh .
+Equation (7) is the transition-side counterpart
+of the conditional independence already imposed
+on the emissions, and it is what lets a posterior
+formed at the seed be propagated with the unconditioned kernel. Substantively it says that dense
+retrieval’s decision to select this seed carries information about the surrounding region only through
+the seed’s own context state. It would fail if the
+ranker scored a node using signal that also predicts
+the context of nodes deeper in the tree without passing through the parent, for instance a repositorylevel or file-level feature shared by a whole subtree.
+As with the other conditions in this section, we
+regard it as a restriction on the analyzed regime
+rather than something the setup supplies.
+Lemma A.3 yields exactly Assumption A.8. The
+observable content is the curve ph = π + ∆λh ; the
+
+latent state is one mechanism that produces it, and
+the theory does not require Zv to be a literal causal
+variable.
+Remark A.4 (Interpreting the seeding condition).
+The requirement q > ζ has a direct operational
+reading. Since Pr(seed ∈ V ∗ | S) = r0 + (r1 −
+r0 )q and the unconditional rate is π = r0 + (r1 −
+r0 )ζ, we have
+q > ζ ⇐⇒ Pr(seed ∈ V ∗ | S) > Pr(v ∈ V ∗ ),
+(12)
+i.e. q > ζ holds exactly when a dense-selected seed
+is more likely to be edited than a uniformly random
+function. This is the property Assumption A.1 is
+intended to capture, but it does not follow from
+that assumption alone. First-order stochastic dominance constrains the two marginal score distributions, whereas a seed is the arg max of scores
+across nodes, so whether it is enriched depends on
+their joint behaviour. Under ties, or under strong
+dependence between target and non-target scores,
+a dominating marginal can still yield a top-ranked
+item that is no more likely to be edited than a random function, and passing from the marginals to
+the selection event requires an additional exchangeability or conditional-independence condition. We
+therefore treat q > ζ the same way we treat the
+per-rank profile in Section A.2.5, as an empirical
+property rather than a theorem. It is also the cheapest of our quantities to check, since q is identified
+by seed precision, which is directly measurable
+from the runs we already report.
+Remark A.5 (Unedited seeds). If one additionally
+observes that the seed is not edited,
+ its context
+posterior dropsto q0 = q(1 − r1 ) q(1 − r1 ) +
+(1 − q)(1 − r0 ) , and such a seed remains informative only when q0 > ζ: the dense evidence must
+outweigh the negative update from the seed’s own
+label. SpIDER does not observe that label at retrieval time, so its operative ex-ante parameter is
+q.
+Proposition A.6 (Mixing over multiple seeds).
+Let CQ contain C seeds with context posteriors
+q1 , . . . , qC , assign each reached function to its
+nearest seed, and let wc,h be the share of shellh functions assigned to seed c, determined by tree
+geometry alone. Then
+ph = π + ¯
+∆h λh ,
+P
+q̄h = c wc,h qc .
+
+¯
+∆h = (r1 − r0 )(q̄h − ζ),
+(13)
+
+If in addition the shares are depth-invariant over
+the analyzed range, wc,h = wc for all h, then
+¯h ≡ ∆
+¯ and the curve takes the single-seed form
+∆
+assumed in Assumption A.8.
+
+Proof. By Lemma A.3, ph (q) = π + (r1 − r0 )(q −
+ζ)λh is affine in q. Averaging over the shell-h
+seed assignment therefore replaces q by q̄h , giving
+Equation (13). Depth-invariant shares make q̄h and
+hence ¯
+∆h constant in h.
+Remark A.7 (Depth-invariance is an extra condition). Depth-invariance of the shares does not follow from disjointness of the seed neighborhoods.
+Disjointness removes double counting, but the
+shells around different seeds can still grow at different rates, so a seed sitting in a large class may
+supply most of the functions at h=2 while a seed in
+a small one supplies more at h=4. In that case q̄h
+¯ Two condrifts with depth and there is no single ∆.
+sequences follow. First, Assumption A.8 should be
+read, under C > 1, as holding exactly only when
+the shares are depth-invariant, and otherwise as
+an approximation whose adequacy is part of what
+the protocol in Section A.2.7 tests, since wc,h is
+directly countable from the graph. Second, the
+prefix property in Theorem A.11 relies on ph decreasing in h, which Equation (13) no longer gives
+automatically. A sufficient condition is that ¯
+∆h be
+nonincreasing, since the product of a nonincreasing positive sequence with the strictly decreasing
+λh is strictly decreasing. This is the multi-seed
+analogue of the monotonicity condition on θh in
+Section A.2.5, and we treat it the same way, as a
+checkable condition rather than a consequence.
+Subject to that condition, Proposition A.6 is why
+the single-seed analysis carries over to the deployed
+C=5 configuration, with an effective seeding gain
+¯
+∆. Assigning each node to its nearest seed also
+discards evidence when neighborhoods overlap,
+and the direction of that bias is known: a node
+reachable from a second, farther seed c′ receives
+additional positive evidence whenever qc′ > ζ, and
+discarding it understates q̄, hence ¯
+∆, hence ph . The
+approximation therefore biases d⋆ downward and
+under-promises reach, so a cutoff derived under it
+is conservative. Adding seeds raises q̄ only if the
+new seeds are themselves well-placed, which is
+one mechanism for the saturation in C observed in
+Section 5.3.
+
+A.2.3 Graph volume and admission rates
+Let Hh be the distinct function nodes at distance h
+and nh = |Hh |. Theorem A.11 uses these observed
+counts and does not require geometric growth; the
+regular-growth form nh = kbh−1 is invoked only to
+interpret target volume. In pure contains graphs,
+function-to-function distances are typically even
+(siblings are 2 hops apart through their container),
+so odd shells may be empty; the theorem is stated
+over nonempty shells and the last beneficial one is
+d¯⋆ = max{h ≤ d⋆ : nh > 0}.
+Decompose the admission pipeline by groundtruth label, at depth h:
+t = Pr(v ∈ SN \ SK | v ∈ V ∗ ),
+f = Pr(v ∈ SN \ SK | v ∈
+/ V ∗ ),
+α = Pr(L(v)=1 | v ∈ V ∗ , ·),
+β = Pr(L(v)=1 | v ∈
+/ V ∗ , ·),
+γ1 = Pr(v ∈ A | L(v)=1, v ∈ V ∗ ),
+γ0 = Pr(v ∈ A | L(v)=1, v ∈
+/ V ∗ ),
+
+(14)
+
+so that the effective rates of Assumption A.9 are
+a = tαγ1 and c = f βγ0 , with γ1 , γ0 absorbing priority, deduplication and capacity truncation.
+Depth comparisons use a nested, shell-first policy: increasing d from h − 1 to h leaves earlier
+admissions unchanged and causes only additional
+baseline-prefix evictions. Once capacity binds the
+effective rates are zero, a saturated shell has zero
+incremental gain, and the depth statement no longer
+applies.
+Let h(v) be the distance from v to its nearest
+seed and nh the number of distinct functions in
+shell h.
+Assumption A.8 (Seeded spatial decay). The shellh target prevalence is ph := Pr(v ∈ V ∗ | h(v) =
+h) = π + ∆λh , for a background rate π, a seeding
+gain ∆ > 0 and a per-hop persistence λ ∈ (0, 1).
+Lemma A.3 derives this form.
+Assumption A.9 (Admission and exchange rates).
+Over the analyzed depth range, a shell-h candidate
+is admitted with probability a > 0 if edited and
+c > 0 if not (composing top-N retention, the LLM
+decision, deduplication and capacity). Moreover
+the frontier relevance is constant conditional on the
+number of evictions,
+
+
+E |DJ ∩ V ∗ | J = τ J,
+τ ∈ (0, 1). (15)
+Remark A.10 (Why Equation (15) is stronger than
+the definition of τ ). In Proposition 4.1, τ is a ratio of marginal expectations, E|DJ ∩ V ∗ |/E|DJ |,
+
+and that identity holds with no assumption because the proposition aggregates over the whole
+exchange. Theorem A.11 instead charges an eviction cost to each shell separately, which requires
+the per-eviction relevance to be unaffected by how
+many candidates a query happens to admit. Without Equation (15) the two can differ: if J and the
+relevance of the displaced frontier are correlated,
+for instance because queries that admit many neighbors are also queries whose rank-K items are unusually relevant, then E[τJ J] ̸= τ E[J] and the
+shell decomposition below fails. We therefore state
+the conditional form explicitly rather than deriving
+it from the definition. Like the constancy of a and
+c, it is an assumption about our operating range and
+not a consequence of the setup.
+Theorem A.11 (Seeded spatial-completion law).
+Under Assumptions A.8 and A.9, shell h contributes
+nh aph targets and nh c(1 − ph ) distractors at precision ηh = aph /(aph + c(1 − ph )), and its
+expected contribution to the recall numerator is
+Gh = nh [((1 − τ )a + τ c)ph − τ c]. Then: (i) with
+θ := τ c/((1 − τ )a + τ c),
+Gh > 0 ⇐⇒ ηh > τ ⇐⇒ ph > θ;
+
+(16)
+
+(ii) the shell’s excess target mass is nh ∆λh ,
+which under regular growth nh = kbh−1 equals
+k∆λ(bλ)h−1 , so if bλ > 1 deeper shells expose strictly more edited functions even though ηh
+strictly decreases; and (iii) beneficial shells form
+a prefix, so when π < θ < p1 the expected recall
+numerator is maximized at the useful radius
+
+
+
+d⋆ = log((θ − π)/∆) log λ − 1.
+A.2.4
+
+(17)
+
+Proof of Theorem A.11
+
+Proof. (Counts and precision.) By linearity of expectation, and again without requiring independence within a shell, the expected admitted target
+and distractor counts from shell h are Th = nh aph
+and Fh = nh c(1 − ph ), and dividing target admissions by all admissions gives ηh = aph /(aph +
+c(1 − ph )).
+(Threshold.) By Equation (15), the expected
+relevant loss accompanying these admissions is
+τ (Th + Fh ), so
+Gh = Th − τ (Th + Fh )
+
+
+= nh (1 − τ )aph − τ c(1 − ph )
+
+
+
+= nh (1 − τ )a + τ c ph − τ c .
+
+(18)
+
+Since (1 − τ )a + τ c > 0, Gh > 0 ⇐⇒ ph >
+θ with θ as in Equation (16). Dividing ηh > τ
+through by c(1 − ph ) > 0 yields (a/c) ph /(1 −
+ph ) > τ /(1 − τ ), which rearranges to the same
+inequality, giving the equivalence Gh > 0 ⇐⇒
+ηh > τ ⇐⇒ ph > θ.
+(Reach vs. precision.) Substituting ph − π =
+∆λh gives excess mass nh ∆λh , and nh = kbh−1
+gives k∆λ(bλ)h−1 , which increases in h iff bλ >
+1. Meanwhile ηh is strictly increasing in ph and
+ph is strictly decreasing, so ηh strictly decreases
+regardless of b.
+(Useful radius.) As 0 < λ < 1 and ∆ > 0, ph
+decreases strictly to π, so {h : ph > θ} is a prefix.
+In the interior case π < θ < p1 ,
+θ−π
+∆
+log((θ − π)/∆)
+,
+⇐⇒ h <
+log λ
+
+ph > θ ⇐⇒ λh >
+
+(19)
+
+the inequality reversing because log λ < 0. The
+largest integer strictly below the right-hand side is
+d⋆ of Equation (17), and θ < p1 forces d⋆ ≥ 1.
+Shell increments are positive up to d⋆ and nonpositive after, so the cumulative expectation is maximized there; if the first excluded shell has Gh = 0
+then d⋆ +1 attains the same value but no larger.
+Corollary A.12 (Accuracy is harder than recall).
+If the baseline is already complete (V ∗ ⊆ SK ),
+LLM )] − E[Acc@K(S )] =
+then E[Acc@K(SK
+K
+− Pr(DJ ∩ V ∗ ̸= ∅) ≤ 0, with strict inequality
+whenever τ > 0 and J ≥ 1.
+Proof of Corollary A.12. If V ∗ ⊆ SK then M =
+LLM ) = 1{D ∩
+∅, so by Equation (4) Acc@K(SK
+J
+V ∗ = ∅} while Acc@K(SK ) = 1. Taking expectations gives the claim; the inequality is strict when
+some eviction can be a target.
+Corollary A.12 is a stratified prediction and we
+are careful not to overstate it. It says that on issues
+whose baseline already contained every edited function, any insertion can only lose Acc@K, through
+a single bad eviction. It does not predict that aggregate Acc@K falls, and aggregate Acc@K is not a
+valid test of it: gains on incomplete-baseline issues
+can dominate, and in our main results Acc@K rises
+alongside Recall@K in almost every cell. The corresponding test is to restrict to instances where the
+dense baseline already attains Acc@K = 1 and
+measure the eviction rate there; we have not run
+it, and report Corollary A.12 as a prediction rather
+than a confirmed finding.
+
+A.2.5
+
+Relaxing the constant-rate assumption
+
+The closed form Equation (17) comes from holding
+a, c, τ fixed. If they vary with
+depth, define θh =
+
+τh ch / (1 − τh )ah + τh ch .
+Proposition A.13 (Robustness of the prefix property). Write θh = τh / (1 − τh )xh + τh with
+xh = ah /ch . Then θh is increasing in τh and
+decreasing in xh . Consequently, if (τh ) is nondecreasing and (xh ) is nonincreasing in h, then θh
+is nondecreasing and ph − θh is strictly decreasing, so the beneficial shells still form a prefix. That
+prefix is finite if and only if θh > π for some h,
+equivalently lim inf h θh > π. If instead θh ≤ π at
+every depth, then ph > π ≥ θh for all h and every
+shell remains beneficial, so no finite radius exists.
+−1
+Proof. Write θh = 1 + (1 − τh )xh /τh
+. The
+map τ 7→ (1 − τ )/τ is decreasing on (0, 1), so θh
+increases in τh ; it plainly decreases in xh . Under
+the stated monotonicity θh is nondecreasing while
+ph strictly decreases, so ph − θh is strictly decreasing and changes sign at most once, from positive to
+negative, which gives the prefix property. For finiteness, recall ph ↓ π strictly. If θH > π for some H
+then θh ≥ θH > π for all h ≥ H by monotonicity,
+while ph → π, so ph < θH for all large h and the
+prefix terminates. Conversely if θh ≤ π for every
+h then ph > π ≥ θh at every depth and the prefix
+is the whole sequence.
+Both hypotheses are the natural directions of violation, though we assume rather than derive them.
+Under the shell-first policy, admitting more candidates evicts progressively further up the dense ranking, so τh is nondecreasing whenever the baseline’s
+per-rank target probability is nonincreasing in rank.
+We note that this does not follow from Assumption A.1 alone: first-order stochastic dominance
+of the score distributions constrains the marginals,
+not the per-rank posterior, and an additional exchangeability condition is required to pass from
+one to the other. The per-rank profile is directly
+estimable from the existing dense rankings at no
+additional inference cost, and we regard it as an
+empirical check rather than a theorem. Likewise
+deeper candidates are less semantically similar to
+Q, so both the top-N gate and the LLM plausibly
+discriminate less well and xh = ah /ch degrades.
+Proposition A.13 therefore says the qualitative conclusion survives the simplification, and only the
+closed form Equation (17) depends on it. The
+finiteness clause is the varying-rate analogue of
+
+the trichotomy in Theorem A.11: just as a constant θ ≤ π makes every shell profitable there, a
+sequence with θh ≤ π throughout leaves the useful radius unbounded here, and exploration is then
+limited by token budget rather than by precision.
+Without monotone θh , a later shell can be useful
+after a harmful one and no single-cutoff theorem
+holds.
+A.2.6
+
+LLM pivotality and token cost
+
+Corollary A.14 (When is the LLM pivotal?). Compare a graph-only policy with rates (t, f ) against
+the LLM-filtered policy with rates (tα, f β) at a
+common, count-matched frontier τ . If α > β > 0
+then θL < θG , and shell h is graph-sufficient if
+ph > θG , LLM-pivotal if θL < ph ≤ θG , and
+unprofitable for both if ph ≤ θL .
+Proof of Corollary A.14. With nonbinding capacity the graph-only policy has effective rates
+(aG , cG ) = (t, f ) and the filtered policy
+(aL , cL ) = (tα, f β). Writing θ = τ / (1 − τ )x +
+τ with x = a/c, the map x 7→ θ is strictly decreasing for x > 0. The graph-only ratio is t/f
+and the filtered ratio is (t/f )(α/β) > t/f since
+α > β, hence θL < θG . The three regimes follow
+by applying Equation (16) with each threshold.
+Two caveats bound this result. It does not establish that the evaluated LLM is pivotal: that
+requires measuring α, β and running a countmatched graph-only ablation, since an unfiltered
+policy admits more candidates and would otherwise face a different frontier, which is why Corollary A.14 fixes a common τ . Nor does it make
+an LLM uniquely necessary: any calibrated query–
+candidate interaction model with the same likelihood ratio α/β plays the same role. Finally, if
+LLM inference is priced at κ utility per raw candidate, the numerator of θ becomes τ c + κ, so a
+better likelihood ratio need not imply better total
+utility.
+A.2.7
+
+What to measure, and what would
+falsify the model
+
+Remark A.15 (What the existing ablations can and
+cannot show). Theorem A.11 predicts a finite useful radius in its interior case. Our present ablations
+cannot confirm or refute one, and we state this
+explicitly rather than claim support. The depth
+and top-N sweeps (Tables 9 and 10) are singleseed runs reported to two decimals, with no confidence intervals; the differences that would bear on
+
+Equation (16), namely the flat Java depth column,
+the TypeScript plateau from d=6 to d=8, and the
+Python top-N maximum near N =500, are all of
+size 0.01. That is roughly one sixth of the 95%
+interval half-width we report for the main results
+and below the seed-to-seed drift we document for
+the Stage-2 selector, which runs at nonzero temperature. Pairing across settings would tighten the
+interval on a difference, but it does not remove that
+selector noise, since each run draws fresh LLM
+decisions. We therefore treat these sweeps as compatible with either a cutoff beyond the measured
+range or saturation within it, and as distinguishing
+neither.
+One measurement in this family does clear the
+noise floor, because it is deterministic given the
+candidate set: inference cost. Input tokens per
+query in Table 8 grow 3.6K → 29.7K (Python)
+from d=4 to d=8, an 8.2× increase. Pricing inference at κ per raw candidate replaces the numerator of θ by τ c + κ (Section A.2.6), which moves
+the useful radius inward; this is what makes the
+deployed d=4 a budget choice rather than a measured performance optimum. We emphasise that
+these token counts do not estimate the shell sizes
+nh . They are recorded after Stage-1 gating, and the
+depth ablation runs at N =100, so the evaluated set
+Γd (CQ ) ∩ SN is capped at 100 candidates irrespective of d; the curve therefore reflects a bounded
+pool filling up, not raw shell volume. Consistently,
+the per-two-hop growth ratios are not constant and
+Java’s decreases from d=2 to d=4. Estimating
+nh requires the before-gating counts specified in
+Section A.2.7.
+The theory is useful only as a held-out curve
+prediction. Its observables are nh (distinct shell
+functions before dense-rank gating), ph (countweighted target prevalence before top-N ), th , fh
+(SN \ SK retention by label), αh , βh (raw LLM
+decisions by label), γ1h , γ0h (post-LLM survival),
+and τj (the ground-truth rate of the actual j-th eviction). Across variable-size shells, count weighting
+is essential: nh = ENh and ph = ERh /ENh
+for raw and target shell counts Nh , Rh ; an unweighted mean of per-query shell precisions does
+not satisfy ERh = nh ph . For macro Recall@K
+across varying m, use nmacro
+= E[Nh /m] and
+h
+macro
+ph
+= E[Rh /m]/E[Nh /m].
+The protocol is to fit π, ∆, λ on shallow shells
+and k, b on distinct non-backtracking shell counts,
+freeze them, and predict deeper-shell prevalence,
+
+the sign of Gh , and d⋆ on held-out repositories,
+rather than estimating a free prevalence at every
+depth. Repository-held-out estimation is required
+because functions within a repository, and candidates within one LLM batch, are not independent
+samples. The model is falsified, or must be replaced by a relation-specific one, if: (i) shell prevalence is not approximately geometric after controlling for dense rank, node type and degree; (ii)
+candidate quality has multiple peaks across depth,
+so beneficial shells are not a prefix; (iii) degreepreserving graph rewiring does not reduce seeded
+enrichment; (iv) a count-matched graph-only policy
+matches the LLM policy in the purported pivotal
+region; (v) actual relevant evictions do not track
+the frontier model; or (vi) the predicted cutoff does
+not transfer from shallow shells to held-out deeper
+shells and repositories.
+These quantities are complementary to, not substitutes for, Table 6: target-to-target distances establish reachability, whereas Theorem A.11 additionally requires all-candidate shell prevalence and
+the realized exchange frontier (Remark A.2). Likewise the depth and top-N ablations in Section 5.3
+are outcomes of the full pipeline, so while they are
+consistent with the model (Remark A.15) they do
+not identify which term of Gh changed.
+A.2.8
+
+Scope
+
+The regular-branching model is deliberately small
+enough to make a falsifiable prediction. Real containment graphs mix directories, files, classes and
+functions, admit multiple paths under the chosen
+distance convention, and have overlapping seed
+neighborhoods (Proposition A.6). A multitype
+extension replaces bλ by the spectral radius of a
+type-specific branching–persistence matrix; it is
+warranted only if the single-decay model fails and
+enough data exist to estimate the extra parameters.
+The branching approximation must also stop before
+graph collisions, finite-target depletion, or insertion
+capacity invalidate geometric shell growth.
+We note that bλ governs growth of the expected
+number of excess targets and is not the Kesten–
+Stigum root-reconstruction threshold bλ2 for broadcasting on trees. The theorem concerns expected
+hit count, hence Recall@K at fixed m; it does not
+analyze MRR, because Equation (1) does not fully
+determine the final ordering.
+The hidden-context model is related to broadcasting on trees, where a noisy state propagates
+through a branching structure (Evans et al., 2000),
+
+and the first-moment bλ behaviour has precedent
+in Ising and percolation analysis on trees (Lyons,
+1989). The use here is narrower: the relevant
+question is not reconstruction of the root state,
+but whether a decaying spatial signal can support
+a profitable fixed-budget exchange. The filteredprecision comparison instantiates posterior ranking
+under additive retrieval utility (Robertson, 1977),
+and triggering local exploration from an initially
+promising unit resembles adaptive cluster sampling (Thompson, 1990); adaptive corpus-graph
+re-ranking (MacAvaney et al., 2022) is the closest system analogue. The individual mathematical
+ingredients are standard; the contribution is their
+coupling to SpIDER’s spatial mixing, filtering, and
+fixed-budget eviction.
+A.3
+
+Empirical Support for Graph Locality
+
+Proposition 4.1 needs no locality assumption, since
+it is an identity about the exchange. Graph locality enters one step later, through Assumption A.8,
+which posits that target prevalence decays with distance from a seed as ph = π + ∆λh with ∆ > 0.
+That form implies ph > π at every finite h, which
+is exactly the requirement that relevance be nonnegatively correlated with graph proximity. Locality is therefore necessary for the depth analysis to
+have any content, and, as Remark A.2 notes, necessary but not sufficient for a profitable exchange.
+To check that it is not merely a convenient modeling choice, we analyze the spatial distribution of
+ground-truth functions in SWEBench-Verified.
+Per-instance distances. We restrict attention to
+instances with more than one ground-truth function edit, since locality is only meaningful when
+multiple targets are involved. Of the 469 retained
+SWEBench-Verified instances (out of 500), 190
+contain multi-function edits. Among these, 169
+(88.9%) have all ground-truth functions within a
+maximum graph distance of d ≤ 4 hops along
+contains edges, with 119 (62.6%) within ≤ 2
+hops. The median per-instance mean distance is
+1.92 hops and the median per-instance maximum
+distance is 2 hops; no instance has a disconnected
+ground-truth pair.
+Pairwise distances. At the pairwise level, we examine all 3,869 ground-truth function pairs across
+these 193 instances (each pair drawn from the same
+instance). Of these, 30% (1,171) are sibling functions in the same file or class at distance 2 hops, 45
+pairs have distance 1 (nested containment), and 733
+
+pairs are cross-class within the same file at distance
+3–4. The remaining 48% (1,851) are cross-file or
+cross-package pairs with distance ≥ 6.
+Implication for Proposition 4.1. A clear majority of multi-edit instances admit a small d that
+captures all ground-truth targets, and the bulk of
+within-instance ground-truth pairs concentrate at
+small hop counts. Both observations are direct empirical instantiations of the decay form assumed in
+Assumption A.8: conditioning on membership in
+a small-radius neighborhood Γd ({v}) of a groundtruth node v raises the probability that a candidate
+u is itself ground truth, relative to the unconditional
+base rate over the codebase. The precondition that
+the depth analysis needs therefore holds in practice. It does not by itself imply that expansion is
+profitable, which by Proposition 4.1 additionally
+requires η > τ .
+Cross-dataset extension. To confirm that the locality precondition is not specific to Python or
+to SWEBench-Verified, we run the same analysis on the Python, Java, and JavaScript splits
+of SWE-PolyBench and consolidate it with the
+SWEBench-Verified numbers above. Table 6 reports per-dataset statistics. The median maximum
+within-instance ground-truth distance is exactly 2
+hops in all four splits, the mean shortest-path distance ranges from 1.71 to 2.14 hops, and no split
+contains a disconnected ground-truth pair. The
+locality that Assumption A.8 presumes therefore
+holds uniformly across the multilingual benchmark.
+Where dense retrieval falls short. Two complementary observations from Table 6 explain why the
+graph expansion step matters even though this locality holds. First, single-function instances are easily
+handled by dense retrieval alone (the single ground
+truth is in the top-100 for 67%, 77%, and 75% of
+SWE-PolyBench Python, Java, and JavaScript instances respectively), but multi-function instances
+collapse to 18%, 15%, and 41%. The dense ranker
+reliably surfaces at least one seed, which is the
+seeding condition q > ζ of Remark A.4, but it does
+not co-rank distant siblings. Second, even among
+tightly-clustered multi-function instances (max GTpair distance ≤ 2 hops), only 34% (Python), 30%
+(Java), 53% (JavaScript) recover all ground truth
+in the top-100. Structural proximity exists in the
+graph but is not captured by embedding similarity alone; this is precisely the gap closed by the
+
+BFS-and-LLM-filter expansion in SpIDER.
+Dataset-level reading of Table 6. The four splits
+stratify cleanly along the locality–coverage axes
+the method exploits. (a) SWEBench-Verified is
+the tightest dataset of the four (smallest fan-out
+at 1.23 files and 2.25 funcs/inst, 84.9% tightlyclustered), which explains why contains-edge expansion is so effective on SWEBench-Verified in
+Table 2. (b) SWE-PolyBench Java is the spreadout case (32.9% spread-out, 2.79 files/inst) yet
+has the highest invokes-connectivity (0.63); BFS
+along contains alone structurally cannot reach
+cross-file ground truth in this regime, and routing through invokes is the most promising direction noted in our Limitations. (c) SWE-PolyBench
+JavaScript is dense-ranker-dominated: 53.6% of
+instances are already fully covered in the top-100
+and only 21.8% have any ground truth beyond top500, leaving little headroom for any graph mechanism. (d) SWE-PolyBench Python sits in between,
+with SWEBench-Verified-like dense-rank quality
+but messier structure (5.02 funcs/inst across 1.79
+files), which is where SpIDER adds the most absolute headroom.
+Empirical ceiling under the current initial ranker. Table 6 also shows that 38%
+(SWEBench-Verified), 51% (Python), 62% (Java),
+and 22% (JavaScript) of instances contain at least
+one ground-truth function ranked beyond the top500 by the dense retriever. Since SpIDER’s neighborhood exploration is restricted to the candidate pool SN (Q) with N =500, these out-of-pool
+ground-truth functions cannot be recovered regardless of graph structure. This places a quantifiable
+upper bound on SpIDER’s reachable Recall@K under the current initial ranker, and motivates the limitation noted in the main text: closing this gap requires either a stronger initial ranker or a larger candidate pool N (with a corresponding LLM-token
+cost from Table 14). The same ranker artifact also
+helps explain the relative gain ordering across languages, since the per-language coverage rates correlate with where SpIDER’s absolute Recall@20
+gains sit in Table 2.
+A.4
+
+Algorithm
+
+Note: The LLM selector L receives the source
+code content of all candidates u ∈ CˆQ for a given
+center, along with the issue description Q. It returns L(u) = 1 for candidates deemed relevant to
+resolving the issue, and 0 otherwise.
+
+Algorithm 1 SpIDER
+
+{{"selected": []}}
+
+Require: Code graph G = (V, E), issue description Q, bi-modal encoder F(·)
+Require: Parameters: retrieval budget K, filtering threshold N , number of centers C, search
+depth d
+1: // Semantic Retrieval
+2: Compute node embeddings: {F(v)}v∈V
+3: Compute query embedding: F(Q)
+sQ (v) =
+4: Compute relevance scores:
+cos(F(v), F(Q)) for all v ∈ V
+5: SK (Q) ← arg topK sQ (v) top-K nodes
+ranked by sQ (v) {Baseline retrieval}
+6: SN (Q) ← top-N nodes ranked by sQ (v)
+{Candidate pool}
+7: // Seed Selection
+8: CQ ← top-C nodes from SK (Q) ranked by
+sQ (v) {Centers for BFS}
+9: // Neighborhood Exploration
+10: Γd (CQ ) ← {u ∈ V : distG (u, CQ ) ≤ d} via
+BFS along ‘contains’ edges
+11: // Two-Stage Neighbor Filtering
+12: CˆQ ← Γd (CQ ) ∩ SN (Q) {Stage 1: Semantic
+filtering}
+13: UQ ← {u ∈ CˆQ : L(u) = 1} ∪ CQ {Stage 2:
+LLM selection}
+14: // Output Construction
+LLM (Q) ← U
+15: SK
+Q ∪ SK−|UQ | (Q) {where
+SK−|UQ | (Q) = arg topK−|UQ | sQ (v)}
+v∈SK (Q)
+
+User prompt.
+## GitHub Issue
+{PROBLEM_STATEMENT}
+## Center function (1/5)
+### [center_i] {CENTER_NODE_ID}
+{CENTER_CODE}
+## Neighbors
+### [nbr_i] {NEIGHBOR_i_ID}
+{NEIGHBOR_i_CODE}
+Select ONLY the functions that you are highly confident
+MUST be modified to fix the issue.
+
+Placeholders. node_type is the retrieval granularity (function for all function-level results in
+this paper) and edge_phrase names the edge types
+traversed for that run. PROBLEM_STATEMENT is the
+raw issue title and body. The center header is numbered (i+1)/C over the C seed centers, shown
+above for the default C=5. CENTER_CODE and
+each NEIGHBOR_i_CODE carry the node’s source,
+truncated to 1500 characters with a trailing ...
+[truncated] marker when longer. Neighbors are
+enumerated with the graph node ids that the model
+echoes back in its JSON response. Doubled braces
+are Python format-string escapes; the model receives single braces. The template contains no
+in-context examples, so the selector is used zeroshot.
+
+16: return S(Q)
+
+A.6
+A.5
+
+Stage-2 LLM Filter Prompt
+
+The Stage-2 selector is driven by the system and
+user prompts reproduced below. The prompt is
+deliberately simple, to limit prompt-sensitivity, and
+is applied independently to each of the C seed
+centers.
+System prompt.
+You are a code localization agent. You are examining the
+graph neighborhood of a {node_type} to find related
+{node_type}s that MUST be modified to fix a GitHub issue.
+You will see:
+- The center {node_type}
+- Its graph neighbors (connected via {edge_phrase})
+BE VERY RESTRICTIVE. Only select neighbors where you have
+HIGH CONFIDENCE that the code MUST be modified to fix the
+issue. When in doubt, do NOT select. It is better to
+return an empty list than to include a neighbor that
+probably does not need changes.
+Do NOT include the center itself. Do NOT include neighbors
+that are merely related, called by, or similar to code in
+the issue - only include neighbors whose own code must
+change.
+Respond with ONLY a JSON object:
+{{"selected": ["node_id_1", "node_id_2", ...]}}
+If no neighbor clearly needs changes, respond with:
+
+Graph construction details
+
+JavaScript did not have a unique class data type
+until 2015 as it was only introduced ECMAScript
+2015 also known as ES6. Hence most of the functionality of classes were implemented through functions, causing increased variations in the definition
+styles of a function (e.g. a nested function with
+the definition of container function at some other
+location in the same/different file).
+Artifacts and license. SpIDER-Bench is
+derived from publicly released benchmarks
+(SWEBench-Verified, SWE-PolyBench, and
+Multi-SWEBench). Ground-truth labels are inherited from those upstream sources, and construction
+is deterministic given the repository state, using
+no manual annotation. We release the dataset,
+the graph-construction code, and the Stage-2
+LLM-filter prompt through the links on the first
+page. Because SpIDER-Bench embeds source
+code drawn from many upstream repositories, it
+
+carries no single license. Individual code segments
+remain under the licenses of the projects they were
+adapted from, which include MIT, Apache 2.0,
+BSD and GPL, and the release ships a notice file
+identifying the third-party sources. Users must
+comply with the license attached to each segment
+they use.
+A.7
+
+Extension to Class-level edits
+
+In Table 7, we demonstrate the efficacy of the proposed approach at a class level. Here, we include
+only Python and Java here, excluding JavaScript, as
+most JavaScript repositories in the SWE-PolyBench
+dataset lack significant use of class syntax (introduced in ECMAScript 2015), resulting in very few
+instances with class ground truth nodes. A ground
+truth edit is classified as a class-level edit (and the
+corresponding class as a ground truth class node),
+if the patch introduces a modification within any
+part of the class declaration or definition (e.g., constructors, destructors, or methods) to address the
+issue description.
+A.8
+
+Additional Experiments
+
+Downstream code generation with a toolequipped agent. Figure 3 reports the complementary setting to Table 4, in which the protocol is not hands-tied: mini-swe-agent (Yang
+et al., 2024) with Claude Sonnet 4.5 receives
+the retrieved function paths but retains full grep
+and file-navigation tools, so it can partially compensate for a poor retrieval list on its own. In
+this setting SpIDER improves the pass rate on
+SWEBench-Verified by +0.46 percentage points
+(pp) at K=5 and +2.74 pp at K=10, corresponding to 2 and 12 additional resolved instances. Two
+caveats apply. First, these are single runs, and the
+K=5 margin of 2 instances is within run-to-run
+variation, so we do not read a positive effect into
+it. Second, and more fundamentally, an agent that
+can already locate code independently compresses
+the gap between any two retrieval lists, so this comparison measures only what SpIDER contributes on
+top of a competent search capability rather than the
+contribution of retrieval quality itself. Table 4 isolates the latter by removing the agent’s independent
+search, which is why we report it as the primary
+downstream result.
+MRR@K Gains Depend on Graph Neighborhoods The MRR@K metric benefits from
+SpIDER primarily when the first relevant ground-
+
+K = 10
+K=5
+0.0
+
++2.74 pp (+12)
++0.46 pp (+2)
+0.5
+
+1.0
+
+Mean: +1.60 pp
+
+1.5
+
+2.0
+
+2.5
+
+3.0
+
+Pass Rate Gains (SWERank-SpIDER - SWERank) in percentage points
+
+Figure
+3:
+Pass
+rate
+improvement
+of
+SWERankEmbed-Small-SpIDER over SWERank on
+SWE-bench Verified with C = 5, d = 4, N = 500.
+
+truth item within the top-K results is a neighbor of
+a center node. In cases where the first relevant item
+is a non-center node, particularly in TypeScript as
+shown in Tab. 2—SpIDER may rank neighbors of
+center nodes ahead, slightly reducing MRR@K.
+Since SpIDER is not explicitly designed to optimize the precise ranking order within the top-K
+results, improvements in MRR@K over baseline
+DER methods are modest but still observable.
+A.9
+
+Edge-Type Ablation: Statistical
+Significance
+
+Table 3 in the main text reports point estimates
+for each exploration edge type. Because SpIDER
+and DER are evaluated on identical instances and
+their per-instance scores are highly correlated, we
+assess significance with paired per-instance tests
+rather than by comparing the marginal confidence
+intervals of Table 13, which have substantially less
+power. For each language and edge configuration
+we form the per-instance differences ∆i between
+the SpIDER and DER score on instance i, and report (i) a paired-bootstrap p-value, Pr( ¯
+∆ ≤ 0)
+over B = 10,000 resamples of {∆i }, and (ii) a
+two-sided paired-permutation (sign-flip) test over
+10,000 permutations. Table 20 reports both, for
+Recall@20 and Acc@20.
+The two tests agree in every cell.
+All
+structural-edge gains on Recall@20 are significant at p < 0.01 in all four languages, and at
+p < 0.001 for Java and TypeScript under invokes or contains+invokes. On Acc@20 the only
+non-significant structural cell is Java with contains alone, which becomes significant once invokes edges are added (permutation p = 0.0224);
+this is consistent with the locality analysis of Table 6, where Java combines the highest invokeconnectivity with the lowest dense top-100 coverage. imports and inherits are uniformly nonsignificant, and Proposition 4.1 predicts these two
+nulls for structurally different reasons. For inherits,
+no edge in our schema is incident to a function
+
+python | swerank
+
+12
+
+java | swerank
+
+javascript | swerank
+
+10
+
+SpIDER
+DER
+
+10
+
+SpIDER
+DER
+
+12
+
+15.0
+6
+
+Density
+
+Density
+4
+
+10.0
+
+4
+
+5.0
+
+2
+
+2
+
+2.5
+
+0
+
+0.30
+
+0.35
+
+0.40
+
+0.45 0.50
+Recall
+
+0.55
+
+0.60
+
+0
+
+0.65
+
+0.20
+
+0.25
+
+python | codesage_s_zs
+
+14
+
+0.30
+
+0.35
+Recall
+
+0.40
+
+0.45
+
+0.0
+
+0.50
+
+0.45
+
+0.50
+
+java | codesage_s_zs
+SpIDER
+DER
+
+8
+6
+
+7.5
+
+4
+
+2
+
+10
+
+12.5
+
+Density
+
+6
+
+SpIDER
+DER
+
+14
+
+17.5
+
+8
+
+8
+Density
+
+typescript | swerank
+SpIDER
+DER
+
+20.0
+
+0.55
+Recall
+
+0.60
+
+0
+
+0.65
+
+0.15
+
+0.20
+
+0.25
+
+javascript | codesage_s_zs
+SpIDER
+DER
+
+12
+
+SpIDER
+DER
+
+0.40
+
+0.45
+
+SpIDER
+DER
+
+20
+
+20
+
+12
+
+0.30
+0.35
+Recall
+
+typescript | codesage_s_zs
+
+10
+
+6
+
+15
+
+Density
+
+6
+
+Density
+
+15
+
+8
+
+8
+
+Density
+
+Density
+
+10
+
+10
+
+4
+
+5
+
+5
+2
+
+2
+0
+
+0.10
+
+0.15
+
+0.20
+
+0.25
+Recall
+
+0.30
+
+0.35
+
+0
+
+0.40
+
+python | codesage_s_peft
+
+0.05
+
+0.10
+
+0.15
+
+0.20
+0.25
+Recall
+
+0.30
+
+0.35
+
+0
+
+0.40
+
+0.20
+
+0.25
+
+java | codesage_s_peft
+
+12
+
+SpIDER
+DER
+12
+
+0.30
+
+Recall
+
+0.35
+
+0.40
+
+0
+
+0.45
+
+SpIDER
+DER
+
+SpIDER
+DER
+
+2
+
+2
+0
+0.15
+
+0.20
+
+0.25
+
+0.30
+
+0.35
+Recall
+
+0.40
+
+0.45
+
+0
+
+0.50
+
+python | bm25
+
+10.0
+
+0.10
+
+0.15
+
+0.20
+
+0.25
+Recall
+
+0.30
+
+0.35
+
+0.40
+
+8
+6
+
+5.0
+
+4
+
+0.0
+
+SpIDER
+DER
+
+10
+
+7.5
+
+2.5
+
+2
+0.40
+
+0.45
+
+java | bm25
+
+14
+
+SpIDER
+DER
+
+12
+
+Density
+
+Density
+
+Density
+
+4
+
+0.50
+Recall
+
+0.55
+
+0
+
+0.60
+
+0.10
+
+0.15
+
+javascript | bm25
+SpIDER
+DER
+
+0.20
+
+0.25
+Recall
+
+0.30
+
+0.35
+
+typescript | bm25
+SpIDER
+DER
+
+20
+
+12
+
+0.25
+
+12
+
+12.5
+6
+
+0.20
+
+14
+
+8
+8
+
+0.15
+Recall
+
+16
+
+17.5
+15.0
+
+4
+
+0.10
+
+typescript | codesage_s_peft
+
+20.0
+
+10
+
+6
+
+0.05
+
+javascript | codesage_s_peft
+
+10
+
+Density
+
+10
+
+4
+
+SpIDER
+DER
+
+25
+
+10
+
+20
+
+10
+
+15
+
+8
+6
+
+Density
+
+6
+
+Density
+
+Density
+
+Density
+
+8
+
+10
+
+15
+
+10
+4
+
+4
+5
+
+2
+0
+
+5
+
+2
+
+0.20
+
+0.25
+
+0.30
+
+Recall
+
+0.35
+
+0.40
+
+0.45
+
+0
+
+0.05
+
+0.10
+
+0.15
+
+Recall
+
+0.20
+
+0.25
+
+0.30
+
+0
+
+0.30
+
+0.35
+
+0.40
+Recall
+
+0.45
+
+0.50
+
+0.55
+
+0
+
+0.025
+
+0.050
+
+0.075
+
+0.100 0.125
+Recall
+
+0.150
+
+0.175
+
+0.200
+
+Figure 4: KDE (Kernel Density Estimate) plots with bootstrapped results of SWE-PolyBench benchmark for
+Recall@20 performance across various retrieval methods.
+
+python | swerank
+
+java | swerank
+
+javascript | swerank
+
+10
+
+SpIDER
+DER
+
+SpIDER
+DER
+
+typescript | swerank
+SpIDER
+DER
+
+17.5
+
+10
+
+SpIDER
+DER
+
+14
+12
+
+8
+
+15.0
+
+8
+
+10
+12.5
+
+4
+
+4
+
+2
+
+2
+
+0
+
+0
+
+0.25
+
+0.30
+
+0.35
+0.40
+Accuracy
+
+0.45
+
+0.50
+
+0.55
+
+Density
+
+10.0
+
+6
+
+7.5
+
+0.10
+
+0.15
+
+python | codesage_s_zs
+
+0.20
+
+0.25
+0.30
+Accuracy
+
+0.35
+
+5.0
+
+4
+
+2.5
+
+2
+
+0.0
+
+0.40
+
+0.35
+
+0.40
+
+0.45
+
+java | codesage_s_zs
+SpIDER
+DER
+
+6
+4
+
+2
+
+2
+
+0.05
+
+0.10
+
+0.15
+
+0.20
+Accuracy
+
+0.25
+
+0
+
+0.30
+
+0.00
+
+0.05
+
+0.10
+
+python | codesage_s_peft
+
+0.25
+
+SpIDER
+DER
+
+10
+
+0
+
+0.30
+
+SpIDER
+DER
+
+5
+
+0.15
+
+0.20
+
+0.25
+0.30
+Accuracy
+
+0.35
+
+0
+
+0.40
+
+SpIDER
+DER
+
+16
+14
+12
+
+12.5
+
+6
+
+Density
+
+10
+Density
+
+Density
+
+6
+
+10.0
+7.5
+
+4
+
+4
+
+2
+
+2
+
+0.15
+
+0.20
+
+0.25
+Accuracy
+
+0.30
+
+0.35
+
+0
+
+0.40
+
+4
+
+2.5
+0.05
+
+0.10
+
+0.15
+
+0.20
+Accuracy
+
+0.25
+
+0.30
+
+0.0
+
+0.35
+
+2
+0.30
+
+0.35
+
+java | bm25
+SpIDER
+DER
+
+12
+
+SpIDER
+DER
+
+0
+
+0.55
+
+0.05
+
+0.10
+
+0.15
+0.20
+Accuracy
+
+0.25
+
+typescript | bm25
+SpIDER
+DER
+
+SpIDER
+DER
+
+25
+
+17.5
+20
+
+15.0
+
+10
+8
+
+12.5
+
+8
+
+Density
+
+Density
+
+0.50
+
+20.0
+
+12
+
+6
+
+0.45
+Accuracy
+
+javascript | bm25
+
+14
+
+10
+
+0.40
+
+Density
+
+0.10
+
+8
+6
+
+5.0
+
+python | bm25
+
+Density
+
+0.000 0.025 0.050 0.075 0.100 0.125 0.150 0.175 0.200
+Accuracy
+
+typescript | codesage_s_peft
+SpIDER
+DER
+
+15.0
+
+8
+
+8
+
+0
+
+0.40
+
+10
+
+17.5
+
+10
+
+10
+
+0.35
+
+15
+
+javascript | codesage_s_peft
+
+12
+
+0.25
+0.30
+Accuracy
+
+20
+
+java | codesage_s_peft
+
+12
+
+Density
+
+0.15
+0.20
+Accuracy
+
+0.20
+
+SpIDER
+DER
+
+5
+
+0
+
+0.15
+
+typescript | codesage_s_zs
+
+15
+
+8
+
+4
+
+0.10
+
+SpIDER
+DER
+
+Density
+
+Density
+
+6
+
+0
+
+0.60
+
+20
+
+10
+
+8
+
+0.55
+
+SpIDER
+DER
+
+12
+
+10
+
+0.50
+Accuracy
+
+javascript | codesage_s_zs
+
+14
+
+12
+
+8
+
+Density
+
+0.20
+
+14
+
+Density
+
+Density
+
+6
+
+Density
+
+Density
+
+6
+
+10.0
+
+15
+
+6
+4
+
+2
+0
+
+10
+
+7.5
+
+4
+
+5.0
+5
+
+2
+
+0.10
+
+0.15
+
+0.20
+
+0.25
+Accuracy
+
+0.30
+
+0.35
+
+0.40
+
+0
+
+2.5
+0.00
+
+0.05
+
+0.10
+0.15
+Accuracy
+
+0.20
+
+0.25
+
+0.0
+
+0.20
+
+0.25
+
+0.30
+
+0.35
+Accuracy
+
+0.40
+
+0.45
+
+0
+
+0.000
+
+0.025
+
+0.050
+
+0.075 0.100
+Accuracy
+
+0.125
+
+0.150
+
+0.175
+
+Figure 5: KDE (Kernel Density Estimate) plots with bootstrapped results of SWE-PolyBench benchmark for
+Acc@20 performance across various retrieval methods.
+
+SWERank-Small ZS vs SWERank-Small ZS + SpIDER
+
+Recall
+
+Python
+
+Java
+
+0.6
+
+0.4
+
+0.30
+
+0.5
+
+0.3
+
+0.25
+
+0.4
+
+0.35
+
+SWERank-Small ZS + SpIDER
+SWERank-Small ZS
+20
+
+40
+60
+Budget K
+
+80
+
+100
+
+0.40
+0.35
+0.30
+
+0
+
+20
+
+40
+60
+Budget K
+
+20
+
+80
+
+40
+60
+Budget K
+
+80
+
+100
+
+0
+
+20
+
+0.6
+
+0.25
+
+0.5
+
+0.20
+
+0.4
+
+40
+60
+Budget K
+
+80
+
+0.1
+
+100
+
+SWERank-Small ZS + SpIDER
+SWERank-Small ZS
+0
+
+20
+
+Javascript
+
+0.7
+
+0.30
+
+40
+60
+Budget K
+
+80
+
+100
+
+Typescript
+0.40
+0.35
+0.30
+0.25
+
+0
+
+20
+
+40
+60
+Budget K
+
+80
+
+0.20
+0.15
+
+0.3
+
+SWERank-Small ZS + SpIDER
+SWERank-Small ZS
+
+0.10
+
+100
+
+0.2
+SWERank-Small ZS + SpIDER
+SWERank-Small ZS
+
+0.3
+
+Java
+
+0.15
+
+SWERank-Small ZS + SpIDER
+SWERank-Small ZS
+
+0.20
+
+0
+0.35
+
+0.45
+
+0.25
+
+SWERank-Small ZS + SpIDER
+SWERank-Small ZS
+
+0.20
+
+Python
+
+0.50
+
+Typescript
+0.5
+
+0.7
+
+0.40
+
+0
+
+Accuracy
+
+Javascript
+
+0.45
+
+0.60
+0.55
+0.50
+0.45
+0.40
+0.35
+0.30
+0.25
+
+0.2
+
+100
+
+SWERank-Small ZS + SpIDER
+SWERank-Small ZS
+0
+
+20
+
+40
+60
+Budget K
+
+80
+
+SWERank-Small ZS + SpIDER
+SWERank-Small ZS
+
+0.10
+
+100
+
+0
+
+20
+
+40
+60
+Budget K
+
+80
+
+100
+
+Figure 6: SpIDER vs DER performance at various values of K on SWE-PolyBench benchmark for
+SweRankEmbed-Small ZS embedding model, N = 500, C = 5, d = 4.
+
+0.8
+
+0.2
+
+1 2 3 4 5 6 7 8 9 10 11 13 16 23 26 28 30 40
+number of ground truth functions
+
+0.4
+0.3
+
+0.1
+
+0.1
+
+0.0
+
+0.0
+
+Java - Accuracy
+SpIDER
+DER
+
+0.5
+
+0.2
+0.1
+0.0
+
+1 2 3 4 5 6 7 8 9 10 11 12 13 16 17 18 23
+number of ground truth functions
+
+Javascript - Accuracy
+SpIDER
+DER
+
+0.6
+
+0.4
+
+1 2 3 4 5 6 7 8 9 10 11 12 13 14 16 17
+number of ground truth functions
+
+Typescript - Accuracy
+SpIDER
+DER
+
+0.40
+
+0.3
+0.2
+
+0.5
+
+0.3
+
+SpIDER
+DER
+
+0.2
+
+0.30
+
+0.4
+
+Mean Acc@20
+
+0.4
+
+Mean Acc@20
+
+Mean Acc@20
+
+0.3
+
+0.35
+
+0.5
+
+0.3
+0.2
+
+0.1
+
+0.1
+0.0
+
+1 2 3 4 5 6 7 8 9 10 12 13 15 16 17 27 170
+number of ground truth functions
+
+Mean Acc@20
+
+0.6
+
+0.3
+0.2
+
+Python - Accuracy
+
+0.4
+
+0.4
+
+0.2
+
+SpIDER
+DER
+
+0.5
+
+0.5
+Mean Recall@20
+
+0.4
+
+Typescript - Recall
+SpIDER
+DER
+
+0.6
+
+0.5
+
+0.6
+
+0.0
+
+Javascript - Recall
+SpIDER
+DER
+
+0.6
+
+Mean Recall@20
+
+Mean Recall@20
+
+Java - Recall
+0.7
+
+SpIDER
+DER
+
+Mean Recall@20
+
+Python - Recall
+
+1 2 3 4 5 6 7 8 9 10 11 13 16 23 26 28 30 40
+number of ground truth functions
+
+0.0
+
+0.0
+
+0.20
+0.15
+0.10
+
+0.1
+1 2 3 4 5 6 7 8 9 10 12 13 15 16 17 27 170
+number of ground truth functions
+
+0.25
+
+0.05
+1 2 3 4 5 6 7 8 9 10 11 12 13 16 17 18 23
+number of ground truth functions
+
+0.00
+
+1 2 3 4 5 6 7 8 9 10 11 12 13 14 16 17
+number of ground truth functions
+
+Figure 7: Comparing retrieval Recall@20 and Accuracy vs. number of edits for DER vs SpIDER on
+SweRankEmbed-Small ZS using SWE-PolyBench across various languages for N = 500, C = 5, d = 4. Top
+row: Recall@20. Bottom row: Accuracy.
+
+node in any language, so the explored shell contains no functions at all, nh = 0, and no exchange
+is offered. The configuration returns exactly the
+DER set, which is what Table 3 reports. For imports,
+edges do reach function nodes but their prevalence
+sits at the background rate outside Python, so η falls
+below the frontier τ and the condition genuinely
+fails. A framework that could not separate these
+two cases would be vacuous, whereas here each
+predicts a distinct observable, an identical-to-DER
+result in one case and a non-significant difference
+in the other.
+What the Stage-2 selector contributes. Disabling Stage 2 does not yield a comparable operating point: every node in Γd (CQ ) ∩ SN (Q) is
+promoted, the retrieved set grows to hundreds of
+candidates, and the fixed budget K is abandoned.
+The resulting recall is therefore an upper bound on
+what any selection rule over the same neighborhood
+could achieve, and the useful question is how much
+of that ceiling SpIDER captures while still returning
+only K functions. Table 21 reports both. SpIDER
+recovers 79–89% of the unfiltered neighborhood’s
+reachable recall at K = 20, so Stage 2 discards the
+large majority of surfaced nodes while preserving
+nearly all of the recoverable ground truth; without
+it, the same recall is attainable only by giving up
+the fixed budget. The residual gap also quantifies
+the headroom available to a better Stage-2 selector.
+A.10
+
+Comparison with Lexical and Agentic
+Retrieval
+
+Coding agents in practice often locate code with
+lexical grep search and iterative tool calls rather
+than with a dense retriever. We therefore compare
+SpIDER against both, on SWE-PolyBench at K =
+20.
+Baselines. The lexical baseline operates over the
+same function nodes as the dense retriever: an
+LLM extracts up to 25 search terms from the issue, every function in the code graph is ranked
+by keyword-hit count, and the top-K are returned.
+The agentic baseline is OpenHands (Wang et al.,
+2025), a general-purpose software agent that explores the repository with its own tool suite and is
+not restricted to a fixed retrieval budget.
+Findings. Table 22 supports three observations.
+First, SpIDER outperforms the lexical baseline on
+Python, Java and TypeScript. Second, JavaScript is
+an exception where keyword matching wins, and
+
+this is the outcome our own locality analysis predicts: Table 6 identifies JavaScript as the denseranker-dominated split, with 53.6% of instances already fully covered in the top-100 and only 21.8%
+having any ground truth beyond the top-500, leaving little headroom for a graph mechanism, and it
+is also the split where lexical matching is strongest.
+Third, OpenHands attains the highest recall in every
+language, but by iterative exploration costing 223K–
+600K tokens per instance, between two and forty
+times the cost of SpIDER depending on the edge
+configuration, and without the fixed-budget guarantee that makes the retrieved set directly consumable
+by a downstream generator under a known context
+cost. The comparisons are therefore complementary rather than competing: SpIDER is agnostic to
+its first stage and improves both dense and sparse
+BM25 retrievers (Table 2), so the same expansion
+could be applied on top of a lexical first stage in
+the regime where that stage is strongest.
+Deployability. The two regimes also differ in
+how they can be served. SpIDER’s cost is spread
+over C independent LLM calls that are issued concurrently and carry no context between them, so
+each call sees a small, bounded context regardless
+of repository size; Table 23 shows an open 30B
+coder model filling the filter role to within 0.01–
+0.05 Recall@20 of Claude Sonnet 4, and the
+bounded per-call context is what makes serving
+or fine-tuning a smaller model for this step practical. An iterative agent’s context instead grows
+with its tool-call history, so its budget is neither
+fixed in advance nor parallelizable in the same way,
+and the same substitution is correspondingly harder.
+This matters for the developer-in-the-loop setting
+SpIDER targets, where retrieval runs on an active
+repository at session start under a cost ceiling the
+developer chooses.
+A.11
+
+Per-Language Hyperparameter
+Sensitivity
+
+C, d and N were grid-searched on the Python
+split of SWE-PolyBench and then held fixed for every language and benchmark. The per-language
+sweeps already reported let us check directly
+whether that transfer costs anything. Table 19
+shows Recall@20 saturating at C = 5 for Python,
+JavaScript and Java, with only TypeScript still
+improving marginally up to C = 9 (+0.04 Recall@20). Table 9 shows monotone improvement
+in d for all four languages, so no language prefers
+
+a smaller depth. Table 10 shows saturation at
+N ≈ 300–500 in all four.
+The
+Python-tuned
+configuration
+(C=5, d=4, N =500) is therefore at or near
+the per-language optimum everywhere we measure,
+and the single deviation, TypeScript preferring
+a larger C, would increase SpIDER’s reported
+gains rather than reduce them. The cross-language
+conclusions in Table 2 are consequently not
+an artifact of tuning on Python, and the fixed
+configuration is, if anything, conservative for
+TypeScript.
+A.12
+
+Qualitative Analysis
+
+Which issues benefit from graph expansion?
+Those where the issue names or points at
+one function, but the code that must change
+is a structural neighbor of it; dense retrieval
+ranks the named function highly and stops
+there.
+In huggingface/transformers-5749
+(Python, contains), the issue observes that
+BasicTokenizer._clean_text appears never to
+be called. Dense retrieval ranked _clean_text
+at the top but never surfaced the ground truth
+BasicTokenizer.tokenize, the function that
+must be edited to call it; SpIDER recovered
+tokenize as a same-class contains neighbor of
+the _clean_text center. In apache/dubbo-3479
+(Java, invokes), the issue concerns URL keys in
+simplify mode. Dense retrieval missed both groundtruth functions, ServiceConfig.doExport and
+ServiceConfig.doExportUrlsFor1Protocol,
+which live in a different file from any top-ranked
+function; SpIDER recovered both as invokes
+neighbors of the center ZKTools.pathToKey.
+These are cross-file targets that contains expansion
+cannot structurally reach. Quantitatively, invokes
+expansion changes the retrieved set on 23% of
+instances (macro-averaged over languages) against
+10% for contains, and improves recall in the large
+majority of those cases, with losses of 1–2%.
+When does the Stage-2 filter judge incorrectly?
+In two opposite ways. Over-restrictive: the
+prompt (Section A.5) instructs the selector to
+keep only high-confidence candidates and to return an empty set when in doubt. When the
+ground truth is reached from a center that is itself only tangentially related to the issue, the
+selector sees no issue-relevance and discards it.
+In keras-team/keras-18975, the ground truth
+CompileLoss.build was surfaced as a neighbor
+
+of Trainer.compile but rejected by the filter, so
+the instance remained a miss. Across languages the
+filter retains only 50–70% of the ground-truth functions that graph expansion successfully surfaces,
+which is the same conclusion Table 21 reaches
+from the opposite direction: the selector, not the
+graph, is the current bottleneck. Over-permissive:
+dense call graphs can surface hundreds of neighbors per center, and the selector then admits tangential callers and test functions which, under a
+fixed budget, can evict a correctly retrieved groundtruth function. In prettier/prettier-14788
+(JavaScript), dense retrieval already had the sole
+ground truth handleError inside the top-K and
+neighbor flooding displaced it. This is why we cap
+the invokes neighborhood at the 100 highest-ranked
+neighbors per query (Table 3).
+Operating boundaries. SpIDER helps when the
+target is both (i) within d hops of a top-C center
+and (ii) inside the top-N pool. Targets that are
+simultaneously low-ranked and graph-distant remain unreachable. The best-fit cases are call-chain
+bugs and localized refactors (invokes) and same-file
+or same-class fixes (contains); the worst-fit cases
+are large multi-function refactors and fixes that
+are semantically distant from every highly ranked
+function. Taken together with the filter’s 50–70%
+retention, this points at issue-aware neighbor ranking before filtering, and per-center neighbor caps
+on dense invokes graphs, as the most promising
+directions for improving SpIDER.
+A.13
+
+Evaluating Open Source Models
+
+We examine whether SpIDER can be run end-toend with open-source language models in place
+of Claude Sonnet 4 for the LLM neighborhoodfiltering step. We substitute three Qwen-Coder
+variants of increasing scale and re-run the dense
+retrieval pipeline on SWE-PolyBench. Table 23
+reports function-level Recall and Accuracy across
+all four languages.
+Among
+the
+open-source
+backbones,
+Qwen3-Coder-30B-A3B-Instruct
+obtains
+the best Recall and Accuracy in every language,
+with the largest gains over the 7B and 14B variants
+on Python and JavaScript.
+The top block of Table 23 carries over
+two references from Table 2: the DER baseline (no SpIDER) and the closed-source Claude
+Sonnet 4 used as the LLM filter inside SpIDER.
+Qwen3-Coder-30B-A3B-Instruct improves over
+
+the DER baseline on every language, while the
+smaller 7B and 14B variants show smaller and
+less consistent gains over DER. Relative to Claude
+Sonnet 4, Qwen3-Coder-30B-A3B-Instruct
+closes the Recall@20 gap to roughly 0.02 on Java,
+0.05 on JavaScript, 0.01 on Python, and 0.02 on
+TypeScript; the Accuracy@20 gaps follow a similar
+pattern. This indicates that a sufficiently large opensource coder model is a practical drop-in substitute
+for SpIDER’s LLM filter on SWE-PolyBench.
+A.14
+
+Frequently Asked Questions
+
+This section collects clarifications on points that
+recur in discussion of this work.
+Is the headline “≥ 13%” gain absolute or relative? Relative. The minimum is taken over
+all language × dataset cells in Table 2 comparing SpIDER to DER with SweRankEmbed-Small at
+K = 20. The corresponding absolute Recall@20
+gains range from +0.05 to +0.12 points. For example, Python on SWE-PolyBench goes from 0.42
+to 0.49, a +0.07 absolute / +16.7% relative gain.
+Why is contains the default exploration edge?
+It does not: Table 3 evaluates all four edge types,
+and invokes expansion outperforms contains-only
+expansion in every language. contains is the default because it is the cheapest reliable signal. It
+captures hierarchical structure (function ⊆ class ⊆
+file ⊆ directory), is identified reliably by syntaxbased parsers across all four languages, and costs
+roughly an order of magnitude fewer tokens per
+instance than invokes, whose accurate call-graph
+resolution is also more brittle in dynamic languages (e.g., method dispatch through Python decorators, JavaScript prototype chains, dynamic imports). Where the token budget permits, invokes or
+contains+invokes is the stronger choice, and the
+margin is largest exactly where Table 6 predicts:
+Java, with the highest invoke-connectivity (0.63)
+and the lowest dense top-100 coverage (29%).
+Is the SpIDER-over-DER improvement statistically significant? We report bootstrapped 95%
+confidence intervals in Table 13 and KDE plots
+in Figures 4 and 5. The comparison is paired
+per-instance, so the paired test has substantially
+more power than comparing marginal CIs. Table 20 reports paired-bootstrap and two-sided
+paired-permutation results for every language and
+edge configuration; the two tests agree in every cell,
+and all structural-edge Recall@20 gains are signifi-
+
+cant at p < 0.01 in all four languages. Section A.9
+discusses the one non-significant structural cell.
+Why is LocAgent evaluated only on Python?
+LocAgent is an iterative LLM-driven agent that
+issues many tool calls per instance and took over
+48 hours on SWEBench-Verified and roughly 24
+hours on the Python split of SWE-PolyBench (see
+Table 11). Running it at the same scale on Java,
+JavaScript, and TypeScript was not feasible within
+our compute budget. The comparison in Table 12
+is therefore illustrative for Python only; we do not
+extrapolate cross-method conclusions to other languages.
+Why is the TypeScript function-edit percentage in Table 1 low? Many TypeScript repositories in SWE-PolyBench and Multi-SWEBench are
+linter- or configuration-heavy, and patches more
+often touch type definitions, build configurations,
+or other non-function regions than they do in
+Python or Java. Our function-level evaluation excludes these instances, which is why only 29.6%
+(SWE-PolyBench) and 27.7% (Multi-SWEBench)
+of TypeScript instances have function-level ground
+truth. The class-level breakdown in Table 7 is correspondingly small and is not reported for TypeScript.
+When does SpIDER reduce MRR@K? SpIDER
+promotes graph neighbors of top-ranked seeds,
+which can occasionally rerank a neighbor above a
+high-ranked non-center ground-truth node. The
+MRR@K drop is most visible in TypeScript
+with SweRankEmbed-Small ZS (Table 17) and on
+Multi-SWEBench TypeScript. SpIDER is Recalloriented and not designed to optimize ranking order within the top-K; Recall@K and Acc@K, the
+relevant metrics for downstream patch generation
+under a fixed budget, are not affected. A fuller
+discussion is in App. A.8.
+What is the wall-clock and token-cost overhead
+of SpIDER relative to DER and BM25? SpIDER
+adds one Stage-2 LLM round-trip per seed center
+(default C=5), bounding per-query overhead by
+the input-token budget reported in Tables 8 and 14.
+At the default C=5, d=4, N =500 setting, the perquery input is ∼ 18–32K tokens (per language),
+with output ∼ 150–300 tokens; calls are issued
+concurrently across seeds. Empirically, this corresponds to a per-query latency of roughly 5–10
+seconds with Claude Sonnet 4, compared with
+
+< 1 second for DER alone (dominated by the encoder forward pass and a top-K scan) and a few
+milliseconds for BM25. LocAgent required 24–48
+hours on the same datasets due to its iterative toolcall architecture (Table 11), so SpIDER sits roughly
+two orders of magnitude below LLM-agent localization while remaining only one LLM round-trip
+slower than embedding retrieval.
+Does graph expansion alone (without the LLM
+filter) already provide most of the gain? No.
+The Stage-2 LLM filter is the component that
+makes graph expansion safe at fixed budget K.
+Without it, every node in Γd (CQ ) ∩ SN (Q) would
+be promoted into the top-K set, which scales
+super-linearly with d and quickly displaces highconfidence semantic candidates with noise; equivalently, Stage 1 alone admits too many false-positive
+neighbors per seed for d ≥ 4. Table 21 measures
+this directly: the unfiltered neighborhood’s recall
+is an upper bound attained only by abandoning the
+fixed budget, and SpIDER captures 79–89% of it
+while returning just K functions.
+Why are GraphCodeBERT, RepoGraph, CoRet,
+CoRNStack, RepoDeepSearch and RepoNavigator not included as baselines? GraphCodeBERT (Guo et al., 2021) is a code encoder rather
+than an issue-localization system; the role of
+a strong embedding-based baseline is filled by
+CodeSAGE-Small ZS and CodeSAGE-Small-PEFT
+in Table 2, which are stronger code encoders for
+issue-driven retrieval. CoRNStack (Suresh et al.,
+2025) is a training procedure whose representative
+model is the CodeSAGE family we evaluate. CoRet
+(Fehr et al., 2025) has released neither embeddings
+nor code, preventing direct comparison. RepoGraph (Ouyang et al., 2025) is an agentic localization pipeline built on line-of-code-level graphs,
+constructed with the Python ast module, so it operates at a different granularity than function-level
+retrieval at fixed K and is not directly usable on
+SpIDER-Bench or on existing non-Python benchmarks. RepoDeepSearch (Ma et al., 2025) and RepoNavigator (Zhang et al., 2026) are recent agentic
+localization systems, but, like LocAgent, both lean
+heavily on Python-specific tooling such as ast and
+Python-oriented parsers; running them on the Java,
+JavaScript and TypeScript splits of SpIDER-Bench
+would require substantial pipeline modification,
+which is itself part of the gap SpIDER-Bench is
+intended to expose. RepoNavigator additionally
+has no public implementation. The agentic com-
+
+parators within reach are therefore LocAgent (Tables 11 and 12) and OpenHands (Table 22), which
+is language-agnostic.
+How is SpIDER-Bench constructed, and what
+are the per-language sizes? For each instance
+from SWEBench-Verified, SWE-PolyBench, and
+Multi-SWEBench, we (i) clone the repository at the
+issue’s base commit, (ii) parse all primary-language
+files into syntax trees (Python ast; Tree-sitter for
+Java/JS/TS), (iii) extract function, class, file, and directory nodes plus their contains, invokes, imports,
+and inherits edges following the schema of Chen
+et al. (2025), and (iv) map each patch’s modified
+function bodies back to graph nodes to obtain
+V ∗ . After excluding instances without functionlevel ground truth, the retained per-language
+counts are: Python 182 from SWE-PolyBench
+and 469 from SWEBench-Verified; Java 158
+from SWE-PolyBench; JavaScript 573 from
+SWE-PolyBench; TypeScript subsets across
+SWE-PolyBench and Multi-SWEBench; full
+per-dataset numbers are in Tables 1 and 6. Construction is deterministic given the repository state
+and uses no manual annotation; ground-truth labels
+are inherited from the upstream benchmarks.
+How sensitive are the results to the initial dense
+ranker? The initial ranker bounds SpIDER in two
+ways. First, Table 6 shows that 22%–62% of instances (depending on language) contain at least
+one ground-truth function outside the dense top500 candidate pool SN (Q), and SpIDER cannot
+recover these targets regardless of graph structure.
+Second, the relative gain ordering across languages
+tracks the per-language top-100 coverage of the
+dense baseline: JavaScript benefits less in relative terms because DER already covers most of its
+ground truth at K=20, while Python and Java see
+larger relative gains because their dense top-100
+coverage is lower. A stronger initial ranker would
+lift the ceiling proportionally and is the most direct
+lever for closing the residual gap.
+
+Table 5: Symbols and notation used in the main paper.
+
+Symbol
+
+Description
+
+Graph and codebase
+G = (V, E)
+V
+E
+n
+distG (·, ·)
+
+Code graph with nodes and edges
+Code entity nodes (functions, classes, files, directories)
+Edges of type contains, invokes, imports, inherits
+Number of nodes in V
+Shortest-path distance on G
+
+Query and ground truth
+Q
+V∗ ⊆ V
+m
+
+Issue description (query)
+Ground-truth function nodes for Q
+Number of ground-truth nodes, m = |V ∗ |
+
+Scoring and dense retrieval
+F(·)
+sQ (v) = cos(F (v), F (Q))
+K
+SK (Q)
+
+Bi-modal encoder mapping code/text to a shared embedding space
+Relevance score of node v for Q
+Retrieval budget
+Dense-retrieval (DER) top-K set
+
+SpIDER hyperparameters and intermediate sets
+N
+Primary neighborhood filtering threshold, N > K
+SN (Q)
+Top-N candidate pool
+C
+Number of seed centers, C ≤ K
+CQ
+Top-C seed centers drawn from SK (Q)
+d
+BFS exploration depth
+Γd (CQ )
+d-hop neighborhood of CQ along contains edges
+ˆ
+CQ
+Stage-1 filtered candidates: Γd (CQ ) ∩ SN (Q)
+L(u)
+LLM selector, returns {0, 1}
+UQ
+LLM-selected candidates union seed centers
+LLM (Q)
+SK
+Final SpIDER retrieval set of size K
+Evaluation and theory
+Recall@K
+Acc@K
+MRR@K
+P
+R
+A
+DJ
+η
+τ
+h(v), nh
+ph
+π, ∆, λ
+a, c
+b
+θ, d⋆
+
+|V ∗ ∩ S(Q)|/|V ∗ |
+I[V ∗ ⊆ S(Q)]
+Mean reciprocal rank of the first ground-truth node in S(Q)
+New graph proposals, (Γd (CQ ) ∩ SN (Q)) \ SK
+Protected baseline items: seeds, plus accepted candidates already in SK
+Admitted set, the candidates that consume retrieval budget
+The J = |A| displaced baseline items
+Admitted precision, E|A ∩ V ∗ |/E|A| (Proposition 4.1)
+Frontier relevance of a displaced item, E|DJ ∩ V ∗ |/E|DJ | (Proposition 4.1)
+Distance from v to its nearest seed, and the number of functions at distance h
+Target prevalence at distance h, π + ∆λh (Assumption A.8)
+Background rate, seeding gain, and per-hop persistence
+Admission rates for edited and non-edited candidates (Assumption A.9)
+Branching factor of the shell counts, nh = kbh−1
+Profitability threshold and useful exploration radius (Equation (17))
+
+Table 6: Locality and dense-retrieval coverage statistics on SWEBench-Verified and the Python, Java, and JavaScript
+splits of SWE-PolyBench. Multi-func rows are computed over instances with > 1 ground-truth function. “Tightly
+clustered” denotes maximum within-instance ground-truth-pair distance ≤ 2 hops. Dense retrieval refers to
+SweRankEmbed-Small.
+SWEBench-Verified
+
+SWE-PolyBench Python
+
+SWE-PolyBench Java
+
+SWE-PolyBench JavaScript
+
+469
+190
+2.25 / 1
+1.23 / 1
+
+182
+115
+5.02 / 2
+1.79 / 1
+
+158
+123
+7.93 / 3
+2.79 / 2
+
+573
+367
+3.39 / 2
+1.58 / 1
+
+Graph locality (multi-func instances)
+Mean shortest-path (hops)
+Median max shortest-path (hops)
+Disconnected GT pairs (%)
+Mean invoke-connected ratio
+Tightly / mod. / spread (%)
+
+1.92
+2.0
+0
+0.57
+84.9 / 9.4 / 5.8
+
+2.14
+2.0
+0
+0.31
+64.8 / 14.8 / 20.3
+
+2.00
+2.0
+0
+0.63
+46.8 / 20.3 / 32.9
+
+1.71
+2.0
+0
+0.59
+71.4 / 15.4 / 13.3
+
+Dense retrieval coverage (top-K)
+All GT in top-100 (%)
+All GT in top-500 (%)
+Any GT beyond top-500 (%)
+All in top-100, multi-func (%)
+All in top-100, tightly clustered (%)
+
+44.8
+61.8
+38.2
+—
+—
+
+36.3
+48.9
+51.1
+18.3
+34.0
+
+29.1
+38.0
+62.0
+15.4
+30.2
+
+53.6
+78.2
+21.8
+41.4
+53.1
+
+Instance / ground-truth statistics
+# instances
+# multi-func instances
+Mean / median GT funcs/inst
+Mean / median GT files/inst
+
+Table 7: Class-level performance on SWE-PolyBench for K = 20, N = 500, C = 5, d = 2. Winners per metric are
+in bold.
+Language
+
+Model
+
+Retrieval
+
+Recall@20
+
+Accuracy@20
+
+MRR@20
+
+SweRankEmbed-Small ZS
+
+SpIDER
+DER
+SpIDER
+DER
+SpIDER
+DER
+SpISR
+SR
+
+0.65
+0.59
+0.39
+0.33
+0.31
+0.30
+0.60
+0.58
+
+0.54
+0.48
+0.33
+0.25
+0.26
+0.22
+0.52
+0.48
+
+0.36
+0.45
+0.16
+0.19
+0.16
+0.19
+0.28
+0.35
+
+SpIDER
+DER
+SpIDER
+DER
+SpIDER
+DER
+SpISR
+SR
+
+0.48
+0.46
+0.25
+0.23
+0.26
+0.28
+0.33
+0.33
+
+0.37
+0.37
+0.17
+0.17
+0.18
+0.21
+0.26
+0.26
+
+0.34
+0.34
+0.11
+0.10
+0.12
+0.14
+0.22
+0.25
+
+CodeSAGE-Small ZS
+Python
+
+CodeSAGE-Small-PEFT
+BM25
+SweRankEmbed-Small ZS
+CodeSAGE-Small ZS
+
+Java
+
+CodeSAGE-Small-PEFT
+BM25
+
+Table 8: Token usage for the BFS depth (d) ablation from Table 9 (K = 20, N = 100, C = 3). Average per-call
+LLM input/output tokens grow with d across languages.
+
+d
+
+Python
+Input Output
+
+JavaScript
+Input Output
+
+Java
+Input Output
+
+TypeScript
+Input Output
+
+2
+4
+6
+8
+
+2.6K
+3.6K
+11.9K
+29.7K
+
+2.0K
+3.1K
+10.1K
+15.0K
+
+2.2K
+2.1K
+3.6K
+5.6K
+
+1.5K
+2.0K
+4.3K
+5.6K
+
+32
+35
+48
+69
+
+50
+25
+42
+48
+
+22
+54
+67
+82
+
+21
+24
+33
+37
+
+Table 9: Performance of SpIDER + SweRankEmbed-Small ZS encoder with MRR for different BFS depths d with
+K = 20, N = 100, C = 3
+d
+
+Recall@20
+0.45
+0.46
+0.50
+0.55
+
+2
+4
+6
+8
+
+Python
+Accuracy@20
+0.36
+0.37
+0.41
+0.44
+
+MRR@20
+0.28
+0.30
+0.33
+0.38
+
+Recall@20
+0.54
+0.57
+0.62
+0.67
+
+JavaScript
+Accuracy@20
+0.46
+0.49
+0.53
+0.58
+
+MRR@20
+0.17
+0.18
+0.20
+0.22
+
+Recall@20
+0.33
+0.33
+0.33
+0.34
+
+Java
+Accuracy@20
+0.25
+0.25
+0.25
+0.27
+
+MRR@20
+0.18
+0.18
+0.18
+0.20
+
+Recall@20
+0.31
+0.30
+0.36
+0.36
+
+TypeScript
+Accuracy@20
+0.23
+0.24
+0.28
+0.27
+
+MRR@20
+0.06
+0.06
+0.07
+0.07
+
+Table 10: SpIDER + SweRankEmbed-Small ZS encoder performance with varying neighbor filtering threshold N
+for K = 20, C = 3, d = 4
+N
+50
+100
+300
+500
+700
+900
+1000
+
+Recall@20
+0.45
+0.46
+0.48
+0.49
+0.48
+0.48
+0.48
+
+Python
+Accuracy@20
+0.37
+0.37
+0.39
+0.39
+0.39
+0.39
+0.39
+
+MRR@20
+0.29
+0.30
+0.30
+0.30
+0.31
+0.31
+0.31
+
+Recall@20
+0.56
+0.57
+0.58
+0.59
+0.59
+0.58
+0.59
+
+JavaScript
+Accuracy@20
+0.48
+0.49
+0.50
+0.51
+0.51
+0.50
+0.51
+
+MRR@20
+0.18
+0.18
+0.18
+0.18
+0.18
+0.18
+0.18
+
+Recall@20
+0.32
+0.33
+0.35
+0.35
+0.35
+0.34
+0.36
+
+Java
+Accuracy@20
+0.24
+0.25
+0.26
+0.26
+0.25
+0.25
+0.27
+
+MRR@20
+0.19
+0.18
+0.19
+0.19
+0.18
+0.19
+0.19
+
+Recall@20
+0.31
+0.30
+0.32
+0.31
+0.31
+0.31
+0.32
+
+TypeScript
+Accuracy@20
+0.24
+0.24
+0.25
+0.24
+0.23
+0.24
+0.24
+
+MRR@20
+0.06
+0.06
+0.06
+0.06
+0.06
+0.06
+0.06
+
+Table 11: LocAgent performance on SWEBench-Verified and a subset of Python instances in SWE-PolyBench.
+Running LocAgent took over 48 hours on SWEBench-Verified and approximately 24 hours on SWE-PolyBench,
+highlighting a key limitation of this approach. In addition to the long runtime, LocAgent also requires significantly
+more LLM invocations per instance compared to dense embedding retrieval and BM25, resulting in higher computational costs.
+Dataset
+SWEBench-Verified
+SWE-PolyBench
+(Python subset)
+
+Metrics
+Recall@K
+Acc@K
+MRR@K
+Recall@K
+Acc@K
+MRR@K
+
+K
+3
+0.18
+0.17
+0.12
+0.23
+0.17
+0.21
+
+5
+0.26
+0.23
+0.14
+0.30
+0.23
+0.23
+
+10
+0.41
+0.37
+0.16
+0.41
+0.31
+0.25
+
+20
+0.54
+0.48
+0.17
+0.49
+0.37
+0.25
+
+30
+0.62
+0.57
+0.17
+0.53
+0.41
+0.25
+
+40
+0.68
+0.61
+0.17
+0.58
+0.46
+0.26
+
+50
+0.69
+0.63
+0.17
+0.58
+0.46
+0.26
+
+60
+0.71
+0.64
+0.17
+0.59
+0.46
+0.26
+
+70
+0.72
+0.66
+0.17
+0.59
+0.46
+0.26
+
+80
+0.73
+0.66
+0.17
+0.60
+0.47
+0.26
+
+90
+0.74
+0.67
+0.18
+0.61
+0.48
+0.26
+
+100
+0.74
+0.67
+0.18
+0.61
+0.49
+0.26
+
+Table 12: Comparison of LocAgent with dense retrieval methods + LLM reranker for Python repositories in
+SWE-PolyBench
+
+Dataset
+
+SWE-PolyBench
+
+Model
+LocAgent
+SweRankEmbed-Small ZS+ SpIDER
++ LLM reranker
+CodeSAGE-Small ZS + SpIDER
++ LLM reranker
+CodeSAGE-Small-PEFT + SpIDER
++ LLM reranker
+BM25+ SpISR
+
+Recall@3
+0.18
+0.44
+
+Accuracy@3
+0.17
+0.36
+
+MRR@3
+0.12
+0.54
+
+0.23
+
+0.18
+
+0.31
+
+0.32
+
+0.25
+
+0.42
+
+0.30
+
+0.23
+
+0.38
+
+Table 13: SWE-PolyBench retrieval performance with 95% confidence intervals (µ± CI) for K = 20, N = 500,
+C = 5, d = 4
+
+Language
+
+Model
+SweRankEmbed-Small ZS
+CodeSAGE-Small ZS
+
+Python
+CodeSAGE-Small-PEFT
+BM25
+SweRankEmbed-Small ZS
+CodeSAGE-Small ZS
+Java
+CodeSAGE-Small-PEFT
+BM25
+SweRankEmbed-Small ZS
+CodeSAGE-Small ZS
+JavaScript
+CodeSAGE-Small-PEFT
+BM25
+SweRankEmbed-Small ZS
+CodeSAGE-Small ZS
+TypeScript
+CodeSAGE-Small-PEFT
+BM25
+
+Retrieval
+
+Recall@20
+
+Accuracy@20
+
+SpIDER
+DER
+SpIDER
+DER
+SpIDER
+DER
+SpISR
+SR
+
+0.49 ± 0.06
+0.42 ± 0.06
+0.27 ± 0.06
+0.21 ± 0.06
+0.37 ± 0.06
+0.29 ± 0.06
+0.33 ± 0.07
+0.31 ± 0.06
+
+0.40 ± 0.07
+0.35 ± 0.07
+0.21 ± 0.06
+0.17 ± 0.06
+0.27 ± 0.07
+0.20 ± 0.06
+0.26 ± 0.07
+0.24 ± 0.07
+
+SpIDER
+DER
+SpIDER
+DER
+SpIDER
+DER
+SpISR
+SR
+
+0.36 ± 0.08
+0.31 ± 0.07
+0.23 ± 0.07
+0.15 ± 0.06
+0.28 ± 0.08
+0.21 ± 0.07
+0.16 ± 0.06
+0.15 ± 0.06
+
+0.27 ± 0.08
+0.24 ± 0.08
+0.17 ± 0.07
+0.10 ± 0.05
+0.18 ± 0.07
+0.14 ± 0.06
+0.10 ± 0.05
+0.10 ± 0.05
+
+SpIDER
+DER
+SpIDER
+DER
+SpIDER
+DER
+SpISR
+SR
+
+0.60 ± 0.04
+0.52 ± 0.04
+0.38 ± 0.04
+0.26 ± 0.04
+0.55 ± 0.04
+0.45 ± 0.04
+0.46 ± 0.04
+0.36 ± 0.04
+
+0.52 ± 0.04
+0.45 ± 0.04
+0.32 ± 0.04
+0.21 ± 0.04
+0.48 ± 0.05
+0.38 ± 0.04
+0.39 ± 0.04
+0.29 ± 0.04
+
+SpIDER
+DER
+SpIDER
+DER
+SpIDER
+DER
+SpISR
+SR
+
+0.35 ± 0.06
+0.29 ± 0.05
+0.16 ± 0.04
+0.10 ± 0.04
+0.25 ± 0.05
+0.19 ± 0.05
+0.11 ± 0.04
+0.07 ± 0.03
+
+0.28 ± 0.05
+0.21 ± 0.05
+0.10 ± 0.04
+0.06 ± 0.04
+0.18 ± 0.05
+0.13 ± 0.05
+0.09 ± 0.04
+0.05 ± 0.03
+
+Table 14: Ablation on primary neighborhood filtering threshold N using SpIDER + SweRankEmbed-Small for
+K = 20, C = 3, d = 4. Increasing N improves coverage and Recall@20 with modest increases in LLM token
+usage. Avg. tokens indicate average consumption per LLM call; number of calls equals C. Best Recall and Accuracy
+per language are highlighted.
+Python
+
+N
+
+50
+100
+300
+500
+700
+900
+1000
+
+JavaScript
+
+Java
+
+TypeScript
+
+Recall
+
+Accuracy
+
+Tokens
+(Input / Output)
+
+Recall
+
+Accuracy
+
+Tokens
+(Input / Output)
+
+Recall
+
+Accuracy
+
+Tokens
+(Input / Output)
+
+Recall
+
+Accuracy
+
+Tokens
+(Input / Output)
+
+0.45
+0.46
+0.48
+0.49
+0.48
+0.48
+0.48
+
+0.37
+0.37
+0.39
+0.39
+0.39
+0.39
+0.39
+
+3108 / 33
+3591 / 35
+4848 / 37
+5708 / 39
+6361 / 39
+6903 / 40
+7180 / 40
+
+0.56
+0.57
+0.58
+0.59
+0.59
+0.58
+0.59
+
+0.48
+0.49
+0.50
+0.51
+0.51
+0.50
+0.51
+
+2383 / 23
+3115 / 25
+5119 / 29
+6775 / 30
+7998 / 31
+8780 / 32
+9098 / 32
+
+0.32
+0.33
+0.35
+0.35
+0.35
+0.35
+0.36
+
+0.24
+0.25
+0.26
+0.26
+0.25
+0.26
+0.27
+
+1845 / 49
+2083 / 54
+2644 / 56
+2978 / 57
+3203 / 59
+3343 / 58
+3441 / 59
+
+0.31
+0.30
+0.32
+0.31
+0.31
+0.31
+0.32
+
+0.24
+0.24
+0.25
+0.24
+0.23
+0.24
+0.25
+
+1763 / 23
+1994 / 24
+2459 / 26
+2687 / 26
+2843 / 27
+2943 / 27
+3001 / 27
+
+Table 15: Effect of retrieval budget K on SpIDER + SweRankEmbed-Small performance for N = 500, C = 5,
+d = 4. Increasing K consistently improves Recall@K and Accuracy@K, while MRR@K remains stable. Best
+values per metric are highlighted.
+Python
+
+K
+3
+5
+10
+20
+30
+40
+50
+60
+70
+80
+90
+100
+
+Java
+
+JavaScript
+
+TypeScript
+
+Recall
+
+Accuracy
+
+MRR
+
+Recall
+
+Accuracy
+
+MRR
+
+Recall
+
+Accuracy
+
+MRR
+
+Recall
+
+Accuracy
+
+MRR
+
+0.31
+0.39
+0.44
+0.49
+0.52
+0.52
+0.54
+0.58
+0.58
+0.60
+0.61
+0.62
+
+0.25
+0.32
+0.36
+0.39
+0.42
+0.43
+0.44
+0.47
+0.46
+0.48
+0.50
+0.50
+
+0.27
+0.30
+0.30
+0.29
+0.30
+0.30
+0.30
+0.31
+0.30
+0.30
+0.30
+0.30
+
+0.17
+0.24
+0.33
+0.35
+0.37
+0.38
+0.42
+0.43
+0.45
+0.46
+0.46
+0.46
+
+0.09
+0.16
+0.23
+0.26
+0.27
+0.28
+0.31
+0.32
+0.34
+0.34
+0.34
+0.34
+
+0.17
+0.18
+0.19
+0.19
+0.19
+0.19
+0.19
+0.19
+0.19
+0.19
+0.19
+0.19
+
+0.32
+0.39
+0.49
+0.59
+0.62
+0.65
+0.68
+0.70
+0.72
+0.73
+0.75
+0.77
+
+0.26
+0.34
+0.41
+0.51
+0.54
+0.57
+0.59
+0.61
+0.63
+0.64
+0.67
+0.68
+
+0.16
+0.17
+0.17
+0.18
+0.18
+0.18
+0.18
+0.18
+0.18
+0.18
+0.18
+0.18
+
+0.17
+0.19
+0.29
+0.35
+0.40
+0.42
+0.42
+0.45
+0.47
+0.48
+0.48
+0.52
+
+0.12
+0.14
+0.23
+0.28
+0.31
+0.33
+0.33
+0.36
+0.38
+0.38
+0.39
+0.43
+
+0.06
+0.06
+0.06
+0.06
+0.06
+0.07
+0.06
+0.06
+0.07
+0.07
+0.06
+0.07
+
+Table 16: SweRankEmbed-Small zero-shot performance across varying retrieval budgets K for N = 500, C = 5,
+d = 4. Best Recall and Accuracy per language are highlighted.
+Python
+
+K
+3
+5
+10
+20
+30
+40
+50
+60
+70
+80
+90
+100
+
+Java
+
+JavaScript
+
+TypeScript
+
+Recall
+
+Accuracy
+
+MRR
+
+Recall
+
+Accuracy
+
+MRR
+
+Recall
+
+Accuracy
+
+MRR
+
+Recall
+
+Accuracy
+
+MRR
+
+0.24
+0.31
+0.36
+0.42
+0.47
+0.49
+0.51
+0.55
+0.56
+0.57
+0.58
+0.59
+
+0.19
+0.25
+0.30
+0.35
+0.39
+0.40
+0.42
+0.45
+0.45
+0.46
+0.47
+0.48
+
+0.27
+0.29
+0.30
+0.30
+0.30
+0.30
+0.31
+0.31
+0.31
+0.31
+0.31
+0.31
+
+0.18
+0.26
+0.30
+0.31
+0.33
+0.35
+0.39
+0.41
+0.43
+0.43
+0.43
+0.44
+
+0.12
+0.19
+0.22
+0.24
+0.25
+0.26
+0.29
+0.30
+0.32
+0.32
+0.32
+0.33
+
+0.24
+0.26
+0.26
+0.26
+0.26
+0.27
+0.27
+0.27
+0.27
+0.27
+0.27
+0.27
+
+0.26
+0.33
+0.43
+0.52
+0.57
+0.61
+0.65
+0.67
+0.68
+0.70
+0.72
+0.73
+
+0.22
+0.27
+0.37
+0.45
+0.49
+0.53
+0.56
+0.58
+0.59
+0.61
+0.63
+0.64
+
+0.27
+0.28
+0.30
+0.30
+0.31
+0.31
+0.31
+0.31
+0.31
+0.31
+0.31
+0.31
+
+0.11
+0.16
+0.20
+0.29
+0.34
+0.37
+0.38
+0.41
+0.42
+0.43
+0.46
+0.48
+
+0.07
+0.12
+0.14
+0.21
+0.26
+0.29
+0.30
+0.32
+0.33
+0.34
+0.36
+0.39
+
+0.15
+0.16
+0.17
+0.18
+0.18
+0.18
+0.18
+0.18
+0.18
+0.18
+0.18
+0.18
+
+Table 17: Comparison of dense retrieval and dense retrieval + LLM reranker for K = 20 and N = 500, C = 5,
+d = 4 on SWE-PolyBench. Winners per metric per embedding model are highlighted in light blue.
+Language
+
+Model
+
+SweRankEmbed-Small ZS
+CodeSAGE-Small ZS
+Python
+CodeSAGE-Small-PEFT
+BM25
+SweRankEmbed-Small ZS
+CodeSAGE-Small ZS
+Java
+CodeSAGE-Small-PEFT
+BM25
+SweRankEmbed-Small ZS
+CodeSAGE-Small ZS
+JavaScript
+CodeSAGE-Small-PEFT
+BM25
+SweRankEmbed-Small ZS
+CodeSAGE-Small ZS
+TypeScript
+CodeSAGE-Small-PEFT
+BM25
+
+Retrieval
+
+Dense Retrieval Only
+Recall@20 Accuracy@20 MRR@20
+
+Dense + LLM reranker
+Recall@3 Accuracy@3 MRR@3
+
+SpIDER
+DER
+SpIDER
+DER
+SpIDER
+DER
+SpISR
+SR
+
+0.49
+0.42
+0.27
+0.21
+0.37
+0.29
+0.33
+0.31
+
+0.40
+0.35
+0.21
+0.17
+0.27
+0.20
+0.26
+0.24
+
+0.30
+0.26
+0.13
+0.11
+0.24
+0.21
+0.19
+0.18
+
+0.44
+0.38
+0.23
+0.19
+0.32
+0.26
+0.30
+0.27
+
+0.36
+0.31
+0.18
+0.16
+0.25
+0.20
+0.23
+0.22
+
+0.54
+0.48
+0.31
+0.25
+0.42
+0.38
+0.38
+0.35
+
+SpIDER
+DER
+SpIDER
+DER
+SpIDER
+DER
+SpISR
+SR
+
+0.36
+0.31
+0.23
+0.15
+0.28
+0.21
+0.16
+0.15
+
+0.27
+0.24
+0.17
+0.10
+0.18
+0.14
+0.10
+0.10
+
+0.18
+0.18
+0.10
+0.07
+0.15
+0.13
+0.10
+0.10
+
+0.25
+0.24
+0.16
+0.11
+0.20
+0.17
+0.12
+0.12
+
+0.17
+0.16
+0.09
+0.07
+0.14
+0.11
+0.08
+0.09
+
+0.36
+0.33
+0.26
+0.19
+0.28
+0.25
+0.20
+0.19
+
+SpIDER
+DER
+SpIDER
+DER
+SpIDER
+DER
+SpISR
+SR
+
+0.60
+0.52
+0.38
+0.26
+0.55
+0.45
+0.46
+0.36
+
+0.52
+0.45
+0.32
+0.21
+0.48
+0.38
+0.39
+0.29
+
+0.18
+0.16
+0.09
+0.07
+0.15
+0.14
+0.13
+0.11
+
+0.43
+0.41
+0.30
+0.22
+0.41
+0.36
+0.36
+0.31
+
+0.37
+0.34
+0.25
+0.17
+0.35
+0.30
+0.30
+0.25
+
+0.43
+0.42
+0.31
+0.24
+0.41
+0.39
+0.38
+0.34
+
+SpIDER
+DER
+SpIDER
+DER
+SpIDER
+DER
+SpISR
+SR
+
+0.35
+0.29
+0.16
+0.10
+0.25
+0.19
+0.11
+0.07
+
+0.28
+0.21
+0.10
+0.06
+0.18
+0.13
+0.09
+0.05
+
+0.06
+0.18
+0.03
+0.06
+0.04
+0.11
+0.02
+0.04
+
+0.27
+0.25
+0.14
+0.09
+0.22
+0.18
+0.10
+0.07
+
+0.21
+0.19
+0.09
+0.06
+0.16
+0.12
+0.07
+0.05
+
+0.29
+0.30
+0.19
+0.14
+0.27
+0.24
+0.11
+0.09
+
+Table 18: Dense retrieval performance across benchmarks for K = 20, N = 500, C = 5, d = 4. Winners per
+metric per embedding model highlighted in light blue.
+
+Language
+
+Model
+
+Retrieval
+
+Recall@20
+
+Accuracy@20
+
+MRR@20
+
+Multi-SWEBench
+SweRankEmbed-Small ZS
+CodeSAGE-Small ZS
+Java
+CodeSAGE-Small-PEFT
+BM25
+SweRankEmbed-Small ZS
+CodeSAGE-Small ZS
+JavaScript
+CodeSAGE-Small-PEFT
+BM25
+SweRankEmbed-Small ZS
+CodeSAGE-Small ZS
+TypeScript
+CodeSAGE-Small-PEFT
+BM25
+
+SpIDER
+DER
+SpIDER
+DER
+SpIDER
+DER
+SpISR
+SR
+
+0.37
+0.32
+0.21
+0.15
+0.31
+0.23
+0.23
+0.22
+
+0.28
+0.24
+0.19
+0.13
+0.25
+0.17
+0.17
+0.17
+
+0.08
+0.08
+0.05
+0.03
+0.10
+0.09
+0.07
+0.05
+
+SpIDER
+DER
+SpIDER
+DER
+SpIDER
+DER
+SpISR
+SR
+
+0.39
+0.31
+0.17
+0.09
+0.32
+0.25
+0.21
+0.14
+
+0.30
+0.23
+0.12
+0.06
+0.24
+0.18
+0.14
+0.10
+
+0.18
+0.15
+0.08
+0.05
+0.13
+0.11
+0.08
+0.06
+
+SpIDER
+DER
+SpIDER
+DER
+SpIDER
+DER
+SpISR
+SR
+
+0.52
+0.40
+0.33
+0.26
+0.30
+0.19
+0.32
+0.24
+
+0.42
+0.32
+0.26
+0.21
+0.26
+0.15
+0.27
+0.21
+
+0.08
+0.23
+0.04
+0.13
+0.05
+0.12
+0.04
+0.11
+
+0.56
+0.49
+0.27
+0.19
+0.49
+0.38
+0.41
+0.34
+
+0.32
+0.29
+0.13
+0.10
+0.27
+0.22
+0.25
+0.22
+
+SWEBench-Verified
+SweRankEmbed-Small ZS
+CodeSAGE-Small ZS
+Python
+CodeSAGE-Small-PEFT
+BM25
+
+0.61
+0.54
+0.30
+0.21
+0.55
+0.43
+0.45
+0.38
+
+SpIDER
+DER
+SpIDER
+DER
+SpIDER
+DER
+SpISR
+SR
+
+Table 19: Impact of the number of center nodes (C) on retrieval performance using SpIDER + SweRankEmbed-Small.
+Increasing C generally improves Recall@20 and Acc@20 across languages, while MRR@20 shows modest
+variation.
+C
+1
+3
+5
+7
+9
+
+Recall@20
+
+Python
+Acc@20
+
+MRR@20
+
+Recall@20
+
+0.47
+0.49
+0.49
+0.49
+0.48
+
+0.38
+0.39
+0.40
+0.39
+0.39
+
+0.29
+0.30
+0.30
+0.30
+0.30
+
+0.56
+0.59
+0.60
+0.60
+0.60
+
+JavaScript
+Acc@20 MRR@20
+0.48
+0.51
+0.52
+0.52
+0.53
+
+0.18
+0.18
+0.18
+0.18
+0.19
+
+Recall@20
+
+Java
+Acc@20
+
+MRR@20
+
+Recall@20
+
+0.32
+0.35
+0.36
+0.36
+0.37
+
+0.24
+0.26
+0.27
+0.27
+0.27
+
+0.18
+0.19
+0.18
+0.19
+0.19
+
+0.32
+0.31
+0.35
+0.37
+0.39
+
+TypeScript
+Acc@20 MRR@20
+0.24
+0.24
+0.28
+0.30
+0.31
+
+0.06
+0.06
+0.06
+0.06
+0.06
+
+Table 20: Paired significance of SpIDER over DER on SWE-PolyBench, by exploration edge type, with
+SweRankEmbed-Small at K = 20, N = 500, C = 5. ∆ is the mean per-instance difference; “bootP” is the
+paired-bootstrap Pr( ¯
+∆ ≤ 0) over B = 10,000 resamples; “perm” is the two-sided paired-permutation p-value over
+10,000 sign-flips. ∗∗∗ p < 0.001, ∗∗ p < 0.01, ∗ p < 0.05; unmarked entries are not significant. ∆ is computed on
+unrounded per-instance scores and may therefore differ by up to 0.01 from the difference of the rounded means in
+Table 3. inherits is marked N/A outside Python because the configuration is degenerate at function granularity, for
+the reason given in Table 3.
+Exploration edges / depth
+
+∆
+
+Python
+bootP
+
+perm
+
+∆
+
+Java
+bootP
+
+perm
+
+∆
+
+JavaScript
+bootP
+
+perm
+
+∆
+
+TypeScript
+bootP
+
+perm
+
+Recall@20
+contains / d=4
+invokes / d=2
+imports / d=2
+inherits / d=2
+contains / d=4 + invokes / d=2
+
++0.07
++0.15
++0.01
++0.00
++0.17
+
+< 0.0001∗∗∗
+< 0.0001∗∗∗
+0.1318
+1.0000
+< 0.0001∗∗∗
+
+0.0008∗∗∗
+< 0.0001∗∗∗
+0.4979
+1.0000
+< 0.0001∗∗∗
+
++0.05
++0.11
++0.00
+N/A
++0.11
+
+0.0001∗∗∗
+< 0.0001∗∗∗
+1.0000
+N/A
+< 0.0001∗∗∗
+
+0.0060∗∗
+< 0.0001∗∗∗
+1.0000
+N/A
+< 0.0001∗∗∗
+
++0.08
++0.13
++0.00
+N/A
++0.15
+
+< 0.0001∗∗∗
+< 0.0001∗∗∗
+1.0000
+N/A
+< 0.0001∗∗∗
+
+< 0.0001∗∗∗
+< 0.0001∗∗∗
+1.0000
+N/A
+< 0.0001∗∗∗
+
++0.05
++0.17
++0.00
+N/A
++0.17
+
+< 0.0001∗∗∗
+< 0.0001∗∗∗
+1.0000
+N/A
+< 0.0001∗∗∗
+
+0.0006∗∗∗
+< 0.0001∗∗∗
+1.0000
+N/A
+< 0.0001∗∗∗
+
+Acc@20
+contains / d=4
+invokes / d=2
+imports / d=2
+inherits / d=2
+contains / d=4 + invokes / d=2
+
++0.05
++0.14
++0.01
++0.00
++0.15
+
+0.0026∗∗
+< 0.0001∗∗∗
+0.3648
+1.0000
+< 0.0001∗∗∗
+
+0.0304∗
+0.0001∗∗∗
+1.0000
+1.0000
+0.0003∗∗∗
+
++0.03
++0.07
++0.00
+N/A
++0.06
+
+0.3690
+0.0038∗∗
+1.0000
+N/A
+0.0082∗∗
+
+1.0000
+0.0224∗
+1.0000
+N/A
+0.0392∗
+
++0.07
++0.12
++0.00
+N/A
++0.14
+
+< 0.0001∗∗∗
+< 0.0001∗∗∗
+1.0000
+N/A
+< 0.0001∗∗∗
+
+0.0001∗∗∗
+< 0.0001∗∗∗
+1.0000
+N/A
+< 0.0001∗∗∗
+
++0.07
++0.17
++0.00
+N/A
++0.17
+
+0.0005∗∗∗
+< 0.0001∗∗∗
+1.0000
+N/A
+< 0.0001∗∗∗
+
+0.0080∗∗
+< 0.0001∗∗∗
+1.0000
+N/A
+< 0.0001∗∗∗
+
+Table 21: Stage-2 selector against the unfiltered neighborhood ceiling on SWE-PolyBench with
+SweRankEmbed-Small, N = 500, C = 5. The ceiling
+is Recall of the full Stage-1 neighborhood with Stage 2
+disabled, which returns hundreds of candidates rather
+than K; the SpIDER column is Recall@20 under invokes
+expansion from Table 3, and the last column is its share
+of the corresponding ceiling.
+Language
+Python
+Java
+JavaScript
+TypeScript
+
+Ceiling (Stage 2 disabled)
+contains/4
+invokes/2
+0.517
+0.376
+0.667
+0.400
+
+0.626
+0.533
+0.730
+0.593
+
+SpIDER
+Recall@20
+
+% of
+ceiling
+
+0.56
+0.42
+0.65
+0.47
+
+89
+79
+89
+79
+
+Table 22: Lexical and agentic retrieval on SWE-PolyBench at K = 20. SpIDER rows use SweRankEmbed-Small
+with N = 500, C = 5; DER is carried over from Table 2 for reference. “Tok” is total (input + output) LLM tokens
+per instance. The upper block operates under a fixed retrieval budget of K functions, and the best entry per language
+and metric within that block is in light blue. OpenHands is listed separately because it is an iterative agent that is not
+budget-constrained: it explores until it decides to stop, so its recall is not obtained at a comparable operating point.
+Method
+
+Recall@20
+
+Fixed retrieval budget (K = 20)
+DER
+0.42
+grep + LLM keywords
+0.46
+SpIDER (contains/4)
+0.49
+SpIDER (invokes/2)
+0.56
+Iterative agent (no fixed budget)
+OpenHands
+0.84
+
+Python
+Acc@20
+
+Tok
+
+Recall@20
+
+Java
+Acc@20
+
+Tok
+
+JavaScript
+Recall@20 Acc@20
+
+0.35
+0.40
+0.40
+0.50
+
+0
+1.1K
+12.9K
+109.9K
+
+0.31
+0.29
+0.36
+0.42
+
+0.24
+0.22
+0.27
+0.30
+
+0
+0.7K
+7.8K
+87.4K
+
+0.52
+0.69
+0.60
+0.65
+
+0.45
+0.61
+0.52
+0.58
+
+0
+0.7K
+14.9K
+55.5K
+
+0.29
+0.28
+0.35
+0.47
+
+0.21
+0.24
+0.28
+0.41
+
+0
+0.7K
+8.3K
+92.7K
+
+0.77
+
+273.2K
+
+0.71
+
+0.59
+
+371.4K
+
+0.93
+
+0.89
+
+223.4K
+
+0.66
+
+0.62
+
+599.7K
+
+Tok
+
+TypeScript
+Recall@20 Acc@20
+
+Tok
+
+Table 23: SpIDER pipeline results on SWE-PolyBench (function-level localization, dense retrieval, K=20, N =500,
+C=5, d=4, with a single non-iterative Stage-2 call per seed center). Each cell reports macro-averaged recall and
+accuracy over the language’s evaluation subset. The top block reports two references with SweRankEmbed-Small
+taken from Table 2 (retrieval-only): DER is the dense embedding baseline without SpIDER, and Claude Sonnet 4 is
+the closed-source LLM filter used inside SpIDER. Bold marks the best score in each column across all rows (DER,
+Claude Sonnet 4, and the open-source Qwen variants); underline marks the best score in each column among the
+open-source models only.
+Java
+
+JavaScript
+
+Python
+
+TypeScript
+
+Model
+
+Rec. Acc. Rec. Acc. Rec. Acc. Rec. Acc.
+
+DER (no SpIDER)
+Claude Sonnet 4
+Open-source
+Qwen2.5-Coder-7B-Instruct
+Qwen2.5-Coder-14B-Instruct
+Qwen3-Coder-30B-A3B-Instruct
+
+0.31 0.24 0.52 0.45 0.42 0.35 0.29
+0.36 0.27 0.60 0.52 0.49 0.40 0.35
+
+0.21
+0.28
+
+0.32 0.24 0.51 0.44 0.43 0.35 0.31
+0.33 0.23 0.53 0.45 0.44 0.35 0.31
+0.34 0.24 0.55 0.47 0.48 0.38 0.33
+
+0.23
+0.23
+0.25
+
+

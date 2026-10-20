@@ -1,0 +1,2090 @@
+Compression-Aware Abstention: Teaching LLMs
+to Refuse When KV-Compression Masks Remove Answer Evidence
+Mohammadali Khodabandehlou
+University of Southern California
+mk40089@usc.edu
+
+Bhaskar Krishnamachari
+University of Southern California
+bkrishna@usc.edu
+
+Abstract
+
+ricate a confident wrong answer rather than acknowledge the loss. The qualitative pattern is documented (Yang et al., 2024); existing remedies are
+representation-side (keep evicted entries in lowprecision form rather than dropping them).
+We propose a behavioral remedy: train the
+model to recognize when the surviving context
+cannot support an answer and respond honestly,
+answering when the supporting evidence survives
+and refusing when it does not. We refer to this
+as compression-aware abstention. To our knowledge, this is the first work to address KV-cachecompression-induced evidence loss from a behavioral perspective, by training the model to abstain
+when the surviving compressed context no longer
+supports an answer.
+
+arXiv:2608.29934v1 [cs.CL] 30 Aug 2026
+
+KV-cache compression reduces LLM inference
+memory by evicting context tokens, but when
+the evicted tokens contain answer-bearing evidence, the model may hallucinate instead of recognizing that the compressed context is insufficient. We address this failure from a behavioral
+perspective: to our knowledge, this is the first
+work to formulate compression-aware abstention as a learning problem, in which a model
+learns to answer when supporting evidence survives compression and abstain when it does
+not. We construct supervision from compressor survival masks and tight answer-bearing
+spans, labeling examples as C ONFIDENT when
+evidence survives and A BSTAIN when it is removed. A 10.1M-parameter LoRA adapter
+trained on ∼2.6K MuSiQue 2-hop QA examples reduces base-model hallucinations by 97%
+under prompt-style truncation while preserving correct answering on evidence-retaining
+examples. Unlike prompt-only abstention baselines, which over-abstain on many answerable
+high-retention examples, the trained adapter
+learns a conditional policy. We also evaluate
+the method under actual compressed-cache decoding, where multi-compressor training yields
+a 6–22× relative lift over the unaided base
+on evidence-retaining examples. Controlleddeletion experiments show that the learned behavior is driven by evidence content rather than
+input length alone.
+
+1
+
+Scope. We construct training data from compression masks and feed the surviving tokens to the
+model as a normal prompt; we then test, separately,
+whether the trained behavior survives when the
+model decodes from a physically compressed cache
+(KVzipPress at inference). §5.5 reports both inference paths: the prompt-style (ps) path used to build
+training data and the compressed-cache (cc) path
+that matches deployment. Our objective is complementary to training-aware compression such as KVDistill (Chari et al., 2025), which instead preserves
+uncompressed-model behavior under compression
+(§6).
+
+Introduction
+
+Contributions. We make five contributions:
+C1. We formulate compression-aware abstention
+as a behavioral learning problem. Rather than only
+asking whether KV-cache compression preserves
+the uncompressed model’s answer, we ask whether
+the compressed context still contains enough evidence to support an answer. We define examples
+as C ONFIDENT when answer-bearing evidence survives compression and A BSTAIN when it does not,
+and train the model to answer or refuse accordingly.
+
+KV-cache compression methods reduce inference
+memory by evicting context tokens deemed unimportant by some scoring rule (Li et al., 2024; Zhang
+et al., 2023; Kim et al., 2025; Devoto et al., 2025).
+They are designed to be behavior-preserving, on
+the assumption that low-importance tokens carry
+no answer-relevant signal. When the eviction rule
+drops a token that is answer-bearing for some downstream query, the model is left with an input missing exactly the evidence it needs, and tends to fab1
+
+C2. We show that tight evidence spans are crucial for making this learning problem well-posed.
+Paragraph-level support labels wash out the effect
+of compression because long support paragraphs
+often remain partially present even when key evidence is lost. By labeling survival over short
+answer-bearing spans, we obtain the per-example
+variation needed to distinguish answerable from
+unanswerable compressed contexts.
+C3. We show that a small adapter can sharply
+reduce compression-induced hallucination while
+preserving answerability. A 10.1M-parameter
+LoRA adapter trained on approximately 2.6K
+compression-labeled MuSiQue examples eliminates 97% of base-model hallucinations under
+prompt-style truncation, while preserving correct
+answering on C ONFIDENT-gold examples.
+C4. We show that learned abstention is more conditional than prompt-only abstention and more robust
+when trained across compressors. Prompt-only
+baselines tend to over-abstain when evidence is
+actually present: at high retention, they abstain on
+about half of C ONFIDENT-gold examples, while
+the trained adapter abstains on only 6–10%. Training on multiple compressor masks further improves
+transfer beyond a single compression pattern.
+C5. We evaluate the method under deploymentrelevant compressed-cache decoding and test what
+the adapter has learned. Under actual compressedcache inference, the unaided base model nearly
+collapses on evidence-retaining examples; multicompressor training improves correct answering
+from 4% to 25% aggregate and from 1.4% to
+32% at high retention. Controlled-deletion experiments show that the adapter’s decisions depend on
+which evidence tokens survive, not merely on input
+length.
+
+2
+
+short, specific piece of evidence (the phrase naming
+the founder) to survive compression. Now suppose
+a KV-cache compressor keeps most of the surrounding context (the film, its release, other people and
+companies) but, scoring that particular name as
+low-importance, evicts the few tokens that spell
+it out. The truncated context still reads fluently
+and still looks on-topic, so a base model prompted
+with it tends to supply a confident but unsupported
+name (in our data the base answers “Kevin Smith”).
+The correct behavior depends entirely on whether
+that one phrase survived: if the founder’s name is
+kept, the example is C ONFIDENT and the model
+should answer Mike Medavoy; if it is evicted, the
+example is A BSTAIN and the model should refuse,
+because the surviving text no longer determines the
+answer. The rest of this section makes “a supporting phrase survives” quantitative (Eq. 1) and turns
+this all-or-nothing flip into a training label (Eq. 2).
+Compression-truncated input. Let c ∈ V nc
+be a context tokenized into nc tokens, and let q
+be a query. A KV cache compressor at retention ratio r produces aPper-token survival mask
+m ∈ {0, 1}nc with n1c i mi ≈ r, and the associated compression-truncated input c̃(m) = (ci :
+mi = 1) concatenates the surviving tokens. Different compressors select which tokens survive; the
+model is then run on c̃ as a standard prompt.
+Evidence survival. Let S = {S1 , . . . , SK } be a
+set of supporting spans: contiguous token ranges
+in c that are jointly required for the answer a to be
+derivable from the context. Define the evidencesurvival fraction of span Sk under mask m as
+P
+i∈Sk mi
+ρ(m, Sk ) =
+.
+(1)
+|Sk |
+The granularity of Sk is decisive (§3.1): when |Sk |
+is large, ρ averages out and per-example label variance vanishes; when |Sk | is the size of the verbatim
+answer string (median 3 tokens), ρ is informative.
+
+Compression-aware abstention as a
+learning problem
+
+We give a formal definition of the learning problem the rest of the paper addresses. The definition
+makes three things precise: (i) what a compressiontruncated input is, (ii) how the gold label is determined from the survival mask and the supportingspan structure, and (iii) what the trained adapter
+optimizes.
+
+Gold label. Given thresholds τlow < τhigh ∈
+[0, 1], the gold label y(m, S) is
+
+
+C ONFIDENT if mink ρ(m, Sk ) ≥ τhigh
+y = A BSTAIN
+if mink ρ(m, Sk ) < τlow
+
+
+D ROP
+otherwise (excluded).
+(2)
+Examples whose minimum span survival lands in
+the uncertain zone [τlow , τhigh ) are dropped from
+training to avoid noisy targets.
+
+A motivating example. Consider the 2-hop question “Who founded the company that distributed
+the film UHF?”, whose answer is Mike Medavoy.
+Deriving this answer from the context requires one
+2
+
+Target string and learning objective. Each
+(c, q, a, m, S) tuple is mapped to a target string t =
+a if y = C ONFIDENT and t = t⊥ if y = A BSTAIN,
+where t⊥ is a fixed refusal string. The training set
+D consists of (m, q, t) triples for which y ̸= D ROP,
+with truncated input c̃(m). The adapter parameters
+θ are LoRA weights (Hu et al., 2022) attached to a
+frozen base LLM f , optimizing
+X
+
+L(θ) = −
+log fθ t | c̃(m), q .
+(3)
+
+Long context
++ MuSiQue Q
+
+Tight-span localization
+
+ABSTAIN
+t = refusal string
+
+DROP
+excluded
+
+Figure 1: Training pipeline. KVzip prefill produces a
+per-token survival mask m at the target retention ratio. The labeler computes evidence-survival ρ(m, Sk )
+(Eq. 1) over tight supporting spans and assigns C ONFI DENT, A BSTAIN, or D ROP via Eq. 2. The LoRA adapter
+is trained on (truncated input c̃, query q) → target t.
+
+tokens) as Sk , ρ averages out: at r = 0.50 every
+paragraph keeps roughly half its tokens, so every
+example falls in the uncertain zone and is dropped
+(label entropy 0.000, vs 0.95 for tight spans; Appendix A). The pivot to verbatim answer spans is
+the reason the rest of the paper has signal to fit.
+3.2
+
+Pipeline and adapter
+
+Figure 1 summarizes the construction pipeline.
+The compressor produces m; the labeler computes
+ρ(m, Sk ) for each tight span and assigns y via Eq. 2
+with thresholds τlow = 0.3, τhigh = 0.8 (set a priori). The resulting (truncated input, query, target)
+triple enters D if y ̸= D ROP (per-ratio label entropy
+in Appendix A).
+We attach a 10.1M-parameter LoRA adapter (Hu
+et al., 2022) (rank 16) to the four attention projections (q_proj, k_proj, v_proj, o_proj;
+MLP modules unadapted), 0.13% of Qwen2.57B-Instruct’s parameters. Optimizer, learning-rate
+sweep, and precision settings are in Appendix R.
+Train ≈2.6K instances (30/70 minority-class
+floor); validation 463 at the natural class distribution, disjoint by example ID. We call this
+KVzip-only adapter v1; §5.3 introduces a multicompressor variant, mix, and §5.5 distinguishes
+the prompt-style and compressed-cache versions
+of each (v1-ps, mix-ps, and mix-cc).
+
+Class balance and comparison. Because the
+label distribution is U-shaped in r (mostly A B STAIN at low retention, mostly C ONFIDENT at
+high), the mid-retention regime (r ≈ 0.50) is
+where both classes co-occur and Eq. 2 is informative per-example; we apply a per-(compressor, r)
+class-balance floor at r ≥ 0.20 so both loss terms
+see comparable counts (§3.2, Appendix E). The
+objective is complementary to preservation-style
+training (Chari et al., 2025): once ρ(m, S) < τlow ,
+the uncompressed-model answer is no longer a
+meaningful target, and the right target is t⊥ .
+
+3.1
+
+LoRA training
+(c,̃ q) → t
+
+Tight-span
+labeler
+
+Label assigned by tight-span retention ρ(m, S) vs thresholds τlow , τhigh .
+
+This loss splits over the two label classes, L(θ) =
+LCONF (θ) + LABS (θ), summing the cross-entropy
+over DCONF (target a) and DABS (target t⊥ ). The
+two terms incentivize opposite per-example behaviors: LCONF penalizes refusing when the truncated
+input does support the answer, LABS penalizes answering when it does not. Both are needed for
+calibrated bidirectional behavior: optimizing only
+LABS yields a fixed abstention prior (the promptonly failure mode of §5.2), while optimizing only
+LCONF approaches a preservation-style objective
+(Chari et al., 2025) (always answer). We offer this
+as the natural reading of Eq. 3, not as an ablated
+claim.
+
+Method
+
+survival mask
+m ∈ {0, 1}nc
+
+CONFIDENT
+t=a
+
+(m,q,t)∈D
+
+3
+
+KVzip
+prefill
+
+Eq. 1 is informative only when |Sk | is small. For
+each MuSiQue (Trivedi et al., 2022) 2-hop example, the question_decomposition field
+gives each single-hop sub-answer as a short atomic
+string (e.g., “Mike Medavoy”); we locate each verbatim in its supporting paragraph, yielding a short
+span (median 3 tokens, 99th percentile 11; located
+in 100% of our pool).
+Tight spans are what make the labeling discriminative. With full supporting paragraphs (∼100
+
+4
+
+Experimental setup
+
+Models. Qwen2.5-7B-Instruct (Qwen Team,
+2024) for all main results; Llama-3.1-8B-Instruct
+(Llama Team, Meta AI, 2024) as a held-out base
+model.
+Compressors. KVzip (Kim et al., 2025) for training masks, via the authors’ reference implementa3
+
+n
+
+C/A
+
+base
+
+adp
+
+∆hon
+
+0.05 100
+0.10 95
+0.20 82
+0.30 65
+0.50 48
+0.80 73
+
+0/100
+1/94
+2/80
+3/62
+22/26
+69/4
+
+0.15
+0.27
+0.30
+0.35
+0.44
+0.51
+
+1.00
+0.99
+0.92
+0.79
+0.66
+0.60
+
++0.85
++0.72
++0.62
++0.44
++0.22
++0.09
+
+agg. 463 97/366 0.32 0.86 +0.54
+
+5%
+
+10%
+
+20%
+
+30%
+
+Retention ratio r
+
+50%
+
+80%
+
+consistent with evidence-sensitive behavior, though
+this alone does not rule out a retention-ratio heuristic, which §5.2 and §5.6 test directly. Conditional
+answer quality is preserved (Appendix C).
+No over-abstention cost. A refusal-biased
+adapter could cut hallucinations on A BSTAIN-gold
+while also refusing answerable C ONFIDENT-gold
+examples. It does not: the adapter’s correct-answer
+rate on C ONFIDENT-gold is at least the base’s in
+all eight prompt-style cells across four compressors (answerability preservation ratio 1.00–1.36;
+Appendix L).
+
+Outputs and metric. Greedy decoding, max 64
+new tokens. Outputs are classified into six categories (Appendix B). Honest accuracy is the fraction of outcomes that are either C ONFIDENT-gold
+with the model emitting the answer a, or A BSTAINgold with the model emitting the refusal t⊥ .
+
+5.2
+
+Baselines
+
+Aggregate honest accuracy is useful for orientation, but it is not a reliable operationalization of
+compression-aware abstention by itself. The reason is that the gold labels are highly skewed as a
+function of the retention ratio r: at low r, almost
+all examples are A BSTAIN-gold, while at high r,
+almost all are C ONFIDENT-gold. A trivial policy
+that never sees the truncated input c̃ can exploit this
+structure: predict A BSTAIN when r < τ and C ON FIDENT otherwise. Sweeping τ on Qwen val, the
+best threshold (τ = 0.80) reaches aggregate honest
+accuracy 0.93, exceeding both v1 (0.84) and the
+mixture adapter (0.86). This does not make the
+threshold policy compression-aware; it only shows
+that aggregate accuracy rewards the U-shaped class
+distribution. We therefore use the diagnostic slices
+below to ask whether a method is actually sensitive
+to the evidence that survives in c̃.
+
+Compute and reproducibility. All training and
+evaluation run on a single NVIDIA H100 80GB
+GPU. Code, evaluation outputs, adapters, datasets,
+and a script that recomputes every reported number
+are released.1
+
+Headline
+
+0.4
+
+Figure 2: Per-ratio honest accuracy on Qwen val (KVzip
+masks). Bars are means across three seeds; error bars
+are seed spread. The adapter improves honest accuracy
+at every retention ratio.
+
+Retention ratios. r ∈ {0.05, 0.10, 0.20, 0.30,
+0.50, 0.80}. The gold class distribution is Ushaped in r (Table 1): almost all A BSTAIN at low
+retention, almost all C ONFIDENT at high, and balanced at the headline mid-slice r = 0.50.
+
+5.1
+
+0.6
+
+0.0
+
+tion: kvpress’s KVzipPress defers eviction in
+a way incompatible with prompt-style mask extraction, though §5.5 uses it for compressed-cache
+inference. Expected Attention (Devoto et al., 2025)
+and SnapKV (context-only and native query-aware
+modes) (Li et al., 2024) are held-out compressors,
+accessed via the kvpress library (NVIDIA, 2026).
+All are calibrated to retain an identical number of
+context tokens at each r.
+
+Results
+
+0.8
+
+0.2
+
+Table 1: Per-ratio honest accuracy on Qwen val. Mean
+over three seeds (42, 43, 44). The 0.50 row is the only
+ratio at which the gold class is balanced and at which a
+model conditioning on c̃ can do better than a fixed prior
+(§5.2).
+
+5
+
+Base
++ LoRA
+
+1.0
+
+Honest accuracy
+
+r
+
+Training improves honest accuracy at every retention ratio (Table 1, Figure 2), and the gain is driven
+by a collapse in hallucination: confident wrong answers on A BSTAIN-gold (the hallucinated category
+of Appendix B) fall from 232 to 7. The adapter’s abstention rate falls monotonically as retention rises,
+1
+
+https://github.com/mali-kh/
+compression-aware-abstention
+
+4
+
+Compressor
+KVzip
+ExpAttn
+SnapKV (ctx)
+SnapKV (nat)
+
+gold (C/A) best-τ
+22/26
+23/19
+18/21
+28/9
+
+0.54
+0.55
+0.54
+0.76
+
+P2
+
+Frag
+
+v1
+
+Mix
+
+0.54
+0.60
+0.64
+0.54
+
+0.44
+0.38
+0.33
+0.38
+
+0.65
+0.67
+0.46
+0.41
+
+0.69
+0.71
+0.64
+0.51
+
+The comparison to the prompt-only baseline is
+more nuanced at this slice. Point estimates favor
+the mixture adapter on KVzip (+0.15) and ExpAttn
+(+0.12), tie on SnapKV-context (±0), and slightly
+favor P2 on SnapKV-native (−0.03); none reaches
+per-compressor significance at n ∈ [37, 48] (percompressor exact p-values and paired-bootstrap
+CIs in Appendix K). Pooling the four compressors
+into a 166-example paired test yields ∆ = +0.07
+(p = 0.17). Thus the mid-slice suggests a positive
+trend over prompting, but the available sample does
+not make that comparison decisive. The cleaner
+prompt-vs-training result appears at high retention,
+where the same fixed-prior failure has a larger and
+more measurable effect.
+
+Table 2: Honest accuracy at r = 0.50 across compressors. v1: adapter trained on KVzip masks only. Mix:
+adapter trained on KVzip + ExpAttn + SnapKV masks
+jointly. SnapKV-native at this slice has degenerate gold
+mix (28/9) and is not interpretable for this comparison;
+reported in italics for completeness.
+
+Two diagnostic slices. The balanced midretention slice and the high-retention slice probe
+complementary failure modes. At r = 0.50, the
+gold labels are nearly balanced (22 C ONFIDENT, 26
+A BSTAIN), so a retention-ratio threshold is forced
+into one fixed prediction across the slice. This
+slice tests whether a method can distinguish answerable from unanswerable truncated inputs on
+a per-example basis. At r = 0.80, the gold labels are dominantly C ONFIDENT; this slice tests
+the opposite failure mode, namely whether an abstention method over-refuses even when evidence
+usually survives. Together, these slices separate
+genuine evidence sensitivity from fixed abstention
+or fixed-answering priors.
+
+Fixed prior vs. learned policy. At r = 0.80,
+where roughly 95% of the gold labels are C ONFI DENT , the prompt-only baseline exposes its main
+failure mode: it over-abstains even when evidence
+usually survives. On KVzip, P2 honest accuracy
+drops to 0.34, below the base model’s 0.51. It
+abstains on 49% of the 69 C ONFIDENT-gold examples, compared with 10% for the mixture adapter
+and 3% for v1. The pattern is uniform across compressors (Figure 3): P2 over-abstains on 49–51%
+of C ONFIDENT-gold examples, while the mixture
+adapter over-abstains on only 6–10%.
+Restricting to the C ONFIDENT-gold subset at
+r = 0.80, the mixture adapter outperforms P2
+on every compressor, with ∆ ∈ [+0.28, +0.34]
+and per-compressor paired McNemar exact p ≤
+2 × 10−4 . Pooled across the 260 C ONFIDENT-gold
+examples at this retention, the advantage is ∆ =
++0.32 (95% paired-bootstrap CI [+0.25, +0.38],
+McNemar p ≈ 1.5 × 10−16 ). This is the clearest baseline evidence in our setting: an abstention prompt tends to create a broad refusal prior,
+whereas the trained adapter learns a bidirectional
+policy that answers when evidence survives and
+abstains when it does not. This is precisely the
+behavior encouraged by the loss decomposition in
+Eq. 3 into LCONF and LABS . Whether richer prompting strategies (for example, self-consistency over
+abstention judgments, chain-of-thought introspection, or verifier-style confidence checks) could approximate this behavior at inference time remains
+open; we do not test them here.
+
+Baseline definitions. P2 prompt: a light-touch
+abstention instruction prepended to the user message: “If the available context does not contain
+enough evidence to answer the question, respond
+with: ‘I cannot determine the answer to this question from the available context.’ Otherwise, answer
+the question.” No LoRA adapter is applied. Fragment: the same compression-truncated input c̃ is
+presented to a clean base model, with no LoRA
+adapter and no abstention instruction. The Fragment baseline is input-matched to our adapter;
+the only difference is the learned LoRA weights.
+best-τ : the best ratio-only threshold policy, with
+τ = 0.80 tuned on KVzip aggregate.
+Balanced slice: training helps; prompt inconclusive. Table 2 shows that the mixture adapter
+improves over the Fragment baseline by 25–33pp
+at r = 0.50 on the three interpretable compressor
+settings (per-compressor paired McNemar exact,
+p ∈ [0.0005, 0.012] on KVzip / ExpAttn / SnapKVcontext; not significant on SnapKV-native). This
+establishes that the behavior is not obtained merely
+by showing the base model the surviving text.
+
+Surviving text is not enough. Finally, the Fragment baseline shows that correct abstention is a
+learned property of the adapter, not an automatic
+consequence of seeing a shortened context. Of
+5
+
+Honest accuracy at r = 0.80
+
+0.8
+
+Base
++ P2 prompt
+
+0.7
+
++ LoRA (v1)
++ LoRA (mix)
+
+0.6
+0.5
+0.4
+
+0.2
+0.1
+KVzip
+
+ExpAttn
+
+SnapKV
+(ctx)
+
+SnapKV
+(nat)
+
+Figure 3: Honest accuracy at r = 0.80 (high retention, dominantly C ONFIDENT-gold) across four compressors. The P2 abstention prompt drops below base
+on every compressor (dotted line at base level); the
+trained adapter does not. Calibrated bidirectional behavior (abstain when evidence is missing and answer when
+it survives) requires per-example sensitivity to c̃, which
+the loss decomposition in Eq. 3 explicitly captures (§2).
+(a) Adapter transfer across compressors
+
+0.6
+0.4
+0.2
+0.0
+5%
+
+10%
+
+20%
+
+30%
+
+Retention ratio r
+
+50%
+
+80%
+
+Kept-token IoM with KVzip
+
+Δ Honest accuracy
+
+0.8
+
+1.0
+
+Expected Attention
+SnapKV (context)
+
+0.8
+0.6
+0.4
+0.2
+0.0
+
+5%
+
+10%
+
+20%
+
+30%
+
+Retention ratio r
+
+50%
+
+80%
+
+Figure 4: (a) Per-ratio ∆honest accuracy of the v1
+adapter (KVzip-trained) on three held-out compressors.
+Within-family transfer is clean (KVzip → ExpAttn, aggregate +0.49 vs +0.53); cross-family transfer is partial (KVzip → SnapKV-native, +0.20). (b) Differential transfer tracks kept-token intersection-over-min between each compressor and KVzip.
+
+the 89 examples where v1 correctly abstained on
+KVzip but hallucinated on SnapKV (the crosscompressor failure mode of §5.3), the Fragment
+baseline catches only 13/89 = 15% on the KVzip
+side: it hallucinates on 80% of the same examples
+the adapter abstains on.
+5.3
+
+Mix
+
+mix − v1 Rescue
+
+KVzip
+Expected Attn
+SnapKV (ctx)
+SnapKV (nat)
+
++0.53
++0.49
++0.21
++0.20
+
++0.55
++0.57
++0.53
++0.43
+
++0.02
++0.08
++0.32
++0.23
+
+—
+—
+82/89
+—
+
+ting (+0.49 vs +0.53). Transfer to SnapKV is
+much weaker, with aggregate gains of only +0.21
+for SnapKV-context and +0.20 for SnapKV-native
+(Figure 4a).
+This pattern suggests that the adapter has learned
+two different behaviors. One is compressoragnostic: when the surviving text contains enough
+evidence, the model can read and answer. The other
+is more compressor-specific: recognizing that evidence is missing depends partly on the deletion
+patterns seen during training. The transfer results
+track this interpretation. At r = 0.50, KVzip and
+Expected Attention agree on 75% of kept tokens,
+while KVzip and SnapKV agree on only 62%; the
+drop in transfer follows the same ordering (Figure 4b). Appendix D gives a qualitative decomposition of these “read-and-answer” and “recognizemissing-evidence” behaviors.
+We therefore retrain on a mixture of masks from
+KVzip, Expected Attention, and SnapKV-context.
+The mixture set contains 8772 training instances,
+with per-(compressor, r) class balance for r ≥ 0.20
+and the natural class distribution at the extreme lowretention ratios. Hyperparameters match v1 except
+for lr = 2×10−4 ; results are averaged over two
+seeds.
+Mixture training largely closes the crosscompressor gap without sacrificing performance on
+the original compressor (Table 3). On KVzip, the
+aggregate gain is essentially unchanged (+0.53 →
++0.55). On Expected Attention, it improves from
++0.49 to +0.57. The largest gains appear on
+SnapKV, where v1’s partial transfer is the main
+failure mode: SnapKV-context improves from
++0.21 to +0.53, and SnapKV-native from +0.20
+to +0.43. The rescue analysis makes the same
+point at the example level: of the 89 cases where v1
+abstained correctly under KVzip but hallucinated
+under SnapKV, mixture training catches 82 under
+
+(b) Truncation-pattern similarity to training
+
+KVzip (training)
+Expected Attention
+SnapKV (native)
+
+v1
+
+Table 3: Aggregate ∆honest accuracy: v1 (KVzip-only)
+vs mixture training (KVzip + ExpAttn + SnapKVcontext). v1: seed 42; Mix: mean across seeds 42 and
+43. Rescue: of 89 v1-KVzip-correct → v1-SnapKVhallucinated examples, fraction the mixture catches under SnapKV evaluation (seed 42). Per-cell variance in
+Appendix E.
+
+0.3
+
+0.0
+
+Compressor
+
+Cross-compressor transfer and mixture
+training
+
+A compression-aware abstention policy should not
+depend too tightly on the idiosyncrasies of one
+compressor’s mask. To test this, we first train v1
+only on KVzip masks and evaluate it, without retraining, on three held-out compressors. The result
+is mixed. Transfer to Expected Attention is strong:
+the aggregate gain remains close to the KVzip set6
+
+SnapKV evaluation.
+Mixture training also improves calibration. The
+conditional wrong-when-answering rate decreases
+on 7 of 8 conclusive cells (Appendix C), and the
+KVzip-specific overcaution seen in v1 at r = 0.50
+disappears: mixture overcaution is 23%, matching
+the base model. Thus the benefit of mixture training
+is not merely higher honest accuracy; it makes
+the learned abstention policy less tied to a single
+compressor’s mask geometry.
+5.4
+
+r
+0.05
+0.10
+0.20
+0.30
+0.50
+0.80
+
+—
+—
+—
+—
+—
+—
+
+0.560
+0.495
+0.415
+0.323
+0.271
+0.233
+
+1.000
+0.958
+0.829
+0.600
+0.354
+0.315
+
+1.000
+0.989
+0.963
+0.923
+0.500
+0.315
+
+agg.
+
+0.186
+
+0.406
+
+0.730
+
+0.821
+
+Table 4: Per-ratio honest accuracy under actual
+compressed-cache inference (KVzipPress) on Qwen
+val (n = 463). base-cc: unmodified Qwen2.5-7BInstruct under cc inference (per-ratio omitted; aggregate 0.186). v1-ps: prompt-style-trained, KVzip-only.
+mix-ps: prompt-style-trained, multi-compressor. mix-cc:
+compressed-cache-trained, multi-compressor (seed 42;
+per-seed values and two-seed mean in Appendix M).
+
+What is the load-bearing training signal?
+
+Retraining v1 with masks drawn uniformly at random (at matched per-example retention counts)
+matches the mixture adapter on KVzip val and
+beats KVzip-only v1 on cross-family transfer. Under prompt-style inference, the load-bearing signal
+is therefore the abstention objective itself, not the
+importance-weighted structure of the compressor
+mask; single-compressor training additionally induces an anti-transfer signature. This motivates
+compressor-mixture training (§5.3), which §5.5 extends to compressed-cache inference. Full numbers
+are in Appendix P.
+5.5
+
+base-cc v1-ps cc mix-ps cc mix-cc cc
+
+The trained adapters recover much of this loss.
+Prompt-style multi-compressor training transfers
+surprisingly well to compressed-cache inference:
+mix-ps reaches aggregate honest accuracy 0.730, a
++0.544 gain over base-cc. By contrast, the KVziponly prompt-style adapter transfers much less well:
+v1-ps reaches 0.406, only +0.220 over base-cc.
+This mirrors the cross-compressor pattern in §5.3:
+training on a single mask family leaves the adapter
+more brittle when the inference-time corruption
+pattern changes.
+Training directly in the compressed-cache
+regime adds another gain. Using the same multicompressor mixture but computing the loss after
+cache eviction, mix-cc reaches aggregate honest
+accuracy 0.821, improving by +0.091 over mixps under the same cc inference path. The largest
+gains are at the intermediate retention ratios, especially r = 0.30 and r = 0.50, where mix-cc
+improves over mix-ps by +0.32 and +0.15, respectively. At r = 0.80, mix-cc and mix-ps tie
+in honest accuracy (0.315 vs 0.315; McNemar on
+C ONFIDENT-gold, p = 0.80), indicating that highretention compressed-cache answering remains the
+hardest case.
+The answerability numbers clarify the scale of
+the recovery. On C ONFIDENT-gold examples,
+multi-compressor cc-training improves correct answering from 4/97 to 24/97 aggregate, and from
+1/69 to 22/69 at r = 0.80. This corresponds
+to a 6–22× relative lift over base-cc, with nonoverlapping Wilson 95% confidence intervals (Appendix L). The gain is large because base-cc nearly
+collapses in this regime; the absolute rates also
+show that cc inference remains more difficult than
+
+Compressed-cache inference and
+cc-training
+
+The results so far use prompt-style inference: we
+apply the compressor’s survival mask, feed the surviving tokens back to the model as an ordinary
+prompt, and measure whether the adapter answers
+or abstains. This is useful for controlled training
+and analysis, but it is not the deployment path. In
+actual compressed-cache inference, the model first
+prefills on the full context, the compressor evicts
+low-scoring K/V pairs from the cache, and generation proceeds from the compressed cache state. We
+therefore ask whether the learned abstention behavior survives this more realistic setting. We evaluate
+on the same Qwen validation set using kvpress’s
+KVzipPress at inference.
+Compressed-cache decoding is substantially
+harder for the unaided base model. Under KVzipPress, base-cc reaches aggregate honest accuracy
+0.186, which is 13pp below its prompt-style counterpart. The collapse is most visible on C ONFI DENT -gold examples, where the correct-answer
+rate is only 4/97 aggregate and 1/69 at r = 0.80.
+In other words, when the answer-bearing evidence
+is labeled as surviving, the instruction-tuned base
+model still often fails to use it once generation proceeds from the compressed cache.
+7
+
+prompt-style truncation.
+
+6
+
+Multi-compressor training is important even
+when training directly under compressed-cache decoding. A single-compressor cc-trained adapter
+ties mix-cc on aggregate honest accuracy, but at
+r = 0.80 it produces a 61% wrong-answer rate on
+C ONFIDENT-gold examples, compared with 30%
+for mix-cc (Appendix M). Thus the mixture is not
+merely improving the aggregate score; it keeps the
+answer-vs-abstain tradeoff better calibrated under
+the deployment-relevant inference path.
+
+KV-cache compression. Algorithms for evicting
+low-importance KV pairs score importance variously by trailing-window attention (Li et al., 2024),
+accumulated past-attention with recency (Zhang
+et al., 2023; Liu et al., 2023), attention-sink heuristics (Xiao et al., 2024), layer-wise pyramidal allocation (Cai et al., 2024), context reconstruction
+(Kim et al., 2025), future-query attention (Devoto
+et al., 2025), or per-head retrieval/streaming roles
+(Xiao et al., 2025). Others reduce cache cost without evicting, through query-aware page selection
+(Tang et al., 2024) or low-bit quantization (Liu
+et al., 2024); paged-attention serving frameworks
+(Kwon et al., 2023) supply the memory management underneath. Chari et al. (2025) trains a model
+to preserve uncompressed-model behavior under
+compression, a complementary objective to ours.
+Yang et al. (2024) document compression-induced
+hallucination and propose a representation-side fix.
+We use these as upstream sources of survival masks;
+calibrated abstention as a trained behavior is orthogonal.
+
+5.6
+
+Mechanism: evidence content or input
+length?
+
+The adapter’s decisions track which evidence survives, not how much: it responds to evidence content, not input length. This matters because the
+adapter sees a shortened input and could in principle be abstaining on length alone. Three controlleddeletion tests, all holding input length fixed, rule
+that out (Appendix O). The decisive one constructs,
+for each C ONFIDENT-gold example at r = 0.50,
+two equal-length masks: one keeping KVzip’s
+highest-priority half, one its lowest-priority half.
+The adapter answers on the high-priority masks
+and abstains on the low-priority ones, where neither adapter answers a single example correctly
+and mix-ps abstains on all 22 with zero confident
+wrong answers; replacing only the answer-bearing
+tokens with random kept tokens raises abstention
+just as sharply. A length prior predicts identical
+behavior across these matched-length conditions;
+we observe the opposite.
+5.7
+
+Related work
+
+Abstention and selective generation. Selfknowledge and selective generation in LLMs have
+been studied via calibration (Kadavath et al., 2022),
+self-knowledge benchmarks (Yin et al., 2023),
+verbalized confidence (Lin et al., 2022), selfevaluation gating (Ren et al., 2023), refusal-aware
+tuning (Zhang et al., 2024), retrieve-and-critique
+(Asai et al., 2024), multi-LLM collaboration (Feng
+et al., 2024), and the known-unknown boundary
+(Amayuelas et al., 2024). Kamath et al. (2020)
+formalize selective QA under domain shift; the
+closest neighbor is Joren et al. (2025) on context
+sufficiency in RAG. Our source of insufficiency
+is KV-cache eviction, and the trained behavior is
+bidirectional rather than gating.
+
+Long-context generalization and
+base-model replication
+
+The learned behavior generalizes beyond the training setup. On RULER multi-key NIAH (Hsieh
+et al., 2024) at context lengths up to 16K (four
+times the training maximum), the adapter preserves the same broadly declining-with-r abstention shape seen on MuSiQue val and cuts aggregate
+hallucination rate by 36–43pp at every length (Appendix Q). Rerunning the full pipeline on Llama3.1-8B-Instruct as a held-out base (independent
+training) reproduces the effect: ∆honest accuracy
++0.64 and 96% hallucination reduction, with the
+declining abstention curve preserved on both bases
+(Appendix G).
+
+7
+
+Conclusion
+
+KV-cache compression makes long-context inference more efficient, but it can also remove the very
+evidence needed to answer a downstream query.
+This paper formulates that failure mode as a behavioral learning problem: given a compressionmodified context, the model should answer when
+the surviving evidence supports the answer and abstain when it does not. We show that this behavior
+can be learned with a small LoRA adapter trained
+from compressor masks and tight answer-bearing
+8
+
+Tight-span labels are imperfect. Our labels are
+based on whether short answer-bearing spans survive compression, not on a full semantic proof
+that the truncated context supports the answer.
+On a stratified 400-example audit, these labels
+show moderate agreement with an LLM-judge sufficiency verdict (Cohen’s κ = 0.61, raw agreement 80%). The main disagreement mode occurs
+in multi-hop questions where the answer string survives but the bridging evidence needed to connect
+the question to that answer does not. This means
+the tight-span rule is effective for constructing a
+training signal, but it is not exact ground truth for
+contextual sufficiency.
+
+spans.
+These results suggest that KV-cache compression should not be evaluated only by how well
+it preserves uncompressed-model outputs. When
+compression changes what evidence is available,
+the model’s behavior should change as well.
+Compression-aware abstention offers one way to
+make that behavior explicit: preserve answers when
+the evidence survives, and refuse when compression has made the context insufficient.
+
+Limitations
+Aggregate accuracy is exploitable. Because
+the gold label distribution is highly skewed as a
+function of retention ratio, aggregate honest accuracy can reward policies that do not inspect the
+truncated context at all. As shown in §5.2, a
+simple ratio-threshold rule can beat both trained
+adapters on aggregate by exploiting the fact that
+low-retention examples are mostly A BSTAIN-gold
+and high-retention examples are mostly C ONFI DENT -gold. We therefore report aggregate numbers for orientation, but treat per-ratio and classconditional comparisons as the more meaningful
+tests of compression-aware abstention. The midretention prompt comparison is also underpowered:
+at r = 0.50, the mixture-vs-prompt advantage
+trends positive but is not statistically significant
+(∆ = +0.07, p = 0.17 pooled). Our strongest
+prompt-vs-training evidence comes instead from
+the high-retention C ONFIDENT-gold slice, where
+prompting over-abstains and the trained adapter
+does not.
+
+Hard high-retention cases remain. The adapter
+still fails on rare cases where the overall retention
+ratio is high but the specific evidence needed for
+the question has been evicted. At r = 0.80, across
+three v1 seeds, the adapter converges on hallucinating the same 4 of 7 rare A BSTAIN-gold examples.
+This suggests that the model has learned much of
+the easy version of compression-aware abstention
+(using retention ratio and deletion patterns as strong
+cues) but has not fully learned the harder behavior
+of introspecting on whether the specific evidence
+required for the current question survived.
+Scope and experimental coverage. Our
+training data is limited to MuSiQue 2-hop
+QA, and the tight-span construction relies on
+question_decomposition annotations that
+are not available in all QA datasets. We replicate
+the main behavior on RULER multi-key NIAH
+and on a held-out Llama-3.1-8B-Instruct base
+model, but we do not retrain on another multi-hop
+QA dataset such as HotpotQA. Our compressedcache evaluation also uses KVzipPress; other
+kvpress compressors use different eviction and
+position-indexing paths, and cross-compressor
+cc generalization remains untested. Finally, we
+use greedy decoding and select hyperparameters
+on the same validation set used for headline
+reporting. The search is small and a disjoint
+100-example split reproduces the effect, but a fully
+pre-registered dev/test split and broader sampling
+regimes are left to future work.
+
+The compressed-cache deployment gap. The
+adapter improves substantially under actual
+compressed-cache decoding, but it does not close
+the gap to prompt-style inference. At r = 0.80,
+mix-cc honest accuracy under compressed-cache
+inference is 0.315, compared with 0.658 for mix-ps
+under prompt-style inference at the same retention.
+This should be interpreted together with the basemodel collapse in the same deployment regime: under compressed-cache inference, the unaided base
+answers only 1/69 of C ONFIDENT-gold examples
+correctly at r = 0.80, while the trained adapter
+answers 22/69. Thus cc-training yields a large
+relative lift over the relevant deployment baseline,
+but high-retention compressed-cache answering remains a real generalization limit.
+
+References
+Alfonso Amayuelas, Kyle Wong, Liangming Pan,
+Wenhu Chen, and William Yang Wang. 2024. Knowledge of knowledge: Exploring known-unknowns un-
+
+9
+
+certainty with large language models. In Findings of
+the Association for Computational Linguistics: ACL
+2024. ArXiv:2305.13712.
+
+augmented generation systems. In International
+Conference on Learning Representations (ICLR).
+ArXiv:2411.06037.
+
+Akari Asai, Zeqiu Wu, Yizhong Wang, Avirup Sil, and
+Hannaneh Hajishirzi. 2024. Self-RAG: Learning to
+retrieve, generate, and critique through self-reflection.
+In International Conference on Learning Representations (ICLR). ArXiv:2310.11511.
+
+Saurav Kadavath, Tom Conerly, Amanda Askell, Tom
+Henighan, Dawn Drain, Ethan Perez, Nicholas
+Schiefer, Zac Hatfield-Dodds, Nova DasSarma, Eli
+Tran-Johnson, Scott Johnston, Sheer El-Showk,
+Andy Jones, Nelson Elhage, Tristan Hume, Anna
+Chen, Yuntao Bai, Sam Bowman, Stanislav Fort, and
+17 others. 2022. Language models (mostly) know
+what they know. arXiv preprint arXiv:2207.05221.
+
+Yushi Bai, Xin Lv, Jiajie Zhang, Hongchang Lyu,
+Jiankai Tang, Zhidian Huang, Zhengxiao Du, Xiao
+Liu, Aohan Zeng, Lei Hou, Yuxiao Dong, Jie Tang,
+and Juanzi Li. 2024. LongBench: A bilingual, multitask benchmark for long context understanding. In
+Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics (ACL), pages
+3119–3137.
+
+Amita Kamath, Robin Jia, and Percy Liang. 2020. Selective question answering under domain shift. In
+Proceedings of the 58th Annual Meeting of the Association for Computational Linguistics (ACL), pages
+5684–5696.
+
+Zefan Cai, Yichi Zhang, Bofei Gao, Yuliang Liu,
+Yucheng Li, Tianyu Liu, Keming Lu, Wayne Xiong,
+Yue Dong, Junjie Hu, and Wen Xiao. 2024. PyramidKV: Dynamic KV cache compression based on
+pyramidal information funneling. arXiv preprint
+arXiv:2406.02069.
+
+Jang-Hyun Kim, Jinuk Kim, Sangwoo Kwon, Jae W.
+Lee, Sangdoo Yun, and Hyun Oh Song. 2025. KVzip:
+Query-agnostic KV cache compression with context
+reconstruction. In Advances in Neural Information
+Processing Systems (NeurIPS). NeurIPS 2025 Oral;
+arXiv:2505.23416.
+
+Vivek Chari, Guanghui Qin, and Benjamin Van Durme.
+2025. KV-distill: Nearly lossless learnable context compression for LLMs.
+arXiv preprint
+arXiv:2503.10337.
+
+Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying
+Sheng, Lianmin Zheng, Cody Hao Yu, Joseph E. Gonzalez, Hao Zhang, and Ion Stoica. 2023. Efficient
+memory management for large language model serving with PagedAttention. In Proceedings of the 29th
+Symposium on Operating Systems Principles (SOSP).
+ArXiv:2309.06180.
+
+Tri Dao. 2024. FlashAttention-2: Faster attention with
+better parallelism and work partitioning. In International Conference on Learning Representations
+(ICLR). ArXiv:2307.08691.
+
+Yuhong Li, Yingbing Huang, Bowen Yang, Bharat
+Venkitesh, Acyr Locatelli, Hanchen Ye, Tianle Cai,
+Patrick Lewis, and Deming Chen. 2024. SnapKV:
+LLM knows what you are looking for before generation. In Advances in Neural Information Processing
+Systems (NeurIPS). ArXiv:2404.14469.
+
+Alessio Devoto, Maximilian Jeblick, and Simon Jégou.
+2025. Expected attention: KV cache compression by
+estimating attention from future queries distribution.
+arXiv preprint arXiv:2510.00636.
+
+Stephanie Lin, Jacob Hilton, and Owain Evans. 2022.
+Teaching models to express their uncertainty in
+words. Transactions on Machine Learning Research
+(TMLR). ArXiv:2205.14334.
+
+Shangbin Feng, Weijia Shi, Yike Wang, Wenxuan Ding,
+Vidhisha Balachandran, and Yulia Tsvetkov. 2024.
+Don’t hallucinate, abstain: Identifying LLM knowledge gaps via multi-LLM collaboration. In Proceedings of the 62nd Annual Meeting of the Association
+for Computational Linguistics (Volume 1: Long Papers), pages 14664–14690.
+
+Zichang Liu, Aditya Desai, Fangshuo Liao, Weitao
+Wang, Victor Xie, Zhaozhuo Xu, Anastasios Kyrillidis, and Anshumali Shrivastava. 2023. Scissorhands: Exploiting the persistence of importance
+hypothesis for LLM KV cache compression at test
+time. In Advances in Neural Information Processing
+Systems (NeurIPS). ArXiv:2305.17118.
+
+Cheng-Ping Hsieh, Simeng Sun, Samuel Kriman, Shantanu Acharya, Dima Rekesh, Fei Jia, Yang Zhang,
+and Boris Ginsburg. 2024. RULER: What’s the
+real context size of your long-context language models? In Conference on Language Modeling (COLM).
+ArXiv:2404.06654.
+
+Zirui Liu, Jiayi Yuan, Hongye Jin, Shaochen Zhong,
+Zhaozhuo Xu, Vladimir Braverman, Beidi Chen, and
+Xia Hu. 2024. KIVI: A tuning-free asymmetric 2bit
+quantization for KV cache. In Proceedings of the
+41st International Conference on Machine Learning
+(ICML). ArXiv:2402.02750.
+
+Edward J. Hu, Yelong Shen, Phillip Wallis, Zeyuan
+Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang,
+and Weizhu Chen. 2022. LoRA: Low-rank adaptation of large language models. In International
+Conference on Learning Representations (ICLR).
+ArXiv:2106.09685.
+
+Llama Team, Meta AI. 2024. The Llama 3 herd of
+models. arXiv preprint arXiv:2407.21783.
+
+Hailey Joren, Jianyi Zhang, Chun-Sung Ferng, DaCheng Juan, Ankur Taly, and Cyrus Rashtchian.
+2025. Sufficient context: A new lens on retrieval
+
+NVIDIA. 2026. kvpress: LLM KV cache compression
+made easy. https://github.com/NVIDIA/
+kvpress. Software library, version 0.5.3.
+
+10
+
+Qwen Team. 2024. Qwen2.5 technical report. arXiv
+preprint arXiv:2412.15115.
+Jie Ren, Yao Zhao, Tu Vu, Peter J. Liu, and Balaji
+Lakshminarayanan. 2023. Self-evaluation improves
+selective generation in large language models. arXiv
+preprint arXiv:2312.09300. NeurIPS 2023 ICBINB
+Workshop.
+Jiaming Tang, Yilong Zhao, Kan Zhu, Guangxuan
+Xiao, Baris Kasikci, and Song Han. 2024. Quest:
+Query-aware sparsity for efficient long-context LLM
+inference. In Proceedings of the 41st International Conference on Machine Learning (ICML).
+ArXiv:2406.10774.
+Harsh Trivedi, Niranjan Balasubramanian, Tushar Khot,
+and Ashish Sabharwal. 2022. MuSiQue: Multihop questions via single-hop question composition.
+Transactions of the Association for Computational
+Linguistics (TACL), 10:539–554.
+Guangxuan Xiao, Jiaming Tang, Jingwei Zuo, Junxian
+Guo, Shang Yang, Haotian Tang, Yao Fu, and Song
+Han. 2025. DuoAttention: Efficient long-context
+LLM inference with retrieval and streaming heads.
+In International Conference on Learning Representations (ICLR). ArXiv:2410.10819.
+Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song
+Han, and Mike Lewis. 2024. Efficient streaming
+language models with attention sinks. In International Conference on Learning Representations
+(ICLR). ArXiv:2309.17453.
+June Yong Yang, Byeongwook Kim, Jeongin Bae,
+Beomseok Kwon, Gunho Park, Eunho Yang, Se Jung
+Kwon, and Dongsoo Lee. 2024. No token left behind:
+Reliable KV cache compression via importanceaware mixed precision quantization. arXiv preprint
+arXiv:2402.18096.
+Zhangyue Yin, Qiushi Sun, Qipeng Guo, Jiawen
+Wu, Xipeng Qiu, and Xuanjing Huang. 2023.
+Do large language models know what they don’t
+know? In Findings of the Association for Computational Linguistics: ACL 2023, pages 8653–8665.
+ArXiv:2305.18153.
+Hanning Zhang, Shizhe Diao, Yong Lin, Yi R. Fung,
+Qing Lian, Xingyao Wang, Yangyi Chen, Heng Ji,
+and Tong Zhang. 2024. R-Tuning: Instructing large
+language models to say ‘I don’t know’. In Proceedings of the 2024 Conference of the North American
+Chapter of the Association for Computational Linguistics: Human Language Technologies (Volume 1:
+Long Papers), pages 7113–7139. ArXiv:2311.09677.
+Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong
+Chen, Lianmin Zheng, Ruisi Cai, Zhao Song, Yuandong Tian, Christopher Ré, Clark Barrett, Zhangyang
+Wang, and Beidi Chen. 2023. H2 O: Heavy-hitter
+oracle for efficient generative inference of large language models. In Advances in Neural Information
+Processing Systems (NeurIPS). ArXiv:2306.14048.
+
+11
+
+A
+
+Label entropy under tight-span vs paragraph-level supervision
+
+This is the pre-training diagnostic that motivated the tight-span pivot (§3.1). We sweep retention ratio r
+and compute the entropy (in nats) of the resulting three-class label distribution under two labeling schemes.
+Paragraph-level: assign C ONFIDENT/A BSTAIN/D ROP based on the retention of the entire supporting
+paragraph (∼100 tokens). Tight-span: based on the retention of the ≤ 15-token answer-bearing span.
+Both schemes use the same labeler thresholds (τlow = 0.3, τhigh = 0.8) and the same 50 answerable
+MuSiQue validation rows; with three active classes the maximum attainable entropy is 1.099.
+r
+
+paragraph entropy tight-span entropy
+
+0.05
+0.10
+0.20
+0.30
+0.50
+0.80
+
+0.000
+0.000
+0.098
+0.551
+0.000
+0.686
+
+0.000
+0.098
+0.471
+0.803
+0.950
+0.665
+
+Table 5: Label entropy (nats) at six retention ratios, on a 50-example diagnostic pool. Paragraph-level supervision
+collapses at the headline mid-ratio; tight-span supervision retains per-example variance there. This diagnostic was
+run before the main pipeline, using a small mask generator (Qwen3-0.6B) to make the sweep cheap; the production
+pipeline generates masks with the target base model itself (§3.2).
+
+The headline mid-slice r = 0.50 is the operative comparison. There, paragraph-level supervision has
+zero label entropy because every one of the 50 examples lands in D ROP: at r = 0.50 each ∼100-token
+paragraph retains roughly half its tokens, so ρ falls in the uncertain zone [τlow , τhigh ) for every example
+and the scheme yields no usable training signal at all. Tight-span supervision at the same ratio reaches
+0.950, the highest value in either column, restoring the per-example variance required for Eq. 2 to be
+discriminative. The two schemes are closer at the extreme ratios, where retention is decisive under either
+granularity.
+
+B
+
+Output classification categories
+
+For each (record, r) pair we apply the compressor’s survival mask to construct c̃, run greedy decoding
+(max 64 new tokens), and classify the output:
+• correct_confident (C ONFIDENT-gold, model emits the gold answer)
+• correct_abstention (A BSTAIN-gold, model emits the refusal string)
+• hallucinated (A BSTAIN-gold, model emits a confident wrong answer)
+• wrong_answer (C ONFIDENT-gold, model emits a wrong answer)
+• overcautious (C ONFIDENT-gold, model emits the refusal string)
+• lucky_guess (rare; tracked separately)
+Honest accuracy is (correct_confident + correct_abstention)/total at each r. Hallucination rate is
+hallucinated/total. Overcaution rate is overcautious/nC ONFIDENT- GOLD . Conditional wrong-when-answering
+rate is wrong_answer/(model_emits_answer_count) on C ONFIDENT-gold examples.
+Matching rules. Scoring is substring-based, not exact-match. A response counts as an abstention
+if its first 200 characters (lower-cased) contain a refusal phrase (e.g., “i cannot determine”, “cannot
+determine the answer”), which captures refusal-string variants rather than only the exact training target. A
+response counts as containing the gold answer if the gold string or one of its answer aliases occurs as a
+case-insensitive substring. The category is then: for A BSTAIN-gold, correct if it abstains else hallucinated;
+for C ONFIDENT-gold, overcautious if it abstains, correct if it contains the gold answer, else wrong_answer.
+A response that abstains in its opening clause is scored as an abstention even if other text follows.
+12
+
+C
+
+Calibration sub-checks
+
+We split adapter behavior on C ONFIDENT-gold examples into two failure modes: overcaution
+(C ONFIDENT-gold answered with the refusal string) and wrong-when-answering (C ONFIDENT-gold
+answered with a wrong answer). We report at the two slices with sufficient C ONFIDENT-gold sample size,
+r ∈ {0.50, 0.80}.
+r
+
+nC base ovc v1 ovc mix ovc v1 wrong/ans mix wrong/ans
+
+0.50
+0.80
+
+22
+69
+
+23%
+17%
+
+32%
+3%
+
+23%
+10%
+
+33%
+34%
+
+18%
+27%
+
+Table 6: Calibration sub-check on KVzip val (seed 42). v1 preserves conditional answer quality with the +9pp
+r=0.50 overcaution cost flagged in §5.1. Mixture closes the overcaution cost while improving conditional answer
+quality.
+
+Mixture cross-compressor calibration. Conditional wrong-when-answering rate decreases on 7 of 8
+conclusive (compressor, r) cells under mixture training.
+r
+
+Compressor
+
+nC v1 wrong/ans mix wrong/ans v1 ovc mix ovc
+
+0.50
+0.50
+0.50
+0.50
+0.80
+0.80
+0.80
+0.80
+
+KVzip
+ExpAttn
+SnapKV (ctx)
+SnapKV (nat)
+KVzip
+ExpAttn
+SnapKV (ctx)
+SnapKV (nat)
+
+22
+23
+18
+28
+69
+65
+59
+67
+
+18%
+17%
+40%
+35%
+27%
+28%
+27%
+32%
+
+33%
+29%
+33%
+42%
+34%
+41%
+41%
+42%
+
+32%
+9%
+17%
+14%
+3%
+3%
+0%
+0%
+
+23%
+22%
+17%
+18%
+10%
+8%
+7%
+6%
+
+Table 7: Mixture-adapter calibration sub-check on all four val sets, r ∈ {0.50, 0.80}. Conditional wrong-whenanswering improves on 7 of 8 cells.
+
+D
+
+Cross-compressor evidence
+r
+0.05
+0.10
+0.20
+0.30
+0.50
+0.80
+aggregate
+
+KVzip ExpAttn SnapKV (ctx) SnapKV (nat)
++0.85
++0.72
++0.56
++0.43
++0.21
++0.10
++0.53
+
++0.70
++0.66
++0.59
++0.35
++0.29
++0.08
++0.49
+
++0.39
++0.26
++0.17
++0.12
++0.13
++0.05
++0.21
+
++0.40
++0.30
++0.11
++0.04
++0.03
++0.04
++0.20
+
+Table 8: Per-ratio ∆honest accuracy of the v1 adapter (seed 42) on four compressors. Within-family transfer
+(ExpAttn) tracks KVzip closely; cross-family transfer (SnapKV) is partial and most degraded at low r, where
+truncation-pattern divergence is greatest.
+
+Two-pattern decomposition. On 10 A BSTAIN-labeled qualitative examples evaluated under all four
+compressors, the adapter (trained only on KVzip masks) correctly answers under Expected Attention on
+2 examples and under SnapKV-native on 3 examples, cases where the held-out compressor happened
+to retain supporting tokens that KVzip evicted. The read-and-answer behavior is therefore survivingevidence-conditional: it transfers wherever c̃ contains the answer, regardless of which compressor
+produced the truncation. The recognize-missing-evidence behavior is truncation-pattern-specific: 96% of
+ExpAttn correct-abstentions, 97% of SnapKV-context correct-abstentions, and 98% of SnapKV-native
+correct-abstentions are also correct abstentions under KVzip: the held-out compressors do not enable
+abstention recognition on examples KVzip didn’t enable; they cause failure-to-recognize on examples
+KVzip did enable.
+13
+
+E
+
+Mixture training
+
+E.1
+
+Dataset
+
+We construct a training distribution from three compressors at six retention ratios. Per-(compressor, r)
+class balance is applied for r ≥ 0.20 at the standard 30/70 minority floor; at r ∈ {0.05, 0.10} the natural
+distribution is kept (C ONFIDENT-gold rate < 1% across compressors). Final mixture train: 8772 instances.
+Holdout (for checkpoint selection only, disjoint by example ID from training): 984. Val: 1511 instances
+across all three compressors.
+E.2
+
+Seed robustness
+Compressor
+
+seed 42
+
+seed 43
+
+spread
+
+KVzip
+Expected Attention
+SnapKV (ctx)
+SnapKV (nat)
+
++0.5378
++0.5676
++0.5336
++0.4272
+
++0.5551
++0.5676
++0.5267
++0.4296
+
+0.017
+0.000
+0.007
+0.002
+
+Table 9: Aggregate ∆honest accuracy across mixture seeds. Max spread across all four compressors is 0.017.
+
+Per-cell spread at r = 0.80 on SnapKV is large (up to 0.23 with sign flips). These cells have very small
+A BSTAIN-gold n (4 KVzip, 1 ExpAttn, 10 SnapKV); single-example flips swing the percentage. The
+aggregate metric integrates over the full val and is robust to per-cell noise.
+
+F
+
+Held-out test split
+
+We carve a 100-example test split from val (disjoint by example ID from a 363-example selection
+split, never seen during checkpoint selection) and re-evaluate the seed-42 v1 adapter without retraining.
+Aggregate ∆honest accuracy: +0.63 on test vs full val’s +0.53. The aggregate lift is attributable to
+chance class skew (the random shuffle landed on a slice with 85% A BSTAIN-gold vs full val’s 79%).
+Selection split alone (n = 363) shows +0.50, within 3pp of full val. Hallucination count on test split:
+1/85 (vs base 59/85). The v1 result is not overfit to selection val.
+
+G
+
+Llama-3.1-8B-Instruct replication
+
+We retrain the entire pipeline with Llama-3.1-8B-Instruct as the base and KVzip mask-generator, via
+the NousResearch/Meta-Llama-3.1-8B-Instruct mirror (identical weights and tokenizer).
+Same labeler thresholds, same 30/70 floor, same disjoint-by-id discipline. Llama train: 3640 instances (vs
+Qwen’s 2669) because Llama’s KVzip retains slightly more answer-bearing tokens at the same ratios.
+r
+0.05
+0.10
+0.20
+0.30
+0.50
+0.80
+aggregate
+
+Qwen ∆hon Llama ∆hon abs. diff
++0.85
++0.72
++0.56
++0.43
++0.21
++0.10
++0.53
+
++0.84
++0.82
++0.83
++0.73
++0.20
++0.19
++0.64
+
+0.01
+0.10
+0.27
+0.30
+0.01
+0.09
+0.11
+
+Table 10: Per-ratio ∆honest accuracy on Qwen2.5-7B (v1) vs Llama-3.1-8B (independently trained pipeline). Both
+monotone-decreasing; aggregate magnitude comparable.
+
+The Llama adapter eliminates 96% of base hallucinations (228 → 10), preserves the monotone abstention curve (1.00/1.00/1.00/0.85/0.20/0.05 across r), and produces +298 correct answers vs base
+(Qwen: +244). Differences from Qwen reflect differences in label distribution: Llama’s val gold-mix at
+r = 0.50 is C ONF-heavy (35/15) vs Qwen’s (22/26), so Llama’s lower abstention rate at 0.50 (0.20 vs
+Qwen’s 0.58) is correct on its slice.
+14
+
+H
+
+Failure mode detail
+
+At r = 0.80, the remaining failure is concentrated in rare A BSTAIN-gold examples. Decomposition:
+• On 4 A BSTAIN-gold examples at r = 0.80, the adapter hallucinates on all 4 (vs base 3/4); slice too
+small (n = 4) to draw conclusions in isolation, but the four examples replicate as the same items across
+seeds.
+• On 69 C ONFIDENT-gold examples at r = 0.80, adapter wrong-answer count is 23 vs base 21, but
+answer count is 67 vs base 57, so conditional wrong-when-answering improves from 37% to 34%.
+The remaining failure mode is therefore not sloppy answering on C ONFIDENT-gold (conditional answer
+quality actually improves under the adapter); it is the rare A BSTAIN-gold cases at high apparent retention.
+The adapter learned the easy version of compression-aware abstention (use r as a strong prior) and not
+the hard version, which would require introspecting on whether the specific tokens that mattered for this
+question survived.
+A replication artifact strengthens the reading: across three seeds with different LoRA initializations, the
+adapter hallucinates on exactly 7 A BSTAIN-gold examples per seed, but only 4 of the 7 are stable across
+all three seeds. Two of the 4 stable cases are at r = 0.80, two at r = 0.50. The high-fill counter-instances
+are systematically harder; three independent training trajectories converge on the same failures.
+
+I
+
+Qualitative examples
+
+Three representative A BSTAIN-labeled examples on which the base model produces confident wrong
+answers and the adapter abstains correctly:
+Q: Who founded the company that distributed the film UHF?
+Gold: Mike Medavoy
+Base: “Kevin Smith founded the distribution company that released the film UHF. . . ”
+Adapter: “I cannot determine the answer to this question from the available context.”
+Q: Which company owns the manufacturer of Learjet 60?
+Gold: Bombardier Inc.
+Base: “Fieldillusionist is credited with appearances in horror film media. . . ”
+Adapter: “I cannot determine the answer to this question from the available context.”
+Q: What instrument is played by the person from The Blackout All-Stars?
+Gold: conga
+Base: “. . . specifically mentioned to be a Chapman Stick, which is a ten- or twelve-stringed instrument. . . ”
+Adapter: “I cannot determine the answer to this question from the available context.”
+
+In each case, the base model picks up distractor material from c̃ and constructs a confident wrong
+answer. The adapter, given the same input, declines.
+
+J
+
+Pre-training fragment-recoverability check
+
+Before training, we performed a sanity check on 30 A BSTAIN-labeled examples at r = 0.30. We extracted
+the kept tokens via the survival mask, decoded them to text, and presented the resulting fragment as a fresh
+prompt to a clean Qwen2.5-7B-Instruct. As with the sweep in Appendix A, this pre-training diagnostic
+generates masks with a small KVzip pass (Qwen3-0.6B) rather than the production base model. The
+model recovered the correct answer in 0 of 30 cases. In approximately one third of cases the model
+produced confident, specific wrong answers grounded in distractor material that had survived eviction,
+the same failure mode the adapter is intended to fix. The check rules out the alternative explanation that
+A BSTAIN labels are too aggressive for the underlying inputs.
+
+K
+
+Baseline comparison statistics
+
+We report bootstrap CIs and paired McNemar exact tests for the r = 0.50 slice across all four compressors
+and at high retention (r = 0.80) on C ONFIDENT-gold examples. All bootstrap operations use seed 42 with
+10,000 resamples; McNemar tests are exact (two-sided binomial on the discordant pair counts). Pooled
+rows aggregate the discordant counts across compressors and thus treat each (example, compressor) pair as
+independent; because the same example ids recur across compressors, the pooled p-values are descriptive
+and the per-compressor tests are primary.
+15
+
+Comparison (at r = 0.50) Compressor
+
+b/c
+
+exact p
+
+∆ [95% CI]
+
+mix vs P2
+mix vs P2
+mix vs P2
+mix vs P2
+mix vs P2 (pooled)
+
+KVzip
+12 / 5
+ExpAttn
+10 / 5
+SnapKV-ctx 5 / 5
+SnapKV-nat 5 / 6
+all four
+32 / 21
+
+0.143
+0.302
+1.000
+1.000
+0.169
+
++0.15 [−0.02, +0.31]
++0.12 [−0.07, +0.29]
++0.00 [−0.15, +0.15]
+−0.03 [−0.19, +0.14]
++0.066 [−0.024, +0.151]
+
+mix vs Frag
+mix vs Frag
+mix vs Frag
+mix vs Frag (pooled)
+
+KVzip
+16 / 4
+ExpAttn
+15 / 1
+SnapKV-ctx 16 / 4
+all four
+56 / 13
+
+0.012
+0.0005
+0.012
+1.7×10−7
+
++0.25 [+0.08, +0.42]
++0.33 [+0.17, +0.50]
++0.31 [+0.10, +0.51]
++0.259 [+0.169, +0.349]
+
+at r = 0.80 on C ONFIDENT-gold
+mix vs P2
+mix vs P2
+mix vs P2
+mix vs P2
+mix vs P2 (pooled)
+
+KVzip
+25 / 3 2.7×10−5
+ExpAttn
+25 / 4 1.0×10−4
+SnapKV-ctx 23 / 3 8.8×10−5
+SnapKV-nat 22 / 3 1.6×10−4
+all four
+95 / 13 1.5×10−16
+
++0.32 [+0.19, +0.45]
++0.32 [+0.18, +0.46]
++0.34 [+0.19, +0.47]
++0.28 [+0.15, +0.42]
++0.32 [+0.25, +0.38]
+
+Table 11: Paired McNemar exact tests and paired-bootstrap 95% CIs. “mix vs P2” is mixture adapter vs prompt-only
+abstention baseline; “mix vs Frag” is mixture adapter vs base on the same compression-truncated input. The
+mid-slice prompt comparison does not reach significance even pooled; the high-retention prompt comparison is
+decisive on every compressor and pooled.
+
+L
+
+Answerability preservation
+
+For each example with gold = C ONFIDENT, we compute whether the adapter answers correctly
+(classification = correct and model_abstained = False). The preservation rate is
+this count divided by the total C ONFIDENT-gold count; the preservation ratio is adapter-rate divided by
+base-rate. A ratio ≥ 1.0 means the adapter answers correctly at-least-as-often as base.
+
+M
+
+Compressed-cache training details
+
+Training under cc decoding. For each (context, query, target) training tuple, we wrap the forward pass
+in a kvpress press context manager. Prefill processes the full context; the press evicts low-scoring K/V
+pairs from the cache; cross-entropy loss is computed on target tokens decoded from the post-eviction
+cache state. The compression algorithm at training time matches each example’s source compressor
+(compressor field in the mixture training data).
+We use the mixture training set (∼8772 instances across KVzip, ExpAttn, SnapKV-context). Hyperparameters match v1 (LoRA rank 16, α = 32, dropout 0.05; AdamW; constant LR; bf16; FlashAttention-2;
+max seq len 4096; batch size 1, gradient accumulation 16; 3 epochs). We sweep lr ∈ {1×10−4 , 2×10−4 }
+on seed 42 and select the better LR by val loss with sub-epoch checkpointing every 25% of an epoch and a
+fluency spot-check at each saved checkpoint (responses on five r = 0.80 C ONFIDENT-gold val examples
+must be fluent, not sub-token gibberish). The selected configuration was used to train seed 43; seed 44
+was attempted but did not complete.
+Per-seed mix-cc results. Aggregate honest accuracy under KVzipPress at inference: seed 42 = 0.821,
+seed 43 = 0.827, mean = 0.824, two-seed spread 0.006. Per-ratio shape preserved across seeds:
+r = 0.05: 1.000/1.000; r = 0.10: 0.989/0.989; r = 0.20: 0.963/0.976; r = 0.30: 0.923/0.954;
+r = 0.50: 0.500/0.458; r = 0.80: 0.315/0.342.
+Single-compressor cc-training. We also trained a cc-trained adapter on KVzip masks alone (analogous
+to v1 but under cc decoding). Aggregate honest accuracy under cc inference: 0.734, statistically tied
+with mix-ps cc (0.730); but at r = 0.80 on C ONFIDENT-gold, the single-compressor cc-trained adapter
+reduces over-abstention to 0.203 while increasing the wrong-answer count (confident wrong answers
+on C ONFIDENT-gold, not the A BSTAIN-gold hallucinations of Appendix B) to 42/69 (61%). Multicompressor cc-training (mix-cc) yields a wrong-answer count of 21/69 (30%). Qualitative inspection
+of the single-compressor adapter’s high-retention failures shows sub-token-fragment outputs (“Acfairs”,
+16
+
+nC
+
+Condition
+
+base rate [CI]
+
+adapter rate [CI]
+
+ratio
+
+Aggregate (all retention ratios), prompt-style inference
+v1 ps, KVzip
+v1 ps, ExpAttn
+v1 ps, SnapKV-ctx
+v1 ps, SnapKV-nat
+mix ps, KVzip
+mix ps, ExpAttn
+mix ps, SnapKV-ctx
+mix ps, SnapKV-nat
+
+97
+94
+88
+127
+97
+94
+88
+127
+
+0.485 [0.39, 0.58]
+0.468 [0.37, 0.57]
+0.545 [0.44, 0.65]
+0.567 [0.48, 0.65]
+0.485 [0.39, 0.58]
+0.468 [0.37, 0.57]
+0.545 [0.44, 0.65]
+0.567 [0.48, 0.65]
+
+0.557 [0.46, 0.65]
+0.574 [0.47, 0.67]
+0.568 [0.46, 0.67]
+0.575 [0.49, 0.66]
+0.608 [0.51, 0.70]
+0.638 [0.54, 0.73]
+0.591 [0.49, 0.69]
+0.567 [0.48, 0.65]
+
+1.15
+1.23
+1.04
+1.01
+1.25
+1.36
+1.08
+1.00
+
+Restricted to r = 0.80 slice, prompt-style inference
+v1 ps, KVzip
+mix ps, KVzip
+mix ps, ExpAttn
+mix ps, SnapKV-ctx
+
+69
+69
+65
+59
+
+0.522 [0.41, 0.64]
+0.522 [0.41, 0.64]
+0.492 [0.38, 0.61]
+0.542 [0.42, 0.66]
+
+0.638 [0.52, 0.74]
+0.652 [0.53, 0.75]
+0.662 [0.54, 0.77]
+0.678 [0.55, 0.78]
+
+1.22
+1.25
+1.34
+1.25
+
+Compressed-cache inference (KVzipPress)
+mix ps cc, KVzip
+mix cc cc, KVzip
+mix ps cc, KVzip (r=0.80)
+mix cc cc, KVzip (r=0.80)
+
+97
+97
+69
+69
+
+0.041 [0.02, 0.10]
+0.041 [0.02, 0.10]
+0.014 [0.00, 0.08]
+0.014 [0.00, 0.08]
+
+0.258 [0.18, 0.35]
+0.247 [0.17, 0.34]
+0.290 [0.20, 0.41]
+0.319 [0.22, 0.44]
+
+6.25
+6.00
+20.0
+22.0
+
+Table 12: Answerability preservation rates. Wilson 95% CIs. Under prompt-style inference, all 12 cells have
+preservation ratio ≥ 1.0: the adapter does not sacrifice correct answers. Under compressed-cache inference, base
+collapses on C ONFIDENT-gold (4% aggregate, 1.4% at r=0.80); adapter rates of 25–32% (raw 4/97 → 25/97
+aggregate, 1/69 → 22/69 at r=0.80) represent a 6–22× relative lift, with non-overlapping Wilson CIs.
+
+“750pxI came, I I loaves and two fish.”) consistent with the cross-entropy loss over-fitting to short outputs
+without learning to extract content from kept tokens; the multi-compressor mix-cc residual wrong answers
+are cleaner pattern collisions (“March 44 BC” → “28 November 1912”).
+
+N
+
+LLM-judge label validation
+
+To probe the validity of the tight-span retention label as a proxy for answerability, we sample 400
+labeled examples from train_v1.jsonl (stratified: 200 C ONFIDENT, 200 A BSTAIN; balanced across
+retention ratios; sample seed 42), and query a strong judge model (GPT-5, reasoning effort low, seed 42)
+for a YES/NO/PARTIAL sufficiency verdict given the truncated context, query, and gold answer. The
+judge does not see our label or the full context.
+Statistic
+
+Value
+
+Total sampled
+400
+Judge PARTIAL count
+48 (12.0%)
+κ (strict, excluding PARTIAL, n = 352)
+0.609
+κ (lenient, PARTIAL → C ONFIDENT)
+0.525
+κ (lenient, PARTIAL → A BSTAIN)
+0.545
+
+Table 13: Cohen’s κ between tight-span labels and LLM-judge sufficiency verdicts. Moderate agreement (LandisKoch range 0.4–0.7).
+
+The confusion matrix shows directional asymmetry: of 200 C ONFIDENT labels, 123 are confirmed YES,
+55 rejected as NO, 22 marked PARTIAL; of 200 A BSTAIN labels, 160 confirmed NO, 14 rejected as YES,
+26 PARTIAL. Per-retention agreement is near-perfect at extreme low retention (r ∈ {0.05, 0.10}: 0.97–
+1.00) and 0.69–0.76 from r = 0.20 upward. The dominant disagreement pattern (manually inspected
+on 25 and 13 sampled cases from the two disagreement directions) is bridge-evidence loss in multi-hop
+questions: the answer string survives in the kept tokens, and one of the two reasoning hops survives, but
+the bridging evidence linking the hops does not. The tight-span rule cannot distinguish “answer string is in
+the kept tokens” from “the reasoning chain that links the question to the answer is recoverable”: a known
+limitation of substring-based answerability surrogates that affects mid-retention multi-hop QA most.
+17
+
+O
+
+Mechanism: controlled-deletion experiments
+
+Three controlled-deletion experiments probe whether the trained adapter uses evidence content or inputlength priors.
+10A: Fixed retained length. Hold input length constant at L = 500 kept tokens (selected by KVzip
+rank in context order) regardless of the original ratio. On the 208 examples that have ≥ L kept tokens at
+any ratio:
+Adapter Condition
+
+CONF hon [CI]
+
+ABS hon [CI]
+
+mix-ps
+mix-ps
+mix-cc
+mix-cc
+
+0.147 [0.09, 0.23]
+0.621 [0.52, 0.71]
+0.063 [0.03, 0.13]
+0.274 [0.19, 0.37]
+
+0.885 [0.81, 0.93]
+0.823 [0.74, 0.88]
+0.956 [0.90, 0.98]
+0.956 [0.90, 0.98]
+
+fixed-L
+orig-r
+fixed-L
+orig-r
+
+Table 14: Test 10A. Holding input length to 500 reduces C ONFIDENT-gold accuracy (−47pp mix-ps, −21pp mix-cc)
+but not A BSTAIN-gold accuracy. The drop is consistent with both length-prior and evidence-loss explanations; tests
+10B and 10C disambiguate.
+
+10B: Adversarial tight-span eviction. Construct a mask = (existing kept-mask) MINUS (tight-span
+token positions identified from supporting_spans) PLUS (random non-kept positions to refill to
+original length). Same length, same retention count, but answer-bearing tokens forcibly removed.
+Of 97 C ONFIDENT-gold examples (all retention ratios): mix-ps abstention rises from 16.5% on the
+original mask to 56.7% on the adversarial mask (+40.2pp); mix-cc rises from 64.9% to 88.7% (+23.8pp).
+Per-pair, 41/97 (mix-ps) and 25/97 (mix-cc) flip from “answered on original” to “abstained on adversarial.”
+The adapter responds to evidence content, not just length.
+10C: Opposite-priority pairs. For each of 22 C ONFIDENT-gold examples at r = 0.50, construct two
+masks of identical length: Mask A keeps KVzip’s top-50% (tight spans likely retained), Mask B keeps
+KVzip’s bottom-50% (tight spans likely evicted). On Mask A, mix-ps answers correctly 14/22; on Mask
+B, 0/22 correct, 22/22 abstentions. mix-cc: A 5/22, B 0/22 correct with 20/22 abstentions. At identical
+input length and identical example, the adapter’s answer-vs-abstain decision flips entirely based on which
+half of the context is kept. Neither adapter answers correctly on Mask B; mix-ps abstains on all 22, and
+mix-cc’s two non-abstentions are confident wrong answers.
+
+P
+
+Random-mask training-signal probe
+
+To probe whether the contribution depends on the importance-weighted nature of compressor masks
+or on the abstention objective itself, we retrain v1 with masks drawn uniformly at random at matched
+per-example retention counts, holding everything else constant. Under prompt-style inference, the
+random-mask adapter matches the mixture adapter on KVzip val (aggregate 0.873 vs mixture 0.86;
+paired McNemar ∆ = +0.017, p = 0.23) and beats v1 on cross-family transfer (+0.276 on SnapKVcontext, p ≈ 10−24 ). Two implications: under ps inference the abstention objective is the load-bearing
+signal, importance-weighted mask structure is not required to match v1’s headline numbers; and singlecompressor training induces an anti-transfer signature: v1 underperforms even random-mask training on a
+held-out compressor. Both findings motivate compressor-mixture training; §5.5 shows multi-compressor
+training delivers further gains under cc inference that single-compressor training (random or KVzip-only)
+does not.
+
+Q
+
+Long-context generalization (RULER)
+
+We evaluate the v1 adapter (no retraining) on RULER multi-key NIAH (Hsieh et al., 2024) (complementary
+to LongBench (Bai et al., 2024)) at three context lengths up to 16K, four times the training maximum.
+At 16K, abstention rate on A BSTAIN-gold across r is 67%/76%/74%/29%/11%/0%: the same broadly
+declining shape as MuSiQue val, though not strictly monotone at the two lowest ratios (Figure 5a).
+18
+
+(a) Abstention curve preserved at long context
+4K context
+8K context
+16K context (4 × training)
+
+0.8
+0.6
+0.4
+
+(b) Hallucinations halved at every length
+Base
++ LoRA
+
+0.8
+
+Hallucination rate
+
+Adapter abstention rate
+
+1.0
+
+1.0
+
+0.2
+
+0.6
+0.4
+0.2
+
+0.0
+5%
+
+10%
+
+20%
+
+30%
+
+Retention ratio r
+
+50%
+
+0.0
+
+80%
+
+4K
+
+8K
+
+Context length
+
+16K
+
+Figure 5: (a) Adapter abstention rate on A BSTAIN-gold at three context lengths on RULER multi-key NIAH; the
+monotone-decreasing-with-r shape is preserved at 4× training context. (b) Aggregate hallucination rate, base vs
+adapter, by length.
+
+Aggregate hallucination rate drops by 36–43pp at every length (Figure 5b); the adapter trades hallucinations
+on evicted-needle examples for refusals.
+
+R
+
+Training details
+
+The LoRA adapter (rank 16, α = 32, dropout 0.05) adapts only the four attention projections (q_proj,
+k_proj, v_proj, o_proj); MLP modules are unadapted, yielding 10.1M trainable parameters (0.13%
+of Qwen2.5-7B-Instruct’s 7.6B). We train with AdamW at lr ∈ {5×10−5 , 10−4 , 2×10−4 } (1-epoch
+sweep, picked by validation loss), constant LR, batch size 1 with gradient accumulation 16, max sequence
+length 4096, bf16 with FlashAttention-2 (Dao, 2024).
+
+19
+
+

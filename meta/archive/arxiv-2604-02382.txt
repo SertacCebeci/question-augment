@@ -1,0 +1,1779 @@
+Preprint.
+
+I NTERACTIVE C LARIFICATION FOR C LOUD
+I NFRASTRUCTURE - AS -C ODE S YNTHESIS
+Zhenning Yang, Kaden Gruizenga, Tongyuan Miao, Patrick Tser Jern Kon, Ang Chen
+University of Michigan
+{znyang,kgruiz,tymiao,patkon,chenang}@umich.edu
+
+arXiv:2604.02382v2 [cs.SE] 29 Aug 2026
+
+Hui Guan, Andrew Barto
+University of Massachusetts Amherst
+{huiguan,barto}@cs.umass.edu
+
+A BSTRACT
+The scale and complexity of modern cloud infrastructure have made
+“Infrastructure-as-Code” (IaC) essential for managing deployments through
+declarative configurations. While large language models (LLMs) are increasingly
+used to generate IaC configurations from natural language, user requests are often ambiguous and underspecified. Unlike traditional code generation, it is costly
+and time-consuming to test IaC configurations during the synthesis, forcing the
+LLMs into an almost one-shot regime. We observe that ambiguity in IaC synthesis
+exhibits a compositional structure: configurations decompose into three axes (resources, topology, attributes) where higher-level decisions constrain lower-level
+ones. We propose a training-free, multi-level disambiguation framework that generates diverse candidate specifications, identifies structural disagreements across
+these axes, ranks them by informativeness, and produces targeted clarification
+questions that progressively narrow the configuration space. We further introduce A MBIG -I AC, an expert-verified benchmark of 300 validated IaC tasks with
+ambiguous requests, and define evaluation metrics based on graph edit distance
+and exact attribute matching. Comprehensive experiments show that our method
+outperforms existing interactive clarification baselines, with gains that scale with
+the interaction budget and generalize across models. Extensive ablation studies
+and analyses further demonstrate its robustness for interactive IaC synthesis.
+
+1
+
+I NTRODUCTION
+
+LLMs are increasingly adopted for synthesizing structured artifacts from natural-language descriptions: code, database queries, and configuration programs (Ding et al., 2025; Zhou et al., 2025;
+Mu et al., 2024). However, user descriptions that drive this synthesis are often underspecified—
+prompts state high-level goals, not implementation details, so many valid outputs can satisfy the
+same prompt. A model that silently “resolves” this ambiguity via its own priors may produce plausible but misaligned results. Cloud Infrastructure-as-Code (IaC) is a particularly demanding instance
+of this problem (Yang et al., 2025a). IaC frameworks such as Terraform (HashiCorp, 2025b) define
+cloud infrastructure as declarative configurations (Yang et al., 2025a), and recent work has begun
+generating them directly from natural language (Kon et al., 2024). A single user request typically
+specifies only high-level infrastructure goals, leaving lower-level decisions (e.g., compute abstractions, resource connectivity, and security or networking policies) underspecified. This ambiguity
+gives rise to a large space of plausible yet potentially misaligned configurations (Figure 1).
+One way to handle ambiguity is by iterative clarification and refinement. In conventional code
+generation, agents refine programs using execution feedback: running tests, observing failures, and
+repairing. Cloud configuration offers no such loop. Executing an IaC program requires provisioning
+real infrastructure, which is slow, costly, and often irreversible or subject to strict rate limits. Dry-run
+validators such as terraform plan catch syntactic and type errors but cannot detect semantic
+misalignment with user intent. Indeed, we show that roughly 90% of generated configurations pass
+1
+
+Preprint.
+
+Set up AWS infrastructure for a web application that users can access
+through the internet but keep the servers private.
+
+Attribute Ambiguity
+
+main (vpc)
+
+Numerous configuration
+choices per resource
+(CIDR, scaling, policies, etc)
+
+subnet-1
+
+Topology Ambiguity
+
+subnet-0
+
+Multiple ways to connect
+resources
+
+EC2
+
+EKS
+
+Resource Ambiguity
+
+ECS
+
+...
+
+Multiple compute
+abstractions and services
+
+// define resource
+resource "vpc" "main_vpc" {
+// specify attributes
+cidr_block = "10.0.0.0/16"
+}
+resource "subnet" "subnet-0" {
+vpc_id
+= aws_vpc.main.id
+cidr_block = ...
+}
+resource "subnet" "subnet-1" {
+vpc_id
+= aws_vpc.main.id
+...
+}
+/* other resource blocks */
+
+Simplified Terraform code snippet
+
+Figure 1: An underspecified user request can be satisfied by many plausible cloud infrastructure configurations, each represented as a resource dependency graph (left). Ambiguity arises in choosing
+resource abstractions and services for compute, networking, storage, in inter-resource topology, and
+in per-resource configuration attributes, when translating intent into Infrastructure-as-Code (right).
+Terraform validation regardless of intent alignment (Section 6.5). In one recent public incident,
+an AI-assisted Terraform workflow deleted a production database, requiring roughly 24 hours of
+recovery (Grigorev, 2026). Cloud agents, therefore, operate in an almost one-shot regime where
+incorrect decisions incur real cost and are difficult to undo. Hence, precise disambiguation is a
+first-class requirement in IaC generation.
+Existing clarification methods do not transfer readily to cloud IaC because they target different ambiguity spaces. First, prior work primarily studies open-domain questions that rely on common-sense
+reasoning and admit a small set of salient interpretations (Min et al., 2020; Andukuri et al., 2024;
+Chen et al., 2025a). In such settings, clarification questions are relatively straightforward to formulate, and ambiguity can often be resolved within two to three turns (Zhang et al., 2025; Andukuri
+et al., 2024; Mu et al., 2024). IaC instead exhibits compositional ambiguity across resources, topology, dependencies, and attributes, producing a vast space of plausible configurations. Second, methods from code generation rely on execution feedback. They identify ambiguity through behavioral
+divergence among candidate programs on synthesized tests (Mu et al., 2024; Lahiri et al., 2023). This
+is difficult for IaC because execution may provision or modify real cloud resources, so ambiguity
+must be resolved before deployment. Third, existing approaches provide little guidance on where to
+direct clarification effort. A recent work Vijayvargiya et al. (2025) confirm the consequence empirically: without structural guidance, LLMs waste their question budget on low-value clarifications.
+As Figure 1 illustrates, IaC synthesis explores a structured configuration space where resources,
+topology, and attributes are tightly coupled, which we leverage to guide the clarification process.
+We observe that IaC ambiguity comes from three axes that arise from the hierarchical nature of cloud
+configuration (resources: which components to provision; topology: how they connect; attributes:
+what settings to apply): resource decisions constrain which topologies are feasible, and topology
+decisions constrain which attributes are relevant. Because each axis admits multiple valid choices,
+we can probe the extent of ambiguity by generating diverse candidate specifications and comparing them structurally: points where candidates disagree reveal where ambiguity concentrates. We
+propose a multi-level, disagreement-driven disambiguation framework that exploits this observation
+to guide clarification under a given interaction budget. The framework generates diverse candidate
+specifications, identifies structural disagreements across the three axes, ranks them by informativeness, and uses the most informative disagreements to generate targeted clarification questions. After
+the user answers each question, incompatible candidates are pruned, and the process repeats, progressively narrowing the configuration space. The framework requires no training or fine-tuning and
+works with any sufficiently capable LLM.
+This paper makes the following contributions:
+2
+
+Preprint.
+
+Request Interpretations
+Round 0
+Initial request
+Set up AWS infrastructure for a
+web application that users can
+access through the internet but
+keep the servers private.
+Round 1
+Set up AWS infrastructure for a
+web application with a VPC,
+public and private subnets, a
+load balancer, private EC2 app
+servers in an Auto Scaling
+group, a NAT Gateway,…
+Round n
+
+...
+
+Candidate generation
+
+Compute disagreements
+
+2
+
+3
+
+Resource
+Topology
+
+…
+
+Attribute
+
+4
+
+Candidate pruning
+
+Rank disagreements
+Delta #0
+
+7
+
+…
+
+8
+
+Delta #1
+Delta #2
+
+5
+1
+
+Initial request AND
+Question answers
+
+Users
+
+6
+
+Question generation
+Top
+delta
+
+Targeted
+Question
+
+Figure 2: Overview of the iterative disambiguation process for interactive Infrastructure-as-Code
+synthesis. 1. Users provide an initial IaC request. 2. Initially, a pool of diverse structured specifications is generated based on the current interpretations. 3. Symbolically compute disagreements
+among the current pool of candidates. 4. These disagreements are ranked to identify the most informative differences measured by entropy. 5. Based on the top-ranked disagreement, the system
+generates a targeted clarification question. 6. Interaction with the user. 7. If the candidate pool
+is non-empty, prune candidates inconsistent with the user’s answer. 8. The refined candidate pool
+is fed back into the next iteration, repeating the process until the interaction budget is exhausted.
+Otherwise, pool regeneration will be triggered.
+• We present the first investigation of interactive cloud IaC synthesis that exploits structure of IaC
+configurations to guide multi-turn user intent clarification.
+• We propose a training-free, multi-level framework that decomposes IaC ambiguity into three
+axes (resource, topology, and attribute), generates diverse candidate specifications, and uses
+structural disagreements to produce targeted clarification questions that efficiently narrow the
+configuration space.
+• We introduce A MBIG -I AC, an expert-verified benchmark of 300 IaC tasks, with validated reference configurations and ambiguous prompts. We additionally propose an evaluation framework
+that measures configuration correctness along structure (via graph edit distance) and concrete
+resource–attribute values (via exact, occurrence-aware matching).
+• Our evaluation shows that our method consistently outperforms baselines across interaction
+budgets and generalizes across language models, at a fraction of the computational cost of
+information-gain alternatives. Our ablation studies further demonstrate its robustness.
+
+2
+
+M OTIVATION
+
+Modern compute increasingly relies on large-scale cloud deployments, and this footprint continues
+to grow: Gartner forecasts worldwide IT spending of $6.15 trillion in 2026, driven in part by hyperscale cloud demand (Gartner, 2026). As cloud estates expand, they become harder to manage:
+65% of practitioners report increased cloud complexity over the past two years, yet only 6% report
+complete IaC coverage (Firefly, 2025). In such environments, ad hoc manual changes are difficult
+to audit, reproduce, and reconcile (Yang et al., 2025b), motivating IaC frameworks such as Terraform that express infrastructure through declarative, version-controlled specifications rather than
+imperative step-by-step operations (Amazon Web Services, 2026; HashiCorp, 2025a).
+However, handcrafting IaC configurations remains difficult because it requires substantial knowledge of cloud services, configuration semantics, and provider-specific tooling (Srivatsa et al., 2024).
+This has fueled growing interest in using LLMs to generate IaC from natural language, as reflected
+in recent surveys and benchmarks studying cloud infrastructure generation and editing (Srivatsa
+et al., 2024; Kon et al., 2024). However, generating correct IaC configurations is challenging,
+because it requires mapping underspecified user requests to complex, interdependent cloud
+configurations (Kon et al., 2024).
+3
+
+Preprint.
+
+3
+
+P ROBLEM F ORMULATION
+
+We study the problem of generating IaC configurations from ambiguous natural-language requests
+through interactive clarification. A user’s request expresses their explicit intent I: the initial, underspecified prompt. Because I leaves many decisions open, it admits multiple plausible interpretations,
+which in turn induce a large space C(I) of distinct candidate configurations. We assume that each
+request corresponds to a latent, intended target, represented in our setting by a reference configuration c∗ ∈ C(I) that satisfies not only the explicit intent I but also the user’s implicit intent, the
+unstated constraints and preferences. Since multiple syntactic realizations may represent the same
+design (e.g., different naming conventions), we normalize configurations to remove naming and representational differences. Architecturally distinct configurations, however, correspond to different
+interpretations and are therefore not treated as interchangeable. The agent cannot observe the implicit intent, and thus cannot identify c∗ directly; it can only elicit information about it by asking the
+user a bounded number of clarification questions, progressively narrowing C(I) toward c∗ .
+Structured specifications. Ambiguity in IaC synthesis arises along three axes: resources, topology, and attributes. Together, these axes define the combinatorial space of infrastructure configurations. IaC configurations consist of a set of resource blocks (see Figure 1), and we represent each
+configuration as a structured triple s = (R, T, A), where R is a multiset of resource types, T ⊆
+R × R is a set of directed dependency edges (typed by their source and target resource types), and A
+assigns to each resource a set of configuration key/value pairs. This decomposition induces a structured interface that supports more efficient and systematic intent elicitation by LLM-based agents.
+Interactive objective. The agent is given a fixed budget of K binary clarification questions. At
+each round t ∈ {1, . . . , K}, it selects a question qt , receives the user’s answer at ∈ {yes, no},
+and appends (qt , at ) to the interaction history Ht . After the budget is exhausted, the agent returns
+a single specification ĉ. The goal is to make the final configuration as close as possible to the
+target c∗ . Our evaluation measures this discrepancy using structural graph edit distance and exact
+resource-attribute matching.
+
+4
+
+M ETHOD
+
+Since c∗ is unobserved and C(I) is intractably large, we approximate the configuration space with
+a finite candidate pool P and use disagreement among candidates as a proxy for where the agent’s
+uncertainty about c∗ concentrates. We model LLMs’ alternative interpretations as a set of structured
+specifications, analyze the axes along which they disagree, and construct clarification questions
+based on the most informative disagreement. The agent iteratively asks one question per round,
+prunes the pool based on the user’s answer, and regenerates candidates when the pool is exhausted.
+After the budget is spent, the best surviving candidate is returned.
+Candidate generation. The candidate pool P = {s1 , . . . , sN } serves as a concrete approximation
+of the space of plausible configurations C(I). Given the user’s request (and, in subsequent rounds,
+the accumulated question/answer history Ht ), the agent generates N candidate specifications via
+temperature sampling, so that they explore different resource selections, topology wiring, and attribute choices. Candidates that share the same resource types and topology edges are deduplicated,
+as these higher-level axes determine the overall infrastructure design; attribute-level differences are
+still captured during disagreement detection.
+Computing disagreements. Because each candidate is a structured triple (R, T, A), disagreements
+can be computed symbolically along each axis. For resources, the agent extracts the set of resource
+types from each candidate and records any type that is present in some candidates but absent from
+others. For topology, it extracts the set of directed dependency edges and similarly records edges on
+which candidates disagree. For attributes, it groups candidates by resource type, then for each shared
+attribute key, checks whether candidates assign different values. Each disagreement partitions the
+pool into the candidates on either side of the difference.
+Ranking disagreements. Not all disagreements are equally informative. A disagreement that has
+a vast majority carries little discriminative value, whereas an even split maximizes the information
+gained from a single binary question. We therefore rank disagreements by how evenly they divide the
+candidate pool, measured by the Shannon entropy of the induced split, and discard near-consensus
+4
+
+Preprint.
+
+Dataset
+
+Natural.
+
+Ambig.
+
+Target Cons.
+
+Normalized score (0–1)
+IaC-Eval
+0.25
+A MBIG -I AC
+0.78
+
+0.24
+0.89
+
+0.90
+0.99
+
+Inter-coder agreement (Gwet’s AC)
+IaC-Eval
+0.71
+0.82
+A MBIG -I AC
+0.65
+0.82
+
+0.70
+0.98
+
+Table 1: Human validation of A MBIG -I AC and IaC-Eval on 100 samples, with normalized ratings
+and inter-coder agreement measured by Gwet’s AC. Higher ratings indicate greater naturalness,
+ambiguity, and target consistency.
+disagreements that fall below an entropy floor. To ensure balanced coverage, the surviving disagreements are ranked within each axis and then selected across axes in round-robin order, preventing
+any single axis from dominating the question budget.
+Question generation and pruning. In each round, the agent selects the top-ranked disagreement
+and converts it into a clarification question. The disagreement already partitions the pool into two
+sides (e.g., candidates that include a NAT gateway vs. those that do not). The agent passes it to an
+LLM, whose role is to rephrase the structural difference as a natural language yes/no question that
+a user can answer without knowledge of the underlying candidates. Given the user’s answer at , the
+agent retains only the candidates on the consistent side of the partition and discards the rest. Because
+the partition is already known from the diff, pruning is immediate and deterministic: one answer can
+eliminate multiple candidates at once, efficiently narrowing the pool.
+Regeneration and termination. Regeneration is triggered when the pool is exhausted (fewer than
+two candidates remain). The regeneration procedure repeats candidate construction, conditioning on
+both the original request and the full accumulated interaction history. This lets the model produce
+candidates consistent with the information gathered so far while still exploring the remaining uncertainty; the structured representation makes newly generated candidates easy to deduplicate and filter
+against prior interactions, avoiding revisiting resolved disagreements. The interaction terminates
+when the budget K is exhausted or when the agent can no longer produce structurally distinct candidates, indicating that its uncertainty has been sufficiently resolved. Upon termination, the agent
+returns the best surviving candidate; if none survives, it performs one final generation conditioned
+on the original request and the full interaction history.
+
+5
+
+E XPERIMENTAL S ETUP
+
+Dataset. We construct A MBIG -I AC, a benchmark of 300 Terraform tasks sourced from IaCEval (Kon et al., 2024). We manually verified and fixed the reference programs using terraform
+plan, filtering out programs that could not be validated. The dataset covers 167 unique AWS resource types across 44 service families (e.g., VPC, S3, IAM, RDS, Lambda). To introduce realistic
+ambiguity, we use an LLM to rewrite each original task prompt into a high-level, goal-oriented
+request that preserves consistency with the reference configuration but admits multiple plausible
+architectures. For example, “Configure a weighted routing policy that splits users between two
+db_instances that are replicas of a main db_instance” becomes “Our database is getting slow for
+users in other regions—need to fix that and make reads faster globally.” A manual inspection of
+100 sampled instances (performed by three domain experts) confirms that the rewritten prompts
+are natural yet answerable tasks: relative to IaC-Eval, A MBIG -I AC scores substantially higher on
+Naturalness and Ambiguity while preserving Target consistency, with substantial-to-almost-perfect
+inter-coder agreement (Table 1).
+User Proxy. We simulate user responses with an LLM-based oracle, following prior work (Zhou
+et al., 2025; Mu et al., 2024; Vijayvargiya et al., 2025; Kobalczyk et al., 2025; Zhang et al., 2025).
+Given a ground-truth Terraform configuration and a binary clarification question, the proxy answers
+based solely on whether the reference configuration implies yes or no, and is explicitly instructed to
+answer strictly from the reference, with no external knowledge or assumptions. All methods interact
+with the same oracle under the same question budget, so the information channel is held fixed and
+differences between methods reflect question quality alone.
+5
+
+Preprint.
+
+Baselines. Under the same question budget K, we compare against four interactive baselines:
+• Direct Question Generation: the LLM directly generates clarification questions.
+• Best-of-N: at each round the LLM generates N candidate questions conditioned on prior Q&A,
+and a separate ranker LLM selects one.
+• Self-Consistency: N candidate questions are generated, embedded, and clustered; the question closest to the centroid of the largest cluster is selected, favoring questions that the model
+consistently considers important.
+• Active Task Disambiguation (ATD) (Kobalczyk et al., 2025): ranks candidate questions by
+expected information gain, estimated over a grid of candidate questions × solutions; evaluated
+at K ∈ {5, 10} due to high costs.
+All baselines share the same final generation step: after K rounds of Q&A, the accumulated interaction history is used to construct a clarified intent, from which the final specification is generated.
+Metrics. We evaluate generated specifications against the ground-truth reference along the two
+axes of IaC ambiguity: whether the infrastructure has the right structure, and whether its concrete
+values are exactly right. Both metrics operate on specs normalized to a common label namespace.
+Structure (Struct.) scores graph similarity via the Graph Edit Distance (GED) between the reference
+and generated resource graphs, using unit costs for node/edge insertions, deletions, and cross-type
+substitutions. It jointly penalizes missing or extra resources and incorrect wiring; the distance is
+normalized by graph size and inverted, so 1.0 is an exact structural match. Res+Attr F1 (R+A
+F1) is a deliberately strict, exact-match test of concrete configuration values. Each spec is reduced
+to an occurrence-aware multiset of resource instances and attribute key–value pairs (multiplicity
+counts: three aws_subnet in the reference but two generated yields at most two matches), and
+the score is the exact-match F1 between the two multisets after canonicalizing booleans, numbers,
+and letter case. We grant no embedding or fuzzy credit, because values that are close in form can be
+incompatible in behavior (10.0.0.0/16 vs. 10.1.0.0/16); free-form naming keys and crossresource references (already scored by Structure) are excluded. All methods are evaluated against
+the same reference configurations under the same interaction protocol, so comparisons are made
+under a consistent target and scoring procedure.
+
+6
+
+R ESULTS AND A NALYSIS
+
+Our evaluation centers on four research questions:
+• RQ1: Does structure-aware disambiguation outperform structure-agnostic baselines?
+• RQ2: Does structure-aware disambiguation performance scale with the number of rounds?
+• RQ3: Does the method generalize across different LLMs?
+• RQ4: Are the reported gains statistically robust?
+Following the main results, we present ablation studies on hyperparameter sensitivity, cross-axes
+balancing, and deployment-time validity.
+6.1
+
+RQ1: OVERALL P ERFORMANCE
+
+Structure-aware disambiguation outperforms all structure-agnostic baselines: across budgets of
+K=5, 10, and 15, our method achieves the best Structure score at every budget and the best R+A F1
+at the two larger budgets; its lead over the strongest baseline widens as the budget grows (Table 2).
+We observe that test-time inference techniques (Best-of-N, Self-Consistency) do not offer a meaningful improvement over direct question generation, and Self-Consistency is the weakest method
+overall: question consensus does not align with informativeness in a highly structured configuration
+space, where useful questions are those that target the specific points on which interpretations diverge. ATD, also an information-gain method, generates candidate questions and scores them over
+a question × solution grid rather than deriving them from computed spec deltas. It trails our Structure score while spending 4× our tokens and 11× our wall-clock per task (detailed cost results are
+in the supplementary material), and its one nominal edge, R+A F1 at K=5, sits well inside our
+6
+
+Preprint.
+
+Budget K
+
+Struct. (%)
+
+∆ Struct.
+
+R+A F1 (%)
+
+∆ F1
+
+Direct Q Generation
+Best-of-N
+Self-Consistency
+ATD
+Ours
+
+5
+5
+5
+5
+5
+
+43.08 [39.90, 46.31]
+41.28 [37.97, 44.68]
+38.59 [35.48, 41.73]
+42.23 [38.55, 45.85]
+48.95 [45.95, 51.91]
+
+-5.87 (↓11.99%)
+-7.67 (↓15.67%)
+-10.36 (↓21.16%)
+-6.72 (↓13.73%)
+–
+
+17.69 [15.40, 20.05]
+18.18 [15.80, 20.68]
+15.63 [13.40, 17.97]
+22.70 [20.21, 25.21]
+22.04 [19.57, 24.63]
+
+-4.35 (↓19.74%)
+-3.86 (↓17.51%)
+-6.41 (↓29.08%)
++0.66 (↑2.99%)
+–
+
+Direct Q Generation
+Best-of-N
+Self-Consistency
+ATD
+Ours
+
+10
+10
+10
+10
+10
+
+44.38 [41.31, 47.52]
+43.52 [40.24, 46.79]
+38.41 [35.27, 41.71]
+41.89 [37.95, 45.83]
+50.98 [48.02, 53.98]
+
+-6.60 (↓12.95%)
+-7.46 (↓14.63%)
+-12.57 (↓24.66%)
+-9.09 (↓17.83%)
+–
+
+18.72 [16.58, 20.97]
+18.91 [16.48, 21.34]
+16.30 [14.04, 18.66]
+24.01 [21.38, 26.69]
+24.21 [21.62, 26.87]
+
+-5.49 (↓22.68%)
+-5.30 (↓21.89%)
+-7.91 (↓32.67%)
+-0.20 (↓0.83%)
+–
+
+Direct Q Generation
+Best-of-N
+Self-Consistency
+Ours
+
+15
+15
+15
+15
+
+46.31 [43.28, 49.42]
+43.12 [39.86, 46.48]
+38.19 [34.95, 41.39]
+54.84 [51.87, 57.86]
+
+-8.53 (↓15.55%)
+-11.72 (↓21.37%)
+-16.65 (↓30.36%)
+–
+
+18.45 [16.33, 20.62]
+19.52 [17.08, 22.04]
+16.12 [13.81, 18.50]
+26.53 [23.88, 29.28]
+
+-8.08 (↓30.46%)
+-7.01 (↓26.42%)
+-10.41 (↓39.24%)
+–
+
+Method
+
+Table 2: Main results on A MBIG -I AC using GPT-4o-mini. We report means with 95% task-level
+bootstrap CIs over 300 tasks (10,000 resamples). Struct. is normalized-GED similarity; R+A F1 is
+exact-match resource-and-attribute F1; and ∆ gives each baseline’s absolute and relative difference
+from ours. ATD is evaluated at K ∈ {5, 10} due to its substantially higher cost.
+Method
+Direct Q Gen.
+Best-of-N
+Self-Consistency
+Ours
+
+∆ Struct.
+
+∆ R+A F1
+
++1.62 (↑3.68%)
++0.92 (↑2.25%)
+-0.20 (↓0.52%)
++2.95 (↑5.86%)
+
++0.38 (↑2.19%)
++0.67 (↑3.62%)
++0.25 (↑1.59%)
++2.25 (↑9.71%)
+
+Table 3: Question-budget scaling (GPT-4o-mini): average gain in points per 5-question budget increase, with the relative gain in parentheses (5→10 and 10→15 increments, from Table 2).
+confidence interval (RQ4). For controlled comparison, all methods use the same binary-question
+interface, which restricts the information conveyed per turn. Richer response formats and persistent
+user-preference models may improve absolute performance, but evaluating these extensions requires
+interaction data that is not currently available for IaC. Finding 1: LLMs do not natively ask informative domain-specific clarification questions; deriving questions from computed structural disagreement is simultaneously more informative and dramatically cheaper — matching or exceeding ATD
+while using 4× fewer tokens and 11× less wall-clock time per task.
+
+6.2
+
+RQ2: I NTERACTION S CALING
+
+Most methods benefit from additional questions, as shown in Table 3, with ours gaining the most
+on both metrics. Self-Consistency even shows a slight decrease, suggesting that consensus-based
+selection saturates quickly. The widening gap indicates that our method makes more effective use
+of each additional question. Baselines generate questions without explicit awareness of which axes
+remain ambiguous, so later questions are more likely to be redundant or low-value. In contrast,
+our disagreement-driven approach continually re-estimates where ambiguity lies after each answer,
+directing subsequent questions to the most informative remaining differences. Figure 3 shows that
+disagreement counts decrease steadily across all three axes (left), and resource-level disagreements
+are resolved first, then topology, then attributes, while the pool size shrinks in step (right), converging
+toward a shared interpretation. Figure 4 examines regeneration: most tasks require 3–5 regenerations
+(left), indicating that the candidate pool is typically exhausted within 2–3 questions, as each question
+is sufficiently discriminative to eliminate a substantial fraction of candidates. We see a positive
+correlation between regeneration frequency and performance (right). This suggests that conditioned
+regeneration—producing new candidates consistent with accumulated Q&A history—is an effective
+mechanism for progressive refinement, as each cycle introduces candidates better aligned with the
+user’s intent. Finding 2: Additional interaction helps the most when the agent explicitly tracks
+unresolved ambiguity.
+7
+
+Preprint.
+
+Figure 3: Per-round dynamics show the candidates converging toward a shared interpretation.
+
+Figure 4: Most tasks require three to five regenerations, with performance generally improving as
+regenerations increase.
+6.3
+
+RQ3: C ROSS -M ODEL G ENERALIZATION
+
+The gains generalize across backbones: we re-ran the full pipeline on five models spanning open
+and closed families, and our method achieves the best results on both metrics for every one of them
+(Table 4). Stronger backbones lift all methods, but the relative ordering remains unchanged; the lead
+is largest on Qwen3-Coder and remains clear on the strongest backbone, Claude Opus 4.6.
+6.4
+
+RQ4: S TATISTICAL ROBUSTNESS
+
+The reported gains are statistically robust to both sampling stochasticity and task selection, which
+we assess in two ways. Across three seeded trials on the strongest backbone (Table 5), our lead over
+the strongest baseline is many times the run-to-run standard deviation on both metrics. The tasklevel bootstrap CIs in Table 2 tell the same story at the population level: on Structure, our interval is
+disjoint from every baseline’s at K=10 and K=15, and essentially disjoint at K=5; on the stricter
+R+A F1, our mean lies above every baseline’s upper bound at K=10 and K=15.
+6.5
+
+A BLATION S TUDIES
+
+Hyperparameter sensitivity. We now vary the pool size N ∈{5, 10, 20} and sampling temperature
+T ∈{0.5, 0.7, 0.9} (Table 6). The spread across all nine settings is small; neither knob shows a
+monotonic trend, and every cell outperforms the strongest same-backbone baseline from Table 4.
+Notably, the paper default (N =10, T =0.7) is not even the strongest cell in the sweep, yet it wins
+everywhere it is compared: the gains come from the disagreement-driven procedure, not from a
+fragile hyperparameter choice.
+Cross-axes balancing. Our method allocates questions round-robin across the resource, topology,
+and attribute axes rather than by raw entropy alone. We see a performance drop as shown in Table 7,
+suggesting that the round-robin balancing does help with IaC disambiguation.
+Deployability. Finally, we verify that generated specifications pass Terraform’s own validation
+toolchain. We convert each specification into a program main.tf using an LLM, and run the
+standard pipeline (init → validate → plan): 90% of tasks pass on one-shot emission and 97–
+99% after a single error-guided repair pass, for every method. What separates methods is whether the
+right infrastructure is specified: the resources, wiring, and values the user actually intended, which
+8
+
+Preprint.
+
+Model
+
+Method
+
+Struct. R+A F1
+
+Method
+
+Struct.
+
+R+A F1
+
+Claude Opus 4.6
+
+Direct Q Gen.
+Best-of-N
+Self-Consistency
+Ours
+
+53.17
+57.67
+56.95
+64.69
+
+26.39
+30.07
+28.87
+32.31
+
+Direct Q Generation
+Best-of-N
+Self-Consistency
+Ours
+
+53.46 ±0.37
+57.91 ±0.24
+57.46 ±1.25
+63.95 ±0.68
+
+25.75 ±0.60
+30.37 ±0.83
+28.83 ±0.51
+31.95 ±0.32
+
+GPT-4.1-mini
+
+Direct Q Gen.
+Best-of-N
+Self-Consistency
+Ours
+
+50.77
+53.06
+52.58
+57.33
+
+22.42
+23.69
+22.26
+26.27
+
+Table 5: Seeded runs (Claude Opus 4.6,
+K=5): mean ± std over three seeds.
+
+Direct Q Gen.
+Best-of-N
+Qwen3-Coder NEXT
+Self-Consistency
+Ours
+
+49.05
+48.17
+47.66
+58.53
+
+19.62
+20.28
+18.40
+25.19
+
+Llama-4-Scout
+
+Direct Q Gen.
+Best-of-N
+Self-Consistency
+Ours
+
+48.92
+50.29
+49.42
+54.02
+
+17.37
+18.14
+17.15
+21.23
+
+GPT-4o-mini
+
+Direct Q Gen.
+Best-of-N
+Self-Consistency
+Ours
+
+43.08
+41.28
+38.59
+48.95
+
+17.69
+18.18
+15.63
+22.04
+
+N
+
+T
+
+Struct.
+
+R+A F1
+
+5
+5
+5
+
+0.5
+0.7
+0.9
+
+67.27
+63.19
+62.24
+
+33.03
+33.11
+32.56
+
+10
+10
+10
+
+0.5
+0.7†
+0.9
+
+63.62
+64.69
+66.10
+
+32.85
+32.31
+33.31
+
+20
+20
+20
+
+0.5
+0.7
+0.9
+
+63.69
+64.27
+65.49
+
+32.81
+33.14
+34.66
+
+Table 6: Hyperparameter sweep over pool
+Table 4: Generalization across five backbone LLMs
+size N and temperature T (Claude Opus
+(K=5). Our method is best on both metrics for every
+4.6, K=5).
+model.
+K
+
+Struct.
+
+∆ Struct.
+
+R+A F1
+
+∆ F1
+
+5
+10
+15
+
+47.18
+49.74
+51.65
+
+−1.77 (↓3.62%)
+−1.24 (↓2.43%)
+−3.19 (↓5.82%)
+
+21.08
+23.25
+24.34
+
+−0.96 (↓4.36%)
+−0.96 (↓3.97%)
+−2.19 (↓8.25%)
+
+Table 7: Cross-axes balancing ablation (GPT-4o-mini).
+is exactly what our metrics measure and where our method leads. Finding 3: LLMs can generate
+runnable IaC, but deployment success does not guarantee alignment with user intent; mis-specified
+configurations may deploy successfully despite unresolved ambiguity.
+
+7
+
+R ELATED W ORK
+
+Agents for cloud management. Recent work has explored LLM-based systems for cloud management, including IaC generation benchmarks (Kon et al., 2024), agentic systems for autonomous
+cloud operations and incident analysis (Shetty et al., 2024; Chen et al., 2025b; 2024; Yang et al.,
+2025b; Xiang et al., 2025; Peng et al., 2025), provider-integrated assistants such as Azure Copilot,
+Gemini for Google Cloud, and Amazon Q (Microsoft, 2025; Google Cloud, 2025; Amazon Web
+Services, 2025), and broader discussions of cloud AI agents (Yang et al., 2025a). These efforts
+demonstrate the promise of LLM agents for IaC generation, diagnosis, and cloud operational assistance. However, they generally assume that the given tasks are well specified and do not study how
+an agent should resolve ambiguous user intent before acting.
+Active task disambiguation. Recent work on active task disambiguation selects clarification questions by estimating how candidate answers partition a space of plausible solutions (Kobalczyk et al.,
+2025). ATD ranks freely generated candidate questions by estimated information gain over a question × solution grid; we instead derive questions directly from symbolically computed disagreements across resources, topology, and attributes, which is both substantially cheaper (Section 6.1)
+and better targeted. Our method further coordinates resolution across rounds via cross-dimension
+balancing rather than ranking by aggregate uncertainty alone. This structured selection strategy
+produces better final specifications than entropy-only ranking (Section 6.5).
+Clarification via fine-tuning. Prior work learns clarification behavior in bounded QA, preferenceelicitation, and software-engineering settings through preference optimization, self-training,
+9
+
+Preprint.
+
+multi-turn policy learning, or persistent user modeling (Min et al., 2020; Zhang et al., 2025;
+Andukuri et al., 2024; Chen et al., 2025a; Zhou et al., 2025). These approaches generally assume
+relatively stable task distributions and rely on fine-tuning, synthetic supervision, or learned user
+models. In contrast, cloud IaC is a fast-evolving domain where provider APIs and specifications
+change rapidly, high-quality training data is scarce, and ambiguity is structured across resources,
+topology, and attributes.
+Clarification in code. The closest engineering analogues are code-oriented systems that resolve
+ambiguity by comparing competing realizations of the user’s intent and querying the user on distinguishing evidence (Mu et al., 2024; Lahiri et al., 2023). Recent work in software-engineering agents
+further shows that interaction improves performance on underspecified tasks (Vijayvargiya et al.,
+2025). These results demonstrate the value of clarification in engineering domains, but all rely on
+executable artifacts, generated tests, or cheap iterative repair — feedback unavailable in IaC, where
+execution provisions real infrastructure and ambiguity must be resolved before deployment.
+
+8
+
+C ONCLUSION AND F UTURE W ORK
+
+We have presented a disagreement-driven disambiguation framework for interactive IaC synthesis
+that leverages configuration structure for multi-turn clarification. We have also introduced A MBIG I AC, a 300-task, expert-verified benchmark of IaC tasks with ambiguous prompts. Our method
+outperforms structure-agnostic baselines, with gains that scale with the interaction budget and generalize across models.
+Our evaluation relies on a simulated protocol: prompts rewritten from verified references and answers from a reference-grounded oracle, following standard practice; expert validation supports
+prompt realism (Table 1), and since all methods face the same oracle, relative comparisons remain
+fair. Validating these findings with real users is important future work. More broadly, beyond IaC,
+this work suggests that disagreement-driven clarification may provide a general approach for resolving ambiguity in other structured synthesis tasks.
+
+R EFERENCES
+Amazon Web Services. Amazon Q in AWS services, 2025. URL https://aws.amazon.com/
+q/.
+Amazon Web Services. What is infrastructure as code? https://aws.amazon.com/whatis/iac/, March 2026. Accessed: 2026-04-01.
+Chinmaya Andukuri, Jan-Philipp Fränken, Tobias Gerstenberg, and Noah Goodman. STar-GATE:
+Teaching language models to ask clarifying questions. In First Conference on Language Modeling, 2024. URL https://openreview.net/forum?id=CrzAj0kZjR.
+Maximillian Chen, Ruoxi Sun, Tomas Pfister, and Sercan O Arik. Learning to clarify: Multi-turn
+conversations with action-based contrastive self-training. In The Thirteenth International Conference on Learning Representations, 2025a. URL https://openreview.net/forum?id=
+SIE6VFps9x.
+Yinfang Chen, Huaibing Xie, Minghua Ma, Yu Kang, Xin Gao, Liu Shi, Yunjie Cao, Xuedong Gao,
+Hao Fan, Ming Wen, Jun Zeng, Supriyo Ghosh, Xuchao Zhang, Chaoyun Zhang, Qingwei Lin,
+Saravan Rajmohan, Dongmei Zhang, and Tianyin Xu. Automatic root cause analysis via large
+language models for cloud incidents. In Proceedings of the Nineteenth European Conference on
+Computer Systems, EuroSys ’24, 2024.
+Yinfang Chen, Manish Shetty, Gagan Somashekar, Minghua Ma, Yogesh Simmhan, Jonathan Mace,
+Chetan Bansal, Rujia Wang, and Saravan Rajmohan. Aiopslab: A holistic framework to evaluate
+ai agents for enabling autonomous clouds, 2025b. URL https://arxiv.org/abs/2501.
+06706.
+Zhongjun Ding, Yin Lin, and Tianjing Zeng. Ambisql: Interactive ambiguity detection and resolution for text-to-sql, 2025. URL https://arxiv.org/abs/2508.15276.
+10
+
+Preprint.
+
+Firefly. State of iac 2025. https://www.firefly.ai/state-of-iac-2025, 2025. Accessed: 2026-04-01.
+Gartner. Gartner forecasts worldwide it spending to grow 10.8% in 2026. https://www.
+channel-impact.com/gartner-forecasts-worldwide-it-spending-togrow-10-8-in-2026/, February 2026. Accessed: 2026-04-01.
+Google Cloud. Gemini for Google Cloud, 2025.
+products/gemini.
+
+URL https://cloud.google.com/
+
+Alexey Grigorev.
+How I dropped our production database and now pay 10% more
+for AWS.
+https://alexeyondata.substack.com/p/how-i-dropped-ourproduction-database, March 2026. Substack post. Accessed: 2026-03-31.
+HashiCorp.
+What is infrastructure as code with terraform?
+https://
+developer.hashicorp.com/terraform/tutorials/aws-get-started/
+infrastructure-as-code, June 2025a. Accessed: 2026-04-01.
+HashiCorp. Terraform, 2025b. URL https://developer.hashicorp.com/terraform.
+Katarzyna Kobalczyk, Nicolas Astorga, Tennison Liu, and Mihaela van der Schaar. Active task
+disambiguation with llms, 2025. URL https://arxiv.org/abs/2502.04485.
+Patrick Tser Jern Kon, Jiachen Liu, Yiming Qiu, Weijun Fan, Ting He Lei Lin, Haoran Zhang,
+Owen M. Park, George S. Elengikal, Yuxin Kang Ang Chen, Mosharaf Chowdhury, Myungjin
+Lee, and Xinyu Wang. Iac-eval: a code generation benchmark for cloud infrastructure-as-code
+programs. In Proceedings of the 38th International Conference on Neural Information Processing
+Systems, NIPS ’24, 2024.
+Shuvendu K. Lahiri, Sarah Fakhoury, Aaditya Naik, Georgios Sakkas, Saikat Chakraborty, Madanlal
+Musuvathi, Piali Choudhury, Curtis von Veh, Jeevana Priya Inala, Chenglong Wang, and Jianfeng
+Gao. Interactive code generation via test-driven user-intent formalization, 2023. URL https:
+//arxiv.org/abs/2208.05950.
+Microsoft. Microsoft copilot in Azure, 2025. URL https://azure.microsoft.com/enus/products/copilot.
+Sewon Min, Julian Michael, Hannaneh Hajishirzi, and Luke Zettlemoyer. AmbigQA: Answering
+ambiguous open-domain questions. In Bonnie Webber, Trevor Cohn, Yulan He, and Yang Liu
+(eds.), Proceedings of the 2020 Conference on Empirical Methods in Natural Language Processing (EMNLP), pp. 5783–5797, Online, November 2020. Association for Computational Linguistics. doi: 10.18653/v1/2020.emnlp-main.466. URL https://aclanthology.org/2020.
+emnlp-main.466/.
+Fangwen Mu, Lin Shi, Song Wang, Zhuohao Yu, Binquan Zhang, ChenXue Wang, Shichao Liu, and
+Qing Wang. Clarifygpt: A framework for enhancing llm-based code generation via requirements
+clarification. Proc. ACM Softw. Eng., 1(FSE), July 2024. doi: 10.1145/3660810. URL https:
+//doi.org/10.1145/3660810.
+Jingjia Peng, Yiming Qiu, Patrick Tser Jern Kon, Pinhan Zhao, Yibo Huang, Zheng Guo, Xinyu
+Wang, and Ang Chen. Automated lifting for cloud infrastructure-as-code programs. In 2025
+IEEE/ACM International Workshop on Cloud Intelligence & AIOps (AIOps), 2025.
+Manish Shetty, Yinfang Chen, Gagan Somashekar, Minghua Ma, Yogesh Simmhan, Xuchao Zhang,
+Jonathan Mace, Dax Vandevoorde, Pedro Las-Casas, Shachee Mishra Gupta, Suman Nath, Chetan
+Bansal, and Saravan Rajmohan. Building ai agents for autonomous clouds: Challenges and design
+principles. In Proceedings of the 15th ACM Symposium on Cloud Computing, 2024.
+Kalahasti Ganesh Srivatsa, Sabyasachi Mukhopadhyay, Ganesh Katrapati, and Manish Shrivastava.
+A survey of using large language models for generating infrastructure as code, 2024. URL
+https://arxiv.org/abs/2404.00227.
+11
+
+Preprint.
+
+Sanidhya Vijayvargiya, Xuhui Zhou, Akhila Yerukola, Maarten Sap, and Graham Neubig. Interactive agents to overcome ambiguity in software engineering, 2025. URL https://arxiv.
+org/abs/2502.13069.
+Yiming Xiang, Zhenning Yang, Jingjia Peng, Hermann Bauer, Patrick Tser Jern Kon, Yiming Qiu,
+and Ang Chen. Automated bug discovery in cloud infrastructure-as-code updates with llm agents.
+In 2025 IEEE/ACM International Workshop on Cloud Intelligence & AIOps (AIOps), 2025.
+Zhenning Yang, Archit Bhatnagar, Yiming Qiu, Tongyuan Miao, Patrick Tser Jern Kon, Yunming
+Xiao, Yibo Huang, Martin Casado, and Ang Chen. Cloud infrastructure management in the age
+of ai agents. SIGOPS Operating Systems Review, 2025a. doi: 10.1145/3759441.3759443. URL
+https://doi.org/10.1145/3759441.3759443.
+Zhenning Yang, Hui Guan, Victor Nicolet, Brandon Paulsen, Joey Dodds, Daniel Kroening, and
+Ang Chen. Automated cloud infrastructure-as-code reconciliation with ai agents, 2025b. URL
+https://arxiv.org/abs/2510.20211.
+Michael JQ Zhang, W. Bradley Knox, and Eunsol Choi. Modeling future conversation turns to
+teach LLMs to ask clarifying questions. In The Thirteenth International Conference on Learning
+Representations, 2025. URL https://openreview.net/forum?id=cwuSAR7EKd.
+Xuhui Zhou, Valerie Chen, Zora Zhiruo Wang, Graham Neubig, Maarten Sap, and Xingyao
+Wang. Tom-swe: User mental modeling for software engineering agents, 2025. URL https:
+//arxiv.org/abs/2510.21903.
+
+12
+
+Preprint.
+
+Algorithm 1 Multi-Level Disambiguation
+Input: request I; budget K; pool size N ; entropy floor θ
+Output: final specification ĉ
+1: H ← ∅
+2: P ← G ENERATE(I, H, N )
+3: for t = 1 to K do
+4:
+if |P| < 2 then
+5:
+P ← P ∪ G ENERATE(I, H, N )
+6:
+end if
+7:
+D ← D ISAGREEMENTS(P)
+8:
+if D = ∅ then
+9:
+break
+10:
+end if
+11:
+D>θ ← { f ∈ D : Hent (f ) > θ }
+12:
+if D>θ ̸= ∅ then
+13:
+D ← D>θ
+14:
+end if
+15:
+F ∗ ← ROUND ROBIN S HORTLIST(D)
+16:
+(qt , P yes , P no ) ← V ERBALIZE(F ∗ )
+17:
+ask qt ; observe at ∈ {yes, no}
+18:
+P ← P ∩ P at
+19:
+H ← H ∪ {(qt , at )}
+20: end for
+21: return S ELECT(P, I, H)
+
+{drop near-consensus splits}
+{≤ 5 diffs, interleaved across axes}
+{deterministic prune}
+
+This supplement contains: (i) pseudocode and sub-routine definitions for the multi-level disambiguation algorithm (Section A); (ii) the experiment configuration—models, roles, decoding settings, and
+method hyperparameters (Section B); (iii) formal definitions of the two evaluation metrics, the GEDbased Structure score and the exact-match Res+Attr F1, together with the label normalization both
+share (Section C); (iv) per-task token and wall-clock costs for all methods, models, and interaction
+budgets (Section D); (v) an ablation of the output protocol, separating the effect of question selection from that of final-spec emission (Section E); and (vi) the system and user prompts used at each
+stage of the pipeline (the Prompts section at the end of this supplement).
+
+A
+
+M ULTI -L EVEL D ISAMBIGUATION A LGORITHM
+
+Algorithm 1 gives the top-level loop of our method; the subsections below define each sub-routine.
+A.1
+
+N OTATION
+
+Each candidate configuration is a structured triple
+s = (R, T, A),
+
+(1)
+
+where R is a multiset of resource types, T ⊆ R × R is a set of directed dependency edges, typed
+by their source and target resource types, and A assigns each resource a set of configuration key–
+value pairs. Concretely, a resource is a label 7→ Terraform-address entry, and τ (a) denotes the type
+extracted from address a, e.g., τ (aws_vpc.main) = aws_vpc. The agent maintains a candidate
+pool P = {s1 , s2 , . . . } approximating the space of plausible configurations, and an interaction
+history H of question–answer pairs. The agent may ask at most K binary questions; N is the pool
+size and θ the entropy floor.
+A.2
+
+C ANDIDATE G ENERATION
+
+G ENERATE(I, H, N ) produces N candidates conditioned on the request I and the history H. One
+anchor spec is generated at temperature 0 under a plain generation prompt with no diversity instructions, so the pool always contains a canonical interpretation. The remaining N −1 specs are sampled
+at a higher temperature (0.7 by default).
+13
+
+Preprint.
+
+A.3
+
+D ISAGREEMENT C OMPUTATION
+
+D ISAGREEMENTS(P) compares the candidates axis by axis; each disagreement f partitions the
+candidates it applies to.
+• Resources. For each type r occurring in any candidate, let present(r) = {i : r ∈ R(si )}
+and absent(r) = {1, . . . , |P|} \ present(r). A disagreement is recorded when both sets are
+non-empty.
+• Topology. The same test, per type-level directed edge: present(e) = {i : e ∈ T (si )}.
+• Attributes. Candidates are grouped by resource type. For each type r and each key k set on r by
+any candidate in the group, every candidate containing r contributes a value: the value it assigns,
+or unset if it does not set k. A disagreement is recorded when these values are not all identical
+(values are compared after canonical JSON serialization).
+A.4
+
+E NTROPY R ANKING AND C ROSS -D IMENSION BALANCING
+
+A near-unanimous split carries little information; an even split is worth a question. Let {Pb } be the
+parts into which f divides the candidates it applies to—present vs. absent for resources and topology,
+one part per distinct value (including unset) for attributes. We score f by the Shannon entropy of
+this split,
+X
+|Pb |
+Hent (f ) = −
+ρb log2 ρb ,
+ρb = P
+.
+(2)
+′
+b′ |Pb |
+b
+
+Disagreements with Hent ≤ θ (0.5 in all experiments) are discarded as near-consensus splits; if the
+floor would discard every disagreement while the candidates still differ, the unfiltered set is used instead, so a round is never wasted. Within each axis, the survivors are ranked by descending entropy,
+and ROUND ROBIN S HORTLIST interleaves the per-axis rankings in round-robin order, keeping at
+most five: the shortlist F ∗ thus mixes the most informative disagreements from all three axes. This
+balancing keeps any single axis from monopolizing the question budget; the main paper’s ablation
+shows it outperforms ranking by entropy alone.
+A.5
+
+Q UESTION G ENERATION AND P RUNING
+
+V ERBALIZE(F ∗ ) renders the shortlist as a structural diff summary—each disagreement listed with
+the candidate indices on either side—preceded by a short resource/topology synopsis of every candidate, and passes it to an LLM (the exact prompt and summary format are in the Prompts section). The LLM emits one yes/no question that targets the most informative ambiguity in the summary, phrased so a user can answer it without seeing the candidates (e.g., a resource disagreement on aws_nat_gateway becomes “Should the infrastructure include a NAT gateway?”); the
+lower-ranked shortlist entries serve as context, helping the LLM keep the question precise and nonoverlapping. Pruning requires no further LLM call and is deterministically answered. One answer
+can eliminate several candidates at once, and survivors are kept exactly as generated, so no editing
+errors accumulate. If the observed answer’s keep set is empty or inconsistent with every surviving
+candidate, the pool is discarded, which triggers regeneration at the start of the next round.
+
+B
+
+E XPERIMENT C ONFIGURATION
+
+Roles. Every run is driven by an LLM configuration with three roles: the generator (candidate and
+final spec generation), the clarifier (question generation), and the proxy (the simulated user). The
+clarifier and generator use the backbone under evaluation; the proxy is GPT-4o-mini at temperature 0
+in every experiment, so all methods and backbones face the same answer channel.
+Backbones. We evaluate GPT-4o-mini, GPT-4.1-mini, Claude Opus 4.6, Llama-4-Scout-17B16E-Instruct, and Qwen3-Coder NEXT, each accessed through its provider’s standard API. The
+pipeline’s prompts are reproduced in the Prompts section at the end of this supplement.
+Method hyperparameters. Table 8 lists the settings of our method; all runs use the values shown
+unless noted otherwise. The method has three design knobs: the pool size N , the diverse-sampling
+14
+
+Preprint.
+
+Parameter
+K
+N
+Tdiv
+θ
+
+Value
+
+question budget
+5 / 10 / 15
+candidates per (re)generation
+10
+diverse-sampling temperature
+0.7
+entropy floor
+0.5
+
+Table 8: Hyperparameters of our method. N and Tdiv are swept in the main paper’s sensitivity
+ablation; the rest are fixed across all experiments.
+temperature Tdiv , and the entropy floor θ. The main paper’s sensitivity ablation sweeps the two
+knobs, N ∈ {5, 10, 20} and Tdiv ∈ {0.5, 0.7, 0.9}, on a 100-task sample (Claude Opus 4.6, K=5),
+with θ held fixed.
+Baselines. All baselines use the same budget K, the same proxy, and the same output protocol
+(final spec regenerated from the clarified intent). Best-of-N and Self-Consistency generate 10 candidate questions per round, matching our pool size. ATD is evaluated at K ∈ {5, 10} because of its
+cost (§D.3).
+
+C
+
+E VALUATION M ETRICS
+
+We evaluate a generated specification against the ground-truth reference along the two axes of IaC
+ambiguity: whether the infrastructure has the right structure, and whether its concrete values are exactly right. Both metrics operate on specs normalized to a common label namespace (§C.2). Structure scores the resource/topology graph via a normalized Graph Edit Distance (§C.3); Res+Attr
+F1 is a deliberately strict, exact-match score over concrete resource instances and attribute values
+(§C.4).
+C.1
+
+P RELIMINARIES
+
+Spec representation. Each specification s consists of three fields: Resources R(s), a mapping
+from a label to a Terraform resource address (e.g., main 7→ aws_vpc.main); Topology T (s), a
+mapping from each label to the labels it depends on; and Attributes A(s), a mapping from each label
+to a key–value dictionary of configuration parameters (e.g., cidr_block, instance_type).
+This is the operational form of the triple s = (R, T, A) of Eq. (1).
+Resource-type extraction. Given a Terraform address a, the resource type τ (a) is its providertype prefix: aws_vpc for aws_vpc.main. For data sources the data. prefix is part of the type
+(e.g., data.aws_iam_policy_document).
+C.2
+
+L ABEL N ORMALIZATION
+
+LLMs choose arbitrary instance names (main_vpc, vpc1, v) for the same resource type, so two
+specs describing the same design may differ only in these names. Such syntactic variants should
+compare as equal; architecturally distinct configurations should not. We therefore apply a deterministic label normalization to both the generated and the reference spec before scoring.
+Procedure. Given a spec, we (1) coerce every resource address to a string (some models emit
+an address as a singleton list, e.g., ["aws_vpc.main"]); (2) group resource labels by their extracted type τ (·); (3) sort the labels within each type group, for determinism; and (4) reassign each
+label a type-indexed name (e.g., aws_vpc_0, aws_subnet_0, aws_subnet_1), rewriting the
+address accordingly (aws_vpc.aws_vpc_0; data sources keep their data. prefix). Topology
+dependencies and attribute maps are re-keyed through the resulting label map. The output is a spec
+whose label set depends only on the resource types present and their multiplicities.
+Effect on each metric. Both metrics compare resource types rather than instance names—GED
+matches nodes by type, and Res+Attr F1 keys every item by type—so the scores are already invariant to renaming. Normalization canonicalizes malformed addresses, fixes one deterministic label
+scheme for both specs, and keeps the node alignments reported by GED readable.
+15
+
+Preprint.
+
+C.3
+
+S TRUCTURE S CORE (GED)
+
+Graph construction. Each normalized spec is converted to a labeled directed graph G = (V, E):
+each resource label becomes a node v with type(v) = τ (R[ℓ]), and each topology dependency
+(ℓ → d) becomes a directed edge, added only when both endpoints exist as nodes.
+Cost model. We compute the Graph Edit Distance between the reference graph Gref and the generated graph Ggen under unit costs: node and edge insertions and deletions cost 1; substituting a
+node by one of the same type is free, by one of a different type costs 1; edge substitutions are free,
+as edges carry no labels. This penalizes missing or extra resources and incorrect wiring in a single
+quantity, unlike type-count schemes that score resources and topology independently.
+Computation. GED is computed with NetworkX’s anytime edit-path search; we keep the best
+path found within a 30-second per-task timeout. The distance is bounded above by D = |Vref | +
+|Eref | + |Vgen | + |Egen |, the cost of deleting every reference element and inserting every generated
+one.
+Normalized score.
+
+The raw distance is normalized by the total graph size D and inverted:
+
+
+GED(Gref , Ggen )
+Sstruct = max 0, 1 −
+,
+D
+
+(3)
+
+so Sstruct ∈ [0, 1], with 1.0 an exact structural match; two empty graphs score 1.0. The score reads
+as the fraction of the maximal structural distance that the generation closes—a score of 0.55 means
+just over half the distance to the reference is closed. It measures equivalence to the reference, not
+deployability; the main paper’s deployability ablation measures the latter via terraform plan
+pass rates.
+C.4
+
+R ES +ATTR F1 (E XACT-M ATCH )
+
+Structure captures graph shape but not concrete configuration values. Res+Attr F1 asks the complementary question: how much of the ground-truth spec—its resource instances and its meaningful
+attribute values—did the generation reproduce exactly? It requires no graph matching; it is computed by occurrence-aware multiset (bag) intersection.
+Bag construction. Each normalized spec s is reduced to one occurrence-aware bag B(s) of items.
+For every resource label ℓ with address a:
+• add one resource item (R, τ (a));
+• flatten the attribute map A(s)[ℓ] to dotted-key/value leaves (below), and for each retained scalar
+value under key k, add one attribute item (A, τ (a), k, v̂), where v̂ is the canonicalized value.
+Because the bag is a multiset, multiplicity counts: three aws_subnet instances in the reference
+but two in the generation yield at most two matched resource items and one missing. Attribute items
+are keyed by resource type, so an attribute value can only match if its resource type was produced—
+attribute credit is conditional on resource coverage.
+Attribute flattening. Attribute values are flattened to dotted.key → scalar (or list of scalars)
+leaves. On the reference side, whose attributes are extracted from the reference program’s
+terraform plan output, expression wrappers are unwrapped ({constant_value: x} →
+x) and cross-resource pointers ({references: ...}) are dropped: references encode topology, which Structure already scores. Nested blocks (lists of dicts) flatten under a shared dotted
+prefix; a list of scalars is kept as a leaf and later exploded into one item per element; null leaves
+are dropped on both sides.
+Value canonicalization. Each scalar is canonicalized before matching: booleans map to
+bool:<true|false>, numbers to num:<float> (so 1, 1.0, and "1" agree), and any other
+value to its case-folded, whitespace-stripped string. There is no embedding or fuzzy credit: values
+that are close in form can be incompatible in behavior (10.0.0.0/16 vs. 10.1.0.0/16 do not
+match).
+16
+
+Preprint.
+
+Exclusions. Two families of items are dropped from both bags because they carry no crossspec matching signal: (1) free-form and name-like keys, identified by a leaf-name denylist—leaf
+∈ {name, description, comment, tags, arn, id} or a leaf ending in _name, _arn, or
+_id—since user-chosen names, human descriptions, and opaque IDs legitimately differ between
+a correct generation and the reference; and (2) generated-side reference interpolations, i.e. values
+containing ${...}, the generated analogue of the reference’s dropped {references} pointers.
+Score. Let Bref and Bgen be the reference and generated bags. The matched count is the multiset
+intersection
+X
+
+min Bref (i), Bgen (i) ,
+(4)
+m = Bref ∩ Bgen =
+i
+
+and the score is the exact-match F1 of the combined resource-and-attribute bags:
+P =
+
+m
+,
+|Bgen |
+
+R=
+
+m
+,
+|Bref |
+
+SR+A F1 =
+
+2P R
+.
+P +R
+
+(5)
+
+An empty generated bag scores 0. Resources and attributes share one bag, so a single F1 rewards
+both provisioning the right resource instances and setting the right values. The score is not comparable to soft or embedding-based attribute metrics: values must match exactly after canonicalization.
+C.5
+
+S CORING AGAINST A S INGLE R EFERENCE
+
+Each task has one verified reference configuration—a valid target, not the unique one. Both metrics
+give partial credit accordingly: Structure is normalized and rewards overlap, so a valid alternative
+architecture does not score 0 but scores in proportion to how much of the reference graph it reproduces, and Res+Attr F1 credits every exactly-matching resource instance and attribute value. Absolute scores are still bounded by the single-reference design: many valid programs satisfy the same
+intent, and Res+Attr F1 is intentionally strict about exact values (a different but workable CIDR
+scores 0 on that item), which depresses absolute numbers for every method. Since all methods are
+evaluated against the same reference under the same procedure, the relative comparison carries the
+signal.
+
+D
+
+C OMPUTATIONAL C OST
+
+We report per-task token usage and wall-clock time for every method. Tokens/task is the mean total
+number of LLM tokens (prompt and completion) consumed per task; Time/task is the mean per-task
+runtime. The quality scores of these same runs are in the main paper.
+D.1
+
+C OST ACROSS BACKBONE M ODELS
+
+Table 9 gives the per-task cost of our method and the three lightweight baselines on all five backbones at K=5, the budget used in the main paper’s cross-model comparison. Our method costs
+more than the three lightweight baselines—the price of maintaining and regenerating the candidate
+pool—and the gap is similar across backbones. ATD is compared separately in §D.3.
+D.2
+
+C OST VS . I NTERACTION B UDGET
+
+Table 10 shows how cost scales with the question budget K ∈ {5, 10, 15} on GPT-4o-mini. Our
+token cost grows roughly linearly in K: each round adds one disagreement-driven question and,
+when the pool is exhausted, a conditioned regeneration. Direct question generation is nearly flat,
+since each round adds only one short prompt; Self-Consistency grows fastest among the baselines
+because each round generates, embeds, and clusters a fresh batch of candidate questions.
+D.3
+
+C OMPARISON TO ATD
+
+ATD scores freely generated candidate questions over a question × solution grid, so its per-round
+cost scales with the product of the two; ours scales with the candidate pool alone, since questions are
+derived from computed diffs rather than generated and re-scored. Table 11 shows what this means
+17
+
+Preprint.
+
+Model
+
+Method
+
+Claude Opus 4.6
+
+Ours
+Direct Q Gen.
+Best-of-N
+Self-Consistency
+
+Tokens/task Time/task
+35.8k
+2.5k
+10.0k
+10.6k
+
+75s
+16s
+64s
+43s
+
+GPT-4.1-mini
+
+Ours
+Direct Q Gen.
+Best-of-N
+Self-Consistency
+
+35.0k
+1.9k
+8.4k
+8.8k
+
+58s
+7s
+29s
+24s
+
+Ours
+Direct Q Gen.
+Qwen3-Coder NEXT
+Best-of-N
+Self-Consistency
+
+37.8k
+1.9k
+9.3k
+10.0k
+
+73s
+7s
+27s
+20s
+
+Llama-4-Scout
+
+Ours
+Direct Q Gen.
+Best-of-N
+Self-Consistency
+
+33.9k
+1.8k
+8.2k
+8.4k
+
+47s
+4s
+15s
+12s
+
+GPT-4o-mini
+
+Ours
+Direct Q Gen.
+Best-of-N
+Self-Consistency
+
+31.8k
+1.8k
+8.2k
+8.6k
+
+28s
+3s
+14s
+13s
+
+Table 9: Per-task cost across five backbone LLMs at K=5 (Ambig-IaC, 300 tasks).
+K=5
+
+K=10
+
+K=15
+
+31.8k / 28s
+1.8k / 3s
+8.2k / 14s
+8.6k / 13s
+
+61.8k / 50s
+2.0k / 4s
+18.0k / 31s
+25.9k / 38s
+
+93.8k / 69s
+2.2k / 6s
+30.0k / 48s
+55.4k / 91s
+
+Method
+Ours
+Direct Q Gen.
+Best-of-N
+Self-Consistency
+Direct (K=0)
+
+0.7k / 1s
+
+Table 10: Per-task cost (Tokens/task / Time/task) vs. interaction budget K (GPT-4o-mini, AmbigIaC). Direct is the no-clarification reference.
+in practice on GPT-4o-mini. At K=5, ATD spends 4.1× our tokens and 10.8× our wall-clock per
+task—the 4×/11× figures quoted in the main paper—while trailing our Structure score. At K=10,
+ATD’s recorded token figure is inflated by prompt-cache reads; even excluding them it spends 3×
+our tokens, and its wall-clock remains an order of magnitude higher.
+
+E
+
+O UTPUT-P ROTOCOL A BLATION
+
+Our method differs from the baselines in two places: which questions it asks and how it emits the
+final specification. The baselines share one output protocol—after K rounds, the accumulated Q&A
+is folded into a natural-language clarified intent, and the spec generator produces the final spec
+from it. Ours instead returns the best surviving pool candidate, falling back to a single conditioned
+generation only when nothing survives. This ablation separates the two.
+Setup. Ours-BaselineOut keeps our question selection unchanged and replaces only the output
+stage: after the interaction, the same generator receives the original task and the accumulated Q&A
+history, constructs a clarified intent, and generates the final specification from it—exactly the baselines’ protocol. The comparison is at K=15 on GPT-4o-mini; the largest budget gives the regeneration protocol the longest history to work from.
+Results. Table 12 reports the ablation. Ours-BaselineOut still beats every baseline on both metrics,
+so disagreement-driven question selection helps on its own, independent of the output stage. The
+full method adds a further gain, mostly in Structure: a surviving pool candidate is consistent with
+the answers by construction—generated under them and pruned by them—while a spec regenerated
+18
+
+Preprint.
+
+K
+
+Method
+
+Tokens/task
+
+Time/task
+
+5
+
+Ours
+ATD
+
+31.8k
+129.1k
+
+28s
+303s
+
+10
+
+Ours
+ATD
+
+61.8k
+1451.6k†
+
+50s
+512s
+
+Table 11: Per-task cost of ATD vs. ours (GPT-4o-mini, Ambig-IaC). † Includes prompt-cache reads
+(∼4.1M cached tokens per task); 188.0k excluding them.
+Method
+
+Struct. (%)
+
+R+A F1 (%)
+
+Ours
+Ours-BaselineOut
+
+54.84
+49.07 (↓10.5%)
+
+26.53
+26.01 (↓2.0%)
+
+Direct Q Generation
+Best-of-N
+Self-Consistency
+
+46.31 (↓15.5%)
+43.12 (↓21.4%)
+38.19 (↓30.4%)
+
+18.45 (↓30.5%)
+19.52 (↓26.4%)
+16.12 (↓39.2%)
+
+Table 12: Output-protocol ablation (GPT-4o-mini, K=15, Ambig-IaC). Ours-BaselineOut keeps
+our question selection but emits the final spec via the baseline clarified-intent regeneration. Parentheses give the relative drop from Ours.
+from free text has no such guarantee. Read as a pair, the two gaps separate the contributions: OursBaselineOut vs. the baselines isolates question selection; Ours vs. Ours-BaselineOut isolates the
+output stage.
+
+P ROMPTS
+This section reproduces the key prompts used in our pipeline, shown as full-width boxes on this and
+the following pages; text in angle brackets, <like this>, marks values substituted at run time.
+S PECIFICATION G ENERATION
+The system prompt and the accompanying user message are shown in the Specification generation
+boxes; Feedback / issue is omitted from the user message before the first answer.
+C LARIFICATION -Q UESTION G ENERATION
+V ERBALIZE (§A.5) sends the Question generation system prompt with {n} instantiated to 1; the
+keep(...) labels become the keep sets P yes and P no . The diff summary supplied in the user
+message renders the shortlist F ∗ per axis (empty sections and ID-like attribute keys omitted).
+S IMULATED U SER (P ROXY )
+The proxy (GPT-4o-mini, temperature 0 for every method and backbone) answers strictly from the
+ground-truth configuration, appended to the system prompt as Reference configuration:
+<ground-truth main.tf>; each question arrives as its own user message.
+I NTERACTION -H ISTORY C ONDITIONING
+The accumulated Q&A is folded into a single clarified intent string used to condition (re)generation
+(§A.2).
+S PEC - TO -T ERRAFORM C ONVERSION
+The deployability ablation converts each method’s final spec into a main.tf and runs init →
+validate → plan.
+Emission user message: Clarified intent: <clarified
+intent> then Infrastructure spec: <spec JSON>; failing tasks get one repair pass
+whose user message adds the failing HCL and the error tail.
+19
+
+Preprint.
+
+Specification generation (system prompt)
+You are an infrastructure spec generator for AWS Terraform. You are
+generating ONE POSSIBLE interpretation of an ambiguous infrastructure
+request. The request can be interpreted in multiple valid ways -- your
+job is to pick a SPECIFIC interpretation that may differ from others.
+Focus on STRUCTURAL diversity -- vary your choices in:
+- **Resources**: Consider different AWS services that could fulfill
+the same need (e.g., ALB vs NLB, RDS vs Aurora vs DynamoDB, CloudWatch
+vs S3 for logging, Lambda vs ECS vs EC2)
+- **Topology**: Consider different dependency structures and how
+resources connect (e.g., direct vs through a gateway, single-tier vs
+multi-tier, which resources reference which)
+- **Resource count**: Consider different numbers of resources (e.g., 2
+replicas vs 3, single AZ vs multi-AZ)
+Output a single JSON object with exactly these keys:
+## 'resources':
+Maps short label strings to full Terraform addresses in the form
+'aws_resource_type.instance_name'. Use real AWS Terraform provider
+resource types.
+## 'topology':
+Maps src_label to list of dep_labels (dependency edges). Labels must
+match keys in 'resources'.
+## 'attributes':
+Maps each resource label to a dict of key Terraform attributes for
+that resource.
+# Guidelines:
+- Focus on structural choices (which resources exist, how they
+connect) rather than specific IDs or values.
+- Do NOT invent specific IDs, ARNs, subnet IDs, AMI IDs, zone IDs, or
+account numbers.
+- For attributes that reference other resources, use Terraform
+resource references (e.g., "${aws_db_instance.main.id}",
+"${aws_route53_zone.primary.zone_id}") instead of hardcoded IDs.
+- For attributes, include structurally meaningful ones (e.g., engine
+type, instance_class, record type, source_db_instance_identifier)
+using resource references where appropriate.
+- Include topology edges whenever resources logically depend on each
+other.
+- Follow the user request and any clarification Q&A, but fill in
+ambiguous structural details with specific choices.
+Output ONLY the JSON object, no markdown, no explanations.
+Specification generation (user message)
+Task description: <request>
+Feedback / issue: <clarified intent>
+This is interpretation <i> of <N>. Make specific, concrete choices
+that may differ from other interpretations.
+
+20
+
+Preprint.
+
+Question generation (system prompt)
+You are an AWS infrastructure expert generating clarification
+questions.
+You are given:
+1. An ambiguous infrastructure request from a user
+2. A summary of structural differences found across multiple candidate
+interpretations (specs)
+3. Each candidate spec is identified by an index (0, 1, 2, ...)
+Your job: generate {n} human-readable yes/no clarification questions
+that resolve the most important structural ambiguities. Each question
+must include filter labels showing which spec indices would be KEPT
+for each answer.
+Rules:
+- Questions must be natural, human-readable language -- no JSON, no
+terraform syntax, no resource IDs.
+- Focus on STRUCTURAL questions: which services to use, how they
+connect, how many of each.
+- Do NOT ask about specific attribute values like IDs, ARNs, CIDR
+blocks, endpoint URLs, names, or regions.
+- Each question should discriminate between candidate specs -- if all
+specs agree, don't ask about it.
+- IMPORTANT: Each answer option (Yes/No) should keep at least 2 specs
+when possible. Avoid questions where one answer keeps only 1 spec -those are too aggressive and waste the question budget.
+- IMPORTANT: Questions must be precise and non-overlapping. Do not ask
+two questions about the same topic with slightly different wording.
+- Label each question with its dimension: [resource], [topology], or
+[attribute].
+Output format -- output ONLY the questions, no code fences, no extra
+text:
+[dimension] Question text here?
+Yes -> keep(0,2,4)
+No -> keep(1,3)
+[dimension] Another question?
+Yes -> keep(0,1)
+No -> keep(2,3,4)
+Question generation (user message)
+Infrastructure request: <request>
+<diff summary>
+Generate exactly 1 clarification question.
+Diff-summary format (input to the question LLM)
+=== <N> Candidate Specs ===
+Spec 0:
+Resources: <comma-separated resource types>
+Connections: <src_type -> dep_type, ...>
+Spec 1:
+...
+
+21
+
+Preprint.
+
+=== Resource Disagreements (specs disagree on whether these exist) ===
+- <resource_type>: YES in specs [<ids>], NO in specs [<ids>]
+=== Topology Disagreements (specs disagree on these connections) ===
+- <src_type> -> <dep_type>: YES in specs [<ids>], NO in specs [<ids>]
+=== Attribute Disagreements (structural, non-ID values only) ===
+- <resource_type>.<key>: spec <id>: <value>, spec <id>: <value>, ...
+Simulated user (system prompt)
+You are an expert in AWS cloud infrastructure and cloud configuration.
+You will be given a cloud configuration and true/false questions about
+the configuration.
+You will need to answer the questions strictly based on the
+configuration.
+Guidelines:
+- Only answer with yes or no.
+- You must strictly follow the reference configuration to answer the
+question.
+Example 1:
+Task: Create an AWS resource to help me store images that I want to
+display on my website
+Reference configuration:
+provider "aws" {
+region = "us-east-1"
+}
+resource "aws_s3_bucket" "example-bucket" {
+bucket = "test-bucket"
+}
+Question 1: Do you need audit logging for access to the stored images?
+Answer: No
+Reason: The reference configuration does not contain any audit logging
+for access to the stored images.
+Question 2: Do you want an S3 bucket for storing the images?
+Answer: Yes
+Reason: The reference configuration contains an S3 bucket for storing
+the images.
+Question 3: Do you require any specific backup or recovery options for
+the stored images?
+Answer: No
+Reason: The reference configuration does not contain any specific
+backup or recovery options for the stored images.
+End of example.
+Clarified-intent template
+Task: <original request>
+Q: <question 1>
+A: <Yes | No>
+Q: <question 2>
+
+22
+
+Preprint.
+
+A: <Yes | No>
+...
+Spec-to-Terraform emission (system prompt)
+You are an AWS Terraform expert. Given an infrastructure spec
+(resources, topology, attributes) and the user's clarified intent,
+produce a single main.tf that `terraform plan` will accept.
+Requirements:
+- Output ONLY valid Terraform HCL. No markdown fences, no commentary.
+- Include a terraform { required_providers { aws = ... } } block and a
+provider "aws" block (region = "us-east-1" unless intent says
+otherwise).
+- Use the spec's labels as resource names where reasonable.
+- Fill required attributes with sensible defaults; favor a plan-clean
+configuration over completeness.
+- Do not reference undeclared resources or variables.
+Error-guided repair pass (system prompt)
+You are an AWS Terraform expert. The Terraform HCL below failed
+`terraform validate` or `terraform plan`. Fix it so both pass.
+Requirements:
+- Output ONLY valid Terraform HCL. No markdown fences, no commentary.
+- Preserve the user's clarified intent and the resource set from the
+infrastructure spec where possible.
+- Address the specific terraform error shown. Add missing required
+attributes, fix invalid references, and drop unsupported/hallucinated
+ones.
+- Keep the terraform { required_providers { aws = ... } } block and a
+provider "aws" block.
+
+23
+
+

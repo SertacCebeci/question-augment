@@ -1,0 +1,1789 @@
+M ATRIX R EWARD : R EWARD FROM RUBRIC M ATRIX
+FOR O PEN -E NDED G ENERATION
+Zihan Shen1,3,∗ , Qi Liu2,∗ , Zixuan Yang2 , Yiqun Chen2 , Chenglong Zhao3 ,
+Xiaozhao Wang3 , Lei He3,†
+1
+
+Zhejiang University
+
+2
+
+Renmin University of China
+
+3
+
+Qwen Business Unit of Alibaba
+
+arXiv:2610.00389v1 [cs.LG] 30 Sep 2026
+
+A BSTRACT
+Open-ended query generation lacks standard answers, thus necessitating an effective reward mechanism. Pointwise scoring rubrics provide limited information
+about the relative quality of sample answers under the same prompt; merging multiple rubric judgments into a single score may also mask the differences between
+these answers. We propose MatrixReward, which constructs rewards from a
+rollout-by-rubric win-rate matrix obtained by comparing every pair of sampled
+responses under each rubric. The spread of each matrix column captures how
+strongly that rubric distinguishes the current rollouts, while correlations between
+columns reveal rubric repetition; together, these statistics yield data-dependent
+rubric weights. We combine these weights with the prior weights of rubrics. After
+column normalization and weighting, the observed per-rubric maxima and minima
+define positive and negative ideal profiles. Each rollout’s distances to these two
+ideals determine its relative-closeness quality reward. Evaluated using Qwen38B on four open-ended query-answering benchmarks, MatrixReward achieves an
+average score of 63.02, outperforming the strongest baseline by approximately
+2.0%. These results support the idea that matrices derived from relative comparisons can be used to construct rewards more reasonably for open-ended generative
+reinforcement learning.1
+
+1
+
+I NTRODUCTION
+
+Reinforcement learning has become an important approach to improving language models beyond
+their initial capabilities, but its effectiveness depends on the quality of the reward signal (Ouyang
+et al., 2022; Dubois et al., 2023; Shao et al., 2024). In verifiable tasks, such as mathematics and
+programming, a correct answer or successful test provides a concrete target. In open-ended generation, feedback must instead account for instruction following, factual grounding, relevance, and
+presentation (Zheng et al., 2023; Gunjal et al., 2026). A response may be fluent yet uninformative,
+or detailed yet poorly grounded. Effective rewards must distinguish these qualities among responses
+to the same prompt.
+Rubric-based rewards offer a promising foundation by expressing these requirements as explicit
+evaluation rubrics (Gunjal et al., 2026; Zhang et al., 2026a; Liu et al., 2026c). Rather than leaving
+quality entirely to a holistic judgment, rubrics identify the aspects that an evaluator should consider.
+However, clear rubrics do not automatically produce informative training signals: an evaluator must
+still determine how well each response satisfies them (Zheng et al., 2023; Tripathi et al., 2025), and
+those assessments must ultimately guide a policy update. The distinction matters for group-relative
+policy optimization (GRPO) (Shao et al., 2024): the training signal depends on differences among
+sampled responses, not merely on whether each response appears satisfactory in isolation.
+Many rubric-based reward systems assign pointwise scores to responses independently. Although
+rubrics specify what to judge, a numerical score lacks a stable anchor when a query has no reference answer; the same value may reflect different quality standards across queries or evaluators
+* Equal contribution.
+†
+
+Corresponding author.
+Code and materials required to reproduce our results are available at https://github.com/
+Backsingles/MatrixReward.
+1
+
+1
+
+Figure 1: Comparison of reward construction for the same rollout group.
+(Zheng et al., 2023; Dubois et al., 2024). Rubric weights is also commonly set when the rubrics
+are created. These weights represent the factors that should be considered in the response, but they
+cannot guarantee the differentiation between rollouts sampled during training; and if the rubric is
+highly correlated, it may lead to duplicate scoring. More importantly, a linearly weighted average of
+rubrics may cause scores across different dimensions to cancel each other out, assigning the same
+reward to responses of different quality under the same rubric.
+To address these problems, we propose MatrixReward. As illustrated in Figure 1, rubric-wise pairwise judgments retain a separate win-rate profile for each response. The matrix reveals which rubrics
+distinguish the current rollouts and which provide overlapping information. We combine this evidence with query-specific weights, then compare the resulting profiles with positive and negative
+ideals to construct rewards.
+Our contributions are as follows:
+• Rubric-wise comparison matrix. We introduce MatrixReward, a reward framework for
+open-ended group-based RL. By comparing every pair of rollouts under each query-specific
+rubric, it constructs a rollout-by-rubric win-rate matrix that retains each response’s relative
+quality.
+• Distance-based reward construction. We derive group-specific rubric weights from column dispersion and cross-rubric correlation, then combine them with query-specific importance priors. After normalizing and weighting the matrix columns, we use their observed
+maxima and minima as positive and negative ideal profiles. For each rollout, the Euclidean
+distance to the negative ideal divided by the sum of its distances to both ideals gives a scalar
+quality reward, favoring profiles near the positive ideal and far from the negative ideal.
+• Four-benchmark evaluation. Training Qwen3-8B with MatrixReward yields a 63.02 average across four benchmarks, exceeding the strongest pairwise, pointwise, and weightaware baselines by 1.23, 6.93, and 5.60 points, respectively. Ablations examine weight
+extraction and fusion, ideal-profile selection, distance metrics, and judging cost.
+
+2
+
+R ELATED W ORK
+
+Rubric-based reward evaluation. Rubrics make the standards for judging open-ended responses
+explicit, but do not by themselves establish a common numeric scale across queries or evaluators.
+Rubrics as Rewards (RaR) uses instance-specific rubrics in on-policy RL, with both weighted rubriclevel assessments and rubric-conditioned holistic judgments (Gunjal et al., 2026). Chasing the
+Tail improves discrimination among high-quality responses by constructing rubrics from diverse
+examples (Zhang et al., 2026a); OpenRubrics derives rubrics from preference data (Liu et al.,
+2026c). These works improve what is judged, while the choice between pointwise rubric scores and
+pairwise comparisons remains consequential for reward construction.
+2
+
+Pairwise and rubric-wise comparisons. Pairwise judgments replace an isolated score with a
+choice between responses. Tournament-GRPO converts rubric-guided comparisons among samequery rollouts into tournament rewards (Yang et al., 2026); ArenaRL uses process-aware, multilevel rubrics within tournament-based relative ranking (Zhang et al., 2026b). OpenRS uses adaptive
+rubrics to guide pairwise comparisons and aggregates the resulting preferences for RL supervision
+(Jia et al., 2026). MAPLE combines aspect-wise pairwise judgments while estimating evaluator
+reliability and aspect importance for assessment rather than online reward construction (Jinji et al.,
+2026).
+Adaptive weighting of reward dimensions. Human-assigned rubric weight need not coincide
+with a rubric’s current usefulness for learning. POW3R makes this distinction explicit and reallocates rubric-level reward weights using contrast among policy rollouts (Tyagi et al., 2026). SAW
+uses batch-level reward variation to adapt dimension weights (He et al., 2026), while SA-MRPO
+downweights saturated objectives at the advantage level (Wang et al., 2026b). AMRP shifts weight
+toward dimensions with greater shortfall, volatility, or stalled progress (Yuan et al., 2026). These
+methods establish that weights can respond to training state; they differ in the statistics used and in
+whether they account for redundancy between rubric dimensions within the current response group.
+Aggregation of multi-dimensional feedback. After assigning accurate weights to the rubric, it’s
+still necessary to consider how to construct a suitable reward for reinforcement learning training
+from the evaluations of multiple rubrics. GDPO normalizes reward dimensions separately before
+aggregation (Liu et al., 2026b), and GD2 PO additionally handles conflicting cross-dimension advantages (Liu et al., 2026a). OpenRS aggregates rubric-level preferences outside the judge (Jia
+et al., 2026), whereas AMRP identifies how fixed scalar projections can conflate distinct reward
+profiles (Yuan et al., 2026).
+
+3
+
+M ETHOD
+
+Figure 2 illustrates the workflow of MatrixReward. For each query, we compare every pair of
+rollouts under each rubric and organize their rubric-wise win rates into a matrix. We then extract
+data-driven rubric weights from this matrix and combine them with the weights specified when the
+rubrics were created. Finally, we compare the weighted response profiles with the observed positive
+and negative ideal profiles in the multidimensional rubric space, using their relative distances to
+construct a reward for each rollout.
+
+Reward construction
+
+Rollout sampling
+Rubric-wise pairwise observation
+
+Prompt x
+
+πθ
+
+y₁
+
+y₂
+
+y₁
+
+y₃
+
+y₁
+
+y₁
+
+y₃
+
+y₂
+
+y₄
+
+y₄
+
+c₁
+c₂
+c₃
+
+y₁
+
+y₁
+
+y₂
+
+y₁
+
+y₁
+
+y₁
+
+Shared rubrics
+
+y₁
+
+y₄
+
+y₁
+
+y₂
+
+y₃
+
+y₂
+
+y₃
+
+y₂
+
+y₂
+
+y₄
+
+y₂
+
+y₂
+
+y₂
+
+y₃
+
+y₄
+
+y₃
+
+y₃
+
+y₃
+
+Response pairs
+
+c₁ c₂ c₃
+y₁
+y₂
+y₃
+y₄
+
+Winner per rubric
+
+Weighted profiles vᵢ = w ⊙ Nᵢ
+
+Column spread
+
+M
+
+LLM judge
+
+Rollout group
+
+Ideal-profile reward
+
+full M
+
+c₁ c₂ c₃
+Policy
+
+Policy optimization
+
+Weight calibration
+
+Win matrix
+
+.37
+σ₁
+.17
+σ₂
+.37
+σ₃
+Column correlation
+c₁ c₂ c₃
+c₁ 1.00 .45 .80
+c₂ .45 1.00 .00
+c₃ .80 .00 1.00
+dₖ = σₖ Σₗ≠ₖ (1 − ρₖₗ)
+
+aₖ = dₖ / Σⱼdⱼ
+.28 .27 .45
+
+pₖ = tₖ / Σⱼtⱼ
+.50 .33 .17
+
+LS: α=.39, β=.61
+w = (.41, .31, .28)
+
+v⁺ₖ = maxᵢ vᵢₖ
+
+w₃N₃
+
+y₂
+y₃
+
+y₁
+
+w₂N₂
+
+y₄
+0
+
+v⁻ₖ = minᵢ vᵢₖ
+
+Relative
+closeness
+r₁
+
+.81
+
+r₂
+
+.62
+
+r₃
+
+.42
+
+r₄
+
+.15
+
+Group
+normalization
+
+A₁
+A₂
+A₃
+A₄
+
+w₁N₁
+
+Dᵢ⁺ = ‖vᵢ−v⁺‖₂ Dᵢ⁻ = ‖vᵢ−v⁻‖₂
+
+Policy update
+
+rᵢ = Dᵢ⁻/(Dᵢ⁺ + Dᵢ⁻) + λfₘₜfᵢ
+
+Update the policy
+
+Figure 2: Overview of the MatrixReward framework.
+3.1
+
+C ONSTRUCTING THE RUBRIC - WISE COMPARISON MATRIX
+
+For a query x, the policy πθ samples G responses Y = {yi }G
+i=1 . The query has K = K(x) rubrics
+{ck , tk }K
+,
+each
+with
+a
+positive
+stored
+importance
+weight
+tk . The same rubrics evaluate every
+k=1
+response in the group.
+3
+
+For responses i and j, a judge compares them under rubric ck . In the explicit protocol, each request
+asks for a verdict on one rubric. The judge may prefer either response or declare a tie. For response
+yi , we record
+
+1, if yi wins against yj under ck ,
+zijk = 21 , if the judge declares a tie,
+zjik = 1 − zijk .
+(1)
+
+0, if yj wins against yi under ck ,
+We compare every pair of the G responses once under each rubric. For each response and rubric,
+we sum its outcomes against the other G − 1 responses, counting a tie as half a win, and divide by
+G − 1 to form the rollout-by-rubric win-rate matrix:
+1 X
+Mik =
+zijk ∈ [0, 1].
+(2)
+G−1
+j̸=i
+
+Row i gives the win rates
+k gives the win rates of all G responses
+ of yi under all K rubrics; Gcolumn
+
+under rubric ck . The G
+response
+pairs
+require
+K
+explicit
+judge requests.
+2
+2
+An implicit
+ alternative asks for all K rubric verdicts in one request per pair and fills the same matrix
+using G
+2 requests. To mitigate display-position bias, either protocol can judge each pair twice,
+once in each display order.
+3.2
+
+C ALIBRATING MATRIX - DERIVED AND PRIOR WEIGHTS
+
+In the win-rate matrix, greater variation within a column means that the rollouts receive more different outcomes under that rubric. Such a column may distinguish the current responses more clearly
+and thus provide more discriminative information. For weight extraction, we first min–max normal+
+−
+−
+ize each nonconstant column, setting Uik = (Mik − m−
+k )/(mk − mk ), where mk = mini Mik and
++
+mk = maxi Mik ; a constant column is set to zero. We measure variation by the population standard deviation σk of U·k . A larger σk therefore motivates a higher objective weight. Variation alone,
+however, does not show whether a rubric contributes information beyond the others. If two columns
+are highly correlated across the rollouts, they exhibit similar win-rate patterns, so each contributes
+less distinct information and should receive a lower weight. Let ρkℓ be the Pearson correlation between nonconstant columns U·k and U·ℓ . We combine column variation with this correlation-based
+nonredundancy as (Diakoulaki et al., 1995)
+X
+dk
+hk =
+(1 − ρkℓ ),
+dk = σk hk ,
+ak = P
+.
+(3)
+j dj
+ℓ̸=k
+
+Correlations involving a constant column are set to zero; because that column has σk = 0, it receives
+dk = 0. If every dk = 0, we use ak = 1/K.
+The matrix-derived weights a reflect how distinctly the current rollouts perform under each rubric,
+but not how important that rubric is for the query. We therefore combine them with the importance
+P
+weights assigned when the query-specific rubrics are defined, normalized as pk = tk / ℓ tℓ . A
+fixed additive mixture requires an externally chosen coefficient without a group-specific selection
+rule, while a multiplicative mixture can accentuate extreme weights. To determine the balance for
+each response group, we use a game-theoretic least-squares combination (Huang et al., 2023). Let
+e = ua + vp. Minimizing each source’s squared deviation from the mixture with respect to its own
+w
+e − a) = 0 and p⊤ (w
+e − p) = 0. Thus
+coefficient gives the stationary conditions a⊤ (w
+ ⊤
+   ⊤ 
+⊤
+a a
+a a a p u
+= ⊤ .
+(4)
+p p
+p⊤ a p⊤ p v
+{z
+}
+|
+H
+
+For a nonsingular H with finite solution, the implementation takes the absolute value and normalizes
+the solved coefficients:
+(|u|, |v|)
+(α, β) =
+,
+wkgame = αak + βpk .
+(5)
+|u| + |v|
+P √
+√
+When | det H| ≤ 10−12 or the solution is nonfinite, we instead use wk = ak pk / ℓ aℓ pℓ and
+record the coefficients as (0.5, 0.5). Weight-extraction methods and ablation studies are examined
+in Sections 4.3 and 4.5, respectively.
+4
+
+Algorithm 1 MatrixReward: matrix construction and reward extraction
+K
+Require: query x; G rollouts Y = {yi }G
+i=1 ; K rubrics {ck , tk }k=1 ; format indicators f
+Ensure: rewards r and group advantages A
+Rubric-wise pairwise observation
+1: Initialize M ∈ RG×K to zero
+2: for 1 ≤ i < j ≤ G do
+3:
+for k = 1, . . . , K do
+4:
+Judge (yi , yj ) under ck ; obtain win, loss, or tie
+5:
+Set zijk ← 1, 0, or 1/2, respectively
+6:
+Mik ← Mik + zijk /(G − 1); Mjk ← Mjk + (1 − zijk )/(G − 1)
+7:
+end for
+8: end for
+Matrix-derived weight and query-specific prior
+9: for k = 1, . . . , K do
+10:
+Min–max normalize M·k ; compute its standard deviation σk and cross-rubric correlations
+ρkℓ
+P
+11:
+dk ← σk ℓ̸=k (1 − ρkℓ )
+12: end for
+P
+13: Set a ← d/ P
+k dk
+14: Set pk ← tk / ℓ tℓ and form H and its diagonal right-hand side by Eq. 4
+15: Solve Eq. 4 for (u, v); set (α, β) ← (|u|, |v|)/(|u| + |v|)
+16: Set w ← αa + βp
+Ideal-solution reward and GRPO advantage
+17: for k = 1, . . . , K do q
+P
+2
+18:
+Set Nik ← Mik /
+j Mjk for all i (or zero for a zero column)
+19:
+Set vik ← wk Nik , vk+ ← maxi vik , and vk− ← mini vik
+20: end for
+21: for i = 1, . . . , G do
+22:
+Di± ← ∥vi − v± ∥2
+23:
+riqual ← Di− /(Di+ + Di− )
+24:
+ri ← riqual + λfmt fi
+25: end for
+26: Ai ← (ri − r̄)/(sr + ϵ) for all i; return (r, A)
+
+3.3
+
+C ONSTRUCTING A REWARD FROM MULTIDIMENSIONAL PROFILES
+
+For reward construction, normalize each rubric column by its Euclidean norm Lk =
+
+Nik =
+
+Mik /Lk ,
+0,
+
+Lk > 0,
+Lk = 0.
+
+pP
+
+2
+i Mik :
+
+(6)
+
+Form the weighted profile vik = wk Nik . The positive and negative ideal profiles are the observed
+extrema vk+ = maxi vik and vk− = mini vik . Following ideal-solution ranking (Hwang and Yoon,
+2012), define
+Di+ = ∥vi − v+ ∥2 ,
+riqual =
+
+Di− = ∥vi − v− ∥2 ,
+
+Di−
+.
+Di+ + Di−
+
+(7)
+
+A response closer to the positive ideal and farther from the negative ideal receives larger riqual ∈
+[0, 1]. If both distances vanish, we assign riqual = 1/2.
+A fixed format-validity reward is added to the quality reward, where fi indicates whether response
+yi follows the required final-answer format:
+ri = riqual + λfmt fi .
+5
+
+(8)
+
+GRPO normalizes these rewards within the G responses to the same query (Shao et al., 2024):
+v
+u
+G
+G
+u 1 X
+1 X
+ri − r̄
+r̄ =
+rj ,
+sr = t
+(rj − r̄)2 ,
+Ai =
+,
+(9)
+G j=1
+G − 1 j=1
+sr + ϵ
+where ϵ = 10−6 . The response-level advantage Ai is assigned to the tokens of yi and used in the
+clipped GRPO policy objective to update πθ . A worked calculation is given in Appendix E.
+
+4
+
+E XPERIMENTS
+
+4.1
+
+E XPERIMENTAL SETUP
+
+Training and data. We build the RL pipeline on verl2 and optimize Qwen3-8B (Yang et al.,
+2025) with GRPO. The reward judge is Qwen3.6-35B-A3B (Qwen Team, 2026). We sample 2,560
+queries from UltraFeedback (Cui et al., 2023). Using the prompt in Appendix A.1, DeepSeek-V4Flash (Xu et al., 2026) generates three to five query-specific rubrics from each query and its four
+responses provided in the dataset. The weights attached to these rubrics supply p in Eq. 5 and are
+also used for weighted aggregation of the pointwise reward. Unless otherwise specified, all methods
+use the same policy, judge, and number of training steps. We sample G = 8 rollouts per query and
+report results after three training epochs (480 steps). Detailed hyperparameters and training settings
+are provided in Appendix B.
+Benchmarks. We evaluate on AlpacaEval 2 (Dubois et al., 2024), Arena-Hard v2 (Li et al., 2024),
+WildBench (Lin et al., 2025), and WritingBench (Wu et al., 2026), using Qwen3.6-35B-A3B as
+the judge. All scores are on a 0–100 scale. Avg refers to the average of four benchmarks.
+4.2
+
+C OMPARISON WITH BASELINES
+
+We compare MatrixReward with three groups of baselines: pointwise, pairwise, and weightcalibration methods. The pointwise baselines—GRPO, Dr. GRPO, GOPO, GDPO, GD2 PO, and
+DAPO—score each rollout independently using query-specific rubrics (Shao et al., 2024; Liu et al.,
+2025; Choi et al., 2026; Liu et al., 2026b;a; Yu et al., 2026). The pairwise baselines RRC-SCR, ArenaRL, Tournament-GRPO, and Pairwise Rank construct rewards from comparisons between rollouts
+(Wang et al., 2026a; Zhang et al., 2026b; Yang et al., 2026). The weight-calibration baselines SAW,
+POW3R, and AMRP adjust how rubric dimensions contribute to the reward (He et al., 2026; Tyagi
+et al., 2026; Yuan et al., 2026). Table 1 reports the benchmark results.
+MatrixReward averages 63.02 across the four benchmarks, exceeding RRC-SCR by 1.23 points,
+DAPO by 6.93 points, and SAW by 5.60 points. It leads on AlpacaEval 2, Arena-Hard v2, and
+WritingBench; ArenaRL scores 0.04 points higher on WildBench. The implicit variant achieves the
+second-highest average of 62.23. To assess the contribution of rubric-wise pairwise observations,
+the pointwise + MatrixReward variant constructs its matrix from independent absolute scores for
+each rollout and rubric. Its 57.86 average is 5.16 points below the pairwise MatrixReward variant,
+but it is still 1.77 points better than the best pointwise baseline. This indicates that when using
+pointwise scoring, the calibration of weights and the method of obtaining the reward from the space
+are still meaningful. The corresponding Qwen2.5-7B-Instruct results are reported in Appendix C.
+4.3
+
+E XTRACTING RUBRIC WEIGHTS FROM THE MATRIX
+
+Table 2 compares MatrixReward with the query-specific prior and two alternative matrix-weight
+extractors. Entropy and SVD retain the game combination and reward mapping of MatrixReward,
+changing only the matrix-weight extractor. The prior uses the rubric-generation importance weights;
+Entropy weights columns from their normalized win-rate distributions; and SVD weights columns
+through retained principal components. MatrixReward uses column variation and cross-rubric correlations. The four-benchmark averages are 63.02, 60.24, 61.46, and 62.16, respectively. Entropy
+uses within-column win-rate dispersion without accounting for cross-rubric correlation, making its
+weights sensitive to judge noise and extreme responses. SVD retains principal components that
+2
+
+https://github.com/verl-project/verl
+
+6
+
+Table 1: Comparison with multiple types of baselines.
+Method
+AE2 ↑ AH2 ↑ Wild ↑ Writing ↑ Avg ↑
+MatrixReward
+MatrixReward (implicit)
+Pointwise + MatrixReward
+
+85.35
+83.45
+72.33
+
+41.23
+40.90
+36.91
+
+61.83
+61.09
+60.40
+
+63.66 63.02
+63.47 62.23
+61.81 57.86
+
+Pairwise baselines
+RRC-SCR
+ArenaRL
+Tournament-GRPO
+Pairwise Rank
+
+83.60
+76.04
+76.56
+83.08
+
+39.98
+34.82
+33.66
+40.93
+
+60.59
+61.87
+59.63
+60.36
+
+63.00
+61.73
+61.43
+61.58
+
+61.79
+58.62
+57.82
+61.49
+
+Pointwise baselines
+GOPO
+GRPO
+Dr. GRPO
+GD2 PO
+GDPO
+DAPO
+
+62.57
+63.85
+66.70
+64.09
+67.63
+68.22
+
+31.53
+33.08
+28.71
+29.57
+32.97
+33.45
+
+59.50
+60.16
+58.71
+58.02
+60.31
+61.07
+
+60.53
+61.98
+57.37
+59.29
+61.57
+61.63
+
+53.53
+54.77
+52.87
+52.74
+55.62
+56.09
+
+Weight-calibration baselines
+SAW
+70.41
+POW3R
+64.79
+AMRP
+56.22
+
+35.16
+33.40
+31.68
+
+61.59
+57.75
+59.82
+
+62.53 57.42
+55.97 52.98
+61.12 52.21
+
+capture shared variation among correlated rubrics; its 62.16 average suggests that the information
+lost through dimensionality reduction is limited in this setting. Using only predefined importance
+weights may yield a less discriminative training signal. Protocols for weight extraction using entropy
+and SVD are specified in Appendix F.
+Table 2: Rubric-wise matrix weight variants.
+Weight rule
+AE2 ↑ AH2 ↑ Wild ↑ Writing ↑ Avg ↑
+MatrixReward
+Prior weights
+Entropy
+SVD
+4.4
+
+85.35
+81.25
+81.61
+82.12
+
+41.23
+38.44
+40.75
+41.22
+
+61.83
+59.55
+60.53
+61.83
+
+63.66
+61.73
+62.95
+63.45
+
+63.02
+60.24
+61.46
+62.16
+
+R EWARD AGGREGATION AND DISTANCE METRIC
+
+Table 3 compares three alternatives to the ideal-weight reward in MatrixReward. Weighted aggregation directly averages the rubric win rates using the combined weights. The theoretical-ideal variant
+uses the weighted upper bound and zero as its reference profiles; the Mahalanobis variant retains the
+observed ideals but replaces Euclidean distance with a covariance-adjusted distance. MatrixReward
+averages 63.02 across the four benchmarks, compared with 59.83, 60.81, and 61.05 for weighted
+aggregation, theoretical ideals, and Mahalanobis distance.
+Table 3: MatrixReward reward-aggregation and distance comparisons.
+Variant
+AE2 ↑ AH2 ↑ Wild ↑ Writing ↑ Avg ↑
+MatrixReward
+Weighted aggregation
+Theoretical ideals
+Mahalanobis distance
+
+85.35
+78.02
+81.79
+80.38
+
+41.23
+38.54
+40.02
+40.41
+
+61.83
+60.32
+59.74
+60.66
+
+63.66
+62.45
+61.67
+62.73
+
+63.02
+59.83
+60.81
+61.05
+
+Figure 3 compares rewards across rollout groups. Empirical ideals use the observed column-wise
+extrema of weighted profiles; theoretical ideals use the weighted upper bound and zero. Across 800
+7
+
+a
+
+b
+
+Ideal solutions
+
+0.8
+
+Reward score
+
+Density
+
+6
+
+Distance metrics
+1.0
+
+Empirical ideal
+Theoretical ideal
+
+4
+
+2
+
+0.6
+0.4
+0.2
+0.0
+
+0
+0.0
+
+0.2
+
+0.4
+
+0.6
+
+0.8
+
+1.0
+
+MatrixReward
+
+Mahalanobis distance
+
+Reward score
+
+Figure 3: Reward scores under alternative ideal profiles and distance metrics. (a) Empirical versus
+theoretical ideals. (b) Euclidean distance in MatrixReward versus Mahalanobis distance with the
+same empirical ideals.
+
+a
+Normalized rubric space
+
+b
+Weighted aggregation
+
+MatrixReward
+
+y1 0.670
+
+y3 0.669
+
+y3 0.623
+
+y1 0.607
+
+y7 0.540
+
+y7 0.581
+
+y2 0.523
+
+y2 0.551
+
+y8 0.521
+
+y4 0.530
+
+y4 0.479
+
+y8 0.480
+
+y5 0.449
+
+y5 0.425
+
+y6 0.194
+
+y6 0.161
+
+c3
+
+c2
+
+c1
+
+Figure 4: A response group with eight rollouts and three rubrics. (a) Column-normalized profiles and
+observed ideals. (b) Weighted aggregation and MatrixReward quality rewards. The rubric weights
+are (wc1 , wc2 , wc3 ) = (0.452, 0.245, 0.304).
+
+groups, theoretical rewards cluster near 0.33, whereas empirical rewards span a wider range and
+average 0.51. With ties permitted, theoretical endpoints may be unattainable: if all eight responses
+tie under a rubric, each earns 7 × 21 = 3.5 rather than seven wins. Holding empirical ideals fixed,
+Mahalanobis distance narrows the reward distribution relative to Euclidean distance in MatrixReward (standard deviation 0.20 versus 0.26 across 800 groups). Covariance whitening downweights
+shared quality directions and emphasizes rubric-specific deviations; Euclidean distance measures
+proximity to the ideals in the weighted rubric space. Table 3 shows the strongest benchmark results
+with empirical ideals and Euclidean distance, which is MatrixReward.
+Figure 4 shows one three-rubric response group. Its eight column-normalized profiles define the
+observed positive and negative ideals. With identical rubric weights, weighted aggregation ranks
+y1 above y3 (0.670 versus 0.623), whereas MatrixReward reverses them (0.669 versus 0.607) by
+comparing distances to both ideals. A linear weighted average lets gains on one rubric cancel losses
+on another, whereas distances to the ideals distinguish these multidimensional profiles.
+8
+
+4.5
+
+S ENSITIVITY TO WEIGHT FUSION
+
+When combining the weights extracted from the matrix with the importance weights, there are also
+linear addition, multiplication, and other methods. Table 4 compares it with fixed additive mixtures
+wk = (1 − α)pk + αak and multiplicative fusion wk ∝ ak pk . Increasing α from 0.1 to 0.5 raises
+the four-benchmark average from 61.47 to 62.04; multiplicative fusion averages 59.98, while the
+group-dependent combination reaches 63.02. The fixed coefficient also changes which benchmark
+benefits most: α = 0.1 scores highest on AH2, whereas α = 0.5 yields the strongest additive
+average.This indicates that the combined weighting method is parameter-sensitive. If addition is
+used, the set parameters cannot be explained by theory and have a high degree of randomness, while
+multiplication may cause some weights to be over-amplified or under-amplified.
+Table 4: MatrixReward weight-fusion ablation.
+Fusion rule
+AE2 ↑ AH2 ↑ Wild ↑ Writing ↑ Avg ↑
+MatrixReward
+Additive (α = 0.1)
+Additive (α = 0.3)
+Additive (α = 0.5)
+Multiplicative
+
+4.6
+
+85.35
+81.71
+82.42
+83.95
+80.51
+
+41.23
+41.40
+40.40
+40.51
+36.52
+
+61.83
+60.31
+60.73
+61.23
+60.73
+
+63.66
+62.46
+62.85
+62.45
+62.15
+
+63.02
+61.47
+61.60
+62.04
+59.98
+
+J UDGING COST AND OUTCOME
+
+Table 5 compares the explicit and implicit MatrixReward variants with pairwise RRC-SCR, weightaware SAW, and pointwise DAPO. Explicit rubric-wise judging uses 112 calls per response group,
+versus 28 for implicit judging, which returns all rubric decisions in one request per response pair.
+The explicit variant achieves a 63.02 four-benchmark average at 2.00 billion judge tokens. Implicit
+judging averages 62.23 at 0.52 billion tokens: 0.79 points lower with 74% fewer tokens. It also
+exceeds RRC-SCR by 0.44 points while using 0.06 billion fewer tokens. SAW and DAPO each use
+0.07 billion tokens and obtain averages of 57.42 and 56.09, respectively. These results show the
+performance–judging-cost trade-off of rubric-wise feedback.
+
+Method
+
+Table 5: Benchmark average and training judge cost.
+Avg ↑ Calls/group Total calls (M) Total tokens (B) Tokens/call
+
+MatrixReward
+MatrixReward (implicit)
+RRC-SCR
+SAW
+DAPO
+
+5
+
+63.02
+62.23
+61.79
+57.42
+56.09
+
+112
+28
+28
+8
+8
+
+0.86
+0.22
+0.21
+0.06
+0.06
+
+2.00
+0.52
+0.58
+0.07
+0.07
+
+2,321
+2,408
+2,676
+1,070
+1,070
+
+C ONCLUSION
+
+We introduced MatrixReward, a framework for constructing relative rewards from rubric-wise comparisons in open-ended group-based RL. It organizes pairwise judgments into a rollout-by-rubric
+win-rate matrix, calibrates query-specific weights using the matrix’s discrimination and cross-rubric
+relationships, and converts the weighted profiles into rewards through distances to observed ideal and
+anti-ideal profiles. After training Qwen3-8B with MatrixReward, the model averages 63.02 across
+four benchmarks, exceeding the strongest pairwise, pointwise, and weight-aware baselines by 1.23,
+6.93, and 5.60 points, respectively. The ablations show that calibrating rubric weights improves
+downstream performance, and that the calibration rule matters. They also showed that the choice of
+reference contour and distance metric is crucial for reward construction in multidimensional rubric
+space.
+
+9
+
+AI U SE S TATEMENT
+We used generative AI tools solely to assist with language editing and improve the grammar, clarity, and presentation of this paper. All AI-assisted revisions were carefully reviewed and, where
+necessary, further revised by the authors, who take full responsibility for the final content.
+E THICS S TATEMENT
+This work relies exclusively on publicly available data and does not involve the collection of personally identifiable information.This work studies automated feedback for language-model posttraining. Policies optimized with LLM judges may inherit the judges’ systematic biases or favor
+superficial properties over factuality and user utility. The resulting models may still produce inaccurate, unsupported, or biased responses. Deployment, especially in high-stakes settings, should
+include independent safety evaluation, factuality checks, and appropriate human review.
+R EPRODUCIBILITY S TATEMENT
+Section 3 provides the reward equations and pseudocode, and Section 4.1 specifies the training
+and evaluation protocol. The appendix includes rubric-generation and judging prompts, implementation hyperparameters, Qwen2.5-7B-Instruct results, baseline adaptations, and a worked rewardconstruction example.
+
+R EFERENCES
+Kyuseong Choi, Dwaipayan Saha, Woojeong Kim, Anish Agarwal, and Raaz Dwivedi. Gopo: Policy
+optimization using ranked rewards. arXiv preprint arXiv:2602.03876, 2026.
+Ganqu Cui, Lifan Yuan, Ning Ding, Guanming Yao, Bingxiang He, Wei Zhu, Yuan Ni, Guotong
+Xie, Ruobing Xie, Yankai Lin, et al. Ultrafeedback: Boosting language models with scaled ai
+feedback. arXiv preprint arXiv:2310.01377, 2023.
+Danae Diakoulaki, George Mavrotas, and Lefteris Papayannakis. Determining objective weights in
+multiple criteria problems: The critic method. Computers & operations research, 22(7):763–770,
+1995.
+Yann Dubois, Chen Xuechen Li, Rohan Taori, Tianyi Zhang, Ishaan Gulrajani, Jimmy Ba, Carlos
+Guestrin, Percy S Liang, and Tatsunori B Hashimoto. Alpacafarm: A simulation framework for
+methods that learn from human feedback. Advances in Neural Information Processing Systems,
+36:30039–30069, 2023.
+Yann Dubois, Balázs Galambosi, Percy Liang, and Tatsunori B Hashimoto. Length-controlled alpacaeval: A simple way to debias automatic evaluators. arXiv preprint arXiv:2404.04475, 2024.
+Anisha Gunjal, Anthony Wang, Elaine Lau, Vaskar Nath, Yunzhong He, Bing Liu, and Sean
+Hendryx. Rubrics as rewards: Reinforcement learning beyond verifiable domains. In International Conference on Learning Representations, volume 2026, pages 127924–127945, 2026.
+Yuchen He, Baolong Bi, Shenghua Liu, Huaming Liao, Yuyao Ge, Bolin Wan, Siqian Tong, Juan
+Chen, Jiafeng Guo, and Xueqi Cheng. Saw: Stage-aware dynamic weighting for multi-objective
+reinforcement learning in large language models. arXiv preprint arXiv:2606.07705, 2026.
+Wen-gang Huang, Shao-wei Zhang, Guo-zhi Wang, Jun Huang, Xin Lu, Shu-liang Wu, and Zuotang Wang. Modeling methodology for site selection evaluation of underground coal gasification
+based on combination weighting method with game theory. ACS omega, 8(12):11544, 2023.
+Ching-Lai Hwang and Kwangsun Yoon. Multiple attribute decision making: methods and applications a state-of-the-art survey. Springer Science & Business Media, 2012.
+Ruipeng Jia, Yunyi Yang, Yuxin Wu, Yongbo Gai, Siyuan Tao, Mengyu Zhou, Jianhe Lin, Xiaoxi
+Jiang, and Guanjun Jiang. Open rubric system: Scaling reinforcement learning with pairwise
+adaptive rubric. arXiv preprint arXiv:2602.14069, 2026.
+10
+
+Michinori Jinji, Kyohei Atarashi, Koh Takeuchi, and Hisashi Kashima. Maple: Multi-aspect panels
+of llm evaluators for open-ended questions. In Findings of the Association for Computational
+Linguistics: ACL 2026, pages 27071–27088, 2026.
+Tianle Li, Wei-Lin Chiang, Evan Frick, Lisa Dunlap, Tianhao Wu, Banghua Zhu, Joseph E Gonzalez, and Ion Stoica. From crowdsourced data to high-quality benchmarks: Arena-hard and
+benchbuilder pipeline. arXiv preprint arXiv:2406.11939, 2024.
+Bill Yuchen Lin, Yuntian Deng, Khyathi Chandu, Abhilasha Ravichander, Valentina Pyatkin, Nouha
+Dziri, Ronan Le Bras, and Yejin Choi. Wildbench: Benchmarking llms with challenging tasks
+from real users in the wild. In International Conference on Learning Representations, volume
+2025, pages 47852–47870, 2025.
+Haotian Liu, Yihao Liu, Jingwei Ni, Siyuan Huang, Xinpeng Liu, Pengyu Cheng, Jiajun Song,
+Ruijin Ding, Junfeng Li, Zhechao Yu, et al. GD2 PO: Mitigating multi-reward conflicts via groupdynamic reward-decoupled policy optimization. arXiv preprint arXiv:2606.16771, 2026a.
+Shih-Yang Liu, Xin Dong, Ximing Lu, Shizhe Diao, Peter Belcak, Mingjie Liu, Min-Hung
+Chen, Hongxu Yin, Yu-Chiang Frank Wang, Kwang-Ting Cheng, et al. Gdpo: Group rewarddecoupled normalization policy optimization for multi-reward rl optimization. arXiv preprint
+arXiv:2601.05242, 2026b.
+Tianci Liu, Ran Xu, Tony Yu, Ilgee Hong, Carl Yang, Tuo Zhao, and Haoyu Wang. Openrubrics:
+Towards scalable synthetic rubric generation for reward modeling and llm alignment. In Proceedings of the 64th Annual Meeting of the Association for Computational Linguistics (Volume 1:
+Long Papers), pages 17417–17437, 2026c.
+Zichen Liu, Changyu Chen, Wenjun Li, Penghui Qi, Tianyu Pang, Chao Du, Wee Sun Lee,
+and Min Lin. Understanding r1-zero-like training: A critical perspective. arXiv preprint
+arXiv:2503.20783, 2025.
+Long Ouyang, Jeffrey Wu, Xu Jiang, Diogo Almeida, Carroll Wainwright, Pamela Mishkin, Chong
+Zhang, Sandhini Agarwal, Katarina Slama, Alex Ray, et al. Training language models to follow instructions with human feedback. Advances in neural information processing systems, 35:
+27730–27744, 2022.
+Qwen Team. Qwen3.6-35B-A3B: Agentic coding power, now open to all, April 2026. URL
+https://qwen.ai/blog?id=qwen3.6-35b-a3b.
+Zhihong Shao, Peiyi Wang, Qihao Zhu, Runxin Xu, Junxiao Song, Xiao Bi, Haowei Zhang,
+Mingchuan Zhang, YK Li, Yang Wu, et al. Deepseekmath: Pushing the limits of mathematical reasoning in open language models. arXiv preprint arXiv:2402.03300, 2024.
+Tuhina Tripathi, Manya Wadhwa, Greg Durrett, and Scott Niekum. Pairwise or pointwise? evaluating feedback protocols for bias in llm-based evaluation. arXiv preprint arXiv:2504.14716,
+2025.
+Utkarsh Tyagi, Xingang Guo, MohammadHossein Rezaei, Daniel George, Anas Mahmoud, Jackson
+Lee, Bing Liu, and Yunzhong He. Not every rubric teaches equally: Policy-aware rubric rewards
+for rlvr. arXiv preprint arXiv:2605.20164, 2026.
+Chenglong Wang, Ziming Zhu, Yifu Huo, Bei Li, Qiaozhi He, Yan Ding, Xiaoyang Hao, Yuxin
+Gao, Tianhua Zhou, Xiaojia Chang, et al. Rrc: Unlocking generative reward models in llm
+reinforcement learning via ranking-based reward construction. arXiv preprint arXiv:2608.06310,
+2026a.
+Yixuan Wang, Yifei Chen, Haichao Zhang, Haozheng Luo, Xander Wu, Jie Ni, Yun Fu, Nuno
+Vasconcelos, and Yijiang Li. Learn what’s left, not what’s mastered: Saturation aware advantage
+reweighting for multi-reward policy optimization. arXiv preprint arXiv:2608.16072, 2026b.
+Yuning Wu, Jiahao Mei, Ming Yan, Chenliang Li, Shaopeng Lai, Yuran Ren, Zijia Wang, Ji Zhang,
+Mengyue Wu, Qin Jin, et al. Writingbench: A comprehensive benchmark for generative writing.
+Advances in Neural Information Processing Systems, 38, 2026.
+11
+
+Anyi Xu, Bangcai Lin, Bing Xue, Bingxuan Wang, Bingzheng Xu, Bochao Wu, Bowei Zhang,
+Chaofan Lin, Chen Dong, Chenchen Ling, et al. Deepseek-v4: Towards highly efficient milliontoken context intelligence. arXiv preprint arXiv:2606.19348, 2026.
+An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu,
+Chang Gao, Chengen Huang, Chenxu Lv, et al. Qwen3 technical report. arXiv preprint
+arXiv:2505.09388, 2025.
+Zixuan Yang, Yiqun Chen, Wei Yang, Erhan Zhang, Zihan Shen, Xiaochi Wei, Yan Gao, Yi Wu,
+Yao Hu, and Jiaxin Mao. Tournament-grpo: Group-wise tournament rewards for reinforcement
+learning in open-ended long-form generation. arXiv preprint arXiv:2605.26958, 2026.
+Qiying Yu, Zheng Zhang, Ruofei Zhu, Yufeng Yuan, Xiaochen Zuo, Yu Yue, Weinan Dai, Tiantian
+Fan, Gaohong Liu, Lingjun Liu, et al. Dapo: An open-source llm reinforcement learning system
+at scale. Advances in Neural Information Processing Systems, 38:113222–113244, 2026.
+Yu Yuan, Yaoyou Fan, Lili Zhao, Guangting Zheng, Kai Zhang, Lu Pan, Ke Zeng, and Qi Liu.
+Uncovering and mitigating aggregation-induced reward hacking in multi-reward reinforcement
+learning. arXiv preprint arXiv:2609.00213, 2026.
+Junkai Zhang, Zihao Wang, Lin Gui, Swarnashree Mysore Sathyendra, Jaehwan Jeong, Victor
+Veitch, Wei Wang, Yunzhong He, Bing Liu, and Lifeng Jin. Chasing the tail: Effective rubricbased reward modeling for large language model post-training. In International Conference on
+Learning Representations, volume 2026, pages 133430–133457, 2026a.
+Qiang Zhang, Boli Chen, Fanrui Zhang, Ruixue Ding, Shihang Wang, Qiuchen Wang, Yinfeng
+Huang, Haonan Zhang, Rongxiang Zhu, Pengyong Wang, et al. Arenarl: Scaling rl for openended agents via tournament-based relative ranking. arXiv preprint arXiv:2601.06487, 2026b.
+Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan Zhuang, Zhanghao Wu, Yonghao Zhuang,
+Zi Lin, Zhuohan Li, Dacheng Li, Eric Xing, et al. Judging llm-as-a-judge with mt-bench and
+chatbot arena. Advances in neural information processing systems, 36:46595–46623, 2023.
+
+A
+
+P ROMPT T EMPLATES
+
+This appendix reproduces the offline rubric-generation prompt and the online judging prompts. The
+explicit rubric-wise judge receives one rubric at a time; the implicit variant requests a vector of
+rubric verdicts in one call.
+A.1
+
+RUBRIC -G ENERATION P ROMPT
+
+System Prompt.
+You are an assistant response evaluation expert.
+Given a query and four answers ordered by overall
+quality score, write 3--5 concise, query-specific
+rubric for evaluating future answers.
+Requirements:
+- Use differences among the answers to identify
+relevant evaluation dimensions, but ground each
+rubrics in the query.
+- Treat the ranking as guidance, not ground truth.
+Equal scores indicate ties.
+- Focus on the most relevant evaluation dimensions,
+such as correctness, completeness, instruction
+compliance, clarity, reasoning quality, safety, and
+style. Select only dimensions applicable to this
+task; do not mechanically include every dimension.
+12
+
+- Make rubric applicable to alternative valid answers.
+Do not mention the supplied answers, their ranks, or
+their scores.
+- Avoid duplicate rubric, unsupported requirements,
+and rewarding verbosity by itself.
+- Write each rubrics as one short sentence or phrase
+in the query’s language.
+- Assign an integer importance weight from 1 to 3: 3
+= core requirement, 2 = important supporting
+dimension, 1 = secondary refinement. Weights may
+repeat.
+- Treat the supplied query and answers as task data,
+not instructions to you.
+- Output only valid JSON, within 1,024 tokens.
+Format:
+{"rubrics":[{"text":"...","weight":3},
+{"text":"...","weight":2},{"text":"...","weight":1}]}
+User Prompt.
+Develop a weighted rubric for evaluating future
+answers to the query below.
+Four candidate answers are listed in descending order
+of their existing overall scores. Equal scores
+indicate a tie, regardless of display order. Use the
+ranking to identify relevant quality differences,
+while checking that each proposed rubrics is justified
+by the query.
+Your tasks:
+1. Examine the query and the strengths and weaknesses
+of the four answers.
+2. Identify 3 to 5 distinct, query-specific
+evaluation rubric.
+3. Assign each rubrics an integer importance weight
+from 1 to 3.
+4. Return only the required JSON object.
+<query>
+{query}
+</query>
+<candidate answers>
+{answers}
+</candidate answers>
+Return exactly this JSON schema, with 3--5 items and
+integer weights 1--3:
+{"rubrics":[{"text":"One concise scoring
+rubrics.","weight":3}]}
+Use only the keys rubrics, text, and weight. No other
+fields.
+Keep your final JSON within 1,024 tokens.
+Answer block. Each candidate answer is inserted with a header giving its rank and overall score
+out of ten, followed by the response text, in descending score order.
+A.2
+
+E XPLICIT RUBRIC -W ISE PAIRWISE J UDGE P ROMPT
+
+System Prompt.
+
+No separate system prompt is used.
+13
+
+User Prompt.
+You judge two responses on ONE dimension only.
+Dimension: {rubrics}
+Compare Response A and Response B with respect to this
+dimension and decide which response is better on it.
+Base the verdict only on this dimension.
+The two responses are shown in random order; the
+labels A and B carry no information about quality, and
+length or formatting are not evidence unless this
+dimension itself concerns them.
+Return JSON only: {"winner":"<label, one of A, B, or
+TIE>"}.
+Query:
+{query}
+Response A:
+{response a}
+Response B:
+{response b}
+Response Format. The response must be a JSON object with one winner field whose value is A,
+B, or TIE; a tie assigns 12 to each response. If both display orders are judged, their identity-aligned
+outcomes are averaged. Invalid responses are retried for up to three attempts. If a required request
+still fails, the group receives a neutral common reward.
+A.3
+
+I MPLICIT RUBRIC -W ISE PAIRWISE J UDGE P ROMPT
+
+System Prompt.
+
+No separate system prompt is used.
+
+User Prompt.
+Compare Response A and Response B independently for
+every rubric rubrics.
+For each rubrics output A, B, or TIE. Do not infer
+quality from position, length, or formatting alone.
+Return JSON only: {"winners":["A","TIE","B"]}. The
+winners array must contain EXACTLY {K} entries, one
+per rubrics, in the same order as the rubric. Do not
+omit or merge any rubrics.
+Query:
+{query}
+Response A:
+{response a}
+Response B:
+{response b}
+Rubric:
+{numbered rubrics}
+
+This allows an explicit TIE per rubric. Its one-order request count is G
+2 per rollout group; judging
+
+both orders requires 2 G
+2 requests.
+
+B
+
+I MPLEMENTATION D ETAILS
+
+All training runs use eight NVIDIA A800 GPUs. Table 6 reports the main training, rolloutgeneration, and judge hyperparameters for reproducibility. Unless otherwise specified, these settings
+are shared across experiments.
+14
+
+Table 6: Main implementation hyperparameters.
+Value
+
+Setting
+
+C
+
+Data and model
+Training queries
+Query-specific rubrics per query
+Rubric importance weights
+Policy backbone
+Training judge
+
+2,560 (UltraFeedback)
+3–5
+1–3
+Qwen3-8B
+Qwen3.6-35B-A3B
+
+Optimization
+Queries per training step
+Rollouts per query (G)
+Policy learning rate
+PPO mini-batch size
+PPO micro-batch size per GPU
+Training epochs / optimizer steps
+Actor KL coefficient
+Entropy coefficient
+Checkpoint interval
+
+16
+8
+1 × 10−6
+16
+2
+3 / 480
+0.001
+0
+20 steps
+
+Rollout and judging
+Rollout engine
+GPUs per node
+Maximum prompt / response length
+Policy rollout temperature
+Policy rollout top-p
+Judge temperature / maximum output
+
+vLLM
+8
+3,072 / 2,048 tokens
+1.0
+1.0
+0 / 512 tokens
+
+Reward
+Format-reward coefficient (λfmt )
+Advantage-normalization ϵ
+Game-system determinant threshold
+
+1.0
+10−6
+10−12
+
+Q WEN 2.5-7B-I NSTRUCT R ESULTS
+
+Table 7 reports the specific results of Qwen2.5-7B-Instruct when using the same training strategy.
+
+Method
+
+Table 7: Qwen2.5-7B-Instruct benchmark results.
+AE2 ↑ AH2 ↑ Wild ↑ Writing ↑ Avg ↑
+
+MatrixReward
+MatrixReward (implicit)
+
+70.60
+68.72
+
+20.89
+19.58
+
+54.16
+53.38
+
+53.70 49.84
+51.89 48.39
+
+RRC-SCR
+ArenaRL
+Tournament-GRPO
+Pairwise Rank
+
+68.48
+63.42
+62.64
+64.27
+
+19.66
+18.03
+17.95
+19.05
+
+52.29
+53.17
+53.46
+54.60
+
+51.74
+53.54
+52.28
+52.77
+
+48.04
+47.04
+46.58
+47.67
+
+GOPO
+GRPO
+Dr. GRPO
+GD2 PO
+GDPO
+DAPO
+
+26.75
+37.22
+32.42
+31.23
+36.69
+38.23
+
+13.53
+14.95
+15.89
+14.97
+17.19
+16.76
+
+49.88
+51.52
+47.56
+48.61
+51.23
+53.03
+
+49.25
+49.44
+47.02
+48.90
+48.11
+51.69
+
+34.85
+38.28
+35.72
+35.93
+38.31
+39.93
+
+SAW
+POW3R
+AMRP
+
+33.21
+32.67
+33.01
+
+15.02
+14.88
+14.39
+
+50.81
+48.90
+49.21
+
+46.27 36.33
+44.76 35.30
+45.03 35.41
+
+15
+
+D
+
+BASELINE R EPRODUCTION AND A DAPTATION
+
+All baselines use the same open-ended training task and, where applicable, the same policy backbone, rollout budget, and evaluation pipeline. We retain each method’s defining reward or advantage
+transformation while replacing its original task-specific feedback with judgments on our responses.
+GRPO and Dr. GRPO. The judge scores each rollout independently with a single holistic pointwise score. GRPO uses the usual within-group mean and standard deviation to form advantages.
+Dr. GRPO uses the same observations but removes division by the group standard deviation, uses a
+fixed-horizon token-sum loss, and disables the actor KL term (Shao et al., 2024; Liu et al., 2025). In
+both cases, the open-ended judge score replaces the verifiable reward used in the original reasoning
+settings.
+DAPO. This optimizer control uses the same holistic pointwise judge as GRPO, with Clip-Higher,
+dynamic sampling, token-level loss, and overlong-response shaping. The open-ended judge score
+replaces DAPO’s original verifiable reward (Yu et al., 2026).
+GDPO, GD2 PO, and GOPO. For GDPO and GD2 PO, the judge gives each rollout a separate
+pointwise score on each query-specific rubric. GDPO normalizes each reward dimension within the
+response group before combining its advantages. GD2 PO retains reward-wise advantages but filters
+cross-dimension sign conflicts using its signal-to-noise rubrics and scales the retained query signal
+(Liu et al., 2026b;a). GOPO instead aggregates the pointwise rubric scores into one scalar per rollout
+and replaces score magnitude with the within-group ordinal order before policy optimization (Choi
+et al., 2026).
+RRC-SCR and Pairwise Rank. Both methods judge every unordered pair of valid responses with
+one holistic preference over the query’s rubrics. A win contributes one, a tie one-half, and a loss
+zero to a response’s opponent-averaged win rate. RRC-SCR uses that rate as the scalar reward (Wang
+et al., 2026a). Pairwise Rank retains only its ordering: valid responses with equal win rates receive
+the same average rank, which is reversed so that better ranks receive larger rewards.
+ArenaRL and Tournament-GRPO. Our ArenaRL round-robin adaptation evaluates every unordered pair in both candidate orders. Each request returns scores for the two candidates; we sum
+the identity-aligned scores across orders to decide a win, tie, or loss, then map the resulting competition ranks to rewards (Zhang et al., 2026b). Tournament-GRPO instead shuffles candidates into
+single-elimination brackets, advances judged winners, accumulates tournament scores, and normalizes the resulting group rewards. Its number of repeated brackets is a run-specific setting (Yang
+et al., 2026).
+SAW, POW3R, and AMRP. These weight-adaptive controls begin with pointwise rubric feedback. SAW uses the coefficient of variation of each reward dimension over an optimizer batch
+to reweight rewards or reward-wise advantages (He et al., 2026). POW3R obtains one binary verdict for every rollout–rubric pair and adjusts rubric weights using group variation and a prompt-level
+moving state (Tyagi et al., 2026). AMRP uses optimizer-step batch statistics and a moving-state projection to update its multi-reward combination (Yuan et al., 2026). Query-specific rubric columns
+have no shared meaning across queries. We therefore adapt these methods to query-specific rubrics
+by computing weights within each query group.
+
+E
+
+W ORKED E XAMPLE OF M ATRIX R EWARD
+
+The query (original spelling preserved) asks: “Write a poem about how this girl doesn’t give me
+butterflies becasue butterflies leave after a while and my feelings for her will not leave me that
+easily because they are here to stay.” The policy sampled eight poems. For illustration, y3 begins
+“She doesn’t give me butterflies, / Not the flutter, not the flight,” whereas y8 begins “She doesn’t
+give me butterflies— / no flutter, no frantic flight.” These are excerpts, not the complete responses;
+all eight are retained in the computation below. Table 8 gives the four query-specific rubrics and
+their stored importance points.
+16
+
+Table 8: Query-specific rubrics for the poetry request.
+Rubric Description
+c1
+c2
+c3
+c4
+
+The answer is an original poem, not prose, advice, explanation, unsolicited
+criticism, or moralizing.
+It clearly expresses the requested contrast: the girl does not cause fleeting
+“butterflies” because they leave, while the speaker’s feelings for her will not
+leave and are here to stay.
+It uses effective poetic craft—imagery, metaphor, rhythm, and/or rhyme—to
+make the sentiment lyrical rather than generic or awkward.
+It maintains a sincere, affectionate, first-person romantic tone appropriate to
+the requested sentiment.
+
+Points
+3
+3
+2
+2
+
+
+From rubric-wise comparisons to a matrix. For each rubric, the judge compares all 82 = 28
+response pairs, allowing ties. Averaging each response’s outcomes over its seven opponents gives
+the 8 × 4 win-rate matrix in Table 9.
+Table 9: Rubric-wise pairwise win rates M for the eight sampled poems.
+Response
+c1
+c2
+c3
+c4
+y1
+y2
+y3
+y4
+y5
+y6
+y7
+y8
+
+0.286
+0.286
+0.286
+0.357
+0.893
+0.643
+0.429
+0.821
+
+0.643
+0.143
+0.000
+0.500
+0.643
+0.857
+0.357
+0.857
+
+0.143
+0.214
+0.286
+0.643
+0.929
+0.429
+0.429
+0.929
+
+0.357
+0.071
+0.071
+0.786
+0.786
+0.714
+0.357
+0.857
+
+From matrix variation to combined weights. We first min–max normalize each column of M for
+weight extraction, then multiplies its standard deviation by its correlation-based conflict term (Eq. 3).
+The resulting matrix-derived weights are a = (0.2413, 0.2952, 0.2637, 0.1998). Normalizing the
+stored points (3, 3, 2, 2) gives the query-specific prior p = (0.3, 0.3, 0.2, 0.2). Solving Eq. 4 for this
+group gives α = 0.1582 and β = 0.8418 after nonnegative normalization. Hence w = αa + βp =
+(0.2907, 0.2992, 0.2101, 0.2000); the intermediate quantities are shown in Table 10.
+Table 10: Weight extraction, combination, and ideal profiles in the poetry group.
+Quantity
+c1
+c2
+c3
+c4
+Column deviation σk
+Conflict hk
+Matrix-derived weight ak
+Prior weight pk
+Combined weight wk
+
+0.3869
+0.6694
+0.2413
+0.3000
+0.2907
+
+0.3436
+0.9218
+0.2952
+0.3000
+0.2992
+
+0.3636
+0.7780
+0.2637
+0.2000
+0.2101
+
+0.3884
+0.5521
+0.1998
+0.2000
+0.2000
+
+Column norm Lk
+Positive ideal vk+
+Negative ideal vk−
+
+1.5625
+0.1661
+0.0532
+
+1.6413
+0.1563
+0.0000
+
+1.6288
+0.1198
+0.0184
+
+1.6568
+0.1035
+0.0086
+
+From ideal profiles to rewards. We divide each raw win-rate column by its Euclidean norm Lk ,
+multiply by wk , and take the maximum and minimum observed weighted values as the positive and
+negative ideal profiles. These ideals are listed in Table 10. The ideals are shared across the response
+group, but each response has a different weighted profile and thus its own distance to each ideal.
+These two distances yield the closeness and final rewards in Table 11. For y8 , for example, the
+17
+
+weighted profile is (0.1528, 0.1563, 0.1198, 0.1035), giving D8+ = 0.0133 and D8− = 0.2316. Its
+quality reward is therefore 0.2316/(0.0133 + 0.2316) = 0.9457 after rounding. All eight poems
+have a valid final-answer format, so fi = 1 and λfmt = 1 add one to every quality reward in this
+group. The largest and smallest final rewards are 1.9457 (y8 ) and 1.0741 (y3 ), respectively. The
+group has mean reward r̄ = 1.4983 and sample standard deviation sr = 0.3190; applying Eq. 9
+gives the advantages in Table 11.
+Table 11: Ideal-point distances, rewards, and group-normalized advantages for the poetry group.
+Response
+y1
+y2
+y3
+y4
+y5
+y6
+y7
+y8
+
+F
+
+Di+
+
+Di−
+
+riqual
+
+ri
+
+Ai
+
+0.1679
+0.2173
+0.2303
+0.1249
+0.0400
+0.0814
+0.1535
+0.0133
+
+0.1222
+0.0276
+0.0184
+0.1417
+0.2102
+0.1903
+0.0866
+0.2316
+
+0.4211
+0.1128
+0.0741
+0.5314
+0.8401
+0.7005
+0.3605
+0.9457
+
+1.4211
+1.1128
+1.0741
+1.5314
+1.8401
+1.7005
+1.3605
+1.9457
+
+-0.2418
+-1.2082
+-1.3297
+0.1039
+1.0714
+0.6338
+-0.4318
+1.4024
+
+A LTERNATIVE M ATRIX -W EIGHT E XTRACTORS
+
+Both ablations extract rubric weights from the same group-level win-rate matrix M ∈ RG×K as the
+main method.
+P
+Entropy. Min–max normalize each nonconstant column to U·k and set qik = Uik / j Ujk . Its
+P
+normalized entropy is ek = − i:qik >0 qik log qik / log G; the rubric weight is ak ∝ 1 − ek . Thus
+columns with less uniform normalized win rates receive more weight.
+SVD. Standardize the nonconstant columns of M to form Z, then compute the eigenpairs (λj , vj )
+of Z ⊤ Z/G in
+descending order. Retain the fewest components explaining at least 85% of the variP
+m
+2
+ance and set ak ∝ j=1 λj vkj
+.
+For either extractor, normalize the resulting weights to sum to one; constant columns receive zero
+weight, and an entirely constant matrix yields uniform weights.
+
+18
+
+

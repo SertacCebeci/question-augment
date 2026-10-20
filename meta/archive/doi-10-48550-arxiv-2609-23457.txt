@@ -1,0 +1,3246 @@
+A P REPRINT - S EPTEMBER 20, 2026
+
+RLVR2 : R EINFORCEMENT L EARNING WITH V ERIFI ABLE RUBRIC - BASED R ANKING
+Hao Li∗ Zhengkun Zhang∗† Gangqiang Hu Zhen Zhang Yude Gao Dai Dai Jing Liu
+ERNIE Team, Baidu Inc.
+
+arXiv:2609.23457v1 [cs.LG] 20 Sep 2026
+
+A BSTRACT
+Reinforcement Learning with Verifiable Rewards (RLVR) is expanding from tasks
+with relatively well-defined correctness signals, such as mathematics and code,
+toward multifaceted quality requirements, where quality is typically specified by
+multi-dimensional rubrics rather than a single criterion. Since policy optimization
+generally consumes one scalar per rollout, rubric-based RL pipelines must map
+multiple criterion scores into a scalar reward. This aggregation step is often treated
+as score scaling, although it implicitly determines how different quality dimensions
+trade off during training. A prevailing practice normalizes each criterion and takes
+a linear aggregation, which implicitly assumes that cardinal score differences are
+comparable across criteria and that gains on one criterion can compensate for
+failures on another—assumptions that are unreliable when rubric criteria are semantically heterogeneous. We propose Reinforcement Learning with Verifiable
+Rubric-based Ranking (RLVR2 ), a verifiable ranking paradigm for rubric-based
+RLVR. For each criterion, RLVR2 converts rubric scores into criterion-specific
+within-group ordinal outcomes and recovers a latent utility from the resulting
+within-group comparison matrix; these utilities are then converted into a single
+optimization signal for policy training. By retaining only within-group ordering
+and discarding raw score magnitudes, RLVR2 avoids calibrating heterogeneous
+rubric scales. RLVR2 further supports objective-preserving attribute adjustment:
+auxiliary attributes that are systematically associated with observed rankings but
+are not themselves training objectives can be incorporated into the estimation
+process without expanding the rubric or directly rewarding those attributes. Across
+three model scales and 16 benchmarks, RLVR2 consistently outperforms a broad
+range of representative rubric-based RLVR baselines, achieves the best overall
+performance on a majority of benchmarks at every scale. Further analysis shows
+that it controls systematic effects associated with reasoning efficiency and response
+formatting while preserving the underlying quality objective.
+
+1
+
+I NTRODUCTION
+
+Reinforcement learning with verifiable rewards (RLVR) has become a central paradigm for posttraining large language models (DeepSeek-AI, 2025). As the qualities expected of tasks grow
+increasingly rich and multi-dimensional, a single holistic reward can no longer capture them (Huang
+et al., 2025; 2026). A question-answering response, for instance, may need to follow instructions,
+stay factually correct, remain in the query’s language, and stay safe (Jia et al., 2026a). Across this
+task spectrum, per-criterion scores must ultimately be fused into a single scalar reward for existing
+policy-optimization algorithms (Schulman et al., 2017; Shao et al., 2024). This raises the central
+question of how heterogeneous rubric criteria should be aggregated.
+Early work aggregates criterion scores through a static linear combination. Uniform weighting is the
+most common instantiation, treating every criterion as equally decisive (Liu et al., 2026b; Gupta et al.,
+2025; Jia et al., 2026b); more refined variants elicit non-uniform coefficients from domain experts
+or predict them with a strong model conditioned on the query and its rubric (Gunjal et al., 2025;
+Viswanathan et al., 2025). Recent work instead departs from this fixed form, reweighting criteria by
+∗
+†
+
+Equal contribution.
+Corresponding author: zhangzhengkun01@baidu.com
+
+1
+
+A P REPRINT - S EPTEMBER 20, 2026
+
+Figure 1: Limitations of scalar reward aggregation in current RLVR pipeline. Different queries
+activate different criterion sets (left). The resulting binary, continuous, and discrete criterion scores
+have different scales and semantics, making cardinal values difficult to compare (middle). Naive
+scalarization then conflates criterion importance with scale correction, while adding criteria can
+introduce exploitable reward variation such as verbosity and formatting preferences (right).
+
+shortfall, volatility, or remaining headroom (Jia et al., 2026a; Yuan et al., 2026), normalizing criterion
+scores to a common scale (Liu et al., 2026a), or suppressing criteria that the response never licensed
+according to their dependencies (Lv et al., 2026). This adaptivity, however, is confined to the weights:
+the aggregator remains a sum, and every criterion verdict is trusted as reported. We argue that two
+limitations remain in this line of work (shown in Figure 1).
+(i) Prior work attends to the relative importance between criteria while neglecting discriminative
+resolution within each criterion. A weight is required to serve two roles at once: to express how
+much a criterion matters, and to render its scores commensurable with those of the others. Prior
+work addresses only the former, tuning relations between criteria while leaving resolution within
+each criterion unexamined. In practice, a binary compliance rubric and a continuous coverage rubric
+do not express quality in the same units. Rescaling them aligns their numerical ranges but does not
+make their semantics comparable (Mandler, 2001). Preference-based feedback avoids the need for
+an absolute score scale by construction (Lambert, 2026), but it records only which response was
+preferred and not the criterion-specific grounds for that preference (Lambert & Calandra, 2024). The
+evaluation standard is therefore implicit and may vary across comparisons (Shen et al., 2023).
+(ii) Prior work improves reward fidelity by adding criteria, but lacks a mechanism for controlling
+non-objective sources of reward variation. Reward fidelity is pursued by introducing successively
+more criteria, under the assumption that denser supervision yields a more faithful reward. Under linear
+aggregation, however, each additional criterion contributes noise alongside information. A high score
+on an easily satisfied criterion can offset a violation of a demanding one. For example, a response that
+fails to follow instructions may still receive a high reward if it scores well on formatting, organization,
+or length-related criteria (Fu et al., 2025). The resulting reward surface admits exploitable optima:
+a policy may increase its score by producing longer responses or reproducing rewarded structural
+templates (Wang et al., 2026b;a), without improving the requested substance.
+To address these limitations, we introduce Reinforcement Learning with Verifiable Rubric-based
+Ranking (RLVR2 ), which combines the comparative nature of preference feedback with the verifiability of rubric-based rewards by representing each criterion ordinally rather than cardinally. To
+address limitation (i), RLVR2 replaces cardinal-score aggregation with within-query comparisons:
+each criterion induces an ordering among the rollouts of the same request, from which we estimate a
+latent utility on a shared scale. This removes the need for cross-criterion scale calibration, allowing
+the aggregation weight to reflect criterion importance rather than scale correction. To address limitation (ii), RLVR2 controls systematic reward variation from auxiliary attributes, such as reasoning
+length and formatting, without treating them as additional quality criteria. Specifically, these attributes
+enter the within-query comparison model as adjustment variables, allowing their effects on observed
+preferences to be estimated and removed from the quality utility. The resulting reward therefore
+reflects the underlying rubric quality while reducing incentives to exploit superficial attributes.
+2
+
+A P REPRINT - S EPTEMBER 20, 2026
+
+In summary, our main contributions are as follows: (i) We introduce RLVR2 , a verifiable ranking
+paradigm for rubric-based RLVR. By replacing cardinal reward aggregation with within-group
+comparisons, RLVR2 provides a principled training framework for heterogeneous rubric-based
+objectives, preserving criterion-level ordering while separating criterion importance from score-scale
+correction. (ii) We develop an extensible framework for reward variation control. Heterogeneous
+verifiers and auxiliary attributes, such as reasoning length and formatting, are incorporated into a
+unified comparison model without becoming additional training objectives. (iii) We extensively
+evaluate RLVR2 across 3 model scales and 16 benchmarks. It achieves leading performance on
+the vast majority of benchmarks consistently across model scales.
+
+2
+
+P RELIMINARIES
+
+For tasks evaluated by multiple verifiable criteria, RLVR rests on two principal components: rubricbased judgment and reward aggregation for policy optimization. We detail each below.
+Rubric-based judgment. Let πθ be an LLM policy parameterized by θ and a dataset D. For
+each query x ∈ D, the policy samples a group of G candidate rollouts {yi }G
+i=1 ∼ πθ (· | x). When
+a single correctness signal is insufficient, each query x is evaluated using Kx verifiable criteria
+x
+C(x) = {c(k) }K
+k=1 , where Kx may vary across queries. The rubric are defined once from the query
+rather than resampled during training, so all G rollouts of a group are graded against the same criteria.
+Each criterion carries a weight wk > 0 reflecting its importance and is scored on its own domain
+Sk , which may be binary for rule-based checks, discrete for graded judgments, or continuous for
+metric-based measurements. We write sk,i ∈ Sk for the score of rollout yi on criteria c(k) .
+Reward Aggregation. To obtain a scalar training signal, each score is mapped into a common
+interval by a per-criterion map, and the standard reward is their weighted average:
+PKx
+wk ϕk (sk,i )
+R(x, yi ) = k=1
+∈ [0, 1].
+(1)
+PKx
+k=1 wk
+The rubric does not specify {ϕk }, whose choice can change R even when they preserve the withincriterion orderings. Following GRPO (Shao et al., 2024), the scalar reward Ri = R(x, yi ) of each rollout is standardized within the group into a group-relative advantage Âi = (Ri − mean(R))/std(R),
+which is then used to update the policy with the following regularized clipped objective:
+"
+|yi |
+G
+1 X 1 X
+JGRPO (θ) = Ex∼D, {yi }G
+min ri,t (θ)Âi ,
+i=1 ∼πθold (·|x)
+G i=1 |yi | t=1
+# (2)
+
+clip(ri,t (θ), 1 − ϵ, 1 + ϵ)Âi − β DKL (πθ ∥πref ) .
+Here ri,t (θ) is the token-level importance ratio, ϵ the clipping threshold, and β the KL weight against
+a reference policy πref . Since Ri is a rollout-level scalar, the same Âi applies to all tokens of yi , so
+policy updates are driven entirely by {ϕk } and {wk }.
+
+3
+
+M ETHODOLOGY
+
+We present RLVR2 , a verifiable ranking framework for training with heterogeneous criteria through
+within-group comparisons. Section 3.1 details within-group ordinal reward aggregation mechanism.
+Section 3.2 shows how non-objective properties fold in as covariates.
+3.1
+
+W ITHIN -G ROUP O RDINAL R EWARD AGGREGATION
+
+For a query x, let Y(x) = {y1 , . . . , yG } denote the rollout group sampled for policy optimization.
+For each of the Kx verifiable criteria, the corresponding verifier assigns a score sk,i to rollout yi .
+These scores may be binary, discrete, or continuous and need not share a common numerical scale.
+3
+
+A P REPRINT - S EPTEMBER 20, 2026
+
+Pair-wise Battle with Covariance Matrices
+
+Rubrics Criteria Rewards
+r1
+
+y(1)
+
+y(1) y(2)
+
+r2
+
+y(2)
+
+Policy
+Model
+
+q
+
+r3
+
+c(1)
+
+c(2)
+c1
+
+c2
+
+y
+
+=
+
+✓
+
+✗
+
+✓
+
+c1
+
+y(2)
+
+✗
+
+=
+
+✓
+
+✗
+
+c2
+
+(n)
+
+✗
+
+y
+
+✓
+
+α
+
+R(1)
+
+α
+r2
+
+Gate
+
+r4
+
+=
+
+r5
+
+y(n)
+
+y(n)
+
+(1)
+
+r4
+
+Hierarchical Gating
+
+Pass
+
+R(n)
+
+Fail
+
+p·R(n)
+
+R(2)
+
+α
+
+=
+
+=
+
+cn
+
+R(n)
+
+cn
+
+r6
+Rubrics Criteria for Query q
+Gating Quality
+
+✓
+
+Win
+
+✗ Lose
+
+Basic Quality
+
+=
+
+Tie
+
+Covariate
+P: Penalty
+
+r1
+
+Safety & Forbidden Content
+
+r3 Clarity & Organization
+
+r5
+
+Factual Correctness
+
+r2
+
+No Repetition / Fragment Integrity
+
+r4
+
+r6
+
+Tone & Empathy
+
+Language Consistency
+
+Figure 2: Overview of RLVR2 . Each rubric criterion becomes a within-group ordering (win/lose/tie);
+orderings are fused into a scale-invariant reward without raw magnitudes. Auxiliary attributes fold in
+as extra covariates so that hackable attributes are controlled for rather than rewarded.
+RLVR2 uses the relative structure induced within Y(x): for each compared pair (i, j) and criterion k,
+we encode the verifier outcome as
+
+
+0.5, |sk,i − sk,j | ≤ τk ,
+ok (i, j) =
+
+sk,i − sk,j > τk ,
+
+1,
+
+
+0,
+
+(3)
+
+sk,j − sk,i > τk ,
+
+where τk ≥ 0 is a criterion-specific tie margin, with τk = 0 for discrete criteria. Only thresholded
+within-group ordering is retained, while the raw score gap is discarded. We fit a Bradley–Terry (BT)
+model (Sun et al., 2024) to these outcomes, positing a latent utility uk,i per rollout with
+
+
+1
+Pr yi ≻ yj | k = σ(uk,i − uk,j ) ,
+σ(z) =
+,
+(4)
+1 + e−z
+and recover uk = (uk,1 , . . . , uk,G ) by maximizing the BT likelihood over the encoded outcomes.
+A tie outcome ok (i, j) = 0.5 is treated as a half-win target, encouraging the predicted probability
+to be one half. Since the construction uses within-group order rather than raw score magnitudes, it
+applies uniformly to binary, discrete, and continuous verifier outputs without cross-verifier calibration.
+Finally, we fuse the criterion-specific utilities and normalize them within the rollout group:
+ui =
+
+K
+x
+X
+
+wk uk,i ,
+
+R̃i =
+
+k=1
+
+3.2
+
+ui − minj uj
+,
+maxj uj − minj uj
+
+(5)
+
+O BJECTIVE -P RESERVING ATTRIBUTE A DJUSTMENT
+
+When a new training requirement arises, a natural solution is to add another reward dimension. This
+may unintentionally turn an auxiliary property into an optimization target and expand the surface
+on which the policy can exploit the reward. RLVR2 instead controls such attributes through the
+within-group comparison matrix already induced by the rubric verifiers, without expanding the rubric
+or changing the underlying quality objective. More generally, any measurable auxiliary attribute can
+be incorporated as a source of systematic variation in the observed ordering rather than introduced as a
+new criterion; the attributes discussed below are representative instances of this broader construction.
+Attribute adjustment. For a response yi , let ai = ϕ(yi ) denote an auxiliary attribute that is not
+itself part of the target rubric. We construct a normalized contrast for each attribute,
+(d)
+
+(d)
+
+ai
+
+− aj
+
+(d)
+
++ aj + ϵ
+
+(d)
+
+zij =
+
+ai
+
+(d)
+
+,
+
+(6)
+
+and standardize each feature over the comparisons in the group. The resulting attributes are incorporated into the same within-group comparison matrix as the rubric-induced outcomes:
+
+
+
+Pr yi ≻ yj | k = σ uk,i − uk,j + γk⊤ zij .
+(7)
+4
+
+A P REPRINT - S EPTEMBER 20, 2026
+
+Here uk,i represents criterion quality, whereas γk captures the systematic association between the
+auxiliary attributes and the observed ordering. Both are estimated jointly, so the attributes influence
+the quality estimation without becoming additional reward dimensions.
+Quality-level gating. Some requirements are non-compensatory and should not be offset by gains
+on other criteria. We therefore apply a stepwise adjustment after ordinal fusion. Let R̃i denote the
+normalized fused reward for rollout i. A failure of the global-quality condition triggers a hard gate,
+while the low-quality condition yields a soft penalty factor ρi :
+(
+0,
+min(sglobal
+) < 1,
+i
+Ri = g(qi )R̃i ,
+g(qi ) =
+0 < ρi ≤ 1,
+(8)
+ρi R̃i , otherwise,
+where sglobal
+contains the GlobalLowQuality scores. For the LowQuality layer, let s̄low
+be its mean
+i
+i
+score. We set
+(
+1,
+s̄low
+≥ τ,
+i
+ρi =
+(9)
+low
+ρmin + (1 − ρmin ) softgate(s̄low
+),
+s̄
+<
+τ,
+i
+i
+where τ is the low-quality threshold and ρmin is the penalty floor.
+Reasoning-efficiency control. The adjustment is useful when rubrics reward information coverage,
+as in recall-oriented and question-answering tasks. Once the relevant content has been identified,
+additional deliberation may yield repeated verification or marginal rubric coverage without improving
+substantive quality. Accordingly, a positive association between reasoning length and observed
+preference need not reflect a genuine quality benefit. We randomly attenuate a fraction λ of the fitted
+positive coefficient, while leaving non-positive coefficients unchanged. This controls the strength of
+adjustment without imposing a target response length, thereby reducing unnecessary deliberation
+while limiting abrupt changes in reasoning behavior.
+Formatting control. Judges may systematically prefer heavily structured responses, even when
+extra formatting adds no substantive information (Yu et al., 2025). We therefore treat formatting
+as an auxiliary source of variation, not a quality criterion. Normalized statistics for headings, lists,
+and emphasis are standardized and included in the attribute-adjusted model, controlling formatting
+preferences without directly rewarding formatting.
+
+4
+
+E XPERIMENTS
+
+In this section, we present the empirical evaluation of RLVR2 . We first describe the experimental
+setup (Section 4.1), then report the main results (Section 4.2), further analyze attribute adjustment
+(Section 4.3), and conclude with ablations of its robustness and computational cost (Section 4.4).
+4.1
+
+E XPERIMENTAL S ETUP
+
+Datasets and Benchmarks. All methods are trained on the same 120k-query mixture of generalchat, scientific reasoning and agentic tasks. They share rubrics, verifiers, and judges and differ only
+in reward aggregation (Appendix A.1). For evaluation, we use a broad suite of public benchmarks
+covering six capability dimensions: instruction following (SysBench [SysB] (Qin et al., 2024),
+AdvancedIF [AdvIF] (He et al., 2026), IFEval [IFE] (Zhou et al., 2023), IFBench [IFB] (Pyatkin
+et al., 2026), and MultiChallenge [MChal] (Deshpande et al., 2025)), long-context (LongBench-v2
+[LB-v2] (Bai et al., 2025), LongProc [LProc] (Ye et al., 2025), HELMET [HLM] (Yen et al., 2025),
+Frames [Frm] (Krishna et al., 2024), AA-LCR [AA-L] (Team, 2025)), factuality and QA (SimpleQAverified [SQA-v] (Haas et al., 2025), ChineseSimpleQA [CSQA] (He et al., 2025)), reasoning (GPQA
+(Rein et al., 2023)), knowledge (MMLU-Pro [MMLU-P] (Wang et al., 2024)), and open-ended chat
+(ArenaHard-v2 [AH-v2] (Li et al., 2024), EQBench3 [EQB3] (Paech, 2023)). Judge models and
+scoring protocols are detailed in Appendix A.
+Baselines and Implementation Details. Beyond the vanilla model, we compare RLVR2 with
+several static and adaptive reward-fusion baselines: Rule-Fusion (Park et al., 2024), a weighted
+5
+
+A P REPRINT - S EPTEMBER 20, 2026
+
+Instruction Following
+
+Factuality & QA
+
+Long-Context
+
+Reason.
+
+Know.
+
+Open-ended
+
+Method
+
+Average
+SysB
+
+IFE
+
+IFB
+
+MChal SQA-v
+
+CSQA
+
+51.08 43.93
+66.88 55.11
+41.6 58.61
+71.44 62.18
+70
+62.92
+68.6 59.89
+72.52 65.7
+69.12 64.64
+73.2 67.32
+
+76.16
+82.42
+93.9
+94.27
+91.68
+92.24
+91.5
+93.16
+94.64
+
+36.05
+67.01
+62.93
+71.77
+73.47
+72.79
+65.99
+70.71
+73.13
+
+40.83 12.6
+52.64 13.9
+59.17
+6.6
+50.14
+9.1
+57.5
+9.7
+48.95 13.8
+58.67
+14
+53.19 13.8
+60.04 15.2
+
+9B
+
+Base
+Rule-Fusion
+GEAR
+GDPO
+GDPO+
+Focal
+Focal+
+RLVR2
+RLVR2 +
+
+67.44
+74.12
+73.68
+74.88
+68.76
+76.44
+75.2
+73.48
+76.44
+
+59.02
+62.23
+61.55
+63.71
+51.34
+63.3
+61.19
+63.61
+65.56
+
+89.65
+90.76
+92.05
+89.83
+72.46
+91.31
+90.57
+92.05
+92.61
+
+42.77
+48.59
+44.28
+67.35
+59.52
+69.05
+70.41
+69.69
+73.81
+
+4B
+
+Base
+Rule-Fusion
+GEAR
+GDPO
+GDPO+
+Focal
+Focal+
+RLVR2
+RLVR2 +
+
+61
+57.8
+72.12
+52.48
+42.76
+67.28
+70.24
+67.12
+74.4
+
+46.51 83.55
+58.36 91.13
+59.48 91.68
+52.62 83.73
+46.64 74.12
+55.58 91.68
+59.83 91.5
+61.09 90.76
+62.6 92.42
+
+58.84
+68.71
+46.08
+64.29
+56.8
+66.33
+70.83
+71.77
+69.73
+
+Base
+Rule-Fusion
+GEAR
+GDPO
+106B GDPO+
+Focal
+Focal+
+RLVR2
+RLVR2 +
+
+AdvIF
+
+AA-L
+
+GPQA
+
+MMLU AH-v2
+
+EQB3
+
+51.37 54.59 81.08 29.74 77.43
+53.67 64.62 83.55 31.38 78.37
+52.62 63.94 85.27 32.47 80.46
+53.21 57.38 83.45 32.94 80.1
+54.17 57.97 83.06 31.88 79.85
+51.47 67.69 81.04 33.37 79.25
+55.23 64.62 85.28 32.42 80.46
+53.97 63.85 84.02 34.36 81.19
+56.07 65.77 84.12 35.31 81.19
+
+47
+63.33
+62.33
+62.33
+65
+63
+59
+64
+67.67
+
+71.46
+74.21
+76.26
+75
+75.63
+75.48
+76.61
+77.2
+77.86
+
+79.19
+78.73
+77.41
+75.36
+76.79
+75.44
+78.65
+73.55
+80.43
+
+85.35 55.65
+82.62 63.13
+85.3
+62.75
+82.65 64.01
+83.6
+65.05
+84.13 64.57
+84.32 65.73
+86.04 65.60
+87.42 67.91
+
+50
+11.5
+55.56 11.6
+50
+12.1
+52.37 11.2
+50
+10.1
+51.67 10.8
+53
+10.9
+55.40 11.1
+56.23 12.2
+
+67.23
+67.13
+67.6
+68.17
+54.27
+68.3
+65.53
+68.43
+69.5
+
+32.8 80.98
+32.01 81.75
+33.6 80.69
+31.61 81.53
+31.41 82.55
+33.6 80.93
+31.81 81.91
+33.8 81.75
+32.21 82.77
+
+54.33 80.18 80.33 35.1
+55.33 80.68 80.39 60.1
+58.33 82.45 80.63 70.3
+57.33 83.33 81.68 62.3
+50.33 82.07 80.15 67.3
+57
+82.7 81.01
+61
+59.67 81.44 80.73 57.3
+58.67 80.81 80.48 71.1
+60
+81.94 81.11 72.7
+
+33.75
+50
+33.33
+56.16
+35.42
+53.06
+53.22
+54
+57.29
+
+56.67
+55.53
+54.8
+54
+55.23
+56.43
+56.47
+56.66
+56.86
+
+32.31 73.22 23.5 73.18 54.33
+32.01 71.74 23.7 72.33
+55
+32.6 80.45 23.44 73.67
+54
+31.41 79.71 23.51 70.51 46.67
+30.82 77.1 24.34 73.42 52.33
+29.82 81.79 26.47 74.39 45.67
+32.01 78.43 26.26 74.03 55.67
+31.21 76.57 25.31 74.51 54.67
+32.21 78.61 26.71 74.39 60.33
+
+6.9
+7.2
+5
+6.9
+6.2
+7.8
+7.3
+7.2
+8.2
+
+LB-v2
+
+LProc
+
+HLM
+
+24.87
+25.86
+4.17
+27.62
+25.42
+27.76
+26.76
+28.18
+26
+
+Frm
+
+74.76
+74.64
+76.58
+75.97
+71.97
+76.46
+76.94
+75.73
+76.21
+
+77.65
+76.77
+78.28
+79.01
+79.03
+77.78
+77.02
+77.15
+79.04
+
+52.6
+61.61
+65.2
+62.9
+67.6
+65.98
+66.65
+66.74
+67.14
+
+76.53 28.1
+76.74 48.5
+77.29 41.3
+75.21 45.8
+76.66 43.4
+77.07 44.5
+77.63 41.3
+76.8 50.8
+77.67 46.5
+
+82.75
+86.65
+88
+82.55
+84.55
+86.2
+86.6
+87.15
+85.65
+
+58.36
+61.71
+61.00
+63.21
+58.89
+63.60
+63.12
+64.46
+65.31
+
+77.3
+82.35
+85.5
+83.65
+83.6
+84.15
+85.15
+85.2
+83.5
+
+53.96
+57.99
+56.81
+56.60
+53.62
+58.74
+59.81
+60.05
+61.28
+
+Table 1: Comparison of reward-aggregation methods across 16 benchmarks and three model
+scales. Within each block, all methods share the same training setting, differing only in reward
+aggregation. Bold and underline mark the best and second-best per block.
+
+sum gated by hard rules; the graph-based gating method GEAR (Lv et al., 2026); and two dynamic
+aggregation methods, Focal (Huang et al., 2025) and GDPO (Liu et al., 2026a) 1 . We evaluate our
+method on a diverse set of LLMs spanning two model families and different scales, including the
+Qwen3.5 series (Qwen3.5-4B and Qwen3.5-9B) (Qwen Team, 2026) and GLM-4.5-Air (106B-A12B)
+(Zeng et al., 2025). The models cover both dense and mixture-of-experts(MoE) architectures. All
+methods are implemented using the PaddleRL framework and trained with the GSPO algorithm
+(Zheng et al., 2025) on up to 128× H800-80GB GPUs. Unless otherwise specified, we use a global
+batch size of 128, a context length of 256K, and a group size of G = 8 rollouts per query. We
+optimize all models with AdamW using a learning rate of 1 × 10−6 . RLVR2 -specific settings are
+held fixed across models and listed in Appendix A.1.
+4.2
+
+M AIN R ESULTS
+
+Performance across capabilities and scales. RLVR2 + achieves the most consistent performance
+across the three model scales, with particularly strong results on instruction following and broad gains
+across factuality, long-context understanding, reasoning, knowledge, and open-ended evaluation.
+It is the best-performing method on a majority of benchmarks at each scale, while competing
+aggregation methods remain competitive on selected tasks. The clearest gains appear on instruction
+following: at 106B, RLVR2 + reaches 73.20, 67.32, and 94.64 on SysBench, AdvancedIF, and
+IFEval, respectively; at 9B, it reaches 76.44, 65.56, and 92.61 on the same benchmarks. The
+improvements are consistent with the intended effect of within-group ordinal fusion: gains on one
+rubric criterion cannot simply compensate for failures on another through arbitrary cardinal score
+differences. Detailed per-benchmark results are shown in Table 1.
+Scale robustness across binary, discrete, and continuous criteria. RLVR2 maintains unchanged
+within-group rankings and fused reward directions under the tested rescaling and monotone transformations. Cardinal aggregation exhibits larger changes in both reward magnitudes and induced
+rankings, while normalized cardinal aggregation provides only partial robustness. These results
+support the view that ordinal fusion reduces dependence on criterion-specific numerical scales.
+Additional analyses are provided in Appendix C.1.
+1
+
+AMRP (Yuan et al., 2026) is excluded, as no official implementation was publicly available.
+
+6
+
+A P REPRINT - S EPTEMBER 20, 2026
+
+Baseline
+
+RLVR²
+
+RLVR²(+0.0)
+
+Overall
+
+RLVR²(+0.25)
+
+RLVR²(+0.5)
+
+RLVR²(+0.75)
+
+Instruction Following
+
+Open-ended Chat & Generation
+9000
+
+8000
+7000
+
+8000
+
+5000
+
+4000
+
+Think Length
+
+Think Length
+
+Think Length
+
+7000
+6000
+
+6000
+
+5000
+
+4000
+
+0
+
+20
+
+40
+
+60
+
+80
+
+100
+
+20
+
+40
+
+60
+
+80
+
+5000
+
+100
+
+0
+
+20
+
+40
+
+60
+
+Training Step
+
+Training Step
+
+Training Step
+
+Factuality & QA
+
+Long-context
+
+Multi-turn Dialogue
+
+8000
+
+5000
+
+6000
+5000
+4000
+
+4000
+
+40
+
+60
+
+80
+
+100
+
+80
+
+100
+
+3000
+
+1000
+
+2000
+20
+
+4000
+
+2000
+
+3000
+3000
+
+100
+
+5000
+
+Think Length
+
+Think Length
+
+6000
+
+80
+
+6000
+
+7000
+
+Think Length
+
+6000
+
+4000
+
+0
+
+7000
+
+0
+
+7000
+
+0
+
+20
+
+40
+
+Training Step
+
+60
+
+80
+
+100
+
+0
+
+20
+
+Training Step
+
+40
+
+60
+
+Training Step
+
+Figure 3: Reasoning-efficiency control under different attenuation ratios. Larger λ yields faster
+convergence toward baseline length, with sensitivity varying by domain.
+
+4.3
+
+F URTHER A NALYSIS
+
+4.3.1
+
+Q UALITY- LEVEL GATING
+
+Setup. We apply the same gate mechanism to RLVR2 and the comparable baselines, denoting gated
+variants by a “+” suffix in Table 1. The gate acts on critical rubric levels after criterion fusion.
+Result. The gated variant RLVR2 + outperforms RLVR2 in most of benchmarks comparisons across
+three scalesCardinal aggregation baselines show less consistent changes. This result indicates that
+hard quality constraints are compatible with within-group ordinal rewards.
+4.3.2
+
+R EASONING - EFFICIENCY CONTROL
+(a) Reasoning-efficiency control.
+
+Method
+
+Setting (λ)
+
+Rule-Fusion
+
+RLVR2 +
+
+IF
+
+Fa.
+
+Lo.
+
+Re.
+
+Kn.
+
+(b) Composition with adaptive rubric weighting.
+Op.
+
+RLVR2 ⊕ Focal
+
+Ovr.
+
+✗
+
+68.93 39.37 53.57 68.01 80.39 86.65 66.15
+
+✗
+0
+0.25
+0.50
+0.75
+
+77.11 40.85 54.24 70.97 81.11 85.65 68.32
+75.73 40.37 53.73 71.01 80.85 85.85 67.92
+75.28 42.37 54.07 70.21 80.72 87.30 68.30
+75.78 41.75 53.56 70.10 81.41 85.30 67.98
+77.73 41.86 54.42 70.49 81.31 85.60 68.57
+
+F ormat 76.32 41.62 53.72 70.07 80.21 85.76 67.95
+
+IFEval
+SimpleQA-v
+CSimpleQA
+MMLU-Pro
+Frames
+AA_LCR
+
+93.16
+13.81
+53.97
+73.55
+81.19
+64.00
+
+93.53
+13.93
+55.75
+77.08
+84.11
+66.67
+
+∆
++0.37 ▲
++0.12 ▲
++1.78 ▲
++3.53 ▲
++2.92 ▲
++2.67 ▲
+
+Table 2: Further analysis of RLVR2 . Bold denotes the best value in each column.
+
+Setup. We resume the Qwen3.5-9B run from step 70 and vary the attenuation ratio λ ∈
+{0, 0.25, 0.50, 0.75}, while keeping the rubric criteria and optimization settings fixed. The adjustment is applied to the fitted positive association between reasoning extent and the observed rubric
+ordering. Table 2a reports capability-level averages, while Figure 3 reports thinking-token dynamics.
+Result. Across the tested values of λ, the adjustment changes reasoning extent while keeping the
+capability-level averages within a narrow range. This suggests that coefficient attenuation controls
+reasoning efficiency without introducing a separate reasoning-length criterion.
+7
+
+A P REPRINT - S EPTEMBER 20, 2026
+
+Step Heading ↓ Bold ↓
+
+Italic
+
+0
+10
+20
+30
+40
+50
+60
+70
+80
+90
+100
+Avg.
+Avg.
+
+12.79
+13.15
+13.33
+14.06
+13.28
+13.44
+13.04
+13.32
+13.17
+13.20
+13.14
+13.30
+13.17
+
+34.45
+34.52
+34.63
+34.71
+34.82
+34.94
+35.08
+35.21
+34.58
+34.12
+33.51
+34.80
+34.07
+
+48.67
+49.38
+49.79
+50.55
+50.81
+51.23
+51.73
+52.10
+50.71
+49.86
+48.92
+50.53
+49.83
+
+Table Row ↓ Code Block ↓ Inline Code
+13.48
+14.24
+14.66
+14.94
+15.13
+15.93
+16.34
+16.72
+15.65
+14.28
+13.38
+15.18
+14.44
+
+7.26
+7.83
+8.42
+8.54
+7.95
+9.06
+9.29
+10.76
+8.28
+6.41
+5.25
+8.64
+6.65
+
+2.25
+2.06
+2.01
+1.83
+2.44
+3.33
+2.17
+2.25
+2.42
+2.26
+2.21
+2.29
+2.30
+
+OL ↓
+
+UL ↓
+
+Blockquote
+
+HR ↓
+
+Link
+
+13.31
+13.54
+14.05
+14.47
+14.72
+15.20
+15.87
+16.42
+15.85
+15.40
+14.22
+14.70
+15.16
+
+28.80
+31.19
+32.31
+32.64
+33.01
+33.34
+34.08
+34.98
+33.36
+32.03
+31.51
+32.54
+32.30
+
+12.16
+12.48
+12.64
+12.71
+11.95
+12.52
+12.88
+12.24
+12.56
+12.86
+12.19
+12.45
+12.54
+
+26.65
+26.87
+26.27
+26.94
+27.54
+27.20
+28.03
+29.08
+27.22
+26.18
+25.81
+27.32
+26.40
+
+0.20
+0.45
+0.02
+0.11
+0.04
+0.31
+0.28
+0.29
+0.33
+0.18
+0.24
+0.21
+0.25
+
+Table 3: Markdown usage during RL training. Columns report Markdown-marker density (%);
+OL, UL, and HR denote ordered lists, unordered lists, and horizontal rules. Light rows show the preand post-control phases; dark rows show averages. Green arrows indicate post-control decreases.
+
+4.3.3
+
+F ORMATTING CONTROL
+
+Setup. We analyze the Qwen3.5-9B training trajectory, tracking densities of markdown format.
+The formatting-control strategy is applied after the 70% checkpoint by treating these statistics as
+auxiliary attributes in the ordinal comparison model rather than as additional rubric criteria.
+Result. Formatting usage rises before control but declines after attribute adjustment, while querydependent markers remain relatively stable. The formatting-controlled variant achieves an overall
+capability average of 68.32, close to the 67.95 of RLVR2 + in Table 2a. These results show that
+formatting-related preference can be controlled without expanding the rubric or directly rewarding
+formatting. Detailed statistics are reported in Table 3.
+A BLATION S TUDY
+Baseline
+
+SOAR
+
+0.82
+
+0.68
+
+0.69
+
+0.43
+
+0.38
+
+0.88
+
+0.31
+
+0.54
+
+0.71
+
+0.00
+
+0.54
+
+0.71
+
+0.59
+
+0.56
+
+0.47
+
+0.81
+
+0.72
+
+0.80
+
+0.85
+
+0.74
+
+1.00
+
+0.79
+
+CornerCaseInstructionCheckpoint
+
+Already
+Saturated
+
+Challenging
+Rubrics
+
+MaterialFaithfulness
+
+0.22
+
+0.56
+
+0.54
+
+0.48
+
+0.48
+
+0.69
+
+0.50
+
+0.75
+
+0.47
+
+0.58
+
+0.04
+
+0.21
+
+0.45
+
+0.62
+
+0.45
+
+0.56
+
+0.72
+
+0.62
+
+0.53
+
+0.52
+
+0.67
+
+0.73
+
+Collie
+
+1.00
+
+0.92
+
+0.83
+
+0.91
+
+1.00
+
+0.83
+
+1.00
+
+0.87
+
+0.94
+
+0.59
+
+0.81
+
+0.82
+
+0.93
+
+0.95
+
+0.75
+
+0.80
+
+0.89
+
+0.94
+
+0.86
+
+0.93
+
+0.97
+
+1.00
+
+MultiChallenge
+
+0.71
+
+0.88
+
+0.94
+
+1.00
+
+0.87
+
+0.84
+
+0.72
+
+0.78
+
+0.60
+
+0.81
+
+0.38
+
+0.76
+
+0.76
+
+0.83
+
+0.79
+
+0.72
+
+0.82
+
+0.91
+
+0.80
+
+0.68
+
+0.89
+
+0.65
+
+LLM
+
+0.84
+
+0.77
+
+0.85
+
+0.74
+
+0.82
+
+0.88
+
+0.93
+
+0.67
+
+0.84
+
+0.76
+
+0.76
+
+0.84
+
+0.85
+
+0.90
+
+0.89
+
+0.65
+
+0.78
+
+0.89
+
+0.91
+
+0.86
+
+0.93
+
+0.89
+
+MaterialUtilization
+
+0.79
+
+0.70
+
+0.62
+
+0.61
+
+0.69
+
+0.44
+
+0.67
+
+0.88
+
+0.58
+
+0.62
+
+1.00
+
+0.78
+
+0.65
+
+0.88
+
+0.70
+
+0.62
+
+0.63
+
+0.89
+
+0.96
+
+0.94
+
+0.93
+
+0.72
+
+MultiTurnMemory
+
+0.90
+
+0.72
+
+0.68
+
+0.86
+
+0.88
+
+0.80
+
+0.79
+
+0.78
+
+0.67
+
+0.58
+
+0.49
+
+0.80
+
+0.65
+
+0.88
+
+0.67
+
+0.72
+
+0.82
+
+0.67
+
+0.71
+
+0.80
+
+0.78
+
+0.73
+
+Business
+
+0.85
+
+0.83
+
+0.84
+
+0.85
+
+0.79
+
+0.84
+
+0.86
+
+0.83
+
+0.82
+
+0.82
+
+0.86
+
+0.86
+
+0.85
+
+0.87
+
+0.85
+
+0.90
+
+0.92
+
+0.88
+
+0.89
+
+0.91
+
+0.92
+
+0.91
+
+TaskType
+
+1.00
+
+1.00
+
+1.00
+
+1.00
+
+1.00
+
+1.00
+
+1.00
+
+1.00
+
+1.00
+
+1.00
+
+1.00
+
+1.00
+
+1.00
+
+1.00
+
+1.00
+
+1.00
+
+1.00
+
+1.00
+
+1.00
+
+1.00
+
+1.00
+
+1.00
+
+TextType
+
+0.97
+
+0.98
+
+0.99
+
+1.00
+
+1.00
+
+0.98
+
+1.00
+
+0.98
+
+1.00
+
+1.00
+
+1.00
+
+0.98
+
+0.99
+
+0.92
+
+1.00
+
+0.98
+
+1.00
+
+1.00
+
+1.00
+
+1.00
+
+1.00
+
+1.00
+
+IdentityRequirement
+
+1.00
+
+0.94
+
+1.00
+
+1.00
+
+0.95
+
+1.00
+
+1.00
+
+1.00
+
+1.00
+
+0.97
+
+0.98
+
+0.99
+
+1.00
+
+0.96
+
+0.98
+
+1.00
+
+0.99
+
+0.97
+
+0.91
+
+0.98
+
+1.00
+
+0.88
+
+Livebench
+
+0.98
+
+1.00
+
+0.97
+
+0.92
+
+0.98
+
+1.00
+
+1.00
+
+1.00
+
+1.00
+
+0.98
+
+0.98
+
+0.99
+
+0.98
+
+0.97
+
+1.00
+
+0.92
+
+0.94
+
+1.00
+
+0.96
+
+0.94
+
+1.00
+
+0.98
+
+CoreIntent
+
+0.92
+
+1.00
+
+0.93
+
+0.99
+
+0.93
+
+1.00
+
+0.94
+
+0.99
+
+0.95
+
+0.98
+
+0.93
+
+0.92
+
+0.94
+
+0.95
+
+0.97
+
+0.98
+
+0.94
+
+0.97
+
+0.99
+
+0.99
+
+0.92
+
+0.93
+
+CapabilityRequirement
+
+1.00
+
+1.00
+
+1.00
+
+0.98
+
+1.00
+
+1.00
+
+1.00
+
+1.00
+
+0.91
+
+0.94
+
+0.96
+
+1.00
+
+0.96
+
+1.00
+
+1.00
+
+0.96
+
+0.98
+
+0.56
+
+1.00
+
+0.69
+
+1.00
+
+1.00
+
+FormatRequirement
+
+0.97
+
+0.95
+
+0.89
+
+0.85
+
+0.98
+
+0.95
+
+1.00
+
+1.00
+
+0.97
+
+0.98
+
+0.89
+
+0.91
+
+0.96
+
+0.97
+
+0.98
+
+0.97
+
+0.95
+
+0.95
+
+0.91
+
+0.96
+
+0.96
+
+0.92
+
+WordCounter
+
+0.97
+
+0.92
+
+0.88
+
+0.91
+
+0.94
+
+0.77
+
+0.91
+
+0.95
+
+0.90
+
+0.98
+
+0.88
+
+0.95
+
+0.92
+
+0.98
+
+0.91
+
+0.91
+
+0.98
+
+0.95
+
+0.84
+
+0.98
+
+0.93
+
+0.93
+
+0
+
+10
+
+20
+
+30
+
+40
+
+50
+
+60
+
+70
+
+80
+
+90
+
+99
+
+0
+
+10
+
+20
+
+30
+
+40
+
+50
+
+60
+
+70
+
+80
+
+90
+
+99
+
+Training Step
+
+Training Step
+
+1.0
+
+0.8
+
+0.6
+
+Dimension Score
+
+4.4
+
+0.4
+
+0.2
+
+0.0
+
+Figure 4: Criterion-level training dynamics. RLVR2 improves more on Challenging Rubrics while
+matching Baseline on Already-Saturated ones.
+Effective weight and criterion headroom. Figure 4 compares training dynamics on challenging
+and already-saturated rubric subsets. RLVR2 improves more on criteria with remaining headroom
+while preserving already-saturated performance. A criterion tied across an entire rollout group
+contributes no utility difference, so fusion emphasizes criteria that distinguish sampled responses. On
+8
+
+A P REPRINT - S EPTEMBER 20, 2026
+
+the challenging subset, the baseline drops by 15.6 points from start to end , whereas RLVR2 gains
+8.0 points from a lower starting point; the saturated subset remains essentially flat for both methods.
+G
+
+IF
+
+Fact.
+
+Long Reas. Know. Open
+
+Avg.
+
+4 73.59 38.77 54.33 70.25 80.67 67.68 63.71
+8 73.45 40.04 53.50 71.43 81.28 67.80 63.82
+16 73.47 39.04 53.43 68.40 80.98 68.33 63.35
+
+Table 4: Effect of rollout group size. Columns
+are dimension-level averages.
+
+Method
+
+Len. Fusion Rollout Total
+
+Rule-Fusion
+Focal
+GDPO
+RLVR2
+
+4936
+5570
+8581
+7344
+
+12.7
+20.5
+16.5
+10.9
+
+101.0
+149.4
+174.3
+160.2
+
+146.7
+222.3
+259.9
+235.4
+
+Table 5: Runtime overhead. Rubric inference is shared across methods and excluded.
+
+Rollout group size. We vary G ∈ {4, 8, 16} for 50 training steps with all other settings fixed.
+Larger groups provide more within-group comparisons but incur proportional rollout cost. Table 4
+shows that RLVR2 + is relatively stable across the tested group sizes: the overall average varies only
+from 63.35 to 63.82, with G = 8 providing a practical trade-off between comparison density, query
+diversity, and computation. Per-benchmark scores are reported in Appendix C.
+Computational overhead. Table 5 compares reward-aggregation overhead on Qwen3.5-9B with
+batch size 128 and G = 8. Rubric scoring is shared and excluded; fusion is measured on identical
+logged rollouts, while total step time also includes generation length. RLVR2 operates only on
+computed rubric outcomes and makes no additional rubric calls. Its fusion takes 10.9 seconds per
+step, compared with others approaches.
+Composition with adaptive rubric weighting. To test whether RLVR2 is complementary to
+existing rubric-level reweighting, we combine it with Focal Reward (Huang et al., 2025) without
+modifying either method. At the 106B scale, RLVR2 ⊕ Focal outperforms RLVR2 on all six
+benchmarks in Table 2b, showing that ordinal reward construction and saturation-aware rubric
+reweighting capture complementary aspects of the training signal.
+
+5
+
+R ELATED W ORK
+
+Rubric-based rewards for RLVR. Rubric-based grading has extended RLVR from tasks with
+well-defined correctness signals, such as mathematics and code, to open-ended generation with
+multiple quality requirements (Yu et al., 2026). Existing studies investigate rubric construction,
+rubric-grounded rollout scaffolding, and rubric-based reward modeling (?He et al., 2026; Li et al.,
+2026; Huang et al., 2025; Zhou et al., 2025; Zhang et al., 2026). Structured rubrics further organize
+evaluation across heterogeneous criteria (Starace et al., 2025; Condor et al., 2022). These works
+primarily focus on rubric design and use, leaving the aggregation of fixed, heterogeneous criterion
+outputs into a scalar policy-optimization signal largely unaddressed.
+Criterion-level reward aggregation. Existing methods mainly aggregate criterion scores in cardinal space using weighted sums, normalization, dependency modeling, or adaptive reweighting (Liu
+et al., 2026a; Lv et al., 2026; Tyagi et al., 2026). Related work also explores relative reward signals
+in group-based RL (Niu et al., 2026). However, these approaches largely rely on cardinal score aggregation and therefore require heterogeneous criteria to be normalized or otherwise aligned. They also
+typically treat auxiliary behavioral attributes as reward criteria, which can alter the objective rather
+than merely control their systematic influence. Detailed comparisons are provided in Appendix D.
+
+6
+
+C ONCLUSION
+
+We introduce RLVR2 , a verifiable ranking paradigm for reinforcement learning with heterogeneous
+criteria. Across three model scales and 16 benchmarks, RLVR2 consistently achieves leading
+performance while supporting attribute control and adaptive weighting. Future work will extend
+RLVR2 to broader tasks, verifiers, and ranking models.
+9
+
+A P REPRINT - S EPTEMBER 20, 2026
+
+E THICS STATEMENT
+This work studies reward fusion for RL post-training. No human subjects were involved and no
+human annotation was collected; all evaluation benchmarks are public research datasets used under
+their respective licenses. In addition, the LLM judges may output incorrect or unsafe content. Such
+content is not intended by the authors and does not reflect our views. Safety alignment of the judges
+is also not this papers focus.
+
+R EFERENCES
+Rahul K Arora, Jason Wei, Rebecca Soskin Hicks, Preston Bowman, Joaquin Quiñonero-Candela,
+Foivos Tsimpourlas, Michael Sharman, Meghan Shah, Andrea Vallone, Alex Beutel, et al. Healthbench: Evaluating large language models towards improved human health. arXiv preprint
+arXiv:2505.08775, 2025.
+Yushi Bai, Shangqing Tu, Jiajie Zhang, Hao Peng, Xiaozhi Wang, Xin Lv, Shulin Cao, Jiazheng Xu,
+Lei Hou, Yuxiao Dong, et al. Longbench v2: Towards deeper understanding and reasoning on
+realistic long-context multitasks. In Proceedings of the 63rd Annual Meeting of the Association for
+Computational Linguistics (Volume 1: Long Papers), pp. 3639–3664, 2025.
+Aubrey Condor, Zachary Pardos, and Marcia Linn. Representing scoring rubrics as graphs for
+automatic short answer grading. In International Conference on Artificial Intelligence in Education,
+pp. 354–365. Springer, 2022.
+DeepSeek-AI. Deepseek-r1: Incentivizing reasoning capability in llms via reinforcement learning.
+CoRR, abs/2501.12948, 2025.
+Kaustubh Deshpande, Ved Sirdeshmukh, Johannes Baptist Mols, Lifeng Jin, Ed-Yeremai HernandezCardona, Dean Lee, Jeremy Kritz, Willow E Primack, Summer Yue, and Chen Xing. Multichallenge: A realistic multi-turn conversation evaluation benchmark challenging to frontier llms. In
+Findings of the Association for Computational Linguistics: ACL 2025, pp. 18632–18702, 2025.
+Jiayi Fu, Xuandong Zhao, Chengyuan Yao, Heng Wang, Qi Han, and Yanghua Xiao. Reward shaping
+to mitigate reward hacking in rlhf. arXiv preprint arXiv:2502.18770, 2025.
+Jiawei Gu, Xuhui Jiang, Zhichao Shi, Hexiang Tan, Xuehao Zhai, Chengjin Xu, Wei Li, Yinghan
+Shen, Shengjie Ma, Honghao Liu, et al. A survey on llm-as-a-judge. The Innovation, 7(6), 2026.
+Anisha Gunjal, Anthony Wang, Elaine Lau, Vaskar Nath, Bing Liu, and Sean Hendryx. Rubrics as
+rewards: Reinforcement learning beyond verifiable domains. CoRR, abs/2507.17746, 2025.
+Taneesh Gupta, Shivam Shandilya, Xuchao Zhang, Rahul Madhavan, Supriyo Ghosh, Chetan Bansal,
+Huaxiu Yao, and Saravan Rajmohan. CARMO: dynamic criteria generation for context aware
+reward modelling. In ACL (Findings), volume ACL 2025 of Findings of ACL, pp. 2202–2261.
+Association for Computational Linguistics, 2025.
+Lukas Haas, Gal Yona, Giovanni D’Antonio, Sasha Goldshtein, and Dipanjan Das. Simpleqa
+verified: A reliable factuality benchmark to measure parametric knowledge. arXiv preprint
+arXiv:2509.07968, 2025.
+Yancheng He, Shilong Li, Jiaheng Liu, Yingshui Tan, Weixun Wang, Hui Huang, Xingyuan Bu,
+Hangyu Guo, Chengwei Hu, Boren Zheng, et al. Chinese simpleqa: A chinese factuality evaluation
+for large language models. In Proceedings of the 63rd Annual Meeting of the Association for
+Computational Linguistics (Volume 1: Long Papers), pp. 19182–19208, 2025.
+Yun He, Wenzhe Li, Hejia Zhang, Songlin Li, Karishma Mandyam, Sopan Khosla, Yuanhao Xiong,
+Nanshu Wang, Xiaoliang Peng, Beibin Li, et al. Advancedif: Rubric-based benchmarking and
+reinforcement learning for advancing llm instruction following. In Proceedings of the 64th
+Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pp.
+18003–18022, 2026.
+10
+
+A P REPRINT - S EPTEMBER 20, 2026
+
+Yu Huang, Zihua Zhao, Zhaoxin Huan, Wanli Gu, Feng Hong, Xinmu Ge, Lin Yuan, Weichang Wu,
+Qiang Hu, Xiaolu Zhang, Jun Zhou, and Jiangchao Yao. Focal reward: Balanced reinforcement
+learning under rubric-based rewards. CoRR, abs/2605.26579, 2026.
+Zenan Huang, Yihong Zhuang, Guoshan Lu, Zeyu Qin, Haokai Xu, Tianyu Zhao, Ru Peng, Jiaqi Hu,
+Zhanming Shen, Xiaomeng Hu, Xijun Gu, Peiyi Tu, Jiaxin Liu, Wenyu Chen, Yuzhuo Fu, Zhiting
+Fan, Yanmei Gu, Yuanyuan Wang, Zhengkai Yang, Jianguo Li, and Junbo Zhao. Reinforcement
+learning with rubric anchors. CoRR, abs/2508.12790, 2025.
+Mengzhao Jia, Zhihan Zhang, Ignacio Cases, Zheyuan Liu, Meng Jiang, and Peng Qi. Autorubric:
+Rubric-based generative rewards for faithful multimodal reasoning. In ACL (Findings), pp. 25707–
+25724. Association for Computational Linguistics, 2026a.
+Ruipeng Jia, Yunyi Yang, Yuxin Wu, Yongbo Gai, Siyuan Tao, Mengyu Zhou, Jianhe Lin, Xiaoxi
+Jiang, and Guanjun Jiang. Open rubric system: Scaling reinforcement learning with pairwise
+adaptive rubric. CoRR, abs/2602.14069, 2026b.
+Seungone Kim, Jay Shin, Joel Jang, Shayne Longpre, Hwaran Lee, Sangdoo Yun, Ryan Shin,
+Sungdong Kim, James Thorne, Minjoon Seo, et al. Prometheus: Inducing fine-grained evaluation
+capability in language models. In International Conference on Learning Representations, volume
+2024, pp. 29927–29962, 2024.
+Satyapriya Krishna, Kalpesh Krishna, Anhad Mohananey, Steven Schwarcz, Adam Stambler, Shyam
+Upadhyay, and Manaal Faruqui. Fact, fetch, and reason: A unified evaluation of retrievalaugmented generation, 2024. URL https://arxiv.org/abs/2409.12941.
+Nathan Lambert. Reinforcement learning from human feedback, 2026. URL https://arxiv.
+org/abs/2504.12501.
+Nathan Lambert and Roberto Calandra. The alignment ceiling: Objective mismatch in reinforcement
+learning from human feedback, 2024. URL https://arxiv.org/abs/2311.00168.
+Sunzhu Li, Jiale Zhao, Huimin Ren, Zhenlin Wei, Yang Zhou, Jingwen Yang, Shunyu Liu, Kaike
+Zhang, and Chen Wei. Rubrichub: A comprehensive and highly discriminative rubric dataset via
+automated coarse-to-fine generation. In Proceedings of the 64th Annual Meeting of the Association
+for Computational Linguistics (Volume 1: Long Papers), pp. 31320–31344, 2026.
+Tianle Li, Wei-Lin Chiang, Evan Frick, Lisa Dunlap, Tianhao Wu, Banghua Zhu, Joseph E Gonzalez,
+and Ion Stoica. From crowdsourced data to high-quality benchmarks: Arena-hard and benchbuilder
+pipeline. arXiv preprint arXiv:2406.11939, 2024.
+Shih-Yang Liu, Xin Dong, Ximing Lu, Shizhe Diao, Peter Belcak, Mingjie Liu, Min-Hung
+Chen, Hongxu Yin, Yu-Chiang Frank Wang, Kwang-Ting Cheng, et al. Gdpo: Group rewarddecoupled normalization policy optimization for multi-reward rl optimization. arXiv preprint
+arXiv:2601.05242, 2026a.
+Tianci Liu, Ran Xu, Tony Yu, Ilgee Hong, Carl Yang, Tuo Zhao, and Haoyu Wang. Openrubrics:
+Towards scalable synthetic rubric generation for reward modeling and LLM alignment. In ACL (1),
+pp. 17417–17437. Association for Computational Linguistics, 2026b.
+Yang Liu, Dan Iter, Yichong Xu, Shuohang Wang, Ruochen Xu, and Chenguang Zhu. G-eval: Nlg
+evaluation using gpt-4 with better human alignment. In Proceedings of the 2023 conference on
+empirical methods in natural language processing, pp. 2511–2522, 2023.
+Can Lv, Mingju Chen, Heng Chang, and Shiji Zhou. Mitigating false credit propagation: Probabilistic graphical reward aggregation for rubric-based reinforcement learning. arXiv preprint
+arXiv:2606.03361, 2026.
+Michael Mandler. Compromises between cardinality and ordinality in preference theory and social
+choice. Available at SSRN 284849, 2001.
+Wenzhe Niu, Wei He, Zongxia Xie, Jinpeng Ou, Huichuan Fan, Yuchen Ge, Yanru Sun, Ziyin
+Wang, Yizhao Sun, Chengshun Shi, et al. From absolute to relative: Rethinking reward shaping in
+group-based reinforcement learning. arXiv preprint arXiv:2601.23058, 2026.
+11
+
+A P REPRINT - S EPTEMBER 20, 2026
+
+Samuel J. Paech. Eq-bench: An emotional intelligence benchmark for large language models, 2023.
+Giseung Park, Woohyeon Byeon, Seongmin Kim, Elad Havakuk, Amir Leshem, and Youngchul Sung.
+The max-min formulation of multi-objective reinforcement learning: From theory to a model-free
+algorithm. arXiv preprint arXiv:2406.07826, 2024.
+Valentina Pyatkin, Saumya Malik, Victoria Graf, Hamish Ivison, Shengyi Huang, Pradeep Dasigi,
+Nathan Lambert, and Hanna Hajishirzi. Generalizing verifiable instruction following. Advances in
+Neural Information Processing Systems, 38, 2026.
+Yanzhao Qin, Tao Zhang, Yanjun Shen, Wenjing Luo, Haoze Sun, Yan Zhang, Yujing Qiao, Weipeng
+Chen, Zenan Zhou, Wentao Zhang, et al. Sysbench: Can large language models follow system
+messages? arXiv preprint arXiv:2408.10943, 2024.
+Qwen Team. Qwen3.5: Towards native multimodal agents, February 2026. URL https://qwen.
+ai/blog?id=qwen3.5.
+David Rein, Betty Li Hou, Asa Cooper Stickland, Jackson Petty, Richard Yuanzhe Pang, Julien Dirani,
+Julian Michael, and Samuel R Bowman. Gpqa: A graduate-level google-proof q&a benchmark.
+arXiv preprint arXiv:2311.12022, 2023.
+John Schulman, Filip Wolski, Prafulla Dhariwal, Alec Radford, and Oleg Klimov. Proximal policy
+optimization algorithms. arXiv preprint arXiv:1707.06347, 2017.
+Zhihong Shao, Peiyi Wang, Qihao Zhu, Runxin Xu, Junxiao Song, Mingchuan Zhang, Y. K. Li,
+Y. Wu, and Daya Guo. Deepseekmath: Pushing the limits of mathematical reasoning in open
+language models. CoRR, abs/2402.03300, 2024.
+Lingfeng Shen, Sihao Chen, Linfeng Song, Lifeng Jin, Baolin Peng, Haitao Mi, Daniel Khashabi,
+and Dong Yu. The trickle-down impact of reward (in-)consistency on rlhf, 2023. URL https:
+//arxiv.org/abs/2309.16155.
+Giulio Starace, Oliver Jaffe, Dane Sherburn, James Aung, Jun Shern Chan, Leon Maksin, Rachel
+Dias, Evan Mays, Benjamin Kinsella, Wyatt Thompson, et al. Paperbench: evaluating ai’s ability
+to replicate ai research. arXiv preprint arXiv:2504.01848, 2025.
+Hao Sun, Yunyi Shen, and Jean-Francois Ton. Rethinking bradley-terry models in preference-based
+reward modeling: Foundations, theory, and alternatives. arXiv preprint arXiv:2411.04991, 2024.
+Artificial Analysis Team. Artificial analysis long context reasoning benchmark(lcr), 2025.
+Utkarsh Tyagi, Xingang Guo, MohammadHossein Rezaei, Daniel George, Anas Mahmoud, Jackson
+Lee, Bing Liu, and Yunzhong He. Not every rubric teaches equally: Policy-aware rubric rewards
+for rlvr. arXiv preprint arXiv:2605.20164, 2026.
+Vijay Viswanathan, Yanchao Sun, Xiang Kong, Meng Cao, Graham Neubig, and Sherry Wu. Checklists are better than reward models for aligning language models. In NeurIPS, 2025.
+Xiaohua Wang, Muzhao Tian, Yuqi Zeng, Zisu Huang, Jiakang Yuan, Bowen Chen, Jingwen Xu,
+Mingbo Zhou, Wenhao Liu, Muling Wu, et al. Reward hacking in the era of large models:
+Mechanisms, emergent misalignment, challenges. arXiv preprint arXiv:2604.13602, 2026a.
+Xinpeng Wang, Nitish Joshi, Barbara Plank, Rico Angell, and He He. Is it thinking or cheating?
+detecting implicit reward hacking by measuring reasoning effort. In International Conference on
+Learning Representations, volume 2026, pp. 96956–96981, 2026b.
+Yubo Wang, Xueguang Ma, Ge Zhang, Yuansheng Ni, Abhranil Chandra, Shiguang Guo, Weiming
+Ren, Aaran Arulraj, Xuan He, Ziyan Jiang, et al. Mmlu-pro: A more robust and challenging multitask language understanding benchmark. Advances in Neural Information Processing Systems, 37:
+95266–95290, 2024.
+Xi Ye, Fangcong Yin, Yinghui He, Joie Zhang, Howard Yen, Tianyu Gao, Greg Durrett, and Danqi
+Chen. Longproc: Benchmarking long-context language models on long procedural generation.
+arXiv preprint arXiv:2501.05414, 2025.
+12
+
+A P REPRINT - S EPTEMBER 20, 2026
+
+Howard Yen, Tianyu Gao, Minmin Hou, Ke Ding, Daniel Fleischer, Peter Izsak, Moshe Wasserblat,
+and Danqi Chen. Helmet: How to evaluate long-context models effectively and thoroughly. In
+International Conference on Learning Representations, volume 2025, pp. 98914–98965, 2025.
+Qiying Yu, Zheng Zhang, Ruofei Zhu, Yufeng Yuan, Xiaochen Zuo, Yu Yue, Weinan Dai, Tiantian
+Fan, Gaohong Liu, Lingjun Liu, Xin Liu, Haibin Lin, Zhiqi Lin, Bole Ma, Guangming Sheng,
+Yuxuan Tong, Chi Zhang, Mofan Zhang, Wang Zhang, Hang Zhu, Jinhua Zhu, Jiaze Chen, Jiangjie
+Chen, Chengyi Wang, Hongli Yu, Yuxuan Song, Xiangpeng Wei, Hao Zhou, Jingjing Liu, WeiYing Ma, Ya-Qin Zhang, Lin Yan, Mu Qiao, Yonghui Wu, and Mingxuan Wang. Dapo: An
+open-source llm reinforcement learning system at scale, 2025. URL https://arxiv.org/
+abs/2503.14476.
+Qiying Yu, Zheng Zhang, Ruofei Zhu, Yufeng Yuan, Xiaochen Zuo, Yu Yue, Weinan Dai, Tiantian
+Fan, Gaohong Liu, Lingjun Liu, et al. Dapo: An open-source llm reinforcement learning system at
+scale. Advances in Neural Information Processing Systems, 38:113222–113244, 2026.
+Yu Yuan, Yaoyou Fan, Lili Zhao, Guangting Zheng, Kai Zhang, Lu Pan, Ke Zeng, and Qi Liu.
+Uncovering and mitigating aggregation-induced reward hacking in multi-reward reinforcement
+learning, 2026. URL https://arxiv.org/abs/2609.00213.
+Aohan Zeng, Xin Lv, Qinkai Zheng, Zhenyu Hou, Bin Chen, Chengxing Xie, Cunxiang Wang,
+Da Yin, Hao Zeng, Jiajie Zhang, et al. Glm-4.5: Agentic, reasoning, and coding (arc) foundation
+models. arXiv preprint arXiv:2508.06471, 2025.
+Junjie Zhang, Guozheng Ma, Shunyu Liu, Haoyu Wang, Jiaxing Huang, Ting-En Lin, Fei Huang,
+Yongbin Li, and Dacheng Tao. A simple" motivation" can enhance reinforcement finetuning of
+large reasoning models. In International Conference on Learning Representations, volume 2026,
+pp. 44166–44187, 2026.
+Chujie Zheng, Shixuan Liu, Mingze Li, Xiong-Hui Chen, Bowen Yu, Chang Gao, Kai Dang, Yuqiong
+Liu, Rui Men, An Yang, Jingren Zhou, and Junyang Lin. Group sequence policy optimization,
+2025. URL https://arxiv.org/abs/2507.18071.
+Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan Zhuang, Zhanghao Wu, Yonghao Zhuang,
+Zi Lin, Zhuohan Li, Dacheng Li, Eric Xing, et al. Judging llm-as-a-judge with mt-bench and
+chatbot arena. Advances in neural information processing systems, 36:46595–46623, 2023.
+Jeffrey Zhou, Tianjian Lu, Swaroop Mishra, Siddhartha Brahma, Sujoy Basu, Yi Luan, Denny
+Zhou, and Le Hou. Instruction-following evaluation for large language models. arXiv preprint
+arXiv:2311.07911, 2023.
+Yang Zhou, Sunzhu Li, Shunyu Liu, Wenkai Fang, Kongcheng Zhang, Jiale Zhao, Jingwen Yang, Yihe
+Zhou, Jianwei Lv, Tongya Zheng, et al. Breaking the exploration bottleneck: Rubric-scaffolded
+reinforcement learning for general llm reasoning. arXiv preprint arXiv:2508.16949, 2025.
+
+13
+
+A P REPRINT - S EPTEMBER 20, 2026
+
+A
+
+DATASET AND B ENCHMARK
+
+In this section, we discuss the training dataset and evaluation dataset used in our experiments.
+(a) General-chat training mixture.
+Domain
+
+(b) Agentic training mixture.
+
+# Queries
+
+Instruction following
+Open-ended generation
+Factuality & QA
+Long-context understanding
+Multi-turn dialogue
+
+24,900
+11,881
+8,819
+8,100
+2,400
+
+Total
+
+56,100
+
+Task family
+
+# Queries
+
+Software engineering
+Reasoning
+Data-analysis agents
+Function-calling agents
+Computer-use/coding agents
+Domain-specific agents
+
+25,591
+18,515
+15,289
+3,618
+718
+389
+
+Total
+
+64,120
+
+Table 6: Composition of the two-stage training data. Internal data sources are grouped into broad
+domains and task families.
+A.1
+
+T RAINING DATASET S TATISTICS
+
+Table 6a summarizes the composition of our 56.1k-query training mixture. The data is organized
+into five broad domains that jointly cover the six capability dimensions evaluated in Section 4.1:
+instruction following, open-ended chat and generation, factuality and QA, long-context, and multi-turn
+dialogue. Instruction following is the largest domain (24.9k, roughly 44% of the mixture), reflecting
+our emphasis on precise constraint satisfaction and its central role in aligning model behavior with
+user intent; it spans a diverse set of constraint types, including format, length, conditional, and
+cross-lingual instructions, in both English and Chinese. The remaining domains balance open-ended
+generation, short- and long-form factual QA, long-context comprehension, and multi-turn consistency,
+so that the policy is exposed to both rule-verifiable and open-ended tasks during training. Each query
+is trained with a maximum decode length of 16,384 tokens. Each query activates a task-dependent
+subset of the shared rubric library, producing binary, discrete, or continuous criterion scores. All
+compared aggregation methods use the same training queries, active criteria, scoring procedures,
+and judges; they differ in how the resulting criterion scores are synthesized for policy optimization.
+To preserve anonymity, internal data sources are referred to by generic capability labels rather than
+product names.
+A.2
+
+AGENTIC T RAINING DATASET
+
+For the agentic experiments, we use an additional mixture of 64,120 queries spanning software
+engineering, reasoning, data analysis, function calling, computer-use and coding agents, and other
+domain-specific agent tasks. Table 6b reports its composition. Software-engineering tasks form the
+largest component and include repository-level problem solving, code repair, code understanding,
+and related coding-agent settings. Data-analysis tasks require agents to inspect files and structured
+data using tools, while function-calling tasks evaluate selecting and invoking external functions. The
+reasoning component broadens the mixture with logic, science, mathematics, and general problemsolving queries. Every example includes a verifier and a length-penalty configuration; tool definitions
+are provided when required by the task. All compared methods use the same queries, tools, verifiers,
+and training settings, differing only in reward construction.
+
+B
+
+C RITERION LIST
+
+This section catalogs representative criteria from the rubric library used in our experiments. The
+library contains more than 180 criteria, with task-dependent subsets activated for each query. Each
+criterion is given a descriptive name, a one-line description, its semantic family, and its output
+value domain: Binary {0, 1}, Ternary {0, 0.5, 1}, Continuous [0, 1], or Multi (other discrete sets, e.g.
+{−1, 0, 1}). Criteria are split into two groups: base criteria emit positive quality signals (Table 7),
+while penalty criteria detect low-quality behavior and subtract from the score (Table 8).
+14
+
+A P REPRINT - S EPTEMBER 20, 2026
+
+Table 7: Base criteria (positive quality signals), grouped by semantic family.
+Criterion
+
+Description
+
+Value
+
+Comprehensive content quality
+GeneralQuality
+LLM-based overall quality score
+BusinessScenarioQuality
+Holistic quality in a business scenario
+CoreIntentMatch
+Core-intent understanding & relevance
+TaskTypeMatch
+Correctness of task-type recognition
+
+Continuous
+Multi
+Binary
+Binary
+
+Content faithfulness & memory
+CoreFactAccuracy
+Coverage/correctness of core facts
+NonCoreFactAccuracy
+Coverage/correctness of non-core facts
+MaterialFaithfulness
+Faithfulness to provided source material
+MultiTurnMemory
+Context consistency across dialogue turns
+
+Ternary
+Ternary
+Binary
+Binary
+
+Format compliance
+GeneralFormatCompliance
+FormatRequirement
+TextTypeMatch
+BulletCount
+HighlightCount
+ParagraphCount
+CaseFormat
+TitleFormat
+QuotationFormat
+Postscript
+PromptRepeat
+ConstrainedResponse
+ConstrainedWriting
+SummaryRecall
+
+General structural/formatting compliance
+Explicit format-requirement satisfaction
+Correct text type/genre (email, article)
+Number of bullet-list items
+Number of highlighted sections
+Number of paragraphs
+Upper/lower-case formatting requirement
+Title presence and format
+Quotation formatting requirement
+Required postscript section
+Must restate the original prompt first
+Response limited to a fixed option set
+Constrained creative writing (acrostic)
+Recall-based summary coverage
+
+Third-party benchmark detectors
+IFBench
+IFBench format/logic check
+MultiIF
+Multi-IF benchmark check
+Collie
+Collie benchmark check
+ComplexBench
+ComplexBench benchmark check
+LiveBench
+LiveBench benchmark check
+
+Binary
+Binary
+Binary
+Binary
+Binary
+Binary
+Binary
+Binary
+Binary
+Binary
+Binary
+Binary
+Multi
+Continuous
+Multi
+Multi
+Multi
+Continuous
+Continuous
+
+Length & counting
+WordCount
+SentenceCount
+EntryCount
+LetterFrequency
+
+Word/char count constraint
+Sentence-count constraint
+Number of entries
+English letter-frequency constraint
+
+Binary
+Binary
+Binary
+Binary
+
+Language & locale
+LanguageRequirement
+LanguageDetection
+CrossLingualInstruction
+
+Required output language
+Detected language of the response
+Cross-lingual instruction compliance
+
+Binary
+Binary
+Binary
+
+Style & wording
+DialogueStyle
+DictionRequirement
+
+Consistency of dialogue style
+Diction / wording-norm requirement
+
+Binary
+Binary
+
+Identity & capability boundary
+RoleConsistency
+Identity/role consistency requirement
+CapabilityBoundary
+Capability-boundary / identity limits
+
+Binary
+Binary
+
+Content presence & matching
+Keyword
+Required keyword presence
+ForbiddenContent
+Forbidden word/content detection
+GroundTruthMatch
+Match against a gold answer
+
+Binary
+Binary
+Binary
+
+15
+
+A P REPRINT - S EPTEMBER 20, 2026
+
+Table 8: Penalty criteria (low-quality signals that subtract from the score).
+Criterion
+
+Description
+
+Value
+
+GeneralLowQuality
+RoboticTemplate
+Verbosity
+Affectation
+ImproperWording
+LogicalError
+UnrealisticContent
+SecurityRisk
+
+Perfunctory / template-like output
+Robotic/templated output detection
+Redundancy / conciseness penalty
+Affected / overwrought wording
+Improper wording detection
+Logical-error detection
+Unrealistic / non-factual content
+Security-risk detection
+
+Binary
+Binary
+Binary
+Binary
+Binary
+Binary
+Binary
+Binary
+
+B.1
+
+E VALUATION B ENCHMARKS S TATISTICS
+
+SysBench. SysBench (Qin et al., 2024) evaluates whether large language models can reliably follow
+system messages. It assesses models along constraint following, instruction misalignment, and
+multi-turn stability, targeting the gap between stated system-level requirements and actual model
+behavior.
+AdvancedIF. AdvancedIF (He et al., 2026) is a rubric-based benchmark for advanced instruction
+following. Each prompt is paired with a set of expert-written rubric criteria, enabling fine-grained
+evaluation of whether a response satisfies complex, compositional instructions beyond surface-level
+compliance.
+IFEval. IFEval (Zhou et al., 2023) measures instruction following through automatically verifiable
+instructions, such as constraints on output length, format, or the inclusion of specified keywords.
+Because compliance is checked programmatically rather than by a judge, the benchmark provides an
+objective, low-noise signal of instruction adherence.
+IFBench. IFBench (Pyatkin et al., 2026) extends verifiable instruction following to a broader and
+more diverse set of constraints, emphasizing generalization to instruction types not seen during
+training. It is designed to test whether models follow the underlying intent of a constraint rather than
+overfitting to a fixed instruction template.
+MultiChallenge. MultiChallenge (Deshpande et al., 2025) is a realistic multi-turn conversation
+benchmark that is challenging for frontier LLMs. It evaluates a model’s ability to maintain instruction
+adherence and contextual consistency across multiple dialogue turns, where earlier constraints must
+continue to hold in later responses.
+LongBench-v2. LongBench-v2 (Bai et al., 2025) targets deeper understanding and reasoning over
+realistic long-context multitasks. It spans a range of long-document scenarios and requires genuine
+comprehension and multi-step reasoning rather than simple retrieval from the context.
+LongProc. LongProc (Ye et al., 2025) benchmarks long-context language models on long procedural generation, where a model must produce lengthy, structured outputs by following multi-step
+procedures. It stresses both long-context comprehension and long-form generation consistency.
+HELMET. HELMET (Yen et al., 2025) is a benchmark for evaluating long-context models effectively
+and thoroughly across diverse application-driven categories. It is designed to provide a more reliable
+and comprehensive picture of long-context capability than single-task or synthetic evaluations.
+AA-LCR. The Artificial Analysis Long Context Reasoning benchmark (AA-LCR) (Team, 2025)
+evaluates reasoning over long inputs, requiring models to integrate and reason over information
+distributed across an extended context rather than locate a single passage.
+SimpleQA-verified. SimpleQA-verified (Haas et al., 2025) is a reliable factuality benchmark
+that measures a model’s parametric knowledge through short, fact-seeking questions with verified
+reference answers. Its verified answer set is intended to reduce label noise and provide a trustworthy
+factuality signal.
+16
+
+A P REPRINT - S EPTEMBER 20, 2026
+
+Instruction Following
+Method
+
+Compr.
+
+Rule-Fusion ✗
+RLVR2 +
+9B RLVR2 +
+RLVR2 +
+RLVR2 +
+RLVR2 +
+
+✗
+on
+0.25
+0.50
+0.75
+
+SysB
+
+AdvIF
+
+LB-v2
+
+32.01 81.75 25.86 74.64 55.33 80.68 80.39 86.65
+
+76.44
+73.80
+74.04
+75.40
+74.60
+
+69.50
+68.91
+70.63
+69.31
+70.36
+
+32.21
+32.21
+32.80
+33.00
+32.80
+
+82.55
+81.14
+81.76
+81.64
+83.10
+
+26.00
+26.20
+26.47
+23.51
+26.03
+
+Frm
+
+76.21
+75.36
+75.24
+76.09
+75.73
+
+AA-L
+
+Open
+
+CSQA
+
+12.20
+11.83
+14.11
+14.19
+13.36
+
+HLM
+
+Know.
+
+67.13
+
+73.81
+72.11
+72.45
+70.75
+77.21
+
+LProc
+
+Reason.
+
+SQA-v
+
+92.61
+92.05
+91.13
+91.68
+92.42
+
+IFB
+
+Long-Context
+
+74.12 62.23 90.76 48.59 11.60
+65.56
+64.95
+63.50
+65.29
+66.69
+
+IFE
+
+Factuality & QA
+
+60.00
+61.33
+57.33
+59.00
+59.67
+
+GPQA MMLU EQB3
+
+81.94
+80.68
+83.08
+81.19
+81.31
+
+81.11
+80.85
+80.72
+81.41
+81.31
+
+85.65
+85.85
+87.30
+85.30
+85.60
+
+Table 9: Effect of thinking-efficiency compression. All rows use the same 9B backbone with
+settings otherwise fixed. MultiChallenge and ArenaHard-v2 are omitted. Judge models and scoring
+protocols are given in Appendix B.1.
+ChineseSimpleQA. ChineseSimpleQA (He et al., 2025) is a Chinese factuality evaluation for large
+language models, consisting of short fact-seeking questions in Chinese. It provides a factuality signal
+complementary to the English benchmarks and covers a broad range of knowledge domains.
+Frames. Frames (Krishna et al., 2024) provides a unified evaluation of retrieval-augmented generation, jointly assessing factuality, retrieval, and reasoning. It requires models to fetch relevant evidence
+and reason over it to arrive at correct answers, rather than testing these abilities in isolation.
+GPQA. GPQA (Rein et al., 2023) is a graduate-level, “Google-proof” multiple-choice questionanswering benchmark spanning biology, chemistry, and physics, with questions ranging from advanced undergraduate to postgraduate difficulty. The questions are constructed so that they cannot be
+answered reliably through simple web search, testing deep domain reasoning.
+MMLU-Pro. MMLU-Pro (Wang et al., 2024) is a more robust and challenging multi-task language
+understanding benchmark. It extends MMLU with harder, reasoning-intensive questions and an
+expanded answer-option set, reducing the effect of guessing and providing a stronger measure of
+broad knowledge.
+ArenaHard-v2. ArenaHard-v2 (Li et al., 2024) is a high-quality open-ended benchmark constructed
+from crowdsourced conversational data via the Arena-Hard / BenchBuilder pipeline. It consists of
+challenging open-ended prompts and is designed to correlate well with human preference on real
+user queries.
+EQBench3. EQBench3 (Paech, 2023) evaluates emotional intelligence in open-ended dialogue,
+scoring responses on their handling of interpersonal and affective content in multi-turn role-play
+scenarios rather than on task correctness. It complements ArenaHard-v2 by probing a dimension of
+open-ended quality that correctness-oriented judges do not capture.
+
+C
+
+ROLLOUT S IZE D ETAIL I MPACT
+
+We report per-benchmark results for the rollout-group-size ablation. All settings other than the group
+size are held fixed.
+Instruction Following
+
+Factuality & QA
+
+Rollout Size
+
+SysB
+
+4
+8
+16
+
+73.76 62.67 91.68 71.49 68.33
+76.88 62.70 90.39 68.71 68.56
+73.64 61.70 91.87 71.41 68.73
+
+AdvIF
+
+IFE
+
+IFB
+
+MChal SQA-v
+10.8
+14.4
+11.4
+
+Long-Context
+LProc
+
+HLM
+
+Reason.
+Frm
+
+AA-L
+
+Know.
+
+Open-ended
+
+CSQA
+
+LB-v2
+
+GPQA MMLU AH-v2 EQB3
+
+66.73
+65.67
+66.67
+
+33.20 82.21 25.80 76.09 57.67 82.83 80.67 49.60 85.75
+31.81 80.30 26.52 75.36 61.67 81.19 81.28 49.30 86.30
+32.01 80.00 26.57 75.12 57.00 79.80 80.98 51.30 85.35
+
+Table 10: Comparison of rollout group size. Judge models and scoring protocols are described in
+Appendix B.1.
+
+C.1
+
+S CORE -R EPRESENTATION ROBUSTNESS
+
+We conduct a controlled robustness experiment using real rollout data from the baseline run.
+The comparison replays multiple aggregation rules on exactly the same response groups, avoid17
+
+A P REPRINT - S EPTEMBER 20, 2026
+
+Table 11: Robustness to order-preserving score transformations. Results are computed on
+identical G = 8 response groups before and after transforming one criterion. Higher values indicate
+greater stability.
+Groups
+
+Sign agreement (%)
+
+Spearman ρ
+
+Cardinal
+Normalized cardinal
+RLVR2 –BT
+
+672
+672
+672
+
+92.52
+98.75
+100.00
+
+0.9783
+0.9985
+1.0000
+
+UniLLM
+
+Cardinal
+Normalized cardinal
+RLVR2 –BT
+
+194
+194
+194
+
+95.88
+99.16
+100.00
+
+0.9651
+0.9921
+1.0000
+
+UniBusiness
+
+Cardinal
+Normalized cardinal
+RLVR2 –BT
+
+954
+954
+954
+
+95.83
+97.68
+100.00
+
+0.99997
+0.99925
+1.0000
+
+Criterion
+
+Aggregation
+
+IFBench
+
+ing differences caused by distinct sampled responses. We retain groups with exactly G = 8
+unique responses and require every retained criterion to have a finite score in [0, 1] for all responses in the group. Quality-gate verifiers and aggregation-derived fields are excluded from
+the criterion matrix, including RepeatSegmentVerifier, focal_score, gdpo_prenorm,
+gdpo_reward, original_reward, and sc_fused_score.
+For each retained group, we construct a criterion matrix from the original scores and replay each
+aggregation rule before and after transforming one target criterion. The transformations preserve
+within-criterion ordering while changing numerical spacing. Specifically, we multiply IFBench scores
+by 10, remap the UniLLM score levels from (0, 0.2, 1) to (0, 1, 100), and square the UniBusiness
+scores. We compare raw cardinal summation, group-wise z-score normalization, and RLVR2 . For
+RLVR2 , every criterion is converted into pairwise win/tie/loss outcomes within the group, and a
+Bradley–Terry utility is fitted from these outcomes before criterion-level fusion. Thus, the experiment
+evaluates the stability of the final fused signal rather than only the stability of an individual criterion
+ranking.
+Here, “Sign agr.” is the fraction of responses whose sign relative to the group-mean fused reward
+is unchanged before and after transformation. Spearman correlation measures agreement of the
+resulting within-group reward ordering. The invariance result is conditional on the transformation
+preserving the pairwise outcome matrix, including any tie decisions. With a nonzero tie margin, a
+numerical transformation can change which pairs are treated as ties; such transformations are outside
+the strict invariance claim.
+
+D
+
+E XTENDED R ELATED W ORK
+
+Open-ended generation is commonly evaluated through multidimensional LLM-as-a-judge protocols
+(Zheng et al., 2023; Liu et al., 2023; Gu et al., 2026). Rubrics make these judgments interpretable
+by decomposing response quality into fine-grained criteria (Kim et al., 2024; Arora et al., 2025).
+Rubric-guided RL subsequently uses such criteria in several forms, including instance-specific
+rewards (?), instruction-following pipelines (He et al., 2026), automatically scaled datasets (Li et al.,
+2026), reward anchors (Huang et al., 2025), rollout scaffolds (Zhou et al., 2025), and in-context
+specifications (Zhang et al., 2026). RLVR2 complements these approaches by focusing on the
+downstream aggregation of heterogeneous criterion-level judgments into a scalar training signal.
+Existing aggregation methods span flat, structured, and adaptive formulations. Weighted sums treat
+rubric items as independent components (?Li et al., 2026), while hierarchical subtasks and rubric
+graphs organize dependencies among criteria (Starace et al., 2025; Condor et al., 2022). Group
+reward-decoupled normalization and policy-aware reweighting adapt the contribution of cardinal
+reward components (Liu et al., 2026a; Tyagi et al., 2026). GEAR instead propagates soft suppression
+over a query-specific rubric graph to prevent unsupported criteria from contributing utility (Lv et al.,
+2026). RLVR2 occupies a complementary position: it aggregates criterion-wise ordinal comparisons
+18
+
+A P REPRINT - S EPTEMBER 20, 2026
+
+and applies explicit quality-level gating, combining reduced dependence on cross-criterion calibration
+with non-compensatory quality control.
+
+19
+
+

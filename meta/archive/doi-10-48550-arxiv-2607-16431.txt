@@ -1,0 +1,2025 @@
+Published as a conference paper at COLM 2026
+
+R IMS: Preference Optimization via Smoothed Multi-pair Aggregation for Small-Scale LLM Retrieval-Augmented Generation
+Pei Tian1 , Zihan Dong2 , Tianci Liu3 , Linjun Zhang2 , Haoyu Wang4
+1 Department of Computer Science, Columbia University
+2 Department of Statistics, Rutgers University
+3 School of Electrical and Computer Engineering, Purdue University
+4 Departiment of Computer Science, SUNY Albany
+pt2632@columbia.edu;hwang28@albany.edu
+
+arXiv:2607.16431v1 [cs.CL] 17 Jul 2026
+
+Abstract
+Small-scale language models (SLMs) are attractive for retrieval-augmented generation (RAG) in resource-constrained settings, but their limited capacity makes
+them highly sensitive to noisy or spurious retrieved evidence. Existing preferencebased methods such as RoseRAG select only the hardest single preference pair
+via hard argmin/argmax, discarding the remaining signal; others treat multiple
+pairs as independent binary comparisons, resulting in low data utilization. We
+propose R IMS, a three-stage preference optimization framework comprising (1)
+synthetic chain-of-thought preference data generation via rejection sampling using the target SLM itself without relying on proprietary models, (2) a differentiable soft aggregation mechanism that replaces hard selection with a smooth
+operator, preserving gradient signal from all preference pairs while retaining the
+discriminative structure of margin-aware selection, and (3) preference optimization with the smoothed objective applied to multiple alignment algorithms. We
+theoretically show that the smoothed approximation admits a controllable error
+bound and that smooth aggregation yields provably tighter gradient alignment
+to the oracle objective than hard selection. Experiments on four multi-hop question answering benchmarks show that our approach outperforms state-of-the-art
+baselines across multiple SLM backbones, achieving consistent gains in Exact
+Match and F1 under noisy retrieval conditions. Our implementation is available at
+https://github.com/tptrix29/RIMS.
+
+1
+
+Introduction
+
+Large language models (LLMs) (Achiam et al., 2023; Comanici et al., 2025; Yang et al., 2025;
+Grattafiori et al., 2024) have achieved strong performance across many natural language tasks
+by learning vast amounts of linguistic and world knowledge during pretraining. However, their
+high computational and memory requirements limit practical deployment in resource-constrained
+environments such as on-device systems or low-infrastructure settings (Zhou et al., 2024; Xu et al.,
+2024b). To address this, small-scale language models (SLMs) with dramatically fewer parameters
+have become a promising alternative due to their lower inference cost, portability, and ease of
+deployment (Belcak et al., 2025; Lu et al., 2025; Vernikos et al., 2024).
+Despite their computational efficiency, SLMs inherently cannot internalize as much knowledge
+as larger models, and their reduced capacity often leads to weaker semantic understanding and
+generalization on knowledge-intensive tasks (Ovadia et al., 2024). Retrieval-augmented generation
+(RAG) (Lewis et al., 2021; Gao et al., 2023; Jiang et al., 2023) offers a natural remedy by coupling
+the model with an external knowledge source, allowing it to answer queries that require up-to-date
+or domain-specific information beyond its pretrained parameters. Applying RAG to SLMs can
+substantially enhance performance by offloading factual grounding to an external retrieval component
+(Wang et al., 2023; Asai et al., 2024; Xu et al., 2025). Yet even with RAG, robust integration of
+retrieved content remains challenging for small models: their limited capacity makes it difficult to
+distinguish relevant evidence from distractors, to reason over multiple retrieved passages, and to
+suppress noisy or contradictory context during generation (Yoran et al., 2024; Liu et al., 2025). This
+1
+
+Published as a conference paper at COLM 2026
+
+underscores the need for mechanisms that go beyond retrieval quality and directly improve how
+SLMs learn to utilize imperfect evidence.
+Existing methods for improving SLM robustness under RAG fall into three broad categories. Promptbased approaches (Wang et al., 2025a; 2024) instruct the model to disregard irrelevant retrieved
+content, but their effectiveness hinges on the model’s own ability to identify noise, an assumption
+that often fails for SLMs. Supervised fine-tuning (SFT) (Yoran et al., 2024; Wei et al., 2025) aligns
+models with curated instruction–response pairs, yet is highly sensitive to noise in retrieved contexts
+and prone to overfitting on imperfect evidence (Chu et al., 2025), particularly for capacity-limited
+SLMs. A third line of work, preference optimization (Rafailov et al., 2024; Xu et al., 2024a; Hong
+et al., 2024; Ethayarajh et al., 2024; Meng et al., 2024), offers a more flexible alternative by learning
+from relative quality signals rather than fixed targets (Liu et al., 2025; Chen et al., 2024). However,
+effectively constructing and utilizing preference data under noisy RAG conditions remains an open
+challenge.
+In RAG settings, preference optimization is particularly appealing because it learns from relative
+quality comparisons rather than treating any single response as ground truth, making it naturally
+more robust to noisy retrieved contexts than supervised fine-tuning. Moreover, by sampling multiple
+responses per query through techniques such as rejection sampling with chain-of-thought prompting,
+one can readily obtain multiple preferred and non-preferred candidates, yielding rich multi-pair
+preference data for each training instance. Despite the abundance of such supervision, existing
+methods utilize only a small fraction of it. Concretely, when multiple preference pairs are available
+for a single query, RoseRAG (Liu et al., 2025) selects only the single hardest pair based on the initial
+model’s likelihoods, discarding the remaining signal entirely and fixing the selection throughout
+training even as the policy evolves. NCA (Chen et al., 2024) aggregates multiple negative responses
+but does not jointly model positive candidates, resulting in an incomplete use of the available
+preference structure. In both cases, the rich multi-pair preference information is substantially
+underutilized, motivating the need for a principled mechanism that can fully leverage all available
+preference pairs during optimization.
+To address these limitations, we propose a preference optimization framework via smoothed multipair aggregation for SLM retrieval-augmented generation (R IMS). Given multiple preference pairs
+generated per query through chain-of-thought (CoT) (Wei et al., 2023) rejection sampling, R IMS
+introduces a differentiable soft aggregation mechanism that replaces hard pair selection with a smooth,
+temperature-controlled operator. This operator consolidates all positive and negative candidates into a
+unified pseudo-pair, preserving gradient signal from every candidate while retaining the discriminative
+structure of margin-aware selection. The smoothed objective is general and can be applied to multiple
+preference optimization algorithms (Rafailov et al., 2024; Xu et al., 2024a; Hong et al., 2024). By
+adaptively aggregating gradient signals across multiple samples of the same question, R IMS improves
+the model’s ability to identify and integrate relevant evidence from noisy retrieval contexts. We further
+provide theoretical guarantees that the smoothed objective admits a controllable approximation error
+and that its gradient updates are provably closer to the oracle than those of hard selection.
+Our contributions can be summarized as follows:
+• We propose R IMS, a preference optimization framework for SLM-based RAG that generates
+multi-pair CoT preference data via rejection sampling using the target SLM itself, without relying
+on proprietary models.
+• We introduce a differentiable soft aggregation mechanism that consolidates multiple preference
+pairs into a unified, algorithm-agnostic objective, replacing hard pair selection while preserving
+the discriminative structure of margin-aware optimization.
+• We provide theoretical analysis showing that the LSE-based smoothing admits a controllable
+approximation error bound, and that smooth aggregation yields provably tighter gradient alignment
+to the oracle objective than hard selection under noisy reward estimation.
+• Experiments on four multi-hop question answering benchmarks with two SLM backbones show
+that R IMS consistently outperforms state-of-the-art baselines.
+2
+
+Published as a conference paper at COLM 2026
+
+2
+
+Related Work
+
+Retrieval-augmented generation (RAG) has emerged as an effective paradigm for alleviating the
+knowledge limitations of language models by grounding generation in external corpora. While early
+RAG frameworks (Izacard et al., 2022) were primarily designed for large language models (LLMs),
+recent studies (Wang et al., 2023; Li et al., 2024; Yu et al., 2024b) have explored adapting RAG to
+SLMs to improve efficiency and deployability in resource-constrained settings. However, due to
+limited representational capacity, SLMs are particularly vulnerable to noisy or irrelevant retrieved
+contexts, often leading to degraded reasoning and hallucinated outputs (Yoran et al., 2024). Prior
+work like Blendfilter (Wang et al., 2024) and RobustRAG (Xiang et al., 2024) has attempted to
+address this issue through prompt-based filtering, but these approaches rely heavily on the model’s
+intrinsic reasoning ability to identify irrelevant context, which is often insufficient for SLMs. In the
+meantime, some methods (Wei et al., 2025; Yu et al., 2024a) investigate training LLMs to handle
+noisy contexts via supervised finetuning on data synthesized with RAG-retrieved content, but they
+significantly suffer from low robustness under noisy retrieval conditions.
+Preference-based optimization methods (Zhang et al., 2024; Dong et al., 2024) have gained traction as
+alternatives to supervised fine-tuning by directly learning from relative preferences, offering improved
+robustness under noisy RAG settings. However, most approaches rely on single-pair comparisons,
+underutilizing the richer supervision available from multiple candidate responses, motivating recent
+work on multi-pair preference optimization. RoseRAG (Liu et al., 2025) introduces margin-aware
+preference optimization by selecting the hardest positive and negative pair based on model likelihoods,
+improving robustness to noisy retrieval but discarding the remaining preference signals. Noise
+Contrastive Alignment (NCA) (Chen et al., 2024) instead aggregates multiple negative responses
+within a contrastive framework, enhancing robustness but neglecting structured relationships among
+positive candidates. Other recent efforts (Xie et al., 2024; Gupta et al., 2025; Wang et al., 2025b; Le
+et al., 2024) explore various strategies for leveraging multiple responses per query, including selective
+subset sampling, multi-perspective preference signals, and multiple reference distributions, yet they
+generally rely on hard selection or heuristic aggregation that limits full exploitation of structured
+multi-pair preference data.
+In contrast, our framework jointly incorporates multiple preference pairs into a single optimization
+objective through a differentiable smoothing mechanism, preserving informative signals while
+maintaining computational efficiency.
+
+3
+
+Preliminaries
+
+We briefly review the standard retrieval-augmented generation framework, preference optimization,
+and margin-aware preference selection, which form the basis of our method.
+3.1
+
+Retrieval-Augmented Generation
+
+Given a language model parameterized by θ, a knowledge base K = {Ki }ik=1 (where k denotes the
+number of documents), a retriever R(·), and a query q, the vanilla retrieval-augmented generation
+(RAG) framework follows a retrieve-then-generate paradigm. Specifically, it first retrieves the top-K
+relevant documents from the knowledge base and then generates an answer conditioned on the
+retrieved information. This process can be formulated as
+
+Kq = R(q, K; K ),
+y ∼ Pθ y | PromptCoT (q, Kq )
+
+
+
+(1)
+
+where y denotes the generated response and PromptCoT (·) represents the CoT prompt.
+3.2
+
+Preference Optimization
+
+Preference alignment for language models has traditionally relied on multi-stage procedures, such as
+reinforcement learning from human feedback (RLHF) (Ouyang et al., 2022; Bai et al., 2022), that
+require an additional reference model to guide and stabilize training. Recent advances have led to
+a class of methods that learn directly from preference data, avoiding or simplifying explicit reward
+modeling. These methods generally optimize a policy πθ over preference pairs (yw , yl ) given a
+prompt x, where yw denotes a preferred response and yl a dispreferred one. A general form of such
+objectives can be expressed as
+3
+
+Published as a conference paper at COLM 2026
+
+L(θ ) = Lbase (πθ ) − λE(x,yw ,yl ) [log σ( β · hθ (yw , yl , x ))]
+
+(2)
+
+where Lbase is an optional base objective (e.g., supervised fine-tuning loss), σ (·) is the sigmoid
+function, β controls the strength of the preference signal, λ weights the preference term, and
+hθ (yw , yl , x ) is an algorithm-specific scoring function that quantifies the relative quality of yw over
+yl . Different instantiations of hθ and Lbase give rise to distinct algorithms, including Direct Preference
+Optimization (DPO) (Rafailov et al., 2024), Contrastive Preference Optimization (CPO) (Xu et al.,
+2024a), and Odds-Ratio Preference Optimization (ORPO) (Hong et al., 2024), which differ in how
+reference normalization, base supervision, and contrast signals are incorporated.
+3.3
+
+Margin-Aware Preference Optimization
+
+In RAG settings, preference optimization is particularly appealing because it learns from relative
+quality comparisons rather than treating any single response as ground truth, making it more robust
+to noisy retrieved context than supervised fine-tuning. When multiple preference pairs are available
+for a single query, selecting the most informative pair becomes critical for effective optimization.
+RoseRAG (Liu et al., 2025) addresses this with a margin-aware selection strategy that identifies the
+hardest positive and negative examples based on current model likelihoods:
+y∗w = arg min log Pθ (yiw | x ),
+i
+(3)
+j
+∗
+yl = arg max log Pθ (yl | x ),
+j
+
+That is, the preferred response with the lowest model confidence and the non-preferred response
+with the highest model confidence are selected, forming the most challenging contrast for the current
+policy. However, this hard argmin/argmax selection retains only a single pair per query, discarding
+the gradient signal from all remaining candidates.
+
+4
+
+Method
+
+We present R IMS, shown in Fig. 1, a framework that improves preference optimization for SLM-based
+RAG by fully utilizing multi-pair preference data. R IMS consists of three components: (1) MultiPair Preference Data Generation, which produces diverse chain-of-thought rationales via rejection
+sampling; (2) Multi-Pair Preference Data Aggregation, which consolidates multiple preference
+pairs into a unified pseudo-pair through a differentiable smoothing operator; and (3) Preference
+Optimization, which applies the smoothed objective to standard alignment algorithms.
+4.1
+
+Multi-Pair Preference Data Generation
+
+To construct preference data for training, we use the target SLM itself to generate chain-of-thought
+(CoT) rationales, and apply rejection sampling to filter for correctness. This avoids dependence on
+proprietary models and produces preference pairs that are well-calibrated to the target model’s own
+capability.
+We instantiate this procedure by constructing a multi-turn prompt consisting of a system message, a
+user message, and an initial assistant message. The system message specifies the task and instructs
+the model to reason step-by-step, acknowledging that the provided knowledge may contain irrelevant
+information. The user message provides the retrieved knowledge documents Kq , the question q, and
+the ground-truth answer a∗ . The assistant message initializes the reasoning process. The complete
+prompt template is provided in Appendix F. Given these inputs, the model generates a rationale r that
+captures its analytical reasoning.
+To ensure quality, we apply rejection sampling (Liu et al., 2024; Guo et al., 2025). Given the
+generated rationale r, we extract an answer a and compare it against the ground-truth label a∗ . If
+a matches a∗ , the full response (r, a) is retained as a preferred response yw . The non-preferred
+response yl is obtained separately as the vanilla RAG output (Eqn. (1)), which is generated without
+ground-truth guidance. By repeating this process with different sampling runs, we obtain multiple
+preferred–non-preferred pairs per query, yielding multi-pair preference data.
+4.2
+
+Multi-Pair Preference Data Aggregation
+
+The margin-aware strategy (Eqn. (3)) selects the single hardest preference pair via hard argmin/argmax,
+discarding all remaining candidates. Directly relaxing this selection poses competing challenges: the
+4
+
+Published as a conference paper at COLM 2026
+
+Phase 1: Data Generation
+Preferred (+)
+Rejective Sampling
+Data Label
+CoT Generation
+
+Vallina Response
+Question
+
+RAG
+
+Knowledge
+Docs
+Dispreferred (- )
+
+Phase 2: Data Aggregation
+
+Phase 3: Preference Optimization
+
+Preferred (+)
+Min LSE
+
+SLM
+
+DPO/CPO/ORPO
+
+Error Bound Control
+
+Smoothed
+Loss Function
+
+Max LSE
+Dispreferred (- )
+
++ RAG
+
+Preference
+Optimization
+
+Enhanced
+Inference
+
+Figure 1: Framework of Smoothing Preference Optimization with Multi-Pair Preference Data
+
+argmin/argmax operators are non-differentiable, preventing gradient signal from propagating through
+the selection step; yet naively replacing them with a simple average dilutes the focus on informative
+hard cases, weakening the discriminative structure that makes margin-aware optimization effective.
+Moreover, hard selection is performed once based on the initial model’s likelihoods and remains fixed
+throughout training; as the policy evolves, the initially selected pair may no longer represent the most
+informative contrast. What is needed is a smooth, differentiable operator that preserves the emphasis
+on hard examples while incorporating signal from all candidates and adapting to the evolving policy.
+We address this with the LogSumExp (LSE) function (Nielsen & Sun, 2016), which provides a
+temperature-controlled smooth approximation to the maximum operator:
+
+ n
+1
+(4)
+LSEτ ( x1 , · · · , xn ) = log ∑ exp(τxi )
+τ
+i =1
+where τ > 0 controls the sharpness of the approximation: as τ → ∞, the LSE operator converges
+to the exact maximum; as τ → 0, it reduces to a uniform average. This provides a principled
+interpolation between hard selection and soft aggregation. Because the LSE operator is evaluated
+using the current policy πθ at each training step, the aggregation weights adapt dynamically as the
+model evolves, in contrast to the static one-time selection of RoseRAG. A formal analysis of the
+approximation bound is provided in Section 5 and Appendix A.1.
+Applying this operator to the policy likelihoods, we aggregate all preferred and non-preferred
+candidates into a unified pseudo-pair ( x, ỹw , ỹl ). For the preferred set, we use the negated LSE
+to approximate the minimum-likelihood (hardest) positive; for the non-preferred set, we use LSE
+directly to approximate the maximum-likelihood (hardest) negative:
+log πθ (ỹw | x ) = −LSEτ (− log πθ (y1w | x ), · · · , − log πθ (ynw | x )),
+log πθ (ỹl | x ) = LSEτ (log πθ (y1l | x ), · · · , log πθ (ynl | x )),
+4.3
+
+(5)
+
+Preference Optimization
+
+For a multi-pair preference data tuple ( x, {yiw }in=1 , {yil }in=1 ), where x is the input prompt, {yiw } is
+the set of preferred responses, and {yil } is the set of non-preferred responses, the smoothed preference
+optimization objective is:
+5
+
+Published as a conference paper at COLM 2026
+
+L̃(θ ) = Lbase (πθ ) − λE(x,yw ,yl ) [log σ ( β · hθ (ỹw , ỹl , x ))]
+
+(6)
+
+where ỹw and ỹl are the smoothed pseudo-responses computed via Eqn. (5). This formulation is
+algorithm-agnostic: for any preference algorithm instantiated through Eqn. (2), the smoothed variant
+is obtained by replacing the original policy likelihoods πθ (yw | x ) and πθ (yl | x ) within hθ with
+their aggregated counterparts πθ (ỹw | x ) and πθ (ỹl | x ), directly yielding smoothed versions of DPO
+(Rafailov et al., 2024), CPO (Xu et al., 2024a), and ORPO (Hong et al., 2024).
+
+5
+
+Theoretical Analysis
+
+In this section, we provide theoretical justifications for the proposed smoothed aggregation mechanism.
+We first establish a formal error bound showing that the LSE approximation can be controlled via an
+interpretable hyperparameter (Section 5.1), and then analyze gradient stability to show that smooth
+aggregation yields provably lower variance than hard selection under candidate-pool sampling
+(Section 5.2).
+5.1
+
+Approximation Error Analysis
+
+The smoothed aggregation mechanism introduced in Section 4 relies on the LSE operator as a
+differentiable proxy for hard max/min selection. A natural question is how tightly this approximation
+tracks the exact maximum, and whether the approximation error can be controlled in a principled
+way. We establish a formal error bound and show how it can be used as a practical hyperparameter.
+Based on the LogSumExp smoothing in Eqn. (4), we establish the following theorem to control the
+upper bound of the approximation error:
+Theorem 1 (LSE Error Bound Control). Let M > 0, n > 1, and x1 , . . . , xn ∈ R. Let x(1) ≤ · · · ≤
+x(n) and assume the top-gap δ := x(n) − x(n−1) > 0, ϵ := LSEτ ( x1 , . . . , xn ) − x(n) for τ > 0.
+
+
+δ ( n −1)
+If τ ≥ Fδ,n ( M ) := 1δ W
+, then ϵ ≤ M. Moreover, for any M > 0, δ > 0, and n > 1,
+M
+Fδ,n ( M ) ∈ R.
+Given Theorem 1, we can treat the error bound M as a hyperparameter in our smoothing strategy and
+adaptively control the temperature τ during training via Fδ,n ( M ), since the top-gap δ and smoothing
+size n are known quantities. The proof is provided in Appendix A.1.
+5.2
+
+Gradient Stability under Candidate-Pool Sampling
+
+We now analyze stability by treating the sampled candidate pool itself as the source of randomness.
+For a fixed prompt x, one training step draws
+Y = (Yw1 , . . . , Ywn , Yl1 , . . . , Yln ) ∼ Px ,
+and the CPO objective maps this pool to either a hard or a smoothed gradient signal. Hard selection
+keeps exactly one preferred/non-preferred pair, while smoothing aggregates the full pool through
+LSE. The key instability of hard selection is that the chosen pair itself is random: when different
+sampled pools select different hard pairs and these pairs induce different updates, this discrete selector
+randomness produces an intrinsic variance floor. By contrast, smoothing replaces this one-hot switch
+by a continuous weighted mixture whose fluctuation can be controlled through the softmax weighting
+structure.
+Define
+
+h
+i
+2
+Vsm ( x, θ ) := EY ∇θ Lsm (θ; x, Y ) − EY ∇θ Lsm (θ; x, Y )
+,
+h
+i
+2
+Vhard ( x, θ ) := EY ∇θ Lhard (θ; x, Y ) − EY ∇θ Lhard (θ; x, Y )
+.
+
+Theorem 2 (Smooth Aggregation Improves Gradient Stability). Under Appendix Assumptions 1, 2,
+and 3,
+Vhard ( x, θ ) > Vsm ( x, θ ).
+Theorem 2 reduces the stability comparison to an interpretable tradeoff between two quantities. The
+term p2 m2 is the selector-mixture variance floor induced by hard selection: it becomes large when
+the hard selector places non-trivial mass on multiple pair indices whose average updates are well
+separated. The right-hand side captures the fluctuation of smoothing: Var( ḡ(Y )) is the branchwise
+averaging baseline, while the second term is the additional variance induced by soft weighting.
+6
+
+Published as a conference paper at COLM 2026
+
+Crucially, this extra term is multiplied by the shrinkage factor δn (τ, R), which vanishes as the branch
+score range collapses. Hence, whenever hard selector competition is strong but the softmax weights
+remain close to a stable average, smooth aggregation yields strictly smaller gradient variance than
+hard selection. The full notation is given in Appendix A.2, and the supporting lemmas and proof
+appear in Appendix A.3.
+
+6
+
+Experiments
+
+In this section, we evaluate the proposed R IMS by addressing the following research questions:
+RQ1 How does R IMS perform compared to state-of-the-art baselines?
+RQ2 How does the proposed smoothed aggregation compare with alternative strategies?
+RQ3 How does R IMS perform across different preference optimization methods?
+RQ4 How does R IMS perform with varying numbers of retrieved documents?
+RQ5 How sensitive is R IMS to the hyperparameters error bound M and smoothing size n?
+6.1
+
+Datasets and Experiment Settings
+
+Datasets and Evaluation Metrics. We conduct experiments on four public multi-hop question
+answering benchmarks: HotPotQA (HPQA, Yang et al. (2018)), 2WikiMultiHopQA (2WMHQA, Ho
+et al. (2020)), MultiHopRAGQA (MHRAGQA, Tang & Yang (2024)), and MuSiQueQA (MSQQA,
+Trivedi et al. (2022)). Following prior work (Shao et al., 2023; Wang et al., 2024; Liu et al., 2025),
+we evaluate the first 500 questions from the development splits of HPQA and 2WMHQA. For
+MSQQA, we select the first 500 questions from its development set. As MHRAGQA lacks an
+official development split, we randomly set aside 20% of the training data for evaluation and use the
+remaining 80% for training, with the final results also computed over 500 questions. We employ
+exact match (EM) and F1 score as evaluation metrics, following Liu et al. (2025).
+Baselines. We compare our method against the following state-of-the-art baselines: 1) CoT Prompting (Wei et al., 2023), 2) ReAct (Yao et al., 2023), 3) SelfAsk (Press et al., 2023), 4) BlendFilter (Wang
+et al., 2024), 5) InstructRAG (Wei et al., 2025), 6) RoseRAG (Liu et al., 2025). Further background
+and details are deferred to Appendix C.
+Implementation Details. Our experiments are conducted using two representative SLMs: Qwen2.51.5B-Instruct (Team, 2024) and Gemma-2-2b-it (Team et al., 2024). For the retriever, we utilize
+the ColBERTv2 retriever (Santhanam et al., 2022), a state-of-the-art efficient retrieval method
+implemented by Khattab et al. (2023a). The knowledge base we employ is the 2017 Wikipedia
+abstracts dump (Khattab et al., 2023b). More implementation details can be found in Appendix D.
+6.2
+
+Overall Performance Comparison
+
+We evaluate the effectiveness of R IMS across four benchmarks against six strong baseline methods to
+answer RQ1. Results for Qwen2.5-1.5B-Instruct and Gemma-2-2B-it are reported in Table 1.
+R IMS consistently outperforms strong baselines across all benchmarks by a substantial margin.
+The gains are especially pronounced on the more challenging multi-hop datasets (2WMHQA and
+MHRAGQA), where retrieved passages tend to be lengthy and noisy (Liu et al., 2025), indicating
+that R IMS is effective at aggregating diverse evidence while maintaining reasoning consistency.
+Prompt-based and decomposition-based methods (ReAct, SelfAsk, BlendFilter) are limited by SLMs’
+intrinsic reasoning capacity, while fine-tuning-based approaches that explicitly enhance robustness to
+noisy contexts show stronger performance. Overall, the superior and stable performance of R IMS
+highlights the importance of designing optimization strategies specifically for SLMs rather than
+directly transferring techniques developed for large-scale models.
+6.3
+
+Effectiveness of Data Aggregation Methods
+
+To answer RQ2, we compare our proposed smoothed aggregation with two alternative strategies
+for combining multi-pair preference data ( x, y1w , · · · , ynw , y1l , · · · , ynl ) into a pseudo-pair: Weighted
+(fixed weights based on base model likelihoods), Average (equal weights). More details can be found
+in Appendix B.
+7
+
+Published as a conference paper at COLM 2026
+
+Table 1: Performance comparison of different methods with Qwen2.5-1.5B-Instruct and gemma-2-2bit as the backbone models. The best and second-best results are highlighted in bold and underlined,
+respectively. (HPQA: HotPotQA, 2WMHQA: 2WikiMultiHopQA, MHRAGQA: MultiHopRAGQA,
+MSQQA: MuSiQueQA)
+Method
+
+Qwen2.5-1.5B-Instruct
+
+Gemma-2-2b-it
+
+HPQA 2WMHQA MHRAGQA MSQQA
+
+HPQA 2WMHQA MHRAGQA MSQQA
+
+EM
+
+F1
+
+EM F1 EM F1 EM
+
+F1
+
+EM
+
+F1
+
+EM F1
+
+CoT
+26.6 38.1 17.4 22.9 3.8
+vanilla RAG 29.0 40.6 15.2 23.32 7.4
+ReAct
+12.0 22.7 6.6 20.9 2.8
+SelfAsk
+22.2 33.9 18.4 24.2 15.0
+BlendFilter 25.0 33.9 12.6 19.1 4.0
+InstructRAG 15.2 23.5 17.8 23.0 16.0
+RoseRAG
+36.6 46.0 29.6 33.7 45.4
+
+EM F1 EM
+
+F1
+
+4.8
+8.39
+3.6
+16.1
+5.0
+16.2
+46.3
+
+3.0 9.6 37.2 48.4 21.6
+7.6 15.7 39.2 50.2 19.4
+3.6 10.5 34.8 47.3 26.4
+3.0 11.4 32.0 42.4 28.4
+3.2 9.9 39.8 50.6 23.0
+2.2 7.8 28.4 37.2 16.0
+9.4 18.6 41.4 52.6 32.4
+
+26.8
+24.9
+33.6
+34.3
+28.9
+20.4
+36.9
+
+19.8
+15.6
+23.8
+29.8
+24.4
+15.2
+58.2
+
+20.6
+16.1
+24.6
+30.2
+26.1
+15.7
+58.5
+
+6.8 15.1
+9.6 17.3
+13.0 23.1
+9.6 16.8
+9.4 17.1
+3.2 7.0
+12.4 21.6
+
+R IMS
+
+53.0
+
+10.8 18.6 42.6 53.0 35.8 40.0 59.0
+
+59.2
+
+12.4 23.4
+
+39.0 49.3 32.2 37.7 52.6
+
+Table 2: Performance (EM/F1) comparison of R IMS with different aggregation strategies. Experiments are conducted on the MHRAGQA using Qwen2.5-1.5B-Instruct as the backbone model.
+(Weighted: weight training data based on untrained model’s likelihood; Average: assign equal weights.
+Detailed explanations of these strategies are provided in Appendix Table 3.
+Aggregation Strategy Smoothing size = 3 Smoothing size = 4
+Positive
+
+Negative
+
+EM
+
+F1
+
+EM
+
+F1
+
+Average
+Average
+Weighted
+Weighted
+
+Average
+Weighted
+Average
+Weighted
+
+48.0
+47.0
+45.2
+48.2
+
+48.5
+47.4
+46.0
+48.7
+
+50.6
+43.4
+48.8
+47.4
+
+51.2
+44.3
+49.1
+47.8
+
+50.80
+
+51.43
+
+52.40
+
+52.98
+
+R IMS-DPO
+
+Results are reported in Table 2, using Qwen2.5-1.5B-Instruct as the backbone. Across two smoothing
+sizes, all heuristic-based methods exhibit significantly worse performance than our proposed R IMS.
+Average and Weighted aggregation dilute informative signals by mixing responses of heterogeneous
+quality. In contrast, our proposed R IMS consistently achieves the best performance and remains
+stable across different smoothing sizes, confirming that LSE smoothing effectively balances the focus
+on hard examples with the utilization of all candidates.
+6.4
+
+Effectiveness Across Different Preference Optimization Methods
+
+Figure 2 reports the performance of three preference optimization methods (DPO, CPO, ORPO)
+with a fixed smoothing component to answer RQ3. R IMS consistently achieves strong and stable
+performance across all three methods, demonstrating the robustness of the proposed smoothing
+mechanism. Among them, DPO yields the highest EM and F1 scores, with the gap being especially
+pronounced on more challenging multi-hop datasets such as MHRAGQA, suggesting that DPO’s
+reference-policy regularization is particularly beneficial for capturing complex reasoning chains under
+noisy retrieval.
+6.5
+
+Effectiveness with a Varying Number of Retrieved Documents
+
+Figure 3a compares R IMS and vanilla RAG on HPQA, with the number of retrieved documents K
+varying from 0 to 10 to answer RQ4. When K = 0, the backbone relies solely on its internal knowledge; R IMS demonstrates comparable performance to vanilla RAG, indicating that the optimization
+did not degrade the model’s intrinsic reasoning abilities and pretrained knowledge.
+As K increases from 1 to 5, both methods benefit from improved retrieval recall, but R IMS exhibits
+much steadier improvement while vanilla RAG shows only marginal gains beyond K = 1. When
+K > 5, vanilla RAG performance begins to degrade due to increased noise, whereas R IMS maintains
+8
+
+Published as a conference paper at COLM 2026
+
+0.30
+
+0.25
+
+0.25
+
+0.20
+
+0.20
+
+0.30
+
+0.30
+
+0.25
+
+0.25
+
+0.20
+
+0.20
+
+0.15
+
+0.15
+
+0.5
+
+0.5
+
+0.4
+
+0.4
+
+0.3
+
+0.3
+
+0.2
+
+0.2
+
+0.1
+
+O
+
+CP
+
+O
+
+DP
+
+PO
+
+O
+
+CP
+
+OR
+
+O
+
+DP
+
+O
+CP
+
+OR
+
+O
+
+DP
+
+PO
+
+0.20
+
+0.15
+
+0.1
+
+0.0
+
+PO
+
+0.20
+
+0.15
+
+F1
+
+0.30
+
+0.35
+
+0.25
+
+EM
+F1
+
+0.6
+
+F1
+
+0.35
+
+F1
+
+0.35
+
+0.35
+
+EM
+
+0.40
+
+0.40
+
+MHRAGQA
+0.25
+
+EM
+F1
+
+0.6
+
+EM
+
+0.40
+
+0.45
+
+0.40
+
+MHRAGQA
+0.45
+
+EM
+F1
+
+F1
+
+0.45
+
+EM
+
+WMHQA
+0.45
+
+0.50
+
+EM
+
+HPQA
+EM
+F1
+
+0.50
+
+0.10
+
+0.10
+
+0.05
+
+0.05
+
+0.0
+
+O
+CP
+
+OR
+
+O
+
+DP
+
+PO
+
+OR
+
+Figure 2: Performance (EM/F1) of R IMS when using different preference optimization methods. The
+backbone model is Qwen2.5-1.5B-Instruct.
+its superior performance and shows greater resilience. These results demonstrate that R IMS provides
+more robust evidence utilization than vanilla RAG, enabling consistent performance gains even as the
+retrieved context grows noisier.
+
+0.3
+
+0.375
+EM
+
+EM
+
+RoseRAG EM
+RISM-DPO EM
+RoseRAG F1
+RISM-DPO F1
+
+0.380
+
+0.2
+
+0.370
+
+0.0
+
+1
+
+2
+
+3
+
+k
+
+(a)
+
+5
+
+10
+
+0.45
+EM
+F1
+
+0.40
+
+0.47
+
+0.360
+
+0
+
+0.50
+
+0.49
+0.48
+
+0.365
+
+0.1
+
+0.50
+
+F1
+
+0.385
+
+Model
+vallina RAG
+RISM-DPO
+
+0.4
+
+0.35
+0.46
+
+0.355
+0.1
+
+1.0
+
+10.0
+
+LSE error bound M
+
+(b)
+
+100.0
+
+2
+
+3
+
+4
+
+Smoothing size n
+
+(c)
+
+Figure 3: Sensitivity analysis of R IMS across different hyperparameter settings. Experiments are
+conducted on the HPQA dataset using Qwen2.5-1.5B-Instruct as the backbone model. (a) EM under
+varying retrieved document counts. (b) EM/F1 under varying LSE approximation error bound M with
+smoothing size n = 4. (c) EM/F1 under varying smoothing size n; inner box shows the interquartile
+range across 4 replicates and outer violin shows the density.
+6.6
+
+Sensitivity Analysis of Hyperparameters
+
+LSE Approximation Error Analysis. The error bound M in Theorem 1 controls how closely
+the LSE operator approximates the exact max/min, with the temperature τ adaptively adjusted via
+Fδ,n ( M ) during training. Figure 3b shows the impact of M on model performance. When M is
+small, R IMS achieves performance comparable to RoseRAG, as the LSE operator degenerates to
+hard selection, validating our theoretical analysis. Performance peaks at M = 1, suggesting that
+a moderately relaxed bound enables the model to leverage a richer set of preference pairs while
+preserving the discriminative structure of margin-aware selection.
+Smoothing Size. The smoothing size n controls the number of candidate responses aggregated in the
+LSE operator. Figure 3c shows the performance under different smoothing sizes with a fixed error
+bound M, where τ is adaptively adjusted following Theorem 1. Both EM and F1 scores exhibit a
+clear degradation as n increases, even when the worst-case approximation error is controlled. This
+indicates that larger smoothing sizes dilute the influence of top-ranked candidates by aggregating over
+a broader spectrum of scores; while controlling M guarantees closeness to the true max in magnitude,
+increasing n alters the relative contributions of subdominant candidates. Consequently, moderate
+smoothing sizes achieve a better balance between optimization smoothness and ranking fidelity.
+
+7
+
+Conclusions
+
+We presented R IMS, a preference optimization framework that addresses the underutilization of
+multi-pair preference data in SLM-based RAG. The core idea is to replace hard pair selection with
+9
+
+Published as a conference paper at COLM 2026
+
+a differentiable LSE-based smoothing mechanism that aggregates all preference candidates into a
+unified objective, preserving informative gradient signals while retaining the discriminative structure
+of margin-aware optimization. The resulting formulation is algorithm-agnostic, directly applicable to
+DPO, CPO, and ORPO without modification. We further provided theoretical guarantees showing
+that the LSE approximation error is controllable via an interpretable hyperparameter, and that smooth
+aggregation yields provably tighter gradient alignment than hard selection. Extensive experiments on
+four multi-hop question answering benchmarks with two representative SLM backbones demonstrate
+that R IMS consistently outperforms state-of-the-art baselines in both Exact Match and F1, highlighting
+the importance of structured multi-pair aggregation for robust evidence utilization under noisy retrieval
+conditions.
+
+References
+Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Florencia Leoni Aleman,
+Diogo Almeida, Janko Altenschmidt, Sam Altman, Shyamal Anadkat, et al. Gpt-4 technical report.
+arXiv preprint arXiv:2303.08774, 2023.
+Akari Asai, Zeqiu Wu, Yizhong Wang, Avirup Sil, and Hannaneh Hajishirzi. Self-RAG: Learning
+to retrieve, generate, and critique through self-reflection. In The Twelfth International Conference on Learning Representations, 2024. URL https://openreview.net/forum?id=
+hSyW5go0v8.
+Yuntao Bai, Andy Jones, Kamal Ndousse, Amanda Askell, Anna Chen, Nova DasSarma, Dawn Drain,
+Stanislav Fort, Deep Ganguli, Tom Henighan, et al. Training a helpful and harmless assistant with
+reinforcement learning from human feedback. arXiv preprint arXiv:2204.05862, 2022.
+Peter Belcak, Greg Heinrich, Shizhe Diao, Yonggan Fu, Xin Dong, Saurav Muralidharan, Yingyan Celine Lin, and Pavlo Molchanov. Small language models are the future of agentic ai, 2025. URL
+https://arxiv.org/abs/2506.02153.
+Huayu Chen, Guande He, Lifan Yuan, Ganqu Cui, Hang Su, and Jun Zhu. Noise contrastive alignment
+of language models with explicit rewards, 2024. URL https://arxiv.org/abs/2402.
+05369.
+Tianzhe Chu, Yuexiang Zhai, Jihan Yang, Shengbang Tong, Saining Xie, Dale Schuurmans, Quoc V.
+Le, Sergey Levine, and Yi Ma. Sft memorizes, rl generalizes: A comparative study of foundation
+model post-training, 2025. URL https://arxiv.org/abs/2501.17161.
+Gheorghe Comanici, Eric Bieber, Mike Schaekermann, Ice Pasupat, Noveen Sachdeva, Inderjit
+Dhillon, Marcel Blistein, Ori Ram, Dan Zhang, Evan Rosen, et al. Gemini 2.5: Pushing the frontier
+with advanced reasoning, multimodality, long context, and next generation agentic capabilities.
+arXiv preprint arXiv:2507.06261, 2025.
+Guanting Dong, Yutao Zhu, Chenghao Zhang, Zechen Wang, Zhicheng Dou, and Ji-Rong Wen.
+Understand what llm needs: Dual preference alignment for retrieval-augmented generation, 2024.
+URL https://arxiv.org/abs/2406.18676.
+Kawin Ethayarajh, Winnie Xu, Niklas Muennighoff, Dan Jurafsky, and Douwe Kiela. Kto: Model
+alignment as prospect theoretic optimization. arXiv preprint arXiv:2402.01306, 2024.
+Yunfan Gao, Yun Xiong, Xinyu Gao, Kangxiang Jia, Jinliu Pan, Yuxi Bi, Yixin Dai, Jiawei Sun,
+Haofen Wang, Haofen Wang, et al. Retrieval-augmented generation for large language models: A
+survey. arXiv preprint arXiv:2312.10997, 2(1):32, 2023.
+Aaron Grattafiori, Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad
+Al-Dahle, Aiesha Letman, Akhil Mathur, Alan Schelten, Alex Vaughan, et al. The llama 3 herd of
+models. arXiv preprint arXiv:2407.21783, 2024.
+Daya Guo, Dejian Yang, Haowei Zhang, Junxiao Song, Peiyi Wang, Qihao Zhu, Runxin Xu, Ruoyu
+Zhang, Shirong Ma, Xiao Bi, et al. Deepseek-r1 incentivizes reasoning in llms through reinforcement learning. Nature, 645(8081):633–638, 2025.
+10
+
+Published as a conference paper at COLM 2026
+
+Taneesh Gupta, Rahul Madhavan, Xuchao Zhang, Chetan Bansal, and Saravan Rajmohan. Ampo:
+Active multi-preference optimization for self-play preference selection, 2025. URL https:
+//arxiv.org/abs/2502.18293.
+Xanh Ho, Anh-Khoa Duong Nguyen, Saku Sugawara, and Akiko Aizawa. Constructing a multi-hop
+qa dataset for comprehensive evaluation of reasoning steps, 2020. URL https://arxiv.org/
+abs/2011.01060.
+Jiwoo Hong, Noah Lee, and James Thorne. Orpo: Monolithic preference optimization without
+reference model, 2024. URL https://arxiv.org/abs/2403.07691.
+Edward J. Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang,
+and Weizhu Chen. Lora: Low-rank adaptation of large language models, 2021. URL https:
+//arxiv.org/abs/2106.09685.
+Gautier Izacard, Patrick Lewis, Maria Lomeli, Lucas Hosseini, Fabio Petroni, Timo Schick, Jane
+Dwivedi-Yu, Armand Joulin, Sebastian Riedel, and Edouard Grave. Atlas: Few-shot learning
+with retrieval augmented language models, 2022. URL https://arxiv.org/abs/2208.
+03299.
+Zhengbao Jiang, Frank F Xu, Luyu Gao, Zhiqing Sun, Qian Liu, Jane Dwivedi-Yu, Yiming Yang,
+Jamie Callan, and Graham Neubig. Active retrieval augmented generation. In Proceedings of the
+2023 conference on empirical methods in natural language processing, pp. 7969–7992, 2023.
+Omar Khattab, Keshav Santhanam, Xiang Lisa Li, David Hall, Percy Liang, Christopher Potts,
+and Matei Zaharia. Demonstrate-search-predict: Composing retrieval and language models for
+knowledge-intensive nlp, 2023a. URL https://arxiv.org/abs/2212.14024.
+Omar Khattab, Arnav Singhvi, Paridhi Maheshwari, Zhiyuan Zhang, Keshav Santhanam, Sri Vardhamanan, Saiful Haq, Ashutosh Sharma, Thomas T. Joshi, Hanna Moazam, Heather Miller,
+Matei Zaharia, and Christopher Potts. Dspy: Compiling declarative language model calls into
+self-improving pipelines, 2023b. URL https://arxiv.org/abs/2310.03714.
+Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph E.
+Gonzalez, Hao Zhang, and Ion Stoica. Efficient memory management for large language model
+serving with pagedattention, 2023. URL https://arxiv.org/abs/2309.06180.
+Hung Le, Quan Tran, Dung Nguyen, Kien Do, Saloni Mittal, Kelechi Ogueji, and Svetha Venkatesh.
+Multi-reference preference optimization for large language models, 2024. URL https://
+arxiv.org/abs/2405.16388.
+Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir Karpukhin, Naman Goyal,
+Heinrich Küttler, Mike Lewis, Wen tau Yih, Tim Rocktäschel, Sebastian Riedel, and Douwe
+Kiela. Retrieval-augmented generation for knowledge-intensive nlp tasks, 2021. URL https:
+//arxiv.org/abs/2005.11401.
+Xiaonan Li, Changtai Zhu, Linyang Li, Zhangyue Yin, Tianxiang Sun, and Xipeng Qiu. Llatrieval:
+Llm-verified retrieval for verifiable generation, 2024. URL https://arxiv.org/abs/2311.
+07838.
+Tianci Liu, Haoxiang Jiang, Tianze Wang, Ran Xu, Yue Yu, Linjun Zhang, Tuo Zhao, and Haoyu
+Wang. RoseRAG: Robust retrieval-augmented generation with small-scale LLMs via margin-aware
+preference optimization. In Wanxiang Che, Joyce Nabende, Ekaterina Shutova, and Mohammad Taher Pilehvar (eds.), Findings of the Association for Computational Linguistics: ACL 2025,
+pp. 13036–13054, 2025.
+Tianqi Liu, Yao Zhao, Rishabh Joshi, Misha Khalman, Mohammad Saleh, Peter J. Liu, and Jialu Liu.
+Statistical rejection sampling improves preference optimization, 2024. URL https://arxiv.
+org/abs/2309.06657.
+Zhenyan Lu, Xiang Li, Dongqi Cai, Rongjie Yi, Fangming Liu, Xiwen Zhang, Nicholas D. Lane,
+and Mengwei Xu. Small language models: Survey, measurements, and insights, 2025. URL
+https://arxiv.org/abs/2409.15790.
+11
+
+Published as a conference paper at COLM 2026
+
+Yu Meng, Mengzhou Xia, and Danqi Chen. Simpo: Simple preference optimization with a referencefree reward. Advances in Neural Information Processing Systems, 37:124198–124235, 2024.
+Frank Nielsen and Ke Sun. Guaranteed bounds on information-theoretic measures of univariate
+mixtures using piecewise log-sum-exp inequalities. Entropy, 18(12):442, December 2016. ISSN
+1099-4300. doi: 10.3390/e18120442. URL http://dx.doi.org/10.3390/e18120442.
+Long Ouyang, Jeffrey Wu, Xu Jiang, Diogo Almeida, Carroll Wainwright, Pamela Mishkin, Chong
+Zhang, Sandhini Agarwal, Katarina Slama, Alex Ray, et al. Training language models to follow
+instructions with human feedback. Advances in neural information processing systems, 35:27730–
+27744, 2022.
+Oded Ovadia, Menachem Brief, Moshik Mishaeli, and Oren Elisha. Fine-tuning or retrieval?
+comparing knowledge injection in LLMs. In Yaser Al-Onaizan, Mohit Bansal, and Yun-Nung
+Chen (eds.), Proceedings of the 2024 Conference on Empirical Methods in Natural Language
+Processing, pp. 237–250, Miami, Florida, USA, November 2024. Association for Computational
+Linguistics. doi: 10.18653/v1/2024.emnlp-main.15. URL https://aclanthology.org/
+2024.emnlp-main.15/.
+Ofir Press, Muru Zhang, Sewon Min, Ludwig Schmidt, Noah Smith, and Mike Lewis. Measuring
+and narrowing the compositionality gap in language models. In Houda Bouamor, Juan Pino,
+and Kalika Bali (eds.), Findings of the Association for Computational Linguistics: EMNLP
+2023, pp. 5687–5711, Singapore, December 2023. Association for Computational Linguistics.
+doi: 10.18653/v1/2023.findings-emnlp.378. URL https://aclanthology.org/2023.
+findings-emnlp.378/.
+Rafael Rafailov, Archit Sharma, Eric Mitchell, Stefano Ermon, Christopher D. Manning, and Chelsea
+Finn. Direct preference optimization: Your language model is secretly a reward model, 2024. URL
+https://arxiv.org/abs/2305.18290.
+Keshav Santhanam, Omar Khattab, Jon Saad-Falcon, Christopher Potts, and Matei Zaharia. ColBERTv2: Effective and efficient retrieval via lightweight late interaction. In Marine Carpuat,
+Marie-Catherine de Marneffe, and Ivan Vladimir Meza Ruiz (eds.), Proceedings of the 2022
+Conference of the North American Chapter of the Association for Computational Linguistics:
+Human Language Technologies, pp. 3715–3734, 2022.
+Zhihong Shao, Yeyun Gong, Yelong Shen, Minlie Huang, Nan Duan, and Weizhu Chen. Enhancing
+retrieval-augmented large language models with iterative retrieval-generation synergy. In Findings
+of the Association for Computational Linguistics: EMNLP 2023, pp. 9248–9274, December 2023.
+Yixuan Tang and Yi Yang. Multihop-rag: Benchmarking retrieval-augmented generation for multi-hop
+queries. arXiv preprint arXiv:2401.15391, 2024.
+Gemma Team, Morgane Riviere, Shreya Pathak, Pier Giuseppe Sessa, Cassidy Hardin, Surya
+Bhupatiraju, Léonard Hussenot, Thomas Mesnard, Bobak Shahriari, Alexandre Ramé, et al.
+Gemma 2: Improving open language models at a practical size. arXiv preprint arXiv:2408.00118,
+2024.
+Qwen Team. Qwen2.5: A party of foundation models, September 2024. URL https://qwenlm.
+github.io/blog/qwen2.5/.
+Harsh Trivedi, Niranjan Balasubramanian, Tushar Khot, and Ashish Sabharwal. Musique: Multihop
+questions via single-hop question composition, 2022. URL https://arxiv.org/abs/
+2108.00573.
+Giorgos Vernikos, Arthur Bražinskas, Jakub Adamek, Jonathan Mallinson, Aliaksei Severyn, and
+Eric Malmi. Small language models improve giants by rewriting their outputs, 2024. URL
+https://arxiv.org/abs/2305.13514.
+Leandro von Werra, Younes Belkada, Lewis Tunstall, Edward Beeching, Tristan Thrush, Nathan
+Lambert, Shengyi Huang, Kashif Rasul, and Quentin Gallouédec. Trl: Transformer reinforcement
+learning. https://github.com/huggingface/trl, 2020.
+12
+
+Published as a conference paper at COLM 2026
+
+Fei Wang, Xingchen Wan, Ruoxi Sun, Jiefeng Chen, and Sercan Ö. Arık. Astute rag: Overcoming
+imperfect retrieval augmentation and knowledge conflicts for large language models, 2025a. URL
+https://arxiv.org/abs/2410.07176.
+Hao Wang, Linlong Xu, Heng Liu, Yangyang Liu, Xiaohu Zhao, Bo Zeng, Liangying Shao, Longyue
+Wang, Weihua Luo, and Kaifu Zhang. Beyond single-reward: Multi-pair, multi-perspective
+preference optimization for machine translation, 2025b. URL https://arxiv.org/abs/
+2510.13434.
+Haoyu Wang, Ruirui Li, Haoming Jiang, Jinjin Tian, Zhengyang Wang, Chen Luo, Xianfeng Tang,
+Monica Xiao Cheng, Tuo Zhao, and Jing Gao. BlendFilter: Advancing retrieval-augmented large
+language models via query generation blending and knowledge filtering. In Yaser Al-Onaizan,
+Mohit Bansal, and Yun-Nung Chen (eds.), Proceedings of the 2024 Conference on Empirical
+Methods in Natural Language Processing, pp. 1009–1025, 2024.
+Yile Wang, Peng Li, Maosong Sun, and Yang Liu. Self-knowledge guided retrieval augmentation for
+large language models, 2023. URL https://arxiv.org/abs/2310.05002.
+Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten Bosma, Brian Ichter, Fei Xia, Ed Chi, Quoc Le,
+and Denny Zhou. Chain-of-thought prompting elicits reasoning in large language models, 2023.
+URL https://arxiv.org/abs/2201.11903.
+Zhepei Wei, Wei-Lin Chen, and Yu Meng. Instructrag: Instructing retrieval-augmented generation
+via self-synthesized rationales, 2025. URL https://arxiv.org/abs/2406.13629.
+Thomas Wolf, Lysandre Debut, Victor Sanh, Julien Chaumond, Clement Delangue, Anthony Moi,
+Pierric Cistac, Tim Rault, Rémi Louf, Morgan Funtowicz, et al. Transformers: State-of-the-art
+natural language processing. In Proceedings of the 2020 conference on empirical methods in
+natural language processing: system demonstrations, pp. 38–45, 2020.
+Chong Xiang, Tong Wu, Zexuan Zhong, David Wagner, Danqi Chen, and Prateek Mittal. Certifiably robust rag against retrieval corruption, 2024. URL https://arxiv.org/abs/2405.
+15556.
+Shuo Xie, Fangzhi Zhu, Jiahui Wang, Lulu Wen, Wei Dai, Xiaowei Chen, Junxiong Zhu, Kai Zhou,
+and Bo Zheng. Mppo: Multi pair-wise preference optimization for llms with arbitrary negative
+samples, 2024. URL https://arxiv.org/abs/2412.15244.
+Haoran Xu, Amr Sharaf, Yunmo Chen, Weiting Tan, Lingfeng Shen, Benjamin Van Durme, Kenton
+Murray, and Young Jin Kim. Contrastive preference optimization: Pushing the boundaries of llm
+performance in machine translation, 2024a. URL https://arxiv.org/abs/2401.08417.
+Jiajun Xu, Zhiyuan Li, Wei Chen, Qun Wang, Xin Gao, Qi Cai, and Ziyuan Ling. On-device language
+models: A comprehensive review, 2024b. URL https://arxiv.org/abs/2409.00088.
+Ran Xu, Hui Liu, Sreyashi Nag, Zhenwei Dai, Yaochen Xie, Xianfeng Tang, Chen Luo, Yang Li,
+Joyce C. Ho, Carl Yang, and Qi He. Simrag: Self-improving retrieval-augmented generation for
+adapting large language models to specialized domains, 2025. URL https://arxiv.org/
+abs/2410.17952.
+An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu, Chang
+Gao, Chengen Huang, Chenxu Lv, et al. Qwen3 technical report. arXiv preprint arXiv:2505.09388,
+2025.
+Zhilin Yang, Peng Qi, Saizheng Zhang, Yoshua Bengio, William Cohen, Ruslan Salakhutdinov, and
+Christopher D. Manning. HotpotQA: A dataset for diverse, explainable multi-hop question answering. In Ellen Riloff, David Chiang, Julia Hockenmaier, and Jun’ichi Tsujii (eds.), Proceedings
+of the 2018 Conference on Empirical Methods in Natural Language Processing, pp. 2369–2380,
+Brussels, Belgium, October-November 2018. Association for Computational Linguistics. doi:
+10.18653/v1/D18-1259. URL https://aclanthology.org/D18-1259/.
+Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran, Karthik Narasimhan, and Yuan Cao.
+React: Synergizing reasoning and acting in language models, 2023. URL https://arxiv.
+org/abs/2210.03629.
+13
+
+Published as a conference paper at COLM 2026
+
+Ori Yoran, Tomer Wolfson, Ori Ram, and Jonathan Berant. Making retrieval-augmented language
+models robust to irrelevant context, 2024. URL https://arxiv.org/abs/2310.01558.
+Wenhao Yu, Hongming Zhang, Xiaoman Pan, Peixin Cao, Kaixin Ma, Jian Li, Hongwei Wang, and
+Dong Yu. Chain-of-note: Enhancing robustness in retrieval-augmented language models. In Yaser
+Al-Onaizan, Mohit Bansal, and Yun-Nung Chen (eds.), Proceedings of the 2024 Conference on
+Empirical Methods in Natural Language Processing, pp. 14672–14685, Miami, Florida, USA,
+November 2024a. Association for Computational Linguistics. doi: 10.18653/v1/2024.emnlp-main.
+813. URL https://aclanthology.org/2024.emnlp-main.813/.
+Yue Yu, Wei Ping, Zihan Liu, Boxin Wang, Jiaxuan You, Chao Zhang, Mohammad Shoeybi, and
+Bryan Catanzaro. RankRAG: Unifying context ranking with retrieval-augmented generation in
+LLMs. In The Thirty-eighth Annual Conference on Neural Information Processing Systems, 2024b.
+URL https://openreview.net/forum?id=S1fc92uemC.
+Ruizhe Zhang, Yongxin Xu, Yuzhen Xiao, Runchuan Zhu, Xinke Jiang, Xu Chu, Junfeng Zhao, and
+Yasha Wang. Knowpo: Knowledge-aware preference optimization for controllable knowledge
+selection in retrieval-augmented language models, 2024. URL https://arxiv.org/abs/
+2408.03297.
+Zixuan Zhou, Xuefei Ning, Ke Hong, Tianyu Fu, Jiaming Xu, Shiyao Li, Yuming Lou, Luning
+Wang, Zhihang Yuan, Xiuhong Li, Shengen Yan, Guohao Dai, Xiao-Ping Zhang, Yuhan Dong,
+and Yu Wang. A survey on efficient inference for large language models, 2024. URL https:
+//arxiv.org/abs/2404.14294.
+
+A
+
+Omitted Proofs
+
+This section collects all proofs omitted from the main text. Appendix A.1 proves the approximationerror result used in the main text. Appendix A.2 then switches to the CPO setting and analyzes
+gradient stability under candidate-pool sampling. The two analyses are independent: the first controls
+LSE approximation error, while the second explains why smoothing produces a more stable training
+signal than hard pair selection.
+A.1
+
+LogSumExp Error Bound Analysis
+
+Lemma 1 (LSE Error Bound). Let n > 1, τ > 0, and x1 , . . . , xn ∈ R. Let x(1) ≤ · · · ≤ x(n) be
+the order statistics and define
+
+ n
+1
+LSEτ ( x1 , . . . , xn ) :=
+log ∑ eτxi .
+τ
+i =1
+If δ := x(n) − x(n−1) ≥ 0, then the error ϵ := LSEτ ( x1 , . . . , xn ) − x(n) satisfies
+ϵ≤
+
+1
+n − 1 −τδ
+log n and ϵ ≤
+e
+τ
+τ
+
+Proof. Factor out eτx(n) from the exponential sum:
+n
+
+n
+
+∑ eτxi = eτx(n) ∑ eτ(x(i) −x(n) )
+
+i =1
+
+i =1
+
+n −1
+
+
+
+= eτx(n) 1 + ∑ eτ (x(i) −x(n) )
+
+
+
+i =1
+
+Therefore
+ϵ=
+
+
+
+n −1
+1
+log 1 + ∑ eτ ( x(i) − x(n) )
+τ
+i =1
+
+Uniform bound. Since x(i) ≤ x(n) for all i, we have eτ ( x(i) − x(n) ) ≤ 1, and thus
+n
+
+∑ eτ(x(i) −x(n) ) ≤ n.
+
+i =1
+
+14
+
+Published as a conference paper at COLM 2026
+
+Consequently,
+ϵ=
+
+ n
+
+1
+1
+log ∑ eτ ( x(i) − x(n) ) ≤ log n.
+τ
+τ
+i =1
+
+δ-Bound. For each i ≤ n − 1, we have x(i) ≤ x(n−1) , hence x(i) − x(n) ≤ x(n−1) − x(n) = −δ,,
+so eτ ( x(i) − x(n) ) ≤ e−τδ . Summing these bounds gives
+n −1
+
+∑ eτ(x(i) −x(n) ) ≤ (n − 1)e−τδ ,
+
+i =1
+
+and thus
+
+
+
+1
+log 1 + (n − 1)e−τδ .
+τ
+Finally, since log(1 + u) ≤ u for all u ≥ 0, we obtain
+
+
+1
+n − 1 −τδ
+ϵ ≤ log 1 + (n − 1)e−τδ ≤
+e
+.
+τ
+τ
+ϵ≤
+
+Lemma 2 (Lambert W inversion equivalence). Let a > 0. For any y > 0,
+yey ≥ a ⇐⇒ y ≥ W ( a),
+where W is the (principal) Lambert W function and W ( a) ∈ R.
+Proof. Fix a > 0 and consider the function
+f : (0, ∞) → (0, ∞), f (y) = yey .
+We first show that f is strictly increasing on (0, ∞). Indeed,
+f ′ ( y ) = e y (1 + y ) > 0
+for all y > 0,
+so f is strictly increasing and hence injective.
+By definition of the (principal) Lambert W function, W ( a) is the unique real number w such that
+wew = a.
+Existence and uniqueness follow here because f is continuous, strictly increasing, and satisfies
+limy→0 f (y) = 0 and limy→∞ f (y) = ∞; thus for each a > 0 there is a unique w > 0 with
+f (w) = a.
+Since f is strictly increasing and f (W ( a)) = a, for any y > 0 we have
+yey ≥ a = f (W ( a)) ⇐⇒ f (y) ≥ f (W ( a)) ⇐⇒ y ≥ W ( a).
+Theorem 3 (LSE Error Bound Control). Let M > 0, n > 1, and x1 , . . . , xn ∈ R. Let x(1) ≤ · · · ≤
+x(n) and assume the top-gap δ := x(n) − x(n−1) > 0, ϵ := LSEτ ( x1 , . . . , xn ) − x(n) for τ > 0. If
+1  δ ( n − 1) 
+τ ≥ Fδ,n ( M ) := W
+,
+δ
+M
+then ϵ ≤ M. Moreover, for any M > 0, δ > 0, and n > 1, Fδ,n ( M ) ∈ R.
+Proof. By Lemma 1,
+
+n − 1 −τδ
+e
+.
+τ
+1 −τδ
+≤ M. Let y := τδ > 0 and a :=
+Thus it suffices to show that τ ≥ Fδ,n ( M ) implies n−
+τ e
+ϵ≤
+
+δ ( n −1)
+> 0. Since τ ≥ Fδ,n ( M) means y ≥ W ( a), Lemma 2 (applied right-to-left) gives yey ≥ a,
+M
+
+i.e.,
+
+δ ( n − 1)
+δ ( n − 1) − y
+n − 1 −τδ
+≤ yey ⇐⇒
+e ≤ y ⇐⇒
+e
+≤ M.
+M
+M
+τ
+n−1 −τδ
+Hence ϵ ≤ τ e
+≤ M.
+δ ( n − 1)
+is strictly positive.
+M
+δ ( n − 1) 
+The principal branch W (z) is real-valued for all z ≥ 0, hence W
+∈ R and therefore
+M
+Fδ,n ( M ) ∈ R.
+For the final claim, since M > 0, δ > 0, and n > 1, the argument
+
+15
+
+Published as a conference paper at COLM 2026
+
+A.2
+
+Notation for Gradient Stability Analysis
+
+Throughout this appendix, ∥ · ∥ denotes the Euclidean norm. For probability vectors p, q ∈ Rn , we
+use the total variation distance
+n
+1 n
+TV( p, q) := ∑ | pi − qi | = 1 − ∑ min{ pi , qi }.
+2 i =1
+i =1
+CPO-Specific Quantities.
+
+Let
+
+ϕ(u) := − log σ (u).
+For a fixed prompt x and sampled candidate pool
+Y = (Yw1 , . . . , Ywn , Yl1 , . . . , Yln ) ∼ Px ,
+define branchwise scores and score gradients by
+siw (Y ) := log πθ (Ywi | x ),
+sil (Y ) := log πθ (Yli | x ),
+i
+ui (Y ) := ∇θ log πθ (Yw | x ),
+vi (Y ) := ∇θ log πθ (Yli | x ).
+The hard-selected indices and smoothed branch weights are
+⋆
+⋆
+iw
+(Y ) := arg min siw (Y ),
+il⋆ (Y ) := arg max sil (Y ),
+I (Y ) : = ( i w
+(Y ), il⋆ (Y )),
+i
+
+i
+
+w
+
+e−τsi (Y )
+
+qw,i (Y ) :=
+
+,
+−τsw (Y )
+
+l
+
+eτsi (Y )
+
+ql,i (Y ) :=
+
+.
+τsl (Y )
+∑nj=1 e j
+∑nj=1 e j
+For hard selection, we interpret the update on each sampled pool Y as the active-branch gradient,
+⋆ (Y ) and i ⋆ (Y ) held fixed. Equivalently, away
+i.e., the gradient evaluated with the selected indices iw
+l
+from selector-switching boundaries, the hard objective is locally smooth and the formula below is its
+ordinary gradient. Define the hard and smoothed margins by
+
+∆hard (Y ) := β siww⋆ (Y ) (Y ) − sil⋆ (Y ) (Y ) ,
+l
+
+
+l
+l
+∆sm (Y ) := β − LSEτ (−s1w (Y ), . . . , −sw
+n (Y )) − LSEτ ( s1 (Y ), . . . , sn (Y )) .
+The corresponding gradients are
+
+ghard (Y ) := β ϕ′ (∆hard (Y )) uiw⋆ (Y ) (Y ) − vi⋆ (Y ) (Y ) ,
+(7)
+l
+!
+gsm (Y ) := β ϕ′ (∆sm (Y ))
+
+n
+
+n
+
+i =1
+
+i =1
+
+∑ qw,i (Y )ui (Y ) − ∑ ql,i (Y )vi (Y )
+
+.
+
+(8)
+
+We also use
+
+1 n
+1 n
+u
+(
+Y
+)
+,
+v̄
+(
+Y
+)
+:
+=
+v i (Y ) ,
+i
+n i∑
+n i∑
+=1
+=1
+and the corresponding averaged smoothed gradient
+
+ḡ(Y ) := β ϕ′ (∆sm (Y )) ū(Y ) − v̄(Y ) .
+ū(Y ) :=
+
+For any square-integrable vector random variable X, we use
+h
+i
+Var( X ) := E ∥ X − EX ∥2 .
+For probability vectors p, q ∈ Rn , we use the total variation distance
+n
+1 n
+TV( p, q) := ∑ | pi − qi | = 1 − ∑ min{ pi , qi }.
+2 i =1
+i =1
+
+
+We write
+1
+1
+,...,
+Unifn :=
+n
+n
+for the uniform distribution on n points.
+For the hard lower bound, define for each pair index i
+p i : = P ( I (Y ) = i ) ,
+µi := E[ ghard (Y ) | I (Y ) = i ].
+We also use the two-index specialization: there exist a ̸= b and constants p ∈ (0, 1/2], m > 0 such
+that
+P( I (Y ) = a) ≥ p,
+P( I (Y ) = b) ≥ p,
+∥µ a − µb ∥ ≥ m.
+Finally, define
+δn (τ, R) :=
+
+(n − 1)(eτR − 1)
+.
+n(eτR + n − 1)
+16
+
+Published as a conference paper at COLM 2026
+
+Assumptions for the Stability Comparison.
+Assumption 1 (Bounded branch scores and score gradients). There exist constants G > 0 and
+Rw , Rl ≥ 0 such that
+∥ui (Y )∥ ≤ G,
+∥vi (Y )∥ ≤ G
+for every candidate index i and every sampled pool Y, and
+max siw (Y ) − min siw (Y ) ≤ Rw ,
+i
+
+i
+
+max sil (Y ) − min sil (Y ) ≤ Rl
+i
+
+i
+
+for every sampled pool Y.
+Assumption 2 (Bounded within-pool gradient diameters). There exist Dw , Dl ≥ 0 such that
+max ∥ui (Y ) − u j (Y )∥ ≤ Dw ,
+max ∥vi (Y ) − v j (Y )∥ ≤ Dl
+i,j
+
+i,j
+
+for every sampled pool Y.
+Assumption 3 (Selector-mixture dominance). The selector-mixture variance floor of hard selection
+dominates the fluctuation budget of smoothing:
+
+2
+p2 m2 > 2 Var( ḡ(Y )) + 2β2 Dw δn (τ, Rw ) + Dl δn (τ, Rl ) .
+Assumption 3 is the explicit comparison condition used in the main theorem. Its left-hand side is
+the irreducible selector-mixture variance floor induced by hard selection, while the right-hand side
+measures the total fluctuation budget of smoothing: the branchwise averaging baseline Var( ḡ(Y ))
+plus the additional soft-weighting term controlled by the diameters Dw , Dl and the shrinkage factor
+δn (τ, R). Intuitively, the condition is most plausible when hard selector competition is strong but the
+softmax weights remain close to a stable branchwise average.
+A.3
+
+Auxiliary Lemmas for Gradient Stability
+
+Lemma 3 (Hard selector induces a variance floor). Under the notation above,
+1
+Vhard ( x, θ ) ≥ ∑ pi p j ∥µi − µ j ∥2 .
+2 i,j
+In particular, if there exist a ̸= b and p ∈ (0, 1/2] such that
+P( I (Y ) = a) ≥ p,
+P( I (Y ) = b) ≥ p,
+then
+Vhard ( x, θ ) ≥ p2 m2 .
+
+∥µ a − µb ∥ ≥ m,
+
+Proof. Let
+
+Z (Y ) := ghard (Y ),
+Applying the law of total variance with respect to the hard-selected pair index
+
+
+
+Var( Z ) = E Var( Z | I (Y )) + Var E[ Z | I (Y )] ,
+
+and therefore
+Vhard ( x, θ ) = Var( Z ) ≥ Var E[ Z | I (Y )] .
+Write
+µ j : = E [ Z | I (Y ) = j ] ,
+p j : = P ( I (Y ) = j ) .
+Then
+2
+
+1
+Var E[ Z | I (Y )] = ∑ p j µ j − ∑ pk µk = ∑ pi p j ∥µi − µ j ∥2 .
+2 i,j
+j
+k
+This proves the first claim.
+For the second claim, suppose there exist two indices a ̸= b such that p a ≥ p, pb ≥ p, and
+∥µ a − µb ∥ ≥ m.
+Keeping only the ( a, b) contribution in the pairwise-variance formula, we obtain
+
+Var E[ Z | I (Y )] ≥ p a pb ∥µ a − µb ∥2 ≥ p2 m2 .
+Hence
+Vhard ( x, θ ) ≥ p2 m2 .
+
+17
+
+Published as a conference paper at COLM 2026
+
+Remark 1 (Interpretation). Lemma 3 isolates the instability mechanism specific to hard selection
+without conditioning on any auxiliary event. Whenever the hard selector places non-trivial probability
+mass on multiple pair indices and those indices induce distinct average updates, the resulting selector
+mixture contributes a non-zero variance floor. Smoothing removes this discrete mixture by replacing
+one-hot selection with a continuous weighted aggregation, which is why it is more stable.
+Lemma 4 (Refined upper bound for smoothed variance). Under Assumptions 1 and 2,
+
+
+∥ gsm (Y ) − ḡ(Y )∥ ≤ β Dw δn (τ, Rw ) + Dl δn (τ, Rl )
+for every sampled pool Y. Consequently,
+
+2
+Vsm ( x, θ ) ≤ 2 Var( ḡ(Y )) + 2β2 Dw δn (τ, Rw ) + Dl δn (τ, Rl ) .
+Proof. Write
+
+Ξ(Y ) := gsm (Y ) − ḡ(Y ).
+
+By (8),
+"
+Ξ(Y ) = β ϕ′ (∆sm (Y ))
+
+n
+
+∑ qw,i (Y )ui (Y ) − ū(Y )
+
+!
+
+n
+
+−
+
+i =1
+
+∑ ql,i (Y )vi (Y ) − v̄(Y )
+
+!#
+.
+
+i =1
+
+Since ϕ(u) = − log σ(u), we have |ϕ′ (u)| ≤ 1.
+For the preferred branch, Assumption 1 implies
+w
+
+maxi e−τsi (Y )
+w
+
+mini e−τsi (Y )
+
+≤ eτRw .
+
+Hence every soft weight satisfies
+1
+eτRw
+≤
+q
+(
+Y
+)
+≤
+.
+w,i
+eτRw + n − 1
+eτRw + n − 1
+Since maxi qw,i (Y ) ≥ 1/n, we have
+n
+
+TV(qw (Y ), Unifn ) = 1 − ∑ min{qw,i (Y ), 1/n}
+i =1
+
+n−1
+1
+−
+= δn (τ, Rw ).
+(9)
+n eτRw + n − 1
+Now let z be any unit vector in the dual norm. The scalar function
+f z (i ) := ⟨z, ui (Y )⟩
+has oscillation at most Dw by Assumption 2. Therefore, by the standard total-variation bound for
+bounded observables,
+
+≤ 1−
+
+n
+
+1
+
+n
+
+∑ qw,i (Y )⟨z, ui (Y )⟩ − n ∑ ⟨z, ui (Y )⟩ ≤ Dw TV(qw (Y ), Unifn ).
+
+i =1
+
+i =1
+
+Taking the supremum over dual unit vectors z and using (9) gives
+n
+
+∑ qw,i (Y )ui (Y ) − ū(Y ) ≤ Dw δn (τ, Rw ).
+
+i =1
+
+The non-preferred branch is identical. Assumption 1 implies
+TV(ql (Y ), Unifn ) ≤ δn (τ, Rl ),
+and Assumption 2 yields
+n
+
+∑ ql,i (Y )vi (Y ) − v̄(Y ) ≤ Dl δn (τ, Rl ).
+
+i =1
+
+Combining (A.3) and (A.3), we obtain
+
+
+∥Ξ(Y )∥ ≤ β Dw δn (τ, Rw ) + Dl δn (τ, Rl ) .
+This proves the first claim.
+18
+
+Published as a conference paper at COLM 2026
+
+For the variance bound, write
+
+
+gsm (Y ) − Egsm (Y ) = ḡ(Y ) − E ḡ(Y ) + Ξ(Y ) − EΞ(Y ) .
+Using ∥ a + b∥2 ≤ 2∥ a∥2 + 2∥b∥2 and
+Var(Ξ) ≤ E∥Ξ∥2 ,
+we get
+
+Vsm ( x, θ ) ≤ 2 Var( ḡ(Y )) + 2E∥Ξ(Y )∥2 .
+Applying the pointwise bound on ∥Ξ(Y )∥ yields
+
+2
+Vsm ( x, θ ) ≤ 2 Var( ḡ(Y )) + 2β2 Dw δn (τ, Rw ) + Dl δn (τ, Rl ) .
+
+A.4
+
+Proof of Theorem 2
+
+Proof. Lemma 3 gives
+
+Vhard ( x, θ ) ≥ p2 m2 .
+
+Lemma 4 gives
+
+
+2
+Vsm ( x, θ ) ≤ 2 Var( ḡ(Y )) + 2β2 Dw δn (τ, Rw ) + Dl δn (τ, Rl ) .
+Subtracting the two bounds yields
+
+2
+Vhard ( x, θ ) − Vsm ( x, θ ) ≥ p2 m2 − 2 Var( ḡ(Y )) − 2β2 Dw δn (τ, Rw ) + Dl δn (τ, Rl ) .
+Assumption 3 therefore implies
+
+B
+
+Vhard ( x, θ ) > Vsm ( x, θ ).
+
+Data Aggregation Strategies
+
+Table 3 summarizes the different aggregation strategies used to aggregate multi-pair preference data
+for preference optimization. We present 4 strategies and corresponding formulation to generate
+pseudo preferred data ỹw and pseudo non-preferred data ỹl .
+Table 3: Different aggregation strategies for multi-pair preference data to formulate ỹw and ỹl .
+Method
+
+log Pθ (ỹw | x )
+
+log Pθ (ỹl | x )
+
+Weighted
+
+Pθ0 (yiw | x )
+log Pθ (yiw | x )
+n
+i
+i =1 ∑i =1 Pθ0 ( yw | x )
+
+Average
+
+1 n
+log Pθ (yiw | x )
+n i∑
+=1
+
+Pθ0 (yil | x )
+log Pθ (yil | x )
+n
+i
+i =1 ∑i =1 Pθ0 ( yl | x )
+1 n
+log Pθ (yil | x )
+n i =1
+
+n
+
+C
+
+∑
+
+Description
+
+n
+
+∑
+
+∑
+
+Weighted aggregation by likelihood given base model
+Uniform averaging
+
+Baseline
+• CoT (Wei et al., 2023) instructs the LLM to generate answers accompanied by explicit
+reasoning steps.
+• ReAct (Yao et al., 2023) integrates reasoning, action, and observation steps, concluding the
+generation process upon reaching a terminal state. The action step involves either generating
+a query to retrieve additional knowledge or finalizing the generation, while the observation
+step incorporates the retrieved knowledge documents.
+• SelfAsk (Press et al., 2023) involves generating follow-up questions, retrieving relevant
+information, and answering these follow-up questions. Each retrieval operation is based on
+the generated follow-up questions. When no additional follow-up questions are produced,
+the LLM provides the answer to the original question. We prepend the newly retrieved
+knowledge to the original question following the approach of Yoran et al. (2023).
+• BlendFilter (Wang et al., 2024) combines internal and external knowledge to enhance
+retrieval quality. Additionally, it employs the LLM to filter out irrelevant information,
+thereby preventing the model from being misled.
+19
+
+Published as a conference paper at COLM 2026
+
+• InstructRAG (Wei et al., 2025) instructs the LLM to generate rationales that analyze the
+relevance between the query and the retrieved knowledge.
+• RoseRAG (Liu et al., 2025) generates preference data through rejection sampling and
+optimizes the model using a single hard preference pair selected based on the model’s
+likelihoods.
+
+D
+
+Implementation Details
+
+We evaluate models with two small-sclae LLMs: Qwen2.5-1.5B-Instruct (Team, 2024) and Gemma2-2b-it (Team et al., 2024). We employ the state-of-the-art efficient retrieval method ColBERT v2
+(Santhanam et al., 2022) as implemented by (Khattab et al., 2023b), which applies quantization to
+accelerate approximate nearest neighbor search. Our knowledge base comprises Wikipedia abstracts
+from the 2017 dump (Khattab et al., 2023a). For experiments, we use Transformers (Wolf et al.,
+2020) and TRL (von Werra et al., 2020) as backbone frameworks for fine-tuning and vLLM (Kwon
+et al., 2023) for inference. For multi-pair aggregation, we implemented the trainer based on TRL
+library to apply our R IMS strategy and comparisons to other data aggregation strategies for three
+types of preference optimization algorithms (DPO, CPO, ORPO).
+In all experiments, we adopt a 3-shot in-context learning setting following the approach of (Shao
+et al., 2023), with the count of retrieval documents set to 5 for all methods. The prompts for
+generating preference data are shown in Figure 5, while those for question answering are presented in
+Figure 6. We generate preference data using the first 10k training samples from HPQA, 2WMHQA
+and MSQQA while all data in MHRAGQA. For all backbones, we apply LoRA (Hu et al., 2021) with
+a rank of 16 and lora alpha = 32, targeting ”all-linear modules. Experiments are conducted
+on eight 80G A100 NVIDIA GPUs. The learning rate is 1e−5 and number of training epochs is 2.
+
+E
+
+Qualitative Comparison of RoseRAG and R IMS
+
+Figure 4 presents a case study comparing the inference outputs of models trained with RoseRAG
+and R IMS on a multi-hop question with noisy retrieved passages. The RoseRAG-trained model,
+which was optimized using only a single hardest preference pair per query, fails to reason correctly
+through the noisy context and produces an incorrect answer. In contrast, the R IMS-trained model,
+which leveraged all preference pairs via smoothed aggregation during training, demonstrates stronger
+robustness to noisy distractors and arrives at the correct answer. This case illustrates that training with
+smoothed multi-pair aggregation yields models with improved evidence discrimination and multi-hop
+reasoning ability under noisy retrieval conditions.
+
+F
+
+Prompt Details
+
+We show the prompts we used in Fig. 5 and Fig. 6.
+
+20
+
+Published as a conference paper at COLM 2026
+
+Which company, commonly associated with the news sources The Verge, The Age, and
+TechCrunch for its practices in local search ranking, deals with major tech companies to maintain default
+search engine status, and faces accusations of anticompetitive behavior affecting news publishers'
+revenues?
+Google
+
+[Doc 1] ...
+...
+[Doc i] ... Vox Media is an American multinational digital media company ... It currently runs eight editorial
+brands: SB Nation, The Verge, Polygon, Curbed, Eater, Racked, Vox, and Recode. Vox's brands are built on
+Concert, a publisher-led market place for advertising and Chorus, its proprietary content management
+system ....
+...
+[Doc k] ...
+
+... Vox Media runs multiple brands including The
+Verge, The Age, and TechCrunch. It deals with
+major tech companies through its subsidiary
+Chorus, a proprietary content management
+system. Vox Media has faced accusations of
+anticompetitive behavior, particularly regarding
+its practices in local search ranking ...
+So the answer is Vox Media.
+
+... Finally, let's match these elements to a single
+entity: Google fits all criteria perfectly. It owns The
+Verge, The Age, and TechCrunch through Vox Media.
+It maintains default search engine status for major
+tech companies. It has been accused of
+anticompetitive behavior, particularly concerning its
+practices affecting news publishers' revenues.
+So the answer is Google.
+
+Figure 4: Qualitative comparison on a multi-hop question. RoseRAG, which relies on hard pair
+selection, is misled by noisy retrieved passages and produces an incorrect answer. R IMS, using
+soft aggregation over multiple preference pairs, arrives at the correct answer despite the same noisy
+context.
+
+Rationale Generation
+System Prompt: You are a useful assistant.
+I will provide one question, several pieces of knowledge (which may be related or unrelated
+to the question), and the answer to the question. Please explain your reasoning process in
+a single paragraph consisting of no more than four sentences. If the provided knowledge is
+insufficient, you may make an informed guess, but do not respond with “Unknown.”
+User Prompt: Knowledge: Kq
+Question: q
+Answer: a∗
+Assistant Prompt: Let’s think step by step.
+Output: {rationale r }
+
+Figure 5: Prompt template for rationale generation
+
+21
+
+Published as a conference paper at COLM 2026
+
+Few-shot Prompt for Question Answering Benchmark
+System Prompt: Y ou are a useful assistant. Y ou should answer the following question
+quickly and accurately based on given knowledge. Provide your reasoning in few sentences
+and answer in one or few words. Please begin your final answer with ’So the answer is’.
+User Prompt: Knowledge:Mr. Big (film) — Mr. Big is a 2007 documentary directed and
+produced by Tiffany Burns and edited by Alec MacNeill Richardson. The documentary
+examines the ”Mr. Big” undercover methods used by the Royal Canadian Mounted Police
+(RCMP). In these operations, RCMP officers pose as gang criminals and develop a relationship
+with the target in the hope of eventually determining what, if any, knowledge the target has of
+the crime being investigated. ”Mr. Big” operations have been credited with securing difficult
+convictions in a large number of cases, but concerns have been raised that they involve a risk
+of false confessions and wrongful convictions. It Might Get Loud — It Might Get Loud is a
+2008 American documentary film by filmmaker Davis Guggenheim. It explores the careers
+and styles of prominent rock musicians Jimmy Page, The Edge, and Jack White. The film
+received a wide release on August 14, 2009 in the U.S. by Sony Pictures Classics.
+Question:Are It Might Get Loud and Mr. Big both Canadian documentaries?
+Assistant Prompt: Let’s think step by step. Mr. Big is a 2007 documentary which examines
+the ”Mr. Big” undercover methods used by the Royal Canadian Mounted Police. However,
+Are It Might Get Loud is a 2008 American documentary film. So the answer is no.
+User Prompt: Knowledge:Leslie H. Martinson — Leslie Herbert ”Les” Martinson (January
+16, 1915 – September 3, 2016) was an American television and film director. László Benedek
+— László Benedek (] ; March 5, 1905 – March 11, 1992; sometimes ”Laslo Benedek”) was
+a Hungarian-born film director and cinematographer, most notable for directing ”The Wild
+One” (1953).
+Question:Were László Benedek and Leslie H. Martinson both film directors?
+Assistant Prompt: Let’s think step by step. László Benedek was a Hungarian-born film
+director and Leslie H. Martinson was an American film director. So the answer is yes.
+User Prompt: Knowledge:Lucium — Lucium was the proposed name for an alleged new
+element found by chemist Prosper Barrière in 1896 in the mineral monazite. Later, William
+Crookes confirmed that the new element was actually an impure sample of yttrium. William
+Crookes — Sir William Crookes ( ; 17 June 1832 – 4 April 1919) was an English chemist
+and physicist who attended the Royal College of Chemistry in London, and worked on
+spectroscopy. He was a pioneer of vacuum tubes, inventing the Crookes tube which was
+made in 1875. Crookes was the inventor of the Crookes radiometer, which today is made
+and sold as a novelty item. Late in life, he became interested in spiritualism, and became the
+president of the Society for Psychical Research.
+Question:Lucium was confimed to be an impure sample of yttrium by an English chemist
+who became the president of what?
+Assistant Prompt: Let’s think step by step. Lucium was confimed to be an impure sample of
+yttrium by William Crookes. William Crookes is Sir William Crookes. Sir William Crookes
+became the president of the Society for Psychical Research. So the answer is Society for
+Psychical Research.
+User Prompt: Knowledge: Kq
+Question: q
+Assistant Prompt: Let’s think step by step. {answer a}
+
+Figure 6: Few-shot prompt template for benchmark
+
+22
+
+

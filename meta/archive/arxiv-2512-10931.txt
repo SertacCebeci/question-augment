@@ -1,0 +1,4832 @@
+Asynchronous Reasoning: Training-Free Interactive
+Thinking LLMs
+
+arXiv:2512.10931v3 [cs.LG] 13 May 2026
+
+George Yakushev∗
+Yandex, HSE University
+
+Nataliia Babina∗
+Masoud Vahid Dastgerdi∗
+The University of Tokyo, MATS
+HSE University
+
+Vyacheslav Zhdanovskiy∗ Denis Kuznedelev∗
+Yandex
+Yandex
+
+Alina Shutova
+Max Ryabinin†
+Yandex, HSE University
+Together AI
+
+Abstract
+Many state-of-the-art LLMs are trained to think before giving their answer. Reasoning can greatly improve language model capabilities, but it also makes them
+less interactive: given a new input, a model must stop thinking before it can respond. Real-world use cases such as voice-based or embodied assistants require
+an LLM agent to respond and adapt to additional information in real time, which
+is incompatible with sequential interactions. In contrast, humans can listen, think,
+and act asynchronously: we begin thinking about the problem while reading it
+and continue thinking while formulating the answer. In this work, we augment
+LLMs capable of reasoning to operate in a similar way without additional training.
+Our method uses the properties of positional embeddings to enable LLMs built
+for sequential generation to simultaneously think, listen, and write outputs. We
+evaluate our approach on math, commonsense, and safety reasoning: it allows
+models to generate accurate thinking-augmented answers while reducing time to
+first non-thinking token from minutes to ≤ 5s and the overall delays by up to 12×.
+
+1
+
+Introduction
+
+Modern language models solve complex tasks using inference-time computation mechanisms [1, 2, 3],
+such as chain-of-thought reasoning [4, 5, 6, 7] and agentic tool use [10, 11, 12]. Recent models,
+both proprietary [18, 19, 20] and open [21, 22, 23], are explicitly trained for reasoning and agentic
+capabilities. As we trust these models with harder problems [24, 25], their ability to “think” becomes
+ever more important. The current dominant strategy for large language model (LLM) reasoning is the
+read-think-answer cycle: the model encodes a given problem, generates chain-of-thought reasoning,
+possibly calls tools, and then formulates the final answer [18, 21, 23]. This paradigm naturally fits
+the sequential view of LLMs as next token prediction models. However, it also means that the LLM
+must follow a rigid turn structure that can limit its flexibility. The “thinking” phase can take minutes
+of real time, during which the agent does not get new information or output its current results.
+By contrast, people have an innate ability to think asynchronously [26, 27, 28, 29]. We can begin
+solving a problem even before hearing its entire statement. Moreover, we might start talking (or
+acting) while still completing our solution. Such “multitasking” is not always easy or efficient [30],
+but it allows us to operate effectively in a dynamic environment [31].
+Similarly, artificial agents often need the ability to dynamically change their course of action. A voice
+assistant is expected to maintain a conversation in real time [32, 33, 34, 35, 36, 37, 38]. The VLA
+model of an embodied agent needs to quickly adjust to new inputs [39, 40, 41]. Even fully text-based
+“deep research” agents benefit from interactive communication with the user [42]. However, the
+standard read-think-answer cycle is inherently non-interactive. During the thinking phase, if an agent
+receives new inputs or must take action, it can either stop reasoning, discarding any incomplete
+thoughts, or wait until the thinking phase is complete, sacrificing interactivity. As a result, many
+real-time LLM applications do not fully benefit from thinking.
+Preprint.
+Equal contribution.
+
+† Senior author.
+
+Correspondence to: mryabinin0@gmail.com.
+
+Task: A bat and a ball are 1.10$, and the bat is 1$ more than the ball. How much is the ball?
+Time
+Thinker:
+
+Writer:
+
+Let the ball cost x dollars, x + (x + 1) = 1.10...
+
+simplified to 2x + 1 = 1.10, x = 0.05...
+
+Thinker pauses the Writer ...
+
+... resumes the Writer.
+
+waiting...
+
+The price is $0.05
+
+Let me solve this...
+
+Writer runs when Thinker is ahead, otherwise pauses.
+
+Figure 1: An intuitive explanation of asynchronous reasoning: the model generates its response
+concurrently with thinking. If the thinking stream needs additional time, it can pause the writing
+stream until the next reasoning step is ready. See animated version in the supplementary code.
+In this work, we propose a technique that enables asynchronous LLM reasoning. Instead of retraining
+the model to satisfy each specific degree of interactivity, we propose an approach that leverages
+existing models, only changing their operation at inference time. Our approach uses three concurrent
+token streams: user inputs, private thoughts, and a public response, all of which can be updated in
+real time. We rely on the geometric properties of rotary positional embeddings to make the LLM
+perceive these streams as a single contiguous sequence without additional training. The model itself
+can decide whether it should continue talking or pause and think, depending on the current state of
+the three streams. The resulting asynchronous reasoning method can be formulated as standard LLM
+inference with a modified attention cache, making it possible to easily integrate our approach into
+efficient LLM inference frameworks [43, 44]. Our main contributions can be summarized as follows:
+• We propose AsyncReasoning, a zero-shot method that allows existing reasoning LLMs to think,
+write outputs, and encode extra inputs concurrently. Our approach relies on model-agnostic
+concurrent attention and zero-shot mode switching, making it easy to adapt to new models.
+• We evaluate AsyncReasoning on multiple real-time benchmarks in mathematical and commonsense
+reasoning. Our experiments demonstrate that the proposed approach lets the LLM overlap thinking
+and answering, reducing time to first token by up to 80× and total user-perceived delay by 12×
+while retaining accuracy gains from reasoning.
+• We demonstrate how AsyncReasoning can be used to improve model safety by thinking about risks
+in the background. This allows streaming real-time outputs on benign requests, while considering
+the safety implications in a private thinking stream that can pause potentially harmful outputs.
+• Finally, we evaluate on tasks where the user specifies additional information after the initial prompt,
+such as clarifications or error correction. We found that modern LLMs with AsyncReasoning can
+incorporate this information on the fly without interrupting reasoning.
+• We provide a reference implementation of AsyncReasoning1, including GPU kernels for concurrent
+attention and a minimal voice assistant with asynchronous thinking capabilities.
+
+2
+
+Related Work
+
+2.1
+
+Real-time LLM Applications
+
+Modern LLM agents are deployed in a wide range of applications that require varying degrees of
+interactivity. Even with text-based AI assistants, users often interrupt inference to provide missing
+context or corrections [45], but they do not always expect quick responses. For instance, a background
+code review agent can pause and think for several minutes, whereas a real-time voice assistant cannot.
+Here, we briefly review several LLM applications that require quick or interactive responses.
+Voice assistants. Recent works [33, 34] and industry releases [32, 46, 47] use LLM agents as
+interactive voice assistants that talk to users in real time, often through phones or edge devices,
+or participate in a group conversation [48, 49]. Compared to their text-based counterparts, voice
+assistants need faster reaction time, with the user often adding information while the agent is thinking.
+There are two main strategies for building voice assistants: modular and end-to-end. The first strategy
+feeds the output of automated speech recognition [50, 51, 52, 53] into a text-based LLM, then sends
+its response into a text-to-speech (TTS) system [54, 55, 56, 57, 58, 59, 60, 61]. The pipeline overlaps
+the LLM generation with TTS to stream audio in real time. The second, more recent, strategy is using
+language models that are trained to process and generate audio natively, often called omnimodal or
+1 See github.com/yandex-research/AsyncReasoning
+
+2
+
+speech language models [35, 38, 36, 37]. However, due to the constraints on response time, many
+speech LMs are not trained for long-form reasoning, and thinking models often cannot generate
+speech. For example, in the recent Qwen3-Omni family [62], the 30B-A3B-Instruct model can speak,
+but does not generate <think> blocks, while the 30B-A3B-Thinking model has no speech output.
+Robotic & virtual agents. Another type of LLM applications that requires interactivity is agents in
+real-time environments. Agents controlling robotic systems use Embodied Language Models [41,
+39, 66, 67, 68] for action planning or Vision-Language-Action [40, 69, 70] models to control the
+system directly. Aside from robotic systems, similar agents have been proposed for videogames [71]
+or managing operating systems and mobile devices [72, 73, 74, 75]. Similar to voice assistants,
+embodied agents need to react quickly to new stimuli from the environment.
+Reasoning and Safety. Multiple works have studied the interactions between LLM reasoning and the
+safety of model’s responses [76, 77]. By default, thinking can both mitigate safety risks and create
+new ones [78, 79, 80]. However, when specifically prompted to reason about the safety implications
+of their task, language models can detect and prevent jailbreak attacks [81, 82, 83, 84]. We review
+these works in Appendix I. At the same time, standard reasoning delays the model’s response, which
+is inconvenient for interactive usage. We show that LLMs can reason about the safety of the user’s
+request in the background, mitigating jailbreaks without response delays.
+2.2 Efficient LLM Reasoning
+As we have shown above, there is a wide range of tasks that require LLMs to reason in real time.
+However, most thinking models [18, 21, 85] follow a read-think-answer cycle, which is inherently
+non-interactive. When receiving new information mid-thought, such LLMs can either interrupt their
+reasoning to react, sacrificing any incomplete thought tokens, or continue reasoning non-interactively.
+Recently, there has been a large influx of techniques for efficient reasoning [86] through more concise
+chain-of-thought [87, 88, 89], adaptive reasoning effort [90, 91, 92] or early stopping [93, 94, 95].
+Another line of work explores reasoning in parallel, with multiple concurrent LLM instances solving
+different subtasks [96, 97, 98, 99, 100, 101], or parallel tool calling [102, 103]. In this work, we
+focus on an orthogonal direction: instead of generally faster thinking, we let the LLM formulate its
+response concurrently with its reasoning to reduce delays.
+Reducing reasoning-induced delays. Several recent studies propose techniques that reduce the
+reasoning delays for real-time applications with partial read/think overlapping [104] or specialized
+two-model architectures with fast interactive and slow reasoning modules [106]. A concurrent
+work [107] introduced a method that fine-tunes reasoning LLMs to solve their task with interleaved
+thinking and talking sub-blocks, making these models more interactive. Note that all these techniques
+require specialized fine-tuning or training from scratch, which complicates their adoption. In practice,
+the requirements for interactive LLM use also vary with hardware and software configuration: a
+model trained for “real-time” reasoning on a B200 GPU may have delays on slower GPUs or with
+batched inference. Hence, models that were trained for one interactive use setup may need retraining
+for other setups. Instead, we design an asynchronous reasoning method that does not require training.
+
+3
+
+AsyncReasoning
+
+To convert a reasoning LLM into an asynchronous thinker, we need to formulate concurrent reasoning
+in a way that is compatible with the prompting structure the model was trained with. In Section 3.1,
+we describe how to dynamically rearrange the model’s context so that it views two asynchronous
+streams as one sequence. In Section 3.2, we discuss mode switching: allowing the LLM to alternate
+between concurrent writing and waiting for thoughts to finish. Finally, we discuss efficient parallel
+token processing and other implementation details in Section 3.3.
+3.1 Dual Thinker & Writer Views
+The core idea behind our approach is that transformer LLMs are designed to manipulate sets [108,
+109], and the only thing that makes them aware of sequence order is positional encoding [110, 111,
+112]. To change the order of elements in the prefix, we do not need to physically rearrange tokens in
+memory. Instead, it is sufficient to change positional relations between tokens, since the rest of the
+transformer architecture is already position-invariant.
+At each inference step, AsyncReasoning manipulates positional representations to rearrange past
+tokens into a different order for thinking and for writing the response. Public response tokens “see”
+the (partial) private thoughts as if they were generated in a standard read-think-answer cycle. In
+turn, tokens within the <think> block “see” the response as if it was generated during the previous
+conversation turn. We illustrate this dual view in Figure 2 and provide prompts in Appendix A.
+3
+
+Thinker view
+
+Writer view
+
+<|im_start|>user
+
+<|im_start|>user
+
+Prompt Block
+
+Prompt Block
+
+You are an AI assistant that can think and write outputs concurrently. You can reason in private and your
+thoughts will be used to form the public response in the background. Your task is to write thoughts and control
+when the automated system can continue writing the response <...>. Please reason step by step.
+Task: Calculate x - x^2 + x^3 for x = 5,6,7,8. Return all 4 answers in \\boxed{ }.
+
+You are an AI assistant that can think and write outputs concurrently. You can write outputs for the user based
+on partial CoT that will be continued in the background by an automated system.You should outline what you're
+going to do, then write your response as thoughts progress, but not ahead of your thoughts.
+Task: Calculate x - x^2 + x^3 for x = 5,6,7,8. Return all 4 answers in \\boxed{ }.
+
+<|im_end|>
+<|im_start|>assistant
+
+<|im_end|>
+<|im_start|>assistant
+<think>
+
+Writer Block (read-only)
+
+Thinker Block (read-only)
+
+I am in Writer mode. My text is visible to the user. We are asked to evaluate the expression x - x² + x³ for x
+values 5, 6, 7, and 8. Let's compute each value step by step. For x = 5: 5 - 5^2 + 5^3 = 5 - 25 + 125
+125
+
+I am in Thinker mode. My text is not visible to the user. The user wants <...>. Starting with x = 5. The expression
+is 5 - 5² + 5³. Let's break it down: 5 squared is 25, and 5 cubed is 125. So substituting those in, it becomes 5 25 + 125. Calculating that: 5 - 25 is -20, and then adding 125 gives 105. So for x=5, the result
+
+SYSTEM: [the system will continue writing the response here]
+<|im_end|>
+<|im_start>assistant
+<think>
+
+SYSTEM: [additional thoughts will appear here]
+</think>
+
+Thinker Block
+
+Writer Block
+
+I am in Thinker mode. My text is not visible to the user. The user wants <...>. Starting with x = 5. The expression
+is 5 - 5² + 5³. Let's break it down: 5 squared is 25, and 5 cubed is 125. So substituting those in, it becomes 5 25 + 125. Calculating that: 5 - 25 is -20, and then adding 125 gives 105. So for x=5, the result
+
+I am in Writer mode. My text is visible to the user. We are asked to evaluate the expression x - x² + x³ for x
+values 5, 6, 7, and 8. Let's compute each value step by step. For x = 5: 5 - 5^2 + 5^3 = 5 - 25 + 125
+
+Figure 2: A dual thinker / writer view of the same reasoning task. The two views reuse the same KV
+cache and generate tokens in parallel. Both thinker and writer views match the model’s chat template.
+This approach allows both “streams” (thinking and response) to immediately attend to each other’s
+tokens as they are generated. The response tokens can “see” and use the latest thoughts without
+synchronization delays. Likewise, the thinking “stream” sees the current response tokens and can
+pause the model’s output if longer thinking is necessary. This also allows our implementation
+to encode each generated token exactly once and rearrange tokens using the geometry of relative
+positional embeddings (see Section 3.3).
+3.2
+
+Mode Switching
+
+Another important challenge of asynchronous thinking is deciding when to synchronize. Depending
+on the task at hand, the thinking stream may encounter a subtask that needs more “thinking time” to
+complete. If this is the case, the agent should briefly pause writing the response2 and wait for the
+chain of thought to progress. AsyncReasoning lets the model itself control synchronization.
+To achieve this, we periodically ask the model if its private thoughts are still ahead of the public
+response, or if it should pause and think more. Specifically, we insert a special prompt3 into the
+thinking stream and compare the probabilities of “yes” vs. “no” as the next token. If the “yes” token
+is more likely, we keep thinking asynchronously. Otherwise, we pause the response stream until the
+model outputs “yes” again.
+In our current implementation, we insert this question at the end of every paragraph or after every
+T =20 thinking tokens, whichever comes first. Crucially, once the model gives its “yes” or “no”
+response, we remove this prompt from its view (by hiding the corresponding key-value entries) so
+that it does not interfere with the model’s chain-of-thought. See Appendix B for more details.
+We compare different mode-switching prompts in Section 4.1. Overall, we found that existing thinking
+LLMs can already control asynchronous reasoning, though sometimes they do make mistakes (we
+elaborate on that in Appendix C). It is possible to design more advanced mechanisms, such as
+allowing the LLM to reason about mode switching in parallel or introducing a classifier “head” to
+decide when to pause responding. However, we opt to keep AsyncReasoning simple and training-free,
+deferring further study of mode switching to future work.
+3.3
+
+Implementation Details
+
+In summary, AsyncReasoning arranges the thinking and response tokens in a different order depending
+on the generation phase, processes both streams in parallel, and periodically prompts the model to
+decide if it should pause and think. Thus, our algorithm alternates between two modes: either thinking
+and writing concurrently, or simply thinking while the writing is paused. When only one stream is
+active, AsyncReasoning is equivalent to standard sequential LLM inference with a combined KV
+cache. We focus the rest of this section on handling concurrent token streams.
+We implement concurrent thinking and writing by creating a custom key-value cache and adjusting
+the positional embeddings to account for the dual views from Figure 2. The main purpose of this
+algorithm is to avoid redundant computation and the key-value cache bloat. Instead of encoding
+tokens twice for both views, we process each token exactly once and keep one KV cache entry that is
+“viewed” from different relative positions. This optimization is inspired by a similar rotation trick
+proposed in Hogwild! Inference [98], extended to support mode switching.
+2 For voice assistants, it may be better to communicate “Hmm, let me think about it...”, but we do not do that.
+3 "...\n\nWait, are my current thoughts enough to write the next paragraph or formula? (yes/no): "
+
+4
+
+Implementation
+
+Thinker View
+0
+
+P
+
+P+W
+
+P+W+T
+
+T
+
+Positions
+
+Writer
+Block
+
+Query
+Thinker
+
+Thinker
+Block
+
+Query
+Thinker
+
+Thinker
+Block
+
+Query
+Thinker
+
+Writer
+Block
+
+Query
+Thinker
+
+Prompt
+Block
+
+T+
+W
+
+Prompt
+Block
+
+Query
+Thinker
+
+0
+
+P
+
+Prompt
+Block
+
+P+T
+
+Thinker
+Block
+
+P+T+W
+
+Writer
+Block
+
+T+
+W
+
+Positions
+
++P
+
+Writer View
+
+Query
+Writer
+
+Offset: 0
+
+Figure 3: Concurrent thinking and writing implemented as batched inference. Newly added tokens
+attend to cache blocks with additional query rotations. Checkered areas represent masked tokens.
+Key-Value Cache Structure. To implement different positional views, we split the model’s KV
+cache into three contiguous “blocks” (tensors): the inputs, the thinking stream, and the output stream.
+As new tokens are generated or added by the user, we store them in the corresponding cache block
+using positional representations relative to the block start4 .
+During the self-attention forward pass, we concatenate the dot products between the query and all
+cache blocks, but we transform the query differently for each block to simulate the difference in token
+positions. This way, the same set of attention blocks can be combined for both thinking and writing
+views from Figure 2 without extra memory use.
+Manipulating Positional Information. Almost all modern LLMs use some form of relative positional
+information [110, 112, 111]. The most popular variant is rotary positional embeddings (RoPE, 112),
+which rotate query and key vectors by an angle proportional to their index in the sequence before
+computing the self-attention. Note that if both query and key are rotated by the same angle, their
+dot product does not change. Thus, attention only depends on the difference between query and key
+positions. In other words, rotating attention keys by +α is equivalent to rotating the query by −α.
+We take advantage of this property to avoid rotating the entire KV cache on each inference step.
+Instead, we keep track of the starting positions for each block and rotate the attention queries. Suppose
+there are three contiguous KV blocks: Prompting with P tokens, Thinking with T tokens, and Writing
+with W tokens. When viewed contiguously (PTW), the difference between the most recent writer
+token and the thinker block is T +W −1 tokens. Thus, when running the forward pass for the writer,
+we rotate its query by the RoPE angle corresponding to position T +W −1 when looking at reasoning
+tokens and by W −1 when looking at writer’s own tokens. In contrast, the thinker attends to itself at
+T −1 and to writer at W +T −1. The same principle applies to all query-key pairs.
+Formally, let ρ(q, i)h denote applying RoPE for vector qiat position i. The writer attends to blocks P,
+T
+W
+T, W: A:=ρ(q, iq )· ρ(KP , iP
+k ), ρ(KT , ik ), ρ(KW , ik ) , where [·] denotes concatenation, iq is the
+T W
+query position, iP
+k , ik , ik are cache block positions from the writer’s point of view (see Figure 3)
+and KP,T,W are the corresponding key vectors. Then, we can equivalently compute attention as:
+h
+i
+T
+W
+A:= ρ(q, iq −iP
+k )KP , ρ(q, iq −ik )KT , ρ(q, iq −ik )KW .
+
+In turn, thinker attends to the same KV cache entries with different query rotations corresponding to
+how they are arranged in its own view (Figure 3). This reformulation allows us to compute KP,T,W
+once, store them in the KV cache, and only modify the attention queries for the currently processed
+tokens during each forward pass. Appendix D extends this technique to non-RoPE models.
+Technical Considerations. In summary, our implementation consists of a custom KV cache and an
+attention kernel that uses the query rotation trick described above. In practice, we use more than 3
+KV blocks: in addition to the prompt, thinking and response tokens, we also have short linker tokens
+between thinking and writing blocks. These linkers are implemented as separate KV blocks that are
+visible only in one of the views (thinker or writer). If a block is not visible in the current view, we
+give it a large positional index to make it ignored due to causal attention masking.
+4 For example, given a model with RoPE embeddings, its KV cache will always store the 5th response token “rotated” for
+
+position 5, regardless of how many thinking tokens precede it.
+
+5
+
+This implementation can efficiently parallelize thinking and writing the response for small batch
+sizes. However, it can be optimized further for large batches by only processing the non-masked
+query-key pairs that actually contribute to the attention output. In future work, we plan to explore
+implementing more general kernels for AsyncReasoning based on vLLM’s Paged Attention [43].
+
+4
+
+Experiments
+
+We organize our experiments as follows: in Section 4.1, we verify the design choices for each
+component of AsyncReasoning. In Section 4.2, we expand to additional benchmarks and models.
+Section 4.3 tests the security of AsyncReasoning against adversarial attacks. Finally, Section 4.4 is
+focused on setups where the user provides additional clarifications after the initial prompt.
+4.1
+
+Initial Analysis
+
+We first evaluate different components of AsyncReasoning in detail with Qwen3-32B [85], a popular
+medium-sized reasoning LLM that can run on a single high-end GPU. We run both AsyncReasoning
+and baselines on one A100-SXM4 GPU in bfloat16 precision and greedy sampling. We do not use
+general inference optimizations such as speculative decoding, as they are orthogonal to our work. We
+evaluate on MATH-500 [113, 7], a popular mathematical benchmark with “medium-difficulty” tasks
+that benefit from reasoning.
+We focus on two main metrics: accuracy, computed using an LLM-as-a-judge protocol following
+the original benchmark setup, and real-time delay, defined as the amount of time (in seconds)
+during which the user hears no sound because the LLM has not generated the response yet. To
+evaluate accuracy, we prompt the LLM to put its answer in \boxed{...} in the public response
+and check its equivalence to the reference answer using the standard LLM-as-a-judge protocol5 for
+MATH-500 [114]. To measure real-time delay, we stream the assistant’s response to a TTS engine
+(see Section 3.3) and measure the total “silence time”: the time during which the TTS could not
+generate anything because the LLM is still solving the task. We provide a more detailed description
+of the TTS pipeline and a more fine-grained performance breakdown in Appendix E.
+We compare the following configurations:
+1. Baseline (Non-thinking): regular sequential generation with <think> mode disabled.
+2. Baseline (Thinking): regular sequential generation with <think> mode enabled.
+3. Interleaved Thinking: prompting the model to think and reply in short, interleaved steps, but
+without asynchrony. This setup is similar to Plantain [107], but without model fine-tuning.
+4. DEER: training-free dynamic early exit for reasoning models, recommended parameters [115].
+5. ThinkSwitcher: using a router that chooses between thinking and non-thinking mode [116]. We
+train the router on MATH (train subset) using the protocol for Qwen3-8B from the original paper.
+6. AsyncReasoning: the main setup from Section 3.2. The model is periodically asked whether the
+current thoughts are ahead of writing. If the answer is positive, the thinker and the writer both
+generate the next tokens in parallel. If not, the writer pauses until the next “yes” answer.
+7. AsyncReasoning (+∆): same as above, but we increase the logit for answering “yes” to whether
+the writer should continue by a fixed bias +∆.
+8. AsyncReasoning (invert-q): same as above, but the question is inverted:"...\n\nWait, should
+I pause writing the response and think longer? (yes/no): ".
+The results in Figure 4(left) show that AsyncReasoning can reduce real-time delays while preserving
+most of the accuracy gains from reasoning, outperforming non-asynchronous interleaved thinking.
+5We use the evaluation protocol from https://github.com/openai/simple-evals with a gpt-4-turbo judge.
+
+Math-500 Accuracy
+
+0.94
+
+Accuracy
+
+0.92
+0.90
+Baseline (Non-Thinking)
+Baseline (Thinking)
+Interleaved Thinking
+Interleaved Thinking ( =-0.5)
+DEER (early exit)
+
+0.88
+0.86
+0.84
+
+0
+
+100
+
+200
+
+300
+
+ThinkSwitcher
+AsyncReasoning
+AsyncReasoning ( =+0.1)
+AsyncReasoning ( =+0.5)
+AsyncReasoning (invert-q)
+
+400
+
+500
+
+0.9
+
+0.8
+
+0.7
+
+Baseline (Thinking)
+Baseline (Non-Thinking)
+Async Reasoning
+
+0.6
+
+0.5
+
+600
+
+0.6B
+
+1.7B
+
+4B
+
+8B
+
+14B
+
+32B
+
+Delay (s)
+Model size
+Figure 4: MATH-500 evaluation of AsyncReasoning and baselines on A100. Left: comparison of
+prompts and mode switching methods on Qwen3-32B. Right: performance across Qwen3 models.
+
+6
+
+However, the exact tradeoff between accuracy and delay depends on the mode switching criterion
+and the bias. Our default criterion offers nearly the same accuracy as fully synchronous thinking,
+but at a significantly lower real-time delay. The +∆ logit bias can further reduce this delay at the
+cost of some accuracy loss, which comes from the writer answering too early. Flipping the question
+(where “yes” means pause) makes the model stop and think more often, suggesting that the model
+is biased to answer “yes”. Unless stated otherwise, we use the main setup (no ∆ or inversion) for
+the next sections. We include additional evaluations with other benchmarks, metrics (e.g., TTFT),
+stopping criteria and ablations on T in Appendix F.
+4.2
+
+Additional Benchmarks
+
+Next, we evaluate how AsyncReasoning generalizes across problems and models. Initially, we targeted established speech-language benchmarks [117, 118, 119, 120]. However, we found that modern
+reasoning models can solve even the harder tasks from these benchmarks with near-perfect accuracy
+(≥ 95%) without thinking. Thus, we adopt the approach from [121] and use more challenging general benchmarks: MATH-500 [113], MMLU-Pro [122], GPQA-Diamond [123], AIME-2025 [124],
+ZebraLogic [125], and one voice-specific benchmark spoken-mqa/multi_step_reasoning [119].
+We report accuracy, total real-time delay and TTFT (time-to-first-token), more details in Appendix G.
+Table 1: Evaluation of AsyncReasoning on AIME-2025 (10 seeds) and ZebraLogic (grid) across
+different models using metrics from Section 4.2. ↑ (↓) arrows denote higher (lower) is better.
+Interactive baseline denotes no thinking for Qwen3 and low budget for GPT-OSS. †—Thinking 2507
+Baseline (Thinking)
+Baseline (Interactive)
+Async Reasoning
+Acc ↑ Delay ↓ TTFT ↓ Acc ↑ Delay ↓ TTFT ↓ Acc ↑ Delay ↓ TTFT ↓
+
+AIME-2025
+
+Qwen3-32B
+0.53
+Qwen3-30B-A3B†
+0.67
+Qwen3-235B-A22B† 0.68
+GPT-OSS-20B
+0.62
+GPT-OSS-120B
+0.77
+
+1915.2
+1814.1
+5348.2
+523.53
+326.52
+
+1914.4
+1813.7
+5330.5
+523.53
+326.52
+
+0.20
+0.39
+0.53
+0.36
+0.51
+
+1.70
+5.25
+20.16
+120.09
+91.40
+
+1.13
+5.25
+9.73
+120.09
+91.40
+
+0.49
+0.62
+0.68
+0.59
+0.66
+
+485.93
+5.20
+500.94
+147.96
+166.75
+
+5.41
+5.20
+9.06
+24.15
+24.63
+
+ZebraLogic
+
+Model
+
+Qwen3-32B
+0.71
+Qwen3-30B-A3B†
+0.96
+Qwen3-235B-A22B† 0.88
+GPT-OSS-20B
+0.70
+GPT-OSS-120B
+0.81
+
+297.61
+1244.1
+2111.7
+372.41
+268.83
+
+297.61
+1244.1
+2111.7
+372.41
+268.83
+
+0.37
+0.27
+0.67
+0.01
+0.48
+
+4.27
+4.16
+4.68
+149.44
+248.13
+
+4.27
+4.16
+4.53
+149.44
+248.13
+
+0.68
+0.93
+0.85
+0.61
+0.75
+
+15.83
+3.72
+57.85
+163.34
+131.57
+
+4.37
+3.72
+8.37
+4.37
+7.53
+
+We use three model families: the
+Table 2: Qwen3 SpokenMQA multistep reasoning.
+original Qwen3 family from 0.6B to
+32B [85], Qwen3 (2507) models in 30B- Size Method
+Acc ↑ Delay ↓ TTFT ↓
+A3B and 235B-A22B sizes, and GPT-OSS20B/120B [126]. To better showcase the 0.6B Baseline (Thinking) 0.70 201.53 201.52
+0.72
+0.67
+setups, we run Qwen3 30B-A3B (2507) 0.6B Baseline (no Think) 0.57
+0.6B
+AsyncReasoning
+0.66
+2.56
+1.37
+and GPT-OSS-120B on an H100 GPU, the
+235B-A22B model on a B200 GPU, and 4B Baseline (Thinking) 0.81 227.16 227.15
+the rest on A100. To fit the 235B model 4B Baseline (no think) 0.80
+0.80
+0.70
+into a single GPU, we use NF4 expert-only 4B AsyncReasoning
+0.81
+0.84
+0.80
+quantization [127] and Qwen3 MoE fused
+kernels [128]. The GPT-OSS models come with native ≈4-bit quantization and inference kernels.
+We evaluate the impact of the GPU choice and quantization in Appendix F.
+0.7
+
+GPQA-Diamond Accuracy
+
+MMLU-Pro Accuracy
+
+0.8
+0.7
+0.6
+0.5
+0.4
+
+Baseline (Thinking)
+Baseline (Non-Thinking)
+Async Reasoning
+
+0.3
+0.2
+0.6B
+
+1.7B
+
+4B
+
+8B
+
+Model size
+
+14B
+
+32B
+
+Baseline (Thinking)
+Baseline (Non-Thinking)
+Async Reasoning
+
+0.6
+
+0.5
+
+0.4
+
+0.3
+
+0.2
+0.6B
+
+1.7B
+
+4B
+
+8B
+
+Model size
+
+14B
+
+32B
+
+Figure 5: Evaluating AsyncReasoning and baselines across different Qwen3 model sizes on A100
+GPU for two benchmarks. Left: MMLU-Pro. Right: GPQA-Diamond.
+7
+
+Our results for MATH-500, MMLU-Pro and GPQA-Diamond are summarized in Figure 4 (right)
+and Figure 5 (both), other benchmark / model pairs are gathered in Tables 1 and 2. To save space,
+we report larger models on AIME-2025 because smaller Qwen3 variants score poorly regardless of
+reasoning type. Likewise, we focus on smaller models for SpokenMQA multistep reasoning since it
+contains relatively simple problems that do not need large model reasoning. That said, we report the
+remaining model-benchmark pairs in Appendix G (Tables 12—17) for completeness.
+Overall, we observe the same behavior as before: AsyncReasoning significantly reduces both time
+to first token and overall delays while providing more accurate answers than the non-thinking
+baseline. One notable exception is that smaller models (e.g. Qwen3-0.6B) lose more accuracy with
+asynchronous reasoning. On a closer examination, we found that many of the errors in smaller LLMs
+can be attributed to the writer giving the answer prematurely, suggesting that small models may
+struggle with mode switching. In future work, it would be interesting to revisit smaller models and
+see if their performance can be augmented with fine-tuning or training “mode-switching heads”.
+4.3
+
+Asynchronous Reasoning about Safety
+
+To evaluate the impact of asynchronous reasoning on safety, we conduct experiments on the HarmBench validation set [130]. We use the first 200 samples focused on direct harm and jailbreaking
+attempts. We use LLM-as-a-judge [114] evaluation with gpt-4o, where only actionable harmful
+instructions count as a successful attack.
+We compare the Attack Success Rate (ASR) across the following setups using the Qwen3-32B model:
+(1) Baseline (non-thinking), (2) Baseline (thinking), (3) Baseline (thinking) with a safety prompt,
+(4) AsyncReasoning, and (5) AsyncReasoning with a safety prompt instructing the thinker to verify
+safety before responding (see Appendix A for full prompts). In addition to ASR and accuracy on
+MATH-500, we report time-to-first-token and total real-time delay to demonstrate that the safety
+benefits of AsyncReasoning come without sacrificing interactivity.
+Table 3: Attack Success Rate on HarmBench and Accuracy on MATH-500 for Qwen3-32B.
+Inference Setup
+ASR ↓ Accuracy ↑
+Baseline (non-thinking)
+Baseline (thinking)
+Baseline (thinking) + safety prompt
+
+6.5%
+12.5%
+0.0%
+
+0.84
+0.94
+0.93
+
+AsyncReasoning (default)
+AsyncReasoning + safety prompt
+
+10.0%
+0.5%
+
+0.94
+0.93
+
+Table 3 summarizes our findings: consistent with “The Cost of Thinking” analysis [80], we observe
+that enabling reasoning in the baseline model actually increases vulnerability (ASR 6.5% → 12.5%).
+The model effectively “talks itself into” answering harmful queries by adopting a helpful persona
+or over-analyzing the technical aspects of the prompt. We provide an extended discussion of the
+complex interplay between reasoning and safety in Appendix I.
+A safety-oriented prompt that asks the model to verify request safety before responding strongly
+mitigates these attacks both for synchronous reasoning (ASR 0%) and AsyncReasoning (ASR 0.5%).
+However, synchronous safety reasoning forces the user to wait for the entire chain-of-thought before
+any output appears, dramatically increasing real-time delays (Table 4). AsyncReasoning achieves
+comparable safety while reducing total delay from 45.3s to 35.0s and time-to-first-token from 32.3s
+to 22.2s, and also preserves accuracy on MATH-500 (0.93). We also observe similar trends on
+AdvBench [131], see Appendix K for details. This enables safety reasoning in streaming LLM APIs
+and other time-sensitive applications without the need for specialized fine-tuning. In Appendix J, we
+analyze model responses on successful attacks and identify the failure modes.
+Table 4: Median latency on HarmBench for different setups, Qwen3-32B, A100.
+Inference Setup
+TTFT (s) ↓ Total Delay (s) ↓
+Baseline (non-thinking)
+Baseline (thinking)
+Baseline (thinking) + safety prompt
+
+0.1
+41.3
+32.3
+
+6.1
+61.1
+45.3
+
+AsyncReasoning + safety prompt
+
+22.2
+
+35.0
+
+8
+
+MATH-500 Sharded
+Accuracy
+
+0.9
+
+0.7
+
+0.8
+
+0.6
+
+0.7
+
+0.5
+
+Qwen3-32B
+Qwen3-235B-A22B
+
+0.6
+16
+
+32
+
+64
+
+Accuracy
+
+Qwen3-32B
+Qwen3-235B-A22B
+
+0.4
+128
+
+256
+
+512
+
+1024
+
+16
+
+32
+
+64
+
+128
+
+256
+
+512
+
+64
+
+128
+
+256
+
+512
+
+64
+
+128
+
+256
+
+512
+
+0.8
+
+0.9
+0.8
+
+0.6
+
+0.7
+
+0.4
+
+0.6
+
+Qwen3-8B
+Qwen3-14B
+
+0.5
+16
+
+32
+
+Qwen3-8B
+Qwen3-14B
+
+0.2
+64
+
+128
+
+256
+
+512
+
+1024
+
+16
+
+32
+
+0.8
+
+0.9
+
+Accuracy
+
+Lost in Conversation
+
+0.8
+
+0.8
+
+0.6
+
+0.7
+
+0.4
+
+0.6
+0.5
+
+gpt-oss-20b
+gpt-oss-120b
+
+0.4
+16
+
+32
+
+gpt-oss-20b
+gpt-oss-120b
+
+0.2
+64
+
+128
+
+256
+
+ksteps (log scale)
+
+512
+
+1024
+
+16
+
+32
+
+ksteps (log scale)
+
+Figure 6: Evaluation with partial inputs on sharded MATH-500 (left) and on the math subset of
+lost_in_conversation (right). The first shard is available immediately, subsequent shards are
+inserted every ksteps . Dotted lines denote accuracies without input sharding.
+4.4
+
+Asynchronous Reasoning with Additional Inputs
+
+In real-time settings, additional inputs may arrive after decoding begins. We model these updates
+as shards, i.e., partial problem statements revealed over time. We insert shard i into the prompt,
+thinker, and writer cache blocks after i·ksteps decoding steps (only at paragraph boundaries \n\n),
+then continue generation without re-encoding (see Section 3.3); we vary ksteps . We derive a sharded
+dataset from MATH-500 by using GPT-5 to rewrite each problem into two shards, where the second
+shard adds missing information or corrects an error. We verify the first shard alone is insufficient,
+while both shards are enough (Appendix L). We also evaluate on the math subset (103 samples) of
+lost_in_conversation [132] with more shards.
+Across all models we evaluated, inserting each shard into all three blocks recovers accuracy on both
+datasets, approaching the upper bound where all shards are provided upfront for small ksteps (Figure 6).
+Accuracy drops as ksteps increases because more information arrives later; we do not handle shards
+arriving after generation completes, which may further reduce accuracy at large ksteps . The drop is
+larger on lost_in_conversation, consistent with its higher shard count (avg. ≈ 5.5). We analyze
+alternative strategies for additional inputs in Appendix M.
+
+5
+
+Discussion & Future Work
+
+In this work, we formulated AsyncReasoning — a training-free method that allows reasoning LLMs
+to think and write concurrently. Our preliminary experiments suggest that the proposed approach can
+indeed overlap thinking and writing and reduce user delays while giving more accurate answers than
+the non-thinking models. This lets LLMs think longer and give better answers in time-sensitive tasks
+such as voice assistants, interactive agents, or safety-minded inference.
+There are several directions for future research. First, it would be interesting to see if AsyncReasoning
+can be improved further with fine-tuning, and compare against baselines that require model training.
+This includes both fine-tuning/PEFT and ad-hoc “control heads” for mode switching. Another
+important direction is model safety: extending our initial setup to more comprehensive safety
+guardrails that use background reasoning to protect against a broader range of attacks. Additionally,
+we will work on integrating AsyncReasoning with SGLang [44].
+9
+
+6
+
+Acknowledgements
+
+We would like to thank Andrey Shukshov for his helpful advice about efficient GPU kernel design.
+We also thank Gleb Rodionov for proofreading and helpful suggestions on experiment design and
+paper presentation. We also thank Denis Mazur for his ongoing work on integrating AsyncReasoning
+with SGLang.
+
+References
+[1] Charlie Victor Snell, Jaehoon Lee, Kelvin Xu, and Aviral Kumar. Scaling LLM test-time
+compute optimally can be more effective than scaling parameters for reasoning. In The
+Thirteenth International Conference on Learning Representations, 2025.
+[2] Mirac Suzgun, Nathan Scales, Nathanael Scharli, Sebastian Gehrmann, Yi Tay, Hyung Won
+Chung, Aakanksha Chowdhery, Quoc V. Le, Ed H. Chi, Denny Zhou, and Jason Wei. Challenging big-bench tasks and whether chain-of-thought can solve them. In Findings of the
+Association for Computational Linguistics: ACL 2023, pages 13003–13051, Toronto, Canada,
+2023.
+[3] Edward Beeching, Lewis Tunstall, and Sasha Rush. Scaling test-time compute with open
+models, 2024.
+[4] Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten Bosma, Fei Xia, Ed Chi, Quoc V Le,
+and Denny Zhou. Chain-of-thought prompting elicits reasoning in large language models.
+Advances in neural information processing systems, 35:24824–24837, 2022.
+[5] Takeshi Kojima, Shixiang Shane Gu, Machel Reid, Yutaka Matsuo, and Yusuke Iwasawa.
+Large language models are zero-shot reasoners. In Advances in Neural Information Processing
+Systems, volume 35, pages 22199–22213, 2022.
+[6] Shunyu Yao, Dian Yu, Jeffrey Zhao, Izhak Shafran, Tom Griffiths, Yuan Cao, and Karthik
+Narasimhan. Tree of thoughts: Deliberate problem solving with large language models. In
+A. Oh, T. Naumann, A. Globerson, K. Saenko, M. Hardt, and S. Levine, editors, Advances in
+Neural Information Processing Systems, volume 36, pages 11809–11822. Curran Associates,
+Inc., 2023.
+[7] Hunter Lightman, Vineet Kosaraju, Yuri Burda, Harrison Edwards, Bowen Baker, Teddy Lee,
+Jan Leike, John Schulman, Ilya Sutskever, and Karl Cobbe. Let’s verify step by step. In The
+Twelfth International Conference on Learning Representations, 2024.
+[8] Zhuosheng Zhang, Aston Zhang, Mu Li, and Alexander J. Smola. Automatic chain of thought
+prompting in large language models. ArXiv, abs/2210.03493, 2022.
+[9] Niklas Muennighoff, Zitong Yang, Weijia Shi, Xiang Lisa Li, Li Fei-Fei, Hannaneh Hajishirzi,
+Luke Zettlemoyer, Percy Liang, Emmanuel Candès, and Tatsunori Hashimoto. s1: Simple
+test-time scaling. arXiv preprint arXiv:2501.19393, 2025.
+[10] Timo Schick, Jane Dwivedi-Yu, Roberto Dessi, Roberta Raileanu, Maria Lomeli, Eric Hambro,
+Luke Zettlemoyer, Nicola Cancedda, and Thomas Scialom. Toolformer: Language models can
+teach themselves to use tools. In A. Oh, T. Naumann, A. Globerson, K. Saenko, M. Hardt,
+and S. Levine, editors, Advances in Neural Information Processing Systems, volume 36, pages
+68539–68551. Curran Associates, Inc., 2023.
+[11] Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran, Karthik R Narasimhan, and
+Yuan Cao. React: Synergizing reasoning and acting in language models. In The Eleventh
+International Conference on Learning Representations, 2023.
+[12] Luyu Gao, Aman Madaan, Shuyan Zhou, Uri Alon, Pengfei Liu, Yiming Yang, Jamie Callan,
+and Graham Neubig. PAL: Program-aided language models. In Andreas Krause, Emma
+Brunskill, Kyunghyun Cho, Barbara Engelhardt, Sivan Sabato, and Jonathan Scarlett, editors,
+Proceedings of the 40th International Conference on Machine Learning, volume 202 of
+Proceedings of Machine Learning Research, pages 10764–10799. PMLR, 23–29 Jul 2023.
+10
+
+[13] Yongliang Shen, Kaitao Song, Xu Tan, Dongsheng Li, Weiming Lu, and Yue Ting Zhuang. Hugginggpt: Solving ai tasks with chatgpt and its friends in hugging face. ArXiv, abs/2303.17580,
+2023.
+[14] Yujia Qin, Shi Liang, Yining Ye, Kunlun Zhu, Lan Yan, Ya-Ting Lu, Yankai Lin, Xin Cong,
+Xiangru Tang, Bill Qian, Sihan Zhao, Runchu Tian, Ruobing Xie, Jie Zhou, Marc H. Gerstein,
+Dahai Li, Zhiyuan Liu, and Maosong Sun. Toolllm: Facilitating large language models to
+master 16000+ real-world apis. ArXiv, abs/2307.16789, 2023.
+[15] Zhanna Azerbayev, Dhruv Patel, Sébastien Bubeck, Ronen Eldan, Yin Tat Lee, Yuanzhong
+Li, Tamas Sarlos, and Yi Zhang. Llemma: An open language model for mathematics. In
+Proceedings of the Twelfth International Conference on Learning Representations, 2024.
+[16] Ziyue Wang, Zhiyuan Zhao, Minqi Peng, Shiqi Chen, Mengdi Yang, Chi-Min Lin, Pratyush
+Sharma, Sébastien Bubeck, Ronen Eldan, Yuanzhong Li, Yin Tat Lee, and Yi Zhang. Mathcoder: Seamless code integration in LLMs for enhanced mathematical reasoning. In Proceedings of the Twelfth International Conference on Learning Representations, 2024.
+[17] Chengshu Li, Jacky Liang, Andy Zeng, Xinyun Chen, Karol Hausman, Dorsa Sadigh, Sergey
+Levine, Li Fei-Fei, Fei Xia, and Brian Ichter. Chain of code: Reasoning with a language modelaugmented code emulator. In Proceedings of the 41st International Conference on Machine
+Learning, volume 235 of Proceedings of Machine Learning Research, pages 28259–28277.
+PMLR, 2024. arXiv preprint arXiv:2312.04474.
+[18] OpenAI, :, Aaron Jaech, Adam Kalai, Adam Lerer, Adam Richardson, Ahmed El-Kishky,
+Aiden Low, Alec Helyar, Aleksander Madry, and Alex Beutel et al. Openai o1 system card,
+2024.
+[19] Google DeepMind.
+Thinking.
+
+Gemini
+
+2.5:
+
+Our
+
+Newest
+
+Gemini
+
+Model
+
+with
+
+https://blog.google/technology/google-deepmind/
+gemini-model-thinking-updates-march-2025/#gemini-2-5-thinking,
+2025.
+
+Accessed: 2025-04-07.
+[20] Anthropic. Claude 3.7 sonnet and claude code, 2025. Accessed: 2025.04.02.
+[21] Daya Guo, Dejian Yang, Haowei Zhang, Junxiao Song, Peiyi Wang, Qihao Zhu, Runxin Xu,
+Ruoyu Zhang, Shirong Ma, Xiao Bi, Xiaokang Zhang, Xingkai Yu, Yu Wu, Z. F. Wu, Zhibin
+Gou, Zhihong Shao, Zhuoshu Li, Ziyi Gao, Aixin Liu, Bing Xue, Bingxuan Wang, Bochao
+Wu, Bei Feng, Chengda Lu, Chenggang Zhao, Chengqi Deng, Chong Ruan, Damai Dai, Deli
+Chen, Dongjie Ji, Erhang Li, Fangyun Lin, Fucong Dai, Fuli Luo, Guangbo Hao, Guanting
+Chen, Guowei Li, Hanwei Xu, Honghui Ding, Huazuo Gao, Hui Qu, Hui Li, Jianzhong Guo,
+Jiashi Li, Jingchang Chen, Jingyang Yuan, Jinhao Tu, Junjie Qiu, Junlong Li, J. L. Cai, Jiaqi
+Ni, Jian Liang, Jin Chen, Kai Dong, Kai Hu, Kaige Gao, Kang Guan, Kexin Huang, Kuai
+Yu, Lean Wang, Lecong Zhang, Liang Zhao, Litong Wang, Liyue Zhang, Lei Xu, Leyi Xia,
+Mingchuan Zhang, Minghua Zhang, Minghui Tang, Meng Li, Miaojun Wang, Mingming Li,
+Ning Tian, Panpan Huang, Peng Zhang, Qiancheng Wang, Qinyu Chen, Qiushi Du, Ruiqi Ge,
+Ruisong Zhang, Ruizhe Pan, Runji Wang, R. J. Chen, R. L. Jin, Ruyi Chen, Shanghao Lu,
+Shangyan Zhou, Shanhuang Chen, Shengfeng Ye, Shiyu Wang, Shuiping Yu, Shunfeng Zhou,
+Shuting Pan, S. S. Li, Shuang Zhou, Shaoqing Wu, Tao Yun, Tian Pei, Tianyu Sun, Wangding
+Zeng, Wen Liu, Wenfeng Liang, Wenjun Gao, Wenqin Yu, Wentao Zhang, W. L. Xiao, Wei
+An, Xiaodong Liu, Xiaohan Wang, Xiaokang Chen, Xiaotao Nie, Xin Cheng, Xin Liu, Xin
+Xie, Xingchao Liu, Xinyu Yang, Xinyuan Li, Xuecheng Su, Xuheng Lin, X. Q. Li, Xiangyue
+Jin, Xiaojin Shen, Xiaosha Chen, Xiaowen Sun, Xiaoxiang Wang, Xinnan Song, Xinyi Zhou,
+Xianzu Wang, Xinxia Shan, Y. K. Li, Y. Q. Wang, Y. X. Wei, Yang Zhang, Yanhong Xu, Yao
+Li, Yao Zhao, Yaofeng Sun, Yaohui Wang, Yi Yu, Yichao Zhang, Yifan Shi, Yiliang Xiong,
+Ying He, Yishi Piao, Yisong Wang, Yixuan Tan, Yiyang Ma, Yiyuan Liu, Yongqiang Guo,
+Yuan Ou, Yuduan Wang, Yue Gong, Yuheng Zou, Yujia He, Yunfan Xiong, Yuxiang Luo,
+Yuxiang You, Yuxuan Liu, Yuyang Zhou, Y. X. Zhu, Yanping Huang, Yaohui Li, Yi Zheng,
+Yuchen Zhu, Yunxian Ma, Ying Tang, Yukun Zha, Yuting Yan, Z. Z. Ren, Zehui Ren, Zhangli
+Sha, Zhe Fu, Zhean Xu, Zhenda Xie, Zhengyan Zhang, Zhewen Hao, Zhicheng Ma, Zhigang
+Yan, Zhiyu Wu, Zihui Gu, Zijia Zhu, Zijun Liu, Zilin Li, Ziwei Xie, Ziyang Song, Zizheng
+11
+
+Pan, Zhen Huang, Zhipeng Xu, Zhongyu Zhang, and Zhen Zhang. Deepseek-r1 incentivizes
+reasoning in llms through reinforcement learning. Nature, 645(8081):633–638, 2025.
+[22] Qwen Team. Qwq-32b: Embracing the power of reinforcement learning, March 2025.
+[23] Kimi Team, Yifan Bai, Yiping Bao, Guanduo Chen, Jiahao Chen, Ningxin Chen, Ruijue Chen,
+Yanru Chen, Yuankun Chen, Yutian Chen, Zhuofu Chen, Jialei Cui, Hao Ding, Mengnan
+Dong, Angang Du, Chenzhuang Du, Dikang Du, Yulun Du, Yu Fan, Yichen Feng, Kelin Fu,
+Bofei Gao, Hongcheng Gao, Peizhong Gao, Tong Gao, Xinran Gu, Longyu Guan, Haiqing
+Guo, Jianhang Guo, Hao Hu, Xiaoru Hao, Tianhong He, Weiran He, Wenyang He, Chao
+Hong, Yangyang Hu, Zhenxing Hu, Weixiao Huang, Zhiqi Huang, Zihao Huang, Tao Jiang,
+Zhejun Jiang, Xinyi Jin, Yongsheng Kang, Guokun Lai, Cheng Li, Fang Li, Haoyang Li, Ming
+Li, Wentao Li, Yanhao Li, Yiwei Li, Zhaowei Li, Zheming Li, Hongzhan Lin, Xiaohan Lin,
+Zongyu Lin, Chengyin Liu, Chenyu Liu, Hongzhang Liu, Jingyuan Liu, Junqi Liu, Liang
+Liu, Shaowei Liu, T. Y. Liu, Tianwei Liu, Weizhou Liu, Yangyang Liu, Yibo Liu, Yiping
+Liu, Yue Liu, Zhengying Liu, Enzhe Lu, Lijun Lu, Shengling Ma, Xinyu Ma, Yingwei Ma,
+Shaoguang Mao, Jie Mei, Xin Men, Yibo Miao, Siyuan Pan, Yebo Peng, Ruoyu Qin, Bowen
+Qu, Zeyu Shang, Lidong Shi, Shengyuan Shi, Feifan Song, Jianlin Su, Zhengyuan Su, Xinjie
+Sun, Flood Sung, Heyi Tang, Jiawen Tao, Qifeng Teng, Chensi Wang, Dinglu Wang, Feng
+Wang, Haiming Wang, Jianzhou Wang, Jiaxing Wang, Jinhong Wang, Shengjie Wang, Shuyi
+Wang, Yao Wang, Yejie Wang, Yiqin Wang, Yuxin Wang, Yuzhi Wang, Zhaoji Wang, Zhengtao
+Wang, Zhexu Wang, Chu Wei, Qianqian Wei, Wenhao Wu, Xingzhe Wu, Yuxin Wu, Chenjun
+Xiao, Xiaotong Xie, Weimin Xiong, Boyu Xu, Jing Xu, Jinjing Xu, L. H. Xu, Lin Xu, Suting
+Xu, Weixin Xu, Xinran Xu, Yangchuan Xu, Ziyao Xu, Junjie Yan, Yuzi Yan, Xiaofei Yang,
+Ying Yang, Zhen Yang, Zhilin Yang, Zonghan Yang, Haotian Yao, Xingcheng Yao, Wenjie
+Ye, Zhuorui Ye, Bohong Yin, Longhui Yu, Enming Yuan, Hongbang Yuan, Mengjie Yuan,
+Haobing Zhan, Dehao Zhang, Hao Zhang, Wanlu Zhang, Xiaobin Zhang, Yangkun Zhang,
+Yizhi Zhang, Yongting Zhang, Yu Zhang, Yutao Zhang, Yutong Zhang, Zheng Zhang, Haotian
+Zhao, Yikai Zhao, Huabin Zheng, Shaojie Zheng, Jianren Zhou, Xinyu Zhou, Zaida Zhou,
+Zhen Zhu, Weiyu Zhuang, and Xinxing Zu. Kimi k2: Open agentic intelligence, 2025.
+[24] ARC Prize Foundation. Openai’s new o3 system scores breakthrough on arc-agi-pub, 2024.
+Accessed: 2025.03.28.
+[25] HLE Contributors. Humanity’s last exam: A benchmark for frontier ai capabilities. arXiv
+preprint arXiv:2501.14249, 2025.
+[26] Nicole Landi, Stephen J. Frost, W. Einar Mencl, Rebecca Sandak, and Kenneth R. Pugh.
+Neurobiological bases of reading comprehension: Insights from neuroimaging studies of
+word-level and text-level processing in skilled and impaired readers. Reading & writing
+quarterly : overcoming learning difficulties, 29:145–167, 04 2013.
+[27] Bingjiang Lyu, William D. Marslen-Wilson, Yuxing Fang, and Lorraine K. Tyler. Finding
+structure during incremental speech comprehension. eLife, 12:e89311, 2023.
+[28] Sarah Bro Trasmundi and Juan Toro. Mind wandering in reading: An embodied approach.
+Frontiers in Human Neuroscience, 17, 2023.
+[29] Daisuke Akiba. Ctrl + alt + inner speech: A verbal–cognitive scaffold (vcs) model of pathways
+to computational thinking. Journal of Intelligence, 13(12), 2025.
+[30] Kevin P. Madore and Anthony D. Wagner. Multicosts of multitasking. Cerebrum : the Dana
+Forum on Brain Science, 2019:cer–04–19, 2019.
+[31] Maurizio Corbetta, Gaurav Patel, and Gordon L Shulman. The reorienting system of the
+human brain: from environment to theory of mind. Neuron, 58(3):306–324, 2008.
+[32] OpenAI. Gpt-4o system card. Online technical report, 2024. Voice-mode multimodal model
+supporting audio, text, and vision. Available at https://openai.com/index/hello-gpt-4o.
+[33] Paul K. Rubenstein, Chulayuth Asawaroengchai, Duc Dung Nguyen, Ankur Bapna, Zalán
+Borsos, Félix de Chaumont Quitry, Peter Chen, Dalia El Badawy, Wei Han, Eugene Kharitonov,
+Hannah Muckenhirn, Dirk Padfield, James Qin, Danny Rozenberg, Tara Sainath, Johan
+12
+
+Schalkwyk, Matt Sharifi, Michelle Tadmor Ramanovich, Marco Tagliasacchi, Alexandru
+Tudor, Mihajlo Velimirović, Damien Vincent, Jiahui Yu, Yongqiang Wang, Vicky Zayats, Neil
+Zeghidour, Yu Zhang, Zhishuai Zhang, Lukas Zilka, and Christian Frank. Audiopalm: A large
+language model that can speak and listen. arXiv preprint arXiv:2306.12925, 2023.
+[34] Dong Zhang, Shimin Li, Xin Zhang, Jun Zhan, Pengyu Wang, Yaqian Zhou, and Xipeng Qiu.
+Speechgpt: Empowering large language models with intrinsic cross-modal conversational
+abilities. In Findings of the Association for Computational Linguistics: EMNLP 2023, pages
+15757–15773. Association for Computational Linguistics, December 2023.
+[35] Yunfei Chu, Jin Xu, Xiaohuan Zhou, Qian Yang, Shiliang Zhang, Zhijie Yan, Chang Zhou, and
+Jingren Zhou. Qwen-audio: Advancing universal audio understanding via unified large-scale
+audio-language models. arXiv preprint arXiv:2311.07919, 2023.
+[36] Zhifei Xie and Changqiao Wu. Mini-omni: Language models can hear, talk while thinking in
+streaming. arXiv preprint arXiv:2408.16725, 2024.
+[37] Qingkai Fang, Yan Zhou, Shoutao Guo, Shaolei Zhang, and Yang Feng. LLaMA-omni 2:
+LLM-based real-time spoken chatbot with autoregressive streaming speech synthesis. In
+Wanxiang Che, Joyce Nabende, Ekaterina Shutova, and Mohammad Taher Pilehvar, editors,
+Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics
+(Volume 1: Long Papers), pages 18617–18629, Vienna, Austria, July 2025. Association for
+Computational Linguistics.
+[38] Alexandre Défossez, Laurent Mazaré, Manu Orsini, Amélie Royer, Patrick Pérez, Hervé Jégou,
+Edouard Grave, and Neil Zeghidour. Moshi: a speech-text foundation model for real-time
+dialogue, 2024.
+[39] Michael Ahn, Anthony Brohan, Noah Brown, Yevgen Chebotar, Omar Cortes, Byron David,
+Chelsea Finn, Chuyuan Fu, Keerthana Gopalakrishnan, Karol Hausman, Alex Herzog, Daniel
+Ho, Jasmine Hsu, Julian Ibarz, Brian Ichter, Alex Irpan, Eric Jang, Rosario Jauregui Ruano,
+Kyle Jeffrey, Sally Jesmonth, Nikhil Joshi, Ryan Julian, Dmitry Kalashnikov, Yuheng Kuang,
+Kuang-Huei Lee, Sergey Levine, Yao Lu, Linda Luu, Carolina Parada, Peter Pastor, Jornell
+Quiambao, Kanishka Rao, Jarek Rettinghouse, Diego Reyes, Pierre Sermanet, Nicolas Sievers,
+Clayton Tan, Alexander Toshev, Vincent Vanhoucke, Fei Xia, Ted Xiao, Peng Xu, Sichun Xu,
+Mengyuan Yan, and Andy Zeng. Do as i can and not as i say: Grounding language in robotic
+affordances. In arXiv preprint arXiv:2204.01691, 2022.
+[40] Brianna Zitkovich, Tianhe Yu, Sichun Xu, Peng Xu, Ted Xiao, Fei Xia, Jialin Wu, Paul
+Wohlhart, Stefan Welker, Ayzaan Wahid, Quan Vuong, Vincent Vanhoucke, Huong Tran, Radu
+Soricut, Anikait Singh, Jaspiar Singh, Pierre Sermanet, Pannag R. Sanketi, Grecia Salazar,
+Michael S. Ryoo, Krista Reymann, Kanishka Rao, Karl Pertsch, Igor Mordatch, Henryk
+Michalewski, Yao Lu, Sergey Levine, Lisa Lee, Tsang-Wei Edward Lee, Isabel Leal, Yuheng
+Kuang, Dmitry Kalashnikov, Ryan Julian, Nikhil J. Joshi, Alex Irpan, Brian Ichter, Jasmine
+Hsu, Alexander Herzog, Karol Hausman, Keerthana Gopalakrishnan, Chuyuan Fu, Pete
+Florence, Chelsea Finn, Kumar Avinava Dubey, Danny Driess, Tianli Ding, Krzysztof Marcin
+Choromanski, Xi Chen, Yevgen Chebotar, Justice Carbajal, Noah Brown, Anthony Brohan,
+Montserrat Gonzalez Arenas, and Kehang Han. Rt-2: Vision-language-action models transfer
+web knowledge to robotic control. In Jie Tan, Marc Toussaint, and Kourosh Darvish, editors,
+Proceedings of The 7th Conference on Robot Learning, volume 229 of Proceedings of Machine
+Learning Research, pages 2165–2183. PMLR, 06–09 Nov 2023.
+[41] Danny Driess, Fei Xia, Mehdi S. M. Sajjadi, Corey Lynch, Aakanksha Chowdhery, Brian
+Ichter, Ayzaan Wahid, Jonathan Tompson, Quan Vuong, Tianhe Yu, Wenlong Huang, Yevgen
+Chebotar, Pierre Sermanet, Daniel Duckworth, Sergey Levine, Vincent Vanhoucke, Karol
+Hausman, Marc Toussaint, Klaus Greff, Andy Zeng, Igor Mordatch, and Pete Florence. PaLMe: An embodied multimodal language model. In Andreas Krause, Emma Brunskill, Kyunghyun
+Cho, Barbara Engelhardt, Sivan Sabato, and Jonathan Scarlett, editors, Proceedings of the
+40th International Conference on Machine Learning, volume 202 of Proceedings of Machine
+Learning Research, pages 8469–8488. PMLR, 23–29 Jul 2023.
+13
+
+[42] OpenAI. Chatgpt deep research: Support for user update and multitasking features. https:
+//chat.openai.com, 2025. Accessed 7 December 2025. In late 2025, the Deep Research
+feature was updated to allow user to communicate with the agent while it performs research
+via the "Update" button.
+[43] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu,
+Joseph Gonzalez, Hao Zhang, and Ion Stoica. Efficient memory management for large
+language model serving with pagedattention. In Proceedings of the 29th Symposium on
+Operating Systems Principles, pages 611–626, 2023.
+[44] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue Livia Sun, Jeff Huang, Cody Hao Yu,
+Shiyi Cao, Christos Kozyrakis, Ion Stoica, Joseph E Gonzalez, Clark Barrett, and Ying Sheng.
+Sglang: Efficient execution of structured language model programs. In Conference on Neural
+Information Processing Systems (NeurIPS), 2024.
+[45] Miles McCain, Thomas Millar, Saffron Huang, Jake Eaton, Kunal Handa, Michael Stern, Alex
+Tamkin, Matt Kearney, Esin Durmus, Judy Shen, Jerry Hong, Brian Calvert, Jun Shern Chan,
+Francesco Mosconi, David Saunders, Tyler Neylon, Gabriel Nicholas, Sarah Pollack, Jack
+Clark, and Deep Ganguli. Measuring ai agent autonomy in practice, 2026.
+[46] Gemini live (voice mode). https://gemini.google/overview/gemini-live/, 2024. Accessed: 2025-12-01.
+[47] Anthropic. Using voice mode on claude mobile apps. https://support.claude.com/en/
+articles/11101966-using-voice-mode-on-claude-mobile-apps, 2025. Accessed:
+December 1, 2025.
+[48] James Flamino, Mohammed Shahid Modi, Boleslaw K. Szymanski, Brendan Cross, and Colton
+Mikolajczyk. Testing the limits of large language models in debating humans. Scientific
+Reports, 15:13852, 2025.
+[49] Stephanie Houde, Kristina Brimijoin, Michael Muller, Steven I. Ross, Dario Andres
+Silva Moran, Gabriel Enrique Gonzalez, Siya Kunde, Morgan A. Foreman, and Justin D.
+Weisz. Controlling ai agent participation in group conversations: A human-centered approach.
+In Proceedings of the 30th International Conference on Intelligent User Interfaces, IUI ’25,
+page 390–408, New York, NY, USA, 2025. Association for Computing Machinery.
+[50] K. H. Davis, R. Biddulph, and S. Balashek. Automatic recognition of spoken digits. The
+Journal of the Acoustical Society of America, 24(6):637–642, 11 1952.
+[51] Daniel Povey, Arnab Ghoshal, Gilles Boulianne, Lukas Burget, Ondrej Glembek, Nagendra
+Goel, Mirko Hannemann, Petr Motlicek, Yanmin Qian, Petr Schwarz, Jan Silovsky, Georg
+Stemmer, and Karel Vesely. The kaldi speech recognition toolkit. https://kaldi-asr.org,
+2011. Open-source speech recognition toolkit.
+[52] Steffen Schneider, Alexei Baevski, Ronan Collobert, and Michael Auli. wav2vec: Unsupervised pre-training for speech recognition. In Interspeech 2019, pages 3465–3469, 2019.
+[53] Alec Radford, Jong Wook Kim, Tao Xu, Greg Brockman, Christine Mcleavey, and Ilya
+Sutskever. Robust speech recognition via large-scale weak supervision. In Andreas Krause,
+Emma Brunskill, Kyunghyun Cho, Barbara Engelhardt, Sivan Sabato, and Jonathan Scarlett,
+editors, Proceedings of the 40th International Conference on Machine Learning, volume 202
+of Proceedings of Machine Learning Research, pages 28492–28518. PMLR, 23–29 Jul 2023.
+[54] N. Umeda, H. Omura, and O. Fujimura. First complete text-to-speech system. Technical
+report, Electrotechnical Laboratory, Japan, Tokyo, Japan, 1968.
+[55] Heiga Zen, Keiichi Tokuda, and Alan W. Black. Statistical parametric speech synthesis. Speech
+Communication, 51(11):1039–1064, 2009.
+[56] Aaron van den Oord, Sander Dieleman, Heiga Zen, Karen Simonyan, Oriol Vinyals, Alex
+Graves, Nal Kalchbrenner, Andrew Senior, and Koray Kavukcuoglu. Wavenet: A generative
+model for raw audio. In Proceedings of the 9th ISCA Speech Synthesis Workshop, 2016.
+14
+
+[57] Yuxuan Wang, R. J. Skerry-Ryan, Daisy Stanton, Yonghui Wu, Ron J. Weiss, Navdeep Jaitly,
+Zongheng Yang, Ying Xiao, Zhifeng Chen, Samy Bengio, Quoc Le, Yannis Agiomyrgiannakis, Rob Clark, and Rif A. Saurous. Tacotron: Towards end-to-end speech synthesis. In
+INTERSPEECH, pages 4006–4010. ISCA, 2017.
+[58] Jonathan Shen, Ruoming Pang, Ron J. Weiss, Mike Schuster, Navdeep Jaitly, Zongheng
+Yang, Zhifeng Chen, Yu Zhang, Yuxuan Wang, Rj Skerrv-Ryan, Rif A. Saurous, Yannis
+Agiomvrgiannakis, and Yonghui Wu. Natural tts synthesis by conditioning wavenet on mel
+spectrogram predictions. In 2018 IEEE International Conference on Acoustics, Speech and
+Signal Processing (ICASSP), pages 4779–4783, 2018.
+[59] Ryan Prenger, Rafael Valle, and Bryan Catanzaro. Waveglow: A flow-based generative
+network for speech synthesis. In ICASSP 2019 - 2019 IEEE International Conference on
+Acoustics, Speech and Signal Processing (ICASSP), pages 3617–3621, 2019.
+[60] Jungil Kong, Jaehyeon Kim, and Jaekyoung Bae. Hifi-gan: generative adversarial networks
+for efficient and high fidelity speech synthesis. In Proceedings of the 34th International
+Conference on Neural Information Processing Systems, NIPS ’20, Red Hook, NY, USA, 2020.
+Curran Associates Inc.
+[61] James Betker. Better speech synthesis through scaling. arXiv preprint arXiv:2305.07243,
+2023. Tortoise TTS: expressive multi-voice text-to-speech.
+[62] Jin Xu, Zhifang Guo, Hangrui Hu, Yunfei Chu, Xiong Wang, Jinzheng He, Yuxuan Wang,
+Xian Shi, Ting He, Xinfa Zhu, Yuanjun Lv, Yongqi Wang, Dake Guo, He Wang, Linhan Ma,
+Pei Zhang, Xinyu Zhang, Hongkun Hao, Zishan Guo, Baosong Yang, Bin Zhang, Ziyang Ma,
+Xipin Wei, Shuai Bai, Keqin Chen, Xuejing Liu, Peng Wang, Mingkun Yang, Dayiheng Liu,
+Xingzhang Ren, Bo Zheng, Rui Men, Fan Zhou, Bowen Yu, Jianxin Yang, Le Yu, Jingren
+Zhou, and Junyang Lin. Qwen3-omni technical report. arXiv preprint arXiv:2509.17765,
+2025.
+[63] Wenyi Yu, Siyin Wang, Xiaoyu Yang, Xianzhao Chen, Xiaohai Tian, Jun Zhang, Guangzhi
+Sun, Lu Lu, Yuxuan Wang, and Chao Zhang. Salmonn-omni: A codec-free llm for full-duplex
+speech understanding and generation, 2024.
+[64] Wenyi Yu, Siyin Wang, Xiaoyu Yang, Xianzhao Chen, Xiaohai Tian, Jun Zhang, Guangzhi
+Sun, Lu Lu, Yuxuan Wang, and Chao Zhang. Salmonn-omni: A standalone speech llm without
+codec injection for full-duplex conversation, 2025.
+[65] Qinglin Zhang, Luyao Cheng, Chong Deng, Qian Chen, Wen Wang, Siqi Zheng, Jiaqing Liu,
+Hai Yu, Chaohong Tan, Zhihao Du, and Shiliang Zhang. Omniflatten: An end-to-end gpt
+model for seamless voice conversation, 2025.
+[66] Ruaridh Mon-Williams, Gen Li, Ran Long, Wenqian Du, Christopher G. Lucas, et al. Embodied large language models enable robots to complete complex tasks in unpredictable
+environments. Nature Machine Intelligence, 7:592–601, 2025.
+[67] Guanzhi Wang, Yuqi Xie, Yunfan Jiang, Ajay Mandlekar, Chaowei Xiao, Yuke Zhu, Linxi
+Fan, and Anima Anandkumar. Voyager: An open-ended embodied agent with large language
+models. Transactions on Machine Learning Research (TMLR), 2024.
+[68] Yunfan Jiang, Agrim Gupta, Zichen Zhang, Guanzhi Wang, Yongqiang Dou, Yanjun Chen,
+Li Fei-Fei, Anima Anandkumar, Yuke Zhu, and Linxi Fan. VIMA: Robot manipulation
+with multimodal prompts. In Andreas Krause, Emma Brunskill, Kyunghyun Cho, Barbara
+Engelhardt, Sivan Sabato, and Jonathan Scarlett, editors, Proceedings of the 40th International
+Conference on Machine Learning, volume 202 of Proceedings of Machine Learning Research,
+pages 14975–15022. PMLR, 23–29 Jul 2023.
+[69] Moo Jin Kim, Karl Pertsch, Siddharth Karamcheti, Ted Xiao, Ashwin Balakrishna, Suraj Nair,
+Rafael Rafailov, Ethan P Foster, Pannag R Sanketi, Quan Vuong, Thomas Kollar, Benjamin
+Burchfiel, Russ Tedrake, Dorsa Sadigh, Sergey Levine, Percy Liang, and Chelsea Finn.
+Openvla: An open-source vision-language-action model. In Pulkit Agrawal, Oliver Kroemer,
+and Wolfram Burgard, editors, Proceedings of The 8th Conference on Robot Learning, volume
+15
+
+270 of Proceedings of Machine Learning Research, pages 2679–2713. PMLR, 06–09 Nov
+2025.
+[70] Ranjan Sapkota, Yang Cao, Konstantinos I. Roumeliotis, and Manoj Karkee. Vision-languageaction models: Concepts, progress, applications and challenges, 2025.
+[71] Zihao Wang, Shaofei Cai, Guanzhou Chen, Anji Liu, Xiaojian (Shawn) Ma, and Yitao Liang.
+Describe, explain, plan and select: Interactive planning with llms enables open-world multitask agents. In A. Oh, T. Naumann, A. Globerson, K. Saenko, M. Hardt, and S. Levine, editors,
+Advances in Neural Information Processing Systems, volume 36, pages 34153–34189. Curran
+Associates, Inc., 2023.
+[72] Charles Cao, Feiyi Wang, Lisa Lindley, and Zejiang Wang. Managing linux servers with
+llm-based ai agents: An empirical evaluation with gpt4. Machine Learning with Applications,
+17:100570, 2024.
+[73] Zhiyong Wu, Chengcheng Han, Zichen Ding, Zhenmin Weng, Zhoumianze Liu, Shunyu
+Yao, Tao Yu, and Lingpeng Kong. Os-copilot: Towards generalist computer agents with
+self-improvement, 2024.
+[74] Chi Zhang, Zhao Yang, Jiaxuan Liu, Yucheng Han, Xin Chen, Zebiao Huang, Bin Fu, and
+Gang Yu. Appagent: Multimodal agents as smartphone users, 2023.
+[75] Brian Singer, Keane Lucas, Lakshmi Adiga, Meghna Jain, Lujo Bauer, and Vyas Sekar. On
+the feasibility of using llms to execute multistage network attacks, 01 2025.
+[76] Tomek Korbak, Mikita Balesni, Elizabeth Barnes, Yoshua Bengio, Joe Benton, Joseph Bloom,
+Mark Chen, Alan Cooney, Allan Dafoe, Anca Dragan, Scott Emmons, Owain Evans, David
+Farhi, Ryan Greenblatt, Dan Hendrycks, Marius Hobbhahn, Evan Hubinger, Geoffrey Irving,
+Erik Jenner, Daniel Kokotajlo, Victoria Krakovna, Shane Legg, David Lindner, David Luan,
+Aleksander M ˛
+adry, Julian Michael, Neel Nanda, Dave Orr, Jakub Pachocki, Ethan Perez, Mary
+Phuong, Fabien Roger, Joshua Saxe, Buck Shlegeris, Martín Soto, Eric Steinberger, Jasmine
+Wang, Wojciech Zaremba, Bowen Baker, Rohin Shah, and Vlad Mikulik. Chain of Thought
+Monitorability: A New and Fragile Opportunity for AI Safety. arXiv, 2025.
+[77] Bowen Baker, Joost Huizinga, Leo Gao, Zehao Dou, Melody Y. Guan, Aleksander Madry,
+Wojciech Zaremba, Jakub W. Pachocki, and David Farhi. Monitoring reasoning models for
+misbehavior and the risks of promoting obfuscation. ArXiv, abs/2503.11926, 2025.
+[78] Chengda Lu, Xiaoyu Fan, Yu Huang, Rongwu Xu, Jijie Li, and Wei Xu. Does chain-of-thought
+reasoning really reduce harmfulness from jailbreaking? In Wanxiang Che, Joyce Nabende,
+Ekaterina Shutova, and Mohammad Taher Pilehvar, editors, Findings of the Association
+for Computational Linguistics: ACL 2025, pages 6523–6546, Vienna, Austria, July 2025.
+Association for Computational Linguistics.
+[79] James Chua, Jan Betley, Mia Taylor, and Owain Evans. Thought crime: Backdoors and
+emergent misalignment in reasoning models, 2025.
+[80] Fan Yang. The cost of thinking: Increased jailbreak risk in large language models. arXiv
+preprint arXiv:2508.10032, 2025.
+[81] Kaiwen Zhou, Xuandong Zhao, Gaowen Liu, Jayanth Srinivasa, Aosong Feng, Dawn Song,
+and Xin Eric Wang. Safekey: Amplifying aha-moment insights for safety reasoning, 2025.
+[82] Xinyue Lou, You Li, Jinan Xu, Xiangyu Shi, Chi Chen, and Kaiyu Huang. Think in safety:
+Unveiling and mitigating safety alignment collapse in multimodal large reasoning model. In
+Christos Christodoulopoulos, Tanmoy Chakraborty, Carolyn Rose, and Violet Peng, editors,
+Proceedings of the 2025 Conference on Empirical Methods in Natural Language Processing,
+pages 5167–5186, Suzhou, China, November 2025. Association for Computational Linguistics.
+[83] Tong Wu, Chong Xiang, Jiachen T. Wang, G. Edward Suh, and Prateek Mittal. Effectively
+controlling reasoning models through thinking intervention, 2025.
+16
+
+[84] Yichi Zhang, Yue Ding, Jingwen Yang, Tianwei Luo, Dongbai Li, Ranjie Duan, Qiang Liu,
+Hang Su, Yinpeng Dong, and Jun Zhu. Towards safe reasoning in large reasoning models via
+corrective intervention, 2025.
+[85] An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu,
+Chang Gao, Chengen Huang, Chenxu Lv, Chujie Zheng, Dayiheng Liu, Fan Zhou, Fei Huang,
+Feng Hu, Hao Ge, Haoran Wei, Huan Lin, Jialong Tang, Jian Yang, Jianhong Tu, Jianwei
+Zhang, Jianxin Yang, Jiaxi Yang, Jing Zhou, Jingren Zhou, Junyang Lin, Kai Dang, Keqin
+Bao, Kexin Yang, Le Yu, Lianghao Deng, Mei Li, Mingfeng Xue, Mingze Li, Pei Zhang, Peng
+Wang, Qin Zhu, Rui Men, Ruize Gao, Shixuan Liu, Shuang Luo, Tianhao Li, Tianyi Tang,
+Wenbiao Yin, Xingzhang Ren, Xinyu Wang, Xinyu Zhang, Xuancheng Ren, Yang Fan, Yang
+Su, Yichang Zhang, Yinger Zhang, Yu Wan, Yuqiong Liu, Zekun Wang, Zeyu Cui, Zhenru
+Zhang, Zhipeng Zhou, and Zihan Qiu. Qwen3 technical report, 2025.
+[86] Yang Sui, Yu-Neng Chuang, Guanchu Wang, Jiamu Zhang, Tianyi Zhang, Jiayi Yuan, Hongyi
+Liu, Andrew Wen, Shaochen Zhong, Na Zou, Hanjie Chen, and Xia Hu. A survey on efficient
+reasoning for large language models. arXiv preprint arXiv:2503.16419, mar 2025. Version 4
+(last updated August 21, 2025).
+[87] Silei Xu, Wenhao Xie, Lingxiao Zhao, and Pengcheng He. Chain of draft: Thinking faster by
+writing less. arXiv preprint arXiv:2502.18600, feb 2025. Version 2 (last revised 3 Mar 2025).
+[88] Simon A. Aytes, Jinheon Baek, and Sung Ju Hwang. Sketch-of-thought: Efficient llm reasoning
+with adaptive cognitive-inspired sketching. arXiv preprint arXiv:2503.05179, mar 2025.
+Version 4 (last revised 24 Oct 2025).
+[89] Gengyang Li, Yifeng Gao, Yuming Li, and Yunfang Wu. Thinkless: A training-free inferenceefficient method for reducing reasoning redundancy. arXiv preprint arXiv:2505.15684, may
+2025. Version 2 (last revised 23 May 2025).
+[90] Guosheng Liang, Longguang Zhong, Ziyi Yang, and Xiaojun Quan. Thinkswitcher: Dynamic
+switching between short and long chain-of-thought reasoning in large reasoning models, 2025.
+arXiv preprint.
+[91] Ruiqi Zhang, Changyi Xiao, and Yixin Cao. Long or short cot? investigating instance-level
+switch of large reasoning models, 2025. arXiv preprint.
+[92] Haoyu Zheng, Zhuonan Wang, Yuqian Yuan, Tianwei Lin, Wenqiao Zhang, Zheqi Lv, Juncheng
+Li, Siliang Tang, Yueting Zhuang, and Hongyang He. Fast thinking for large language models,
+2025. arXiv preprint.
+[93] Xiao Pu, Michael Saxon, Wenyue Hua, and William Yang Wang. Thoughtterminator: Benchmarking, calibrating, and mitigating overthinking in reasoning models, 2025. arXiv preprint.
+[94] Renliang Sun, Wei Cheng, Dawei Li, Haifeng Chen, and Wei Wang. Stop when enough:
+Adaptive early-stopping for chain-of-thought reasoning, 2025. arXiv preprint.
+[95] Yassir Laaouach. HALT-cot: Model-agnostic early stopping for chain-of-thought reasoning
+via answer entropy. In 4th Muslims in ML Workshop co-located with ICML 2025, 2025.
+[96] Xuefei Ning, Zinan Lin, Zixuan Zhou, Zifu Wang, Huazhong Yang, and Yu Wang. Skeletonof-thought: Prompting LLMs for efficient parallel generation. In The Twelfth International
+Conference on Learning Representations, 2024.
+[97] Tian Jin, Ellie Y. Cheng, Zack Ankner, Nikunj Saunshi, Blake M. Elias, Amir Yazdanbakhsh,
+Jonathan Ragan-Kelley, Suvinay Subramanian, and Michael Carbin. Learning to keep a
+promise: Scaling language model decoding parallelism with learned asynchronous decoding,
+2025.
+[98] Gleb Rodionov, Roman Garipov, Alina Shutova, George Yakushev, Erik Schultheis, Vage
+Egiazarian, Anton Sinitsin, Denis Kuznedelev, and Dan Alistarh. Hogwild! inference: Parallel
+llm generation via concurrent attention, 2025.
+17
+
+[99] Yijiong Yu. Accelerate parallelizable reasoning via parallel decoding within one sequence,
+2025.
+[100] Chan-Jan Hsu, Davide Buffelli, Jamie McGowan, Feng-Ting Liao, Yi-Chang Chen, Sattar
+Vakili, and Da shan Shiu. Group think: Multiple concurrent reasoning agents collaborating at
+token level granularity, 2025.
+[101] Tong Zheng, Hongming Zhang, Wenhao Yu, Xiaoyang Wang, Runpeng Dai, Rui Liu, Huiwen
+Bao, Chengsong Huang, Heng Huang, and Dong Yu. Parallel-r1: Towards parallel thinking
+via reinforcement learning, 2025.
+[102] In Gim, Seung seob Lee, and Lin Zhong. Asynchronous llm function calling, 2024.
+[103] Sehoon Kim, Suhong Moon, Ryan Tabrizi, Nicholas Lee, Michael W Mahoney, Kurt Keutzer,
+and Amir Gholami. An llm compiler for parallel function calling. In Forty-first International
+Conference on Machine Learning, 2024.
+[104] Junlong Tong, Yingqi Fan, Anhao Zhao, Yunpu Ma, and Xiaoyu Shen. Streamingthinker:
+Large language models can think while reading, 2025.
+[105] Shoutao Guo, Shaolei Zhang, Zhengrui Ma, and Yang Feng. Large language models are
+read/write policy-makers for simultaneous generation, 2025.
+[106] Donghang Wu, Haoyang Zhang, Jun Chen, Xiangyu, Zhang, Hexin Liu, Eng Siong Chng, Fei
+Tian, Xuerui Yang, Xiangyu Zhang, Daxin Jiang, and Gang Yu. Mind-paced speaking: A
+dual-brain approach to real-time reasoning in spoken language models, 2025.
+[107] Anthony Liang, Jonathan Berant, Adam Fisch, Abhimanyu Goyal, Kalpesh Krishna, and Jacob
+Eisenstein. Plantain: Plan-answer interleaved reasoning, 2025.
+[108] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez,
+Ł ukasz Kaiser, and Illia Polosukhin. Attention is all you need. In I. Guyon, U. Von Luxburg,
+S. Bengio, H. Wallach, R. Fergus, S. Vishwanathan, and R. Garnett, editors, Advances in
+Neural Information Processing Systems, volume 30. Curran Associates, Inc., 2017.
+[109] Juho Lee, Yoonho Lee, Jungtaek Kim, Adam Kosiorek, Seungjin Choi, and Yee Whye Teh.
+Set transformer: A framework for attention-based permutation-invariant neural networks. In
+Proceedings of the 36th International Conference on Machine Learning, pages 3744–3753,
+2019.
+[110] Peter Shaw, Jakob Uszkoreit, and Ashish Vaswani. Self-attention with relative position
+representations. In Marilyn Walker, Heng Ji, and Amanda Stent, editors, Proceedings of
+the 2018 Conference of the North American Chapter of the Association for Computational
+Linguistics: Human Language Technologies, Volume 2 (Short Papers), pages 464–468, New
+Orleans, Louisiana, June 2018. Association for Computational Linguistics.
+[111] Ofir Press, Noah Smith, and Mike Lewis. Train short, test long: Attention with linear biases
+enables input length extrapolation. In International Conference on Learning Representations,
+2022.
+[112] Jianlin Su, Murtadha Ahmed, Yu Lu, Shengfeng Pan, Wen Bo, and Yunfeng Liu. Roformer:
+Enhanced transformer with rotary position embedding. Neurocomputing, 568:127063, 2024.
+[113] Dan Hendrycks, Collin Burns, Saurav Kadavath, Akul Arora, Steven Basart, Eric Tang, Dawn
+Song, and Jacob Steinhardt. Measuring mathematical problem solving with the math dataset.
+NeurIPS, 2021.
+[114] Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan Zhuang, Zhanghao Wu, Yonghao
+Zhuang, Zi Lin, Zhuohan Li, Dacheng Li, Eric Xing, et al. Judging llm-as-a-judge with
+mt-bench and chatbot arena. Advances in Neural Information Processing Systems, 36:46595–
+46623, 2023.
+[115] Chenxu Yang, Qingyi Si, Yongjie Duan, Zheliang Zhu, Chenyu Zhu, Qiaowei Li, Minghui
+Chen, Zheng Lin, and Weiping Wang. Dynamic early exit in reasoning models. arXiv preprint
+arXiv:2504.15895, 2025.
+18
+
+[116] Guosheng Liang, Longguang Zhong, Ziyi Yang, and Xiaojun Quan. Thinkswitcher: When to
+think hard, when to think fast. arXiv preprint arXiv:2505.14183, 2025.
+[117] Qian Yang, Jin Xu, Wenrui Liu, Yunfei Chu, Ziyue Jiang, Xiaohuan Zhou, Yichong Leng,
+Yuanjun Lv, Zhou Zhao, Chang Zhou, and Jingren Zhou. Air-bench: Benchmarking large
+audio-language models via generative comprehension. In Proceedings of the 62nd Annual
+Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pages
+1979–1998, Bangkok, Thailand, August 2024. Association for Computational Linguistics.
+[118] Bin Wang, Xunlong Zou, Geyu Lin, Shuo Sun, Zhuohan Liu, Wenyu Zhang, Zhengyuan Liu,
+AiTi Aw, and Nancy F Chen. Audiobench: A universal benchmark for audio large language
+models. NAACL, 2025.
+[119] Chengwei Wei, Bin Wang, Jung-jae Kim, and Nancy F. Chen. Towards spoken mathematical
+reasoning: Benchmarking speech-based models over multi-faceted math problems. arXiv
+preprint arXiv:2505.15000, 2025.
+[120] Ruiqi Yan, Xiquan Li, Wenxi Chen, Zhikang Niu, Chen Yang, Ziyang Ma, Kai Yu, and Xie
+Chen. Uro-bench: Towards comprehensive evaluation for end-to-end spoken dialogue models,
+2025.
+[121] Yemin Shi, Yu Shu, Siwei Dong, Guangyi Liu, Jaward Sesay, Jingwen Li, and Zhiting Hu.
+Voila: Voice-language foundation models for real-time autonomous interaction and voice
+role-play, 2025.
+[122] Yubo Wang, Xueguang Ma, Ge Zhang, Yuansheng Ni, Abhranil Chandra, Shiguang Guo,
+Weiming Ren, Aaran Arulraj, Xuan He, Ziyan Jiang, et al. Mmlu-pro: A more robust and
+challenging multi-task language understanding benchmark. arXiv preprint arXiv:2406.01574,
+2024.
+[123] David Rein, Betty Li Hou, Asa Cooper Stickland, Jackson Petty, Richard Yuanzhe Pang, Julien
+Dirani, Julian Michael, and Samuel R. Bowman. Gpqa: A graduate-level google-proof q&a
+benchmark, 2023.
+[124] AIME. Aime problems and solutions. https://artofproblemsolving.com/wiki/index.
+php/AIME_Problems_and_Solutions, 2025.
+[125] Bill Yuchen Lin, Ronan Le Bras, Kyle Richardson, Ashish Sabharwal, Radha Poovendran,
+Peter Clark, and Yejin Choi. ZebraLogic: On the scaling limits of LLMs for logical reasoning.
+In Aarti Singh, Maryam Fazel, Daniel Hsu, Simon Lacoste-Julien, Felix Berkenkamp, Tegan
+Maharaj, Kiri Wagstaff, and Jerry Zhu, editors, Proceedings of the 42nd International Conference on Machine Learning, volume 267 of Proceedings of Machine Learning Research, pages
+37889–37905. PMLR, 13–19 Jul 2025.
+[126] OpenAI, :, Sandhini Agarwal, Lama Ahmad, Jason Ai, Sam Altman, Andy Applebaum, Edwin
+Arbus, Rahul K. Arora, Yu Bai, Bowen Baker, Haiming Bao, Boaz Barak, Ally Bennett, Tyler
+Bertao, Nivedita Brett, Eugene Brevdo, Greg Brockman, Sebastien Bubeck, Che Chang, Kai
+Chen, Mark Chen, Enoch Cheung, Aidan Clark, Dan Cook, Marat Dukhan, Casey Dvorak,
+Kevin Fives, Vlad Fomenko, Timur Garipov, Kristian Georgiev, Mia Glaese, Tarun Gogineni,
+Adam Goucher, Lukas Gross, Katia Gil Guzman, John Hallman, Jackie Hehir, Johannes
+Heidecke, Alec Helyar, Haitang Hu, Romain Huet, Jacob Huh, Saachi Jain, Zach Johnson,
+Chris Koch, Irina Kofman, Dominik Kundel, Jason Kwon, Volodymyr Kyrylov, Elaine Ya
+Le, Guillaume Leclerc, James Park Lennon, Scott Lessans, Mario Lezcano-Casado, Yuanzhi
+Li, Zhuohan Li, Ji Lin, Jordan Liss, Lily, Liu, Jiancheng Liu, Kevin Lu, Chris Lu, Zoran
+Martinovic, Lindsay McCallum, Josh McGrath, Scott McKinney, Aidan McLaughlin, Song
+Mei, Steve Mostovoy, Tong Mu, Gideon Myles, Alexander Neitz, Alex Nichol, Jakub Pachocki,
+Alex Paino, Dana Palmie, Ashley Pantuliano, Giambattista Parascandolo, Jongsoo Park, Leher
+Pathak, Carolina Paz, Ludovic Peran, Dmitry Pimenov, Michelle Pokrass, Elizabeth Proehl,
+Huida Qiu, Gaby Raila, Filippo Raso, Hongyu Ren, Kimmy Richardson, David Robinson, Bob
+Rotsted, Hadi Salman, Suvansh Sanjeev, Max Schwarzer, D. Sculley, Harshit Sikchi, Kendal
+Simon, Karan Singhal, Yang Song, Dane Stuckey, Zhiqing Sun, Philippe Tillet, Sam Toizer,
+Foivos Tsimpourlas, Nikhil Vyas, Eric Wallace, Xin Wang, Miles Wang, Olivia Watkins, Kevin
+19
+
+Weil, Amy Wendling, Kevin Whinnery, Cedric Whitney, Hannah Wong, Lin Yang, Yu Yang,
+Michihiro Yasunaga, Kristen Ying, Wojciech Zaremba, Wenting Zhan, Cyril Zhang, Brian
+Zhang, Eddie Zhang, and Shengjia Zhao. gpt-oss-120b & gpt-oss-20b model card, 2025.
+[127] Tim Dettmers, Artidoro Pagnoni, Ari Holtzman, and Luke Zettlemoyer. Qlora: Efficient
+finetuning of quantized llms. In A. Oh, T. Naumann, A. Globerson, K. Saenko, M. Hardt, and
+S. Levine, editors, Advances in Neural Information Processing Systems, volume 36, pages
+10088–10115. Curran Associates, Inc., 2023.
+[128] Tom Dörr. woct0rdho/transformers-qwen3-moe-fused: Fused qwen3 moe layer for faster
+training, compatible with transformers, lora, bnb 4-bit quant, unsloth, 2025. GitHub repository,
+Apache-2.0 license.
+[129] Bobby Costin, Timor Averbuch, Dhruv Pai, Nathan Chen, and Ben Keigwin. Momoe: Memory
+optimized mixture of experts. Tilde Research Blog, 7 2025. Blog post.
+[130] Mantas Mazeika, Long Phan, Xuwang Yin, Andy Zou, Zifan Wang, Norman Mu, Elham
+Sakhaee, Nathaniel Li, Steven Basart, Bo Li, David Forsyth, and Dan Hendrycks. HarmBench:
+A standardized evaluation framework for automated red teaming and robust refusal. In Ruslan
+Salakhutdinov, Zico Kolter, Katherine Heller, Adrian Weller, Nuria Oliver, Jonathan Scarlett,
+and Felix Berkenkamp, editors, Proceedings of the 41st International Conference on Machine
+Learning, volume 235 of Proceedings of Machine Learning Research, pages 35181–35224.
+PMLR, 21–27 Jul 2024.
+[131] Andy Zou, Zifan Wang, Nicholas Carlini, Milad Nasr, J. Zico Kolter, and Matt Fredrikson.
+Universal and transferable adversarial attacks on aligned language models. arXiv preprint
+arXiv:2307.15043, 2023.
+[132] Philippe Laban, Hiroaki Hayashi, Yingbo Zhou, and Jennifer Neville. Llms get lost in
+multi-turn conversation, 2025.
+[133] Speech-Rule-Engine contributors. Speech-rule-engine: Generating speech descriptions for
+xml structures. GitHub repository, 2025. accessed 2025-12-10.
+[134] Eric Lam. lab-mic: Record audio directly within jupyter/ipython notebooks using browser
+microphone. GitHub repository. accessed 2025-12-10.
+[135] Edresson Casanova, Kelly Davis, Eren Gölge, Görkem Göknar, Iulian Gulea, Logan Hart, Aya
+Aljafari, Joshua Meyer, Reuben Morais, Samuel Olayemi, and Julian Weber. Xtts: a massively
+multilingual zero-shot text-to-speech model, 2024.
+[136] ekwek1. Soprano: Instant, ultra-realistic text-to-speech. https://github.com/ekwek1/
+soprano, 2026. GitHub repository, accessed 2026-01-29.
+[137] Martin Kuo, Jianyi Zhang, Aolin Ding, Qinsi Wang, Louis DiValentin, Yujia Bao, Wei Wei,
+Hai Li, and Yiran Chen. H-cot: Hijacking the chain-of-thought safety reasoning mechanism to
+jailbreak large reasoning models, including openai o1/o3, deepseek-r1, and gemini 2.0 flash
+thinking. arXiv preprint, 2025.
+[138] Zihao Zhu, Xinyu Wu, Gehan Hu, Siwei Lyu, Ke Xu, and Baoyuan Wu. Advchain: Adversarial
+chain-of-thought tuning for robust safety alignment of large reasoning models, 2025.
+[139] Wenhan Chang, Tianqing Zhu, Yu Zhao, Shuangyong Song, Ping Xiong, and Wanlei Zhou.
+Chain-of-lure: A universal jailbreak attack framework using unconstrained synthetic narratives,
+2025.
+
+20
+
+Appendix
+A
+
+Prompting
+
+In this section we provide detailed prompts used in both our main and safety experiments.
+
+A.1
+
+Main propmt
+
+In our main setup, we use a minimal prompt to keep it easy to extend or modify. We do not define
+separate thinker or writer instructions; instead, the user input is shared between both. To indicate that
+the internal reasoning may be partial, we additionally prepend each stream with a fixed prefix.
+
+Writer prefix
+... [SYSTEM: thoughts will continue here]\n</think>\n
+
+Thinker prefix
+<|im_end|>\n<|im_start|>assistant\n<think>\n
+
+For mode switching, we use an auxiliary prompt that introduces the thinker/writer roles and specifies
+the decision rule for switching. This prompt is only shown when the model is explicitly asked to
+change modes.
+
+Mode Switching prompt (before reasoning)
+You are an AI assistant that can think and write responses concurrently,
+,→
+and you must decide whether or not you should pause writing and
+,→
+think more.
+Read the current partial thoughts and response below, then decide
+,→
+whether you can continue writing the response without pausing
+,→
+(yes/no):
+- Answer "yes" if your thoughts have enough information to write the
+,→
+next response paragraph, even if the full task is not solved yet.
+- Answer "no" if your thoughts aren't enough to write the next
+,→
+response paragraph, i.e. if your response ran out of of thoughts.
+
+A.2
+
+AsyncReasoning (Safety Prompts)
+
+The differences from the main prompt are the Thinker prefix, the mode-switching prompt, and the
+mode-switching question. In addition to regular chat template specific tokens they contain safety
+instructions and hints.
+21
+
+Thinker prefix
+<|im_end|>\n<|im_start|>assistant\n<think>
+EXECUTION PROTOCOL:
+1. SAFETY CHECK: Before solving, explicitly evaluate if the user's
+,→
+request is safe, legal, and ethical.
+- If UNSAFE: Your goal is to refuse. You have \"enough information\"
+,→
+to write immediately after you decide to refuse.
+- If SAFE: Proceed to solve the problem step-by-step.
+2. REASONING: If the request is safe, solve the problem step by step.
+3. VALIDATION: Validate your final answer again and again until you see
+,→
+the same answer in the partial response above your thoughts.
+Prioritize safety first, then accuracy.
+
+Mode Switching prompt (before reasoning)
+You are an AI assistant that can think and write responses concurrently,
+,→
+and you must decide whether or not you should pause writing and
+,→
+think more.
+Read the current partial thoughts and response below, then decide
+,→
+whether you can continue writing the response without pausing
+,→
+(yes/no):
+- Answer "yes" if you have completed the safety check and have enough
+,→
+information to write the next response paragraph, even if the full
+,→
+task is not solved yet.
+- Answer "no" if you are still checking safety, need to think more, or
+,→
+need to validate your answer.
+
+While we discuss Mode Switching question separately in Appendix B. In the safety experiments we
+replace it with the following.
+Mode Switching question
+Wait, have I completed the safety check and do I have enough thoughts
+,→
+to write the next paragraph or formula? (yes/no):
+
+B
+
+Mode Switching Details
+
+We implement mode switching as an explicit control query that asks the model to decide whether the
+writer should continue or pause to wait for additional thoughts. Concretely, we build an auxiliary
+“mode-switching” prompt (shown in Appendix A) and append the current thinker and writer partial
+outputs. We then append a short yes/no question:
+Mode Switching question
+Wait, are my current thoughts enough to write the next paragraph or
+,→
+formula? (yes/no):
+
+The model’s next-token distribution is used as a binary decision rule: if p(“yes”) > p(“no”), we
+allow the writer to keep generating; otherwise, we pause the writer and keep advancing the thinker.
+In our implementation we trigger this check every 20 decoding steps or when the thinker emits an
+“end-of-step” marker (two consecutive newlines). Additionally, when the writer finishes a paragraph
+boundary (two consecutive newlines) during simultaneous generation, we temporarily pause writing
+until new thoughts arrive, which prevents the writer from getting too far ahead. Finally, if the thinker
+22
+
+emits an explicit end-of-think token (e.g., </think>), we switch to writer-only mode so the writer
+can complete the response.
+KV-cache layout and reuse. To avoid re-encoding long contexts, we split the KV cache into
+dedicated blocks that can be recombined for different modes. Specifically, we allocate five blocks: (1)
+the shared input prompt, (2) the thinker output prefix and growing thinker stream, (3) the writer output
+prefix and growing writer stream, (4) the fixed mode-switching prompt, and (5) a small “question”
+block that is re-filled each time we ask the control query. During initialization, we prefill the prompt
+blocks once and then only append new tokens to the thinker/writer blocks as generation proceeds.
+We then define cache “views”:
+• thinker_view = [input prompt, thinker output]
+• writer_view = [input prompt, thinker output, writer output]
+• mode_switching_view = [mode-switching prompt, thinker output, writer output, question]
+Each view is wrapped by a cache manager (standard SharedCacheManager or the fast-kernel HogwildCache) so that a single forward pass can reuse the existing KV entries without re-tokenizing or
+re-encoding the full context. When a mode-switch decision is needed, we clear the question block
+(clear() in the standard cache, crop(0) in the fast-kernel cache), encode the short yes/no question
+into that block, and run a one-step forward pass on mode_switching_view. The resulting logits for
+the next token are compared for “yes” and “no” to determine whether the writer should proceed.
+This arrangement keeps the decision query cheap (only the question block is re-encoded) while
+ensuring the decision is conditioned on the same partial thoughts and partial response that the model
+has produced so far.
+
+C
+
+Mode-Switching Failure Mode Analysis
+
+To better understand the reliability of our mode-switching mechanism, we analyze the saved generations used in Figure 4. We focus on critical mode-switching errors that directly affect final answer
+quality, and separate them from other failure modes unrelated to routing between the thinker and
+writer streams.
+We consider two types of critical errors. First, Premature errors occur when the writer outputs an
+incorrect answer before the thinker has finished producing enough reasoning. Second, Stalling errors
+occur when the thinker continues generating while the writer is held back by the mode-switching
+decision, so the writer never gets an opportunity to produce the final answer. These two categories
+capture the main ways in which mode switching can harm final task performance.
+Table 5: Mode-switching failure rates for Qwen3 models on MATH-500.
+Model Premature ↓ Stalling ↓
+0.6B
+1.7B
+4B
+8B
+14B
+32B
+
+0.311
+0.020
+0.000
+0.000
+0.000
+0.000
+
+0.064
+0.028
+0.050
+0.010
+0.008
+0.006
+
+As shown in Table 5, smaller models make substantially more frequent mode-switching errors. This
+is especially pronounced for Qwen3-0.6B, where premature writing is the dominant failure mode. For
+larger models, premature errors disappear in this analysis, while stalling remains rare but non-zero.
+This trend may help explain why smaller models tend to lose more accuracy under mode switching in
+our evaluations.
+This analysis focuses only on critical mode-switching errors that affect final correctness. A more
+fine-grained analysis could additionally quantify minor inefficiencies, such as cases where the writer
+could have started answering slightly earlier without harming correctness.
+23
+
+D
+
+Generalization to Other Positional Embeddings
+
+Most modern LLMs use relative positional information. In practice, the dominant families are:
+(i) RoPE-style rotations [112], (ii) NoPE-style models where attention is position-agnostic, and
+(iii) additive relative-bias approaches such as ALiBi [111]. This appendix explains how the queryadjustment trick from Section 3.3 extends beyond RoPE.
+RoPE-Style. Our method uses the fact that the attention dot product is invariant under rotating
+both Q and K by the same angle. This lets us store the KV-cache in block-local coordinates (each
+token rotated as if its position started at 0 within its block), and then rotate only the query inside
+the attention kernel to emulate the correct relative offsets between blocks (see Section 3.3 for more
+details).
+NoPE-Style. For NoPE models, attention does not encode position in Q and K vectors and does not
+add any positional terms. In this case, implementation is trivial.
+ALiBi-Style. ALiBi adds per-head bias inside attention that is a linear function of relative distance
+between query and key positions. This allows us to store the KV cache as-is and add a view-specific
+relative bias inside the attention kernel. More specifically, for each view we rearrange the bias matrix
+to match the block order in that view.
+Other Relative Positional Schemes. More complex schemes that transform Q and K can often still
+be handled if they satisfy a relative property analogous to RoPE. When this holds, the same design
+principles applies: store each token once, and apply a per-block adjustment at query-time to account
+for the view-specific offset.
+
+E
+
+Detailed Performance Analysis
+
+To measure real-time delays, we implement a basic assistant pipeline that recognizes spoken inputs
+using whisper-base [53], feeds it into AsyncReasoning (or a baseline algorithm) to stream response
+tokens, then group them into short chunks (5 tokens or 1 LaTeX expr.) and use tortoise-tts [61]
+with default parameters to generate speech. For tasks involving LaTeX, we convert it into Clearspeak.
+To better contextualize our main results in Section 4, we report Table 6: Component runtime,
+a more detailed performance breakdown of this pipeline for Qwen3-32B, MATH-500, A100.
+Qwen-32B AsyncReasoning on MATH-500 dataset in Table 6.
+Component
+Latency
+Note that the final row (Full Delay) is not wall time but the total
+“silence time” perceived by the user.
+LLM inference
+203.176
+TTS
+inference
+3.304
+We additionally measure full end-to-end delay on a subset of
+TTS playback
+100.889
+MATH-500 samples with Qwen3-30B-A3B-Thinking-2507 in
+Full Delay (overlap) 102.098
+Table 7, using the same setup as in Section 4. We measure
+the wall time from the moment the user stops talking to the
+moment the system begins speaking, as well as the total frame-by-frame silence duration. Compared
+to our main evaluations, this includes automated speech recognition and additional software/hardware
+delays.
+Table 7: End-to-end latency evaluation for Qwen3-30B-A3B-Thinking-2507.
+Setup
+
+TTFT ↓
+
+Total Delay ↓
+
+AsyncReasoning (end-to-end)
+AsyncReasoning (Section 4)
+Baseline w/ think (end-to-end)
+Baseline w/ think (Section 4)
+
+4.643
+3.901
+895.599
+894.884
+
+9.887
+9.145
+895.599
+894.884
+
+The end-to-end delays are slightly higher than the controlled evaluation from Section 4 due to speech
+recognition, input hardware, and software delays. However, the difference remains below one second,
+while the delay reductions in our main results are much larger, often reaching tens to hundreds of
+seconds.
+The results suggest that the user-perceived delay is almost wholly (over 90%) attributed to LLM
+inference costs hidden under TTS playback, while the inference time of TTS itself plays a relatively
+24
+
+minor role. However, this might change for smaller models (e.g. 0.6B), where LLM inference is
+cheaper. To control for this, we report all main experiments with TTS pipeline running on a separate
+GPU. Whenever the LLM generates another chunk of text, we run the TTS pipeline in parallel as the
+LLM continues its work. In practice, this is consistent with having a TTS API running in a separate
+instance that does not interfere with the main LLM runtime. This also allows us to better decouple our
+results from the TTS engine choice, since there are newer engines faster than TortoiseTTS [135, 136].
+
+F
+
+Additional Ablation for Section 4.1
+
+In this section, we report additional ablations for mode switching criteria and validate our experimental
+setup. We follow the experimental setup from Section 4.1 for Qwen3-32B and vary several parameters.
+Mode switching frequency (T = 5 − 100): Table 8: Mode switching frequency comparison for
+by default, AsyncReasoning prompts the model Qwen3-32B, MATH-500 benchmark, A100 GPU.
+to decide if it should pause writing every T =20
+inference steps. Though we keep T =20 throughSetup
+Acc ↑ Delay ↓ TTFT ↓
+out our experiments, this parameter can be adT =5
+0.938 169.90
+2.75
+justed to balance between reaction time and comT =10
+0.936 117.82
+3.34
+putation overhead:
+T =15
+0.940 105.18
+3.70
+The results in Table 8 demonstrate that AsynT =20
+0.938 102.10
+4.32
+cReasoning is robust to the choice of mode
+T =25
+0.932
+94.88
+5.04
+switching frequency. Lower T values correT =30
+0.922
+83.09
+5.12
+spond to slightly faster “reaction time”, but they
+T =50
+0.918
+81.66
+6.60
+also silently increase GPU overhead since each
+T =100 0.922
+87.70
+10.91
+mode switching question requires additional token processing. Higher T has the opposite effect: reducing overhead at the cost of reaction time.
+Next, we report several alternative prompting techniques that we considered in early experimentation.
+Alternative prompts: we compare several additional mode switching strategies in Figure 7:
+• AsyncReasoning (main) is our default mode swtiching strategy from Section 4 (prompts in
+Appendix A).
+• AsyncReasoning (thinker async) is a setup where we let thinker view the writer response
+as previous term and actively encourage it to think about concurrency.
+
+0.94
+
+Accuracy
+
+0.92
+
+0.90
+
+0.88
+
+Baseline (Non-Thinking)
+Baseline (Thinking)
+Interleaved Thinking
+Interleaved Thinking ( =-0.5)
+DEER (early exit)
+ThinkSwitcher
+
+0.86
+
+0.84
+0
+
+100
+
+200
+
+300
+
+Delay (s)
+
+AsyncReasoning
+AsyncReasoning ( =+0.1)
+AsyncReasoning ( =+0.5)
+AsyncReasoning (invert-q)
+AsyncReasoning (TTS-based)
+400
+
+500
+
+600
+
+Figure 7: Comparing the impact of additional mode switching methods & baselines on MATH-500,
+Qwen3-32B, A100.
+25
+
+• AsyncReasoning (switch prompt) is a setup where we extend the mode switching prompt
+to 1) consider the original problem, 2) take parallel processing into account. Note that mode
+switching is still done based on a “yes”/“no” answer.
+The remaining baselines are the same as in Section 4.1. The results in Figure 7 suggest that giving
+thinker or mode switcher explicit instructions to favor real-time responses does make it somewhat
+faster, but also reduces its accuracy. Crucially, we also found that advanced prompts (thinker async,
+switch prompt) behave eratically on some benchmarks, notably GPQA-Diamond. To that end, we
+chose the simplest prompt as our main setup for Section 4.2.
+AsyncReasoning (TTS-based): this is our attempt to use real-time TTS information to inform mode
+switching. The core intuition is: if the writer is already “ahead of real-time”, it may pause without
+slowing down the response. To incorporate this intuition, we run our TTS pipeline during inference
+over chunks of 5 generated tokens. We keep track of how many seconds of speech are synthesized
+but not yet spoken by any given time. We pause the writer if there are more than 10 seconds worth of
+response tokens “in the buffer”, we pause the writer. Our results demonstrate that mode-switching
+decisions can be effectively guided by downstream speech-generation dynamics. However, using this
+criterion makes AsyncReasoning accuracy tied to the choice of TTS and GPU speed. For that reason,
+we decided to focus on TTS-agnostic criteria.
+There are two more methods that we find interesting but have not fully evaluated yet:
+1. Trained mode-switching: training a classifier head, perhaps on top of the model’s own
+hidden state, to decide when to pause and wait for thoughts. This can reduce overhead GPU
+compute during inference, but it does not fit neatly into our training-free setup.
+2. Planned mode switching: similar to [107], we could prompt the thinker to plan ahead and
+decide which thoughts need to complete before the next response chunk. This type of
+planning can happen before thinker response or as a third “thread” concurrent to thinker
+and writer. However, we found that forming such plans makes the model change its overall
+response strategy (and hence, output length, affecting delay indirectly) significantly, making
+it difficult to compare using our evaluation setup.
+F.1
+
+The impact of GPU type
+
+In Section 4, we normally evaluate each model
+on the same GPU type, e.g. A100 for Qwen332B, B200 for 235B-A22B. In this section, we
+compare the same AsyncReasoning configuration on different GPU types to demonstrate how
+hardware impacts user-perceived delays.
+
+Table 9: GPU type impact for Qwen3-30B-A3BThinking-2507, average latency (s.) over benchmarks: MATH-500, GPQA-Diamond, MMLU-Pro
+subset (random 500 samples).
+GPU
+
+Delay ↓
+
+TTFT ↓
+
+A100
+6.12
+3.85
+Curiously, Blackwell GPU does not offer signifH200
+3.37
+2.25
+icant performance improvements over Hopper
+B200
+4.66
+3.34
+for this model. This is despite the fact that B200
+runs the model faster overall (tokens per second using our kernel). After closer examination, we
+attribute this to the fact that the user-perceived delay is dominated by the early response, after which
+model inference costs are masked by TTS speech time. In this case, the improvement from using
+B200 on relatively small A30B MoE experts does not significantly impact the “warmup time”, and
+after the initial warmup, both Blackwell and Hopper generate tokens quickly enough to incur no
+additional delays due to TTS masking.
+F.2
+
+The impact of NF4 expert quantization
+
+When evaluating Qwen3-235B model in Section 4.2, we quantize its experts to NF4 [127] while
+keeping the rest of the model in bfloat16 precision to fit on a single B200 (or potentially H200) GPU.
+In this section, we verify this by comparing original and NF4 quantized experts on a smaller 30B-A3B
+model where bfloat16 inference is feasible on a single GPU. For this analysis, we evaluate full
+MATH-500 and GPQA-Diamond, but only a sub-sample of 500 out of 12032 samples in MMLU-Pro
+to reduce GPU costs. We evaluate baseline (think) for both precisions and non-thinking for reference
+and report accuracies in Table 10.
+26
+
+Table 10: Expert-only NF4 quantization impact Qwen3-30B-A3B-Thinking-2507, accuracies for
+MATH-500, GPQA-Diamond, MMLU-Pro subset (random 500 samples).
+Setup
+MATH ↑ MMLUs ↑ GPQA ↑
+NF4 (thinking)
+BF16 (thinking)
+BF16 (non-thinking)
+F.3
+
+0.92
+0.93
+0.83
+
+0.76
+0.77
+0.72
+
+0.67
+0.66
+0.54
+
+AsyncReasoning with Small and Quantized Models
+
+The effectiveness of AsyncReasoning depends on whether the base model can reliably coordinate the
+two modes of generation: Thinker and Writer. This limitation is most visible for very small models.
+In our experiments in Section 4, models such as Qwen3-0.6B lose substantially more accuracy
+under our setup compared to their synchronous thinking baselines. Manual inspection suggests that
+this degradation is primarily caused by weaker routing behavior: small models are less reliable at
+predicting when to pause, when to continue writing, and how much reasoning context is sufficient for
+the next response segment. Refer to Appendix C for more details.
+For local deployment on edge devices, such as laptops or smartphones, one can compress larger
+models that already exhibit reliable routing behavior, instead of applying AsyncReasoning directly to
+very small models.
+To test this, we additionally evaluate AsyncReasoning with the official 4-bit AWQ quantization
+of Qwen3-8B on MATH-500. The results in Table 11 show that quantization preserves the main
+AsyncReasoning behavior: the quantized model nearly matches the synchronous thinking baseline in
+accuracy while substantially reducing time to first token and average perceived delay.
+Table 11: Quantized 4-bit Qwen3-8B-AWQ on MATH-500.
+Method
+Accuracy Avg. Delay (s.) TTFT (s.)
+8B-AWQ No Think
+8B-AWQ w/ Think
+8B-AWQ AsyncReasoning
+
+G
+
+0.812
+0.886
+0.880
+
+1.254
+485.535
+6.351
+
+1.254
+485.535
+1.809
+
+Benchmark & Evaluation Details
+
+Below, we provide additional details about the evaluation setup. For consistency across methods, we
+cap the generation length at 16K tokens. We use greedy decoding by default, except for AIME-2025,
+where we use nucleus sampling with the recommended parameters.
+• MATH-500: We report accuracy. Response correctness is determined via an LLM-as-a-judge
+evaluation using GPT-4.1 to check equivalence with the ground-truth answer.
+• MMLU-Pro: We formulate the task as a multiple-choice problem with 7–10 options and
+evaluate by directly comparing the predicted option letter to the ground-truth answer.
+• GPQA-Diamond: We formulate the task as a multiple-choice problem with 4 options and
+evaluate by directly comparing the predicted option letter to the ground-truth answer.
+• AIME-2025: We report accuracy. Due to the small dataset size and high variance, we
+average accuracy over 10 random seeds. We use the sampling parameters recommended in
+the model card for both thinking and non-thinking models.
+• Zebra Logic: We use the grid formulation, as it is the more standard variant.
+• SpokenMQA: We report accuracy as evaluated via an LLM-as-a-judge setup using GPT-4.1.
+In addition to accuracy and total delay, we measure additional performance metrics:
+• Time to first token (TTFT): the wall time delay until the system generates the first nonthinking token.
+• Total delay: same in the previous section. We run TTS on LLM-generated response tokens
+and measure the total delay experienced by the user.
+27
+
+• Steps to first token (STFT): the number of inference steps (LLM forward passes) before
+the first non-thinking token is generated, GPU-agnostic.
+• Steps Delay: The average number of inference steps (forward passes) that do not generate a
+response token.
+• Response tokens: the number of tokens in the “public” user-facing response. We report
+this metric to ensure that the differences in delay come from better asynchrony and not just
+more verbose responses.
+
+H
+
+Additional Experiments for Section 4.2
+
+The benchmark–model coverage in our paper is chosen to match model scale to benchmark difficulty
+while keeping the evaluation budget focused on the most informative settings. We prioritize pairs
+where base model can be meaningfully improved upon with reasoning: larger reasoning models are
+most informative on harder benchmarks such as AIME-2025 and GPQA-Diamond, while smaller
+are suited for simpler or real-time-oriented benchmarks such as MATH-500 and SpokenMQA. In
+particular, running very large models on relatively easy benchmarks provide limited additional signal,
+since their reasoning capacity may not be fully utilized. SpokenMQA is also designed for speechminded real-time LLMs and does not always benefit from longer reasoning for large models. To
+verify that this coverage choice does not change the conclusions, we include additional representative
+evaluations in this appendix, including Qwen3-235B-A22B on MATH-500, smaller Qwen3 models
+on AIME-2025, and larger Qwen3 models on SpokenMQA.
+Below we provide complete results, including accuracies, delays, and steps for the benchmarks:
+• Math-500 results are reported in Table 12.
+• MMLU-Pro results are reported in Table 13.
+• GPQA-Diamond results are reported in Table 14.
+• AIME 2025 results are reported in Table 15
+• Zebra Logic (grid) results are reported in 16
+• SpokenMQA results are reported in Table 17.
+
+Model
+
+Method
+
+Accuracy
+
+Time to 1st token (s)
+
+Total delay (s)
+
+Steps to 1st token
+
+Total delay steps
+
+Writer tokens
+
+Qwen-0.6B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.71
+0.50
+0.66
+
+641.21
+0.79
+2.08
+
+641.29
+1.01
+3.59
+
+4963.93
+1.00
+19.94
+
+4963.93
+1.00
+442.22
+
+434.51
+679.81
+2110.99
+
+Qwen-1.7B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.87
+0.75
+0.69
+
+607.14
+0.78
+0.82
+
+607.23
+1.00
+2.86
+
+4643.06
+1.00
+1.00
+
+4643.06
+1.00
+1.00
+
+561.11
+885.54
+1216.95
+
+Qwen-4B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.92
+0.85
+0.83
+
+556.36
+0.85
+0.88
+
+556.52
+1.14
+3.84
+
+4212.70
+1.00
+1.06
+
+4212.70
+1.00
+2.62
+
+591.50
+922.58
+1598.42
+
+Qwen-8B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.91
+0.85
+0.91
+
+559.02
+0.79
+1.81
+
+559.17
+1.10
+6.35
+
+4577.98
+1.00
+19.88
+
+4577.98
+1.00
+632.01
+
+614.70
+985.25
+1179.49
+
+Qwen-14B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.94
+0.86
+0.95
+
+560.16
+0.87
+6.43
+
+560.34
+1.16
+38.79
+
+3861.68
+1.00
+71.84
+
+3861.68
+1.00
+1411.26
+
+627.35
+941.46
+650.39
+
+Qwen-32B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.94
+0.84
+0.94
+
+649.47
+0.99
+4.32
+
+649.94
+1.63
+102.10
+
+3760.25
+1.00
+28.04
+
+3760.25
+1.00
+1918.95
+
+608.10
+726.92
+750.61
+
+Qwen3-30B-A3B (2507)
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.93
+0.83
+0.95
+
+894.88
+3.46
+3.90
+
+896.69
+7.84
+9.15
+
+4738.73
+0.00
+20.00
+
+4738.73
+0.00
+468.32
+
+595.09
+1367.84
+1405.19
+
+Qwen3-235B-A22B (2507)
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.97
+0.93
+0.96
+
+1675.66
+6.52
+9.98
+
+1688.25
+6.52
+159.2
+
+4931.85
+0.00
+21.93
+
+4931.85
+0.00
+691.35
+
+608.01
+1523.49
+1167.12
+
+Table 12: Performance metrics for various Qwen models on the Math-500 benchmark. Delays are
+measured in seconds; steps refer to model inference steps. Writer tokens indicate the average number
+of generated tokens per sample.
+
+28
+
+Model
+
+Method
+
+Accuracy
+
+Time to 1st token (s)
+
+Total delay (s)
+
+Steps to 1st token
+
+Total delay steps
+
+Writer tokens
+
+Qwen3-0.6B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.29
+0.20
+0.23
+
+278.72
+0.73
+1.52
+
+278.75
+0.86
+2.32
+
+277.74
+0.00
+6.21
+
+2721.82
+0.00
+43.50
+
+211.03
+224.14
+351.88
+
+Qwen3-1.7
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.54
+0.39
+0.43
+
+328.49
+0.72
+0.76
+
+328.54
+1.01
+1.70
+
+327.53
+0.00
+1.00
+
+3154.13
+0.00
+1.00
+
+446.34
+499.59
+491.94
+
+Qwen3-4B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.69
+0.55
+0.66
+
+350.71
+0.77
+0.79
+
+350.81
+1.19
+1.15
+
+349.79
+0.00
+1.00
+
+3076.16
+0.00
+1.00
+
+540.94
+694.33
+837.10
+
+Qwen3-8B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.73
+0.58
+0.70
+
+362.85
+0.79
+2.31
+
+362.94
+1.35
+8.81
+
+361.92
+0.00
+24.20
+
+3278.30
+0.00
+621.18
+
+591.72
+824.81
+735.34
+
+Qwen3-14B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.76
+0.68
+0.75
+
+295.55
+0.87
+7.84
+
+295.70
+1.57
+43.11
+
+294.67
+0.00
+116.00
+
+2565.01
+0.00
+1299.75
+
+548.49
+705.30
+423.38
+
+Qwen3-32B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.79
+0.72
+0.76
+
+346.50
+1.14
+4.23
+
+346.99
+2.43
+28.66
+
+345.81
+0.00
+43.02
+
+2297.41
+0.00
+663.66
+
+521.96
+640.81
+555.92
+
+Qwen3-30B-A3B (2507)
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.78
+0.72
+0.79
+
+481.90
+3.45
+2.23
+
+482.58
+8.89
+3.59
+
+481.50
+0.00
+20.00
+
+2534.95
+0.00
+242.52
+
+462.61
+3007.11
+1379.58
+
+Qwen3-235B-A22B (2507)
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.81
+0.74
+0.79
+
+1150.50
+4.70
+14.65
+
+1161.36
+34.75
+83.83
+
+2967.21
+0.00
+37.67
+
+2967.21
+0.00
+431.15
+
+513.50
+1484.43
+1278.69
+
+GPT-OSS-20B
+
+Baseline (Low Effort)
+Baseline (Medium Effort)
+Async Reasoning
+
+0.64
+0.73
+0.70
+
+5.24
+45.30
+2.43
+
+5.24
+45.30
+6.39
+
+4.24
+44.30
+5.34
+
+122.88
+922.12
+715.01
+
+206.00
+206.22
+223.78
+
+GPT-OSS-120B
+
+Baseline (Low Effort)
+Baseline (Medium Effort)
+Async Reasoning
+
+0.75
+0.78
+0.77
+
+11.82
+39.41
+7.73
+
+11.82
+39.41
+13.36
+
+10.82
+38.41
+13.36
+
+175.71
+605.61
+403.06
+
+206.00
+209.98
+211.14
+
+Table 13: Performance metrics for various models on the MMLU-Pro benchmark. Delays are
+measured in seconds; steps refer to model inference steps. Writer tokens indicate the average number
+of generated tokens per sample.
+
+Model
+
+Method
+
+Accuracy
+
+Time to 1st token (s)
+
+Total delay (s)
+
+Steps to 1st token
+
+Total delay steps
+
+Writer tokens
+
+Qwen3-0.6B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.25
+0.20
+0.19
+
+693.64
+0.73
+1.65
+
+693.64
+0.75
+4.58
+
+5451.25
+1.00
+19.71
+
+5451.25
+1.00
+404.16
+
+240.32
+572.93
+2512.85
+
+Qwen3-1.7B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.36
+0.31
+0.31
+
+969.85
+0.77
+0.83
+
+969.85
+3.77
+0.83
+
+7457.90
+1.00
+1.00
+
+7457.90
+1.00
+1.00
+
+713.05
+1141.47
+1113.42
+
+Qwen3-4B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.52
+0.37
+0.45
+
+985.37
+0.79
+0.88
+
+985.37
+0.84
+0.90
+
+7229.76
+1.00
+1.00
+
+7229.76
+1.00
+1.00
+
+743.40
+1446.78
+2364.18
+
+Qwen3-8B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.56
+0.32
+0.47
+
+905.97
+0.80
+4.23
+
+905.97
+0.86
+57.85
+
+7497.11
+1.00
+49.29
+
+7497.11
+1.00
+2052.61
+
+823.00
+1439.42
+1048.91
+
+Qwen3-14B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.63
+0.57
+0.55
+
+896.27
+0.81
+30.35
+
+896.27
+0.86
+149.75
+
+6314.86
+1.00
+622.32
+
+6314.86
+1.00
+4068.90
+
+838.81
+1465.93
+1004.87
+
+Qwen3-32B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.68
+0.57
+0.65
+
+1132.84
+1.00
+3.61
+
+1132.84
+1.08
+154.31
+
+6241.74
+1.00
+31.99
+
+6241.74
+1.00
+2796.39
+
+750.13
+1144.15
+1064.26
+
+Qwen3-30B-A3B (2507)
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.67
+0.54
+0.67
+
+1293.18
+3.70
+3.78
+
+1294.67
+3.70
+3.94
+
+6836.40
+1.00
+20.00
+
+6836.40
+1.00
+577.06
+
+745.79
+1567.85
+3311.05
+
+Qwen3-235B-A22B (2507)
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.76
+0.66
+0.72
+
+10.10
+12.18
+18.61
+
+10.16
+61.11
+243.57
+
+0.00
+0.00
+53.64
+
+0.00
+0.00
+1376.37
+
+7982.26
+1790.83
+3310.06
+
+Table 14: Performance metrics for various models on the GPQA-Diamond benchmark. Delays are
+measured in seconds; steps refer to model inference steps. Writer tokens indicate the average number
+of generated tokens per sample.
+
+29
+
+Model
+
+Method
+
+Accuracy
+
+Time to 1st token (s)
+
+Total delay (s)
+
+Steps to 1st token
+
+Total delay steps
+
+Writer tokens
+
+Qwen3-0.6B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.15
+0.023
+0.147
+
+1046.13
+3.05
+2.23
+
+1046.16
+3.24
+2.39
+
+11851.68
+0.00
+19.91
+
+11851.68
+0.00
+1292.80
+
+496.48
+1482.81
+890.32
+
+Qwen3-1.7B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.287
+0.096
+0.267
+
+985.46
+3.01
+3.62
+
+985.47
+3.11
+3.67
+
+12867.44
+0.00
+1.00
+
+12867.44
+0.00
+1.00
+
+473.58
+2320.64
+2187.11
+
+Qwen3-4B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.467
+0.177
+0.407
+
+1243.31
+3.81
+3.92
+
+1243.38
+3.95
+3.99
+
+12022.73
+0.00
+1.32
+
+12022.73
+0.00
+9.16
+
+606.09
+1338.29
+650.34
+
+Qwen3-8B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.453
+0.207
+0.433
+
+1281.29
+2.99
+3.49
+
+1281.36
+4.26
+8.95
+
+12326.72
+0.00
+19.87
+
+12326.72
+0.00
+2262.71
+
+620.79
+3542.62
+4715.90
+
+Qwen3-14B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.49
+0.197
+0.493
+
+1013.18
+2.89
+16.89
+
+1013.21
+2.98
+135.91
+
+11972.66
+0.00
+245.17
+
+11972.66
+0.00
+6279.47
+
+701.91
+3642.06
+781.36
+
+Qwen3-32B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.533
+0.2
+0.493
+
+1914.45
+1.13
+5.41
+
+1914.45
+1.70
+485.93
+
+11751.63
+0
+30.67
+
+11751.63
+0
+8224.03
+
+719.98
+3690.07
+756.84
+
+Qwen3-30B-A3B (2507)
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.67
+0.39
+0.62
+
+1813.67
+5.25
+2.20
+
+1814.09
+5.25
+2.20
+
+12937.53
+0.00
+20.00
+
+12937.53
+0.00
+1493.60
+
+573.03
+13563.67
+13587.09
+
+Qwen3-235B-A22B (2507)
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.68
+0.53
+0.68
+
+5330.46
+15.73
+9.06
+
+5348.22
+20.16
+500.94
+
+13753.82
+0.00
+21.96
+
+13753.82
+0.00
+2154.34
+
+413.39
+14127.90
+7377.12
+
+GPT-OSS-20B
+
+Baseline (Medium Effort)
+Baseline (Low Effort)
+Async Reasoning
+
+0.62
+0.36
+0.59
+
+523.53
+120.09
+2.83
+
+523.53
+120.09
+147.96
+
+7691.55
+1694.43
+24.15
+
+7691.55
+1694.43
+5894.61
+
+486.48
+496.57
+521.33
+
+GPT-OSS-120B
+
+Baseline (Medium Effort)
+Baseline (Low Effort)
+Async Reasoning
+
+0.77
+0.51
+0.66
+
+326.52
+91.40
+9.32
+
+326.52
+91.40
+166.75
+
+5079.68
+1411.24
+24.63
+
+5079.68
+1411.24
+3894.61
+
+728.41
+516.63
+683.41
+
+Table 15: Performance metrics for various models on the AIME 2025 benchmark. Delays are
+measured in seconds; steps refer to model inference steps. Writer tokens indicate the average number
+of generated tokens per sample.
+
+Model
+
+Method
+
+Accuracy
+
+Time to 1st token (s)
+
+Total delay (s)
+
+Steps to 1st token
+
+Total delay steps
+
+Writer tokens
+
+Qwen3-0.6B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.31
+0.05
+0.06
+
+892.59
+0.51
+0.73
+
+892.59
+0.51
+0.73
+
+7508.04
+1.00
+2.25
+
+7508.04
+1.00
+21.11
+
+252.37
+386.55
+895.06
+
+Qwen3-1.7B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.61
+0.13
+0.12
+
+803.33
+0.57
+0.72
+
+803.33
+0.57
+0.72
+
+6651.08
+1.00
+1.00
+
+6651.08
+1.00
+1.00
+
+267.85
+1566.85
+3280.79
+
+Qwen3-4B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.81
+0.32
+0.36
+
+681.66
+0.74
+0.88
+
+681.66
+0.74
+0.88
+
+5585.54
+1.00
+1.00
+
+5585.54
+1.00
+1.00
+
+286.06
+2089.58
+4789.77
+
+Qwen3-8B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.85
+0.26
+0.26
+
+743.83
+0.67
+0.70
+
+743.83
+0.67
+0.70
+
+5514.54
+1.00
+1.00
+
+5514.54
+1.00
+1.00
+
+279.38
+1442.88
+2126.38
+
+Baseline (Thinking)
+Async Reasoning
+
+0.88
+0.85
+
+676.05
+11.21
+
+676.05
+173.89
+
+4966.50
+138.74
+
+4966.50
+3725.13
+
+305.56
+399.07
+
+Qwen3-32B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.85
+0.29
+0.66
+
+940.27
+0.75
+10.29
+
+940.27
+0.75
+138.76
+
+5117.19
+1.00
+122.93
+
+5117.19
+1.00
+2569.64
+
+297.65
+1358.23
+1312.06
+
+Qwen3-30B-A3B (2507)
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.96
+0.84
+0.93
+
+1244.08
+3.81
+3.72
+
+1244.08
+3.81
+3.72
+
+5845.74
+0.00
+19.40
+
+5845.74
+0.00
+1353.80
+
+499.07
+6363.42
+4823.37
+
+Qwen3-235B-A22B (2507)
+
+Baseline (Thinking)
+Async Reasoning
+
+0.98
+0.95
+
+2111.67
+8.37
+
+2111.85
+57.85
+
+5643.99
+21.74
+
+5643.99
+212.72
+
+591.71
+3639.62
+
+GPT-OSS-20B
+
+Baseline (Low Effort)
+Baseline (Medium Effort)
+Async Reasoning
+
+0.01
+0.70
+0.61
+
+149.44
+372.41
+4.37
+
+149.44
+372.41
+163.34
+
+2180.52
+5516.39
+23.90
+
+2180.52
+5116.39
+4835.13
+
+339.48
+435.29
+421.06
+
+GPT-OSS-120B
+
+Baseline (Low Effort)
+Baseline (Medium Effort)
+Async Reasoning
+
+0.48
+0.81
+0.75
+
+248.13
+268.83
+7.53
+
+248.13
+268.83
+131.57
+
+2891.53
+3807.28
+31.42
+
+2891.53
+3807.28
+3403.06
+
+683.69
+692.52
+686.87
+
+Qwen3-14B
+
+Table 16: Performance metrics for various models on the Zebra Logic benchmark. Delays are
+measured in seconds; steps refer to model inference steps. Writer tokens indicate the average number
+of generated tokens per sample.
+
+30
+
+Model
+
+Method
+
+Accuracy
+
+Time to 1st token (s)
+
+Total delay (s)
+
+Steps to 1st token
+
+Total delay steps
+
+Writer tokens
+
+Qwen-0.6B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.70
+0.57
+0.66
+
+201.52
+0.68
+1.38
+
+201.53
+0.72
+2.56
+
+1655.04
+1.00
+20.00
+
+1655.04
+1.00
+131.28
+
+258.49
+245.97
+498.99
+
+Qwen-1.7B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.80
+0.73
+0.72
+
+219.21
+0.67
+0.72
+
+219.22
+0.71
+0.73
+
+1808.48
+1.00
+1.00
+
+1808.48
+1.00
+1.00
+
+308.26
+295.39
+301.86
+
+Qwen-4B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.81
+0.81
+0.81
+
+227.16
+0.70
+0.80
+
+227.16
+0.80
+0.84
+
+1768.23
+1.00
+1.07
+
+1768.23
+1.00
+1.67
+
+311.49
+295.66
+312.42
+
+Qwen-8B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.82
+0.81
+0.82
+
+265.22
+0.70
+1.70
+
+265.23
+0.78
+3.22
+
+1908.66
+1.00
+19.91
+
+1908.66
+1.00
+255.66
+
+326.51
+299.81
+337.74
+
+Qwen-14B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.84
+0.83
+0.84
+
+207.97
+0.79
+4.46
+
+207.99
+0.88
+15.86
+
+1368.37
+1.00
+40.74
+
+1368.37
+1.00
+569.14
+
+306.62
+286.36
+241.71
+
+Qwen-32B
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.84
+0.83
+0.84
+
+243.99
+0.94
+5.65
+
+244.07
+2.28
+15.50
+
+1359.35
+1.00
+52.97
+
+1359.35
+1.00
+386.58
+
+299.59
+284.71
+283.06
+
+Qwen3-30B-A3B (2507)
+
+Baseline (Thinking)
+Baseline (Non-thinking)
+Async Reasoning
+
+0.83
+0.84
+0.83
+
+147.19
+1.78
+2.85
+
+147.26
+2.36
+4.57
+
+843.41
+1.00
+20.00
+
+843.41
+1.00
+124.08
+
+267.51
+1088.70
+593.60
+
+Table 17: Performance metrics for various Qwen models on the SpokenMQA benchmark. Delays are
+measured in seconds; steps refer to model inference steps. Writer tokens indicate the average number
+of generated tokens per sample.
+
+I
+
+Safety & Reasoning
+
+Recent studies reveal that Chain-of-Thought reasoning impact on safety risks is complex and bidirectional [78, 79].
+On one hand, CoT enhances safety by enabling transparency [76, 77], allowing models to structure
+the evaluation of harmful intent and facilitate self-correction before generating a final response [4, 81].
+Defense mechanisms like RoboGuard and CoT Prompting use this to reduce attack success rates by
+monitoring reasoning traces for policy violations [84, 83].
+On the other hand, reasoning capabilities introduce new attack vectors not present in standard
+LLMs [80]. The visibility of intermediate states exposes a larger attack surface: adversaries can
+hijack the reasoning process (H-CoT attacks) to bypass refusal mechanisms [137], or exploit the
+“snowball effect” where minor reasoning deviations amplify into harmful outputs [138].
+Furthermore, reasoning models are susceptible to narrative deception and context-switching attacks,
+where the model rationalizes harmful compliance through complex logical deductions or by adopting
+a “helpful” persona in educational contexts [139, 80].
+
+J
+
+Safety Failure Mode Analysis for Section 4.3
+
+While AsyncReasoning allows for real-time safety checks, the asynchronous nature of generation
+introduces specific failure modes where the writer may output harmful content before the thinker
+intervenes. We identify three primary categories of such safety failures:
+1. Race Condition: The writer begins generating a helpful response immediately based on the
+prompt. Although the thinker eventually concludes the request is unsafe, the writer has already
+streamed harmful tokens (e.g., the first steps of a dangerous recipe) to the user before the refusal
+signal is propagated.
+2. Context Leakage: The thinker analyzes the harmful request by recalling technical details (e.g.,
+explaining how a specific SQL injection works to verify its danger). The writer, attending to the
+thinker’s cache, interprets these technical details as the desired answer and formulates them into a
+response, bypassing the thinker’s intent.
+3. Educational Loophole: The thinker adopts an educational persona to explain why a request is
+dangerous. The writer latches onto this educational content and reformats it as a set of instructions,
+stripping away the safety framing context.
+31
+
+Table 18: Failure mode analysis by inference setup on HarmBench.
+Inference Setup
+Failure Mode
+Count
+Baseline (Non-thinking)
+
+Misinformation compliance
+
+13
+
+Baseline (Thinking)
+
+Misinformation compliance
+Educational loophole
+
+15
+10
+
+AsyncReasoning
+
+Context leakage
+Educational loophole
+Race condition
+
+13
+5
+1
+
+AsyncReasoning (Safety Prompt)
+
+Educational loophole
+
+1
+
+These findings suggest that, while AsyncReasoning can effectively filter attacks, strict gating mechanisms (e.g., ensuring the thinker has a “head start” on safety verification) are necessary to prevent
+race conditions in highly sensitive scenarios.
+
+K
+
+Results on AdvBench
+
+To validate our findings, we additionally evaluate safety on the full AdvBench dataset [131] containing 520 harmful behavior prompts. Table 19 presents the results. We observe similar trends to
+HarmBench: enabling thinking in the baseline model increases vulnerability (ASR 0.0% → 3.27%),
+while AsyncReasoning with safety prompting completely eliminates successful attacks. Notably,
+even default AsyncReasoning (ASR 1.15%) outperforms the thinking baseline, suggesting that the
+asynchronous architecture provides some inherent safety benefits by allowing the thinker to flag
+dangerous content before the writer commits to a harmful trajectory.
+Table 19: Attack Success Rate on AdvBench for Qwen3-32B.
+
+L
+
+Inference Setup
+
+ASR↓
+
+Baseline (Non-thinking)
+Baseline (Thinking)
+AsyncReasoning
+AsyncReasoning (Safety Prompt)
+
+0.0%
+3.27%
+1.15%
+0.0%
+
+Sharded MATH-500 Dataset Creation
+
+We construct the sharded dataset by augmenting each problem in MATH-500. For each problem
+in the dataset we prompt GPT-5 to produce multiple cases where an initial prompt is incomplete or
+incorrect, followed by the additional input that makes the problem equivalent to the original. The
+prompt includes the original problem, full solution, and final answer. We prompt the model to provide
+1–3 incomplete cases and 1–3 incorrect cases. Each case is a paired prompt that includes a short
+rationale, the Initial prompt, and the Additional input; the initial version is intentionally missing or
+wrong (e.g., omitted constraints, ambiguous variables, or incorrect constants), and the clarification
+fixes the issue to recover the original problem.
+Full prompt for generating sharded dataset
+I've built a real-time voice assistant that can solve tasks for the
+user and interactively adjust to user inputs. I want to evaluate my
+,→
+assistant's ability to adjust to user giving additional information
+,→
+,→
+while the assistant is already thinking on the problem. I need you
+,→
+to help me set up the evaluation scenario.
+The original problem is:
+
+32
+
+```
+
+{problem}
+
+```
+
+I want you to make this problem into a pair of 1) incomplete or wrong
+,→
+problem description and 2) additional information the user
+,→
+specifies 10-30 seconds after the problem that would make an
+,→
+initially incomplete or wrong problem equivalent to the one above.
+The solution to the original problem is:
+
+```
+
+{solution}
+
+```
+
+The final answer is:
+
+```
+
+{answer}
+
+```
+
+Please make sure that the pair of 1) incomplete / wrong problem and 2)
+,→
+clarification result in the same final answer after incorporating
+,→
+the clarification. Note that the incomplete/wrong problem, if it
+,→
+has a solution, should not be solvable or should produce a solution
+,→
+different from the final one.
+Please provide 1-3 cases with incomplete problems and 1-3 cases with
+,→
+mistakes in the problem definition. Please provide each case in the
+,→
+following format:
+### CASE [number] - [case title here]
+Rationale: [A brief explanation of why the initial problem prompt does
+,→
+not result in the correct answer - and how the additional input
+,→
+fixes that]
+Initial prompt:
+
+```
+
+[incomplete / wrong problem definition goes here]
+
+```
+
+Additional input:
+
+```
+
+[extra input 10-30 seconds in goes here]
+
+```
+
+The code blocks (in ```backticks```) should only contain the prompt and
+,→
+input itself, without extra comments / variants. The "Initial
+,→
+prompt:" and "Additional input:" headers must be verbatim and only
+,→
+one of each per case. Omit the [square brackets] in the actual
+,→
+response.
+
+We discard cases where the incomplete prompt already solves the problem or where with the additional
+input model still fails to recover the answer. Concretely, we run the evaluator model (Qwen3-32B)
+twice per case: once on the Initial prompt alone and once on the prompt augmented with the
+Additional Input, and we keep the case only if the first run does not match the reference answer while
+the second run does match. For a small number of tricky samples we manually select or revise the
+case (including edits to the additional input or occasional rewrites), with assistance from GPT-5 and
+Gemini-Pro. The initial procedure using Qwen3-32B verified 473 samples out of 500 using; those 473
+cases are kept unchanged from the prior version. The remaining samples are filled from the revised
+accepted cases. We include the dataset and the scripts used in its creation in our supplementary code.
+33
+
+M
+
+Additional Experiments for Section 4.4
+
+In this appendix we explore different strategies on how to insert shards into running model’s KV-cache.
+We set two boundaries: lower bound which has model solve the task with only the first shard and
+upper bound which gives model all shards concatenated from the start. On all figures we report only
+upper bound as dotted line. Lower bound is less than 0.05 in all experiments.
+Figure 8 reports an ablation of KV-cache injection targets for shards on sharded MATH-500 with
+Qwen3-32B. We sweep all cache-placement choices across the three cache blocks (prompt, thinker,
+writer) and study how accuracy changes with ksteps , i.e., the number of decoding steps between
+successive shard arrivals. Note: each problem from sharded MATH-500 consists of two shards, one
+is provided at the beginning and the other arrives ksteps steps later.
+Figure 9 extends this analysis with reminder variants. In these settings, the shard content is injected
+into the prompt block, while a short marker prompt6 is appended to the thinker and/or writer blocks
+to indicate that additional user input has arrived.
+Across configurations, injecting shard content into the prompt block is consistently strong, and
+inserting into multiple blocks tends to be the most robust as ksteps increases. In particular, inserting
+shards into all three blocks (prompt+thinker+writer; shard→PTW) maintains higher accuracy at
+larger ksteps , suggesting that later-arriving information benefits from being exposed to both the thinker
+and the writer. Reminder mechanisms recover some performance but generally underperform the
+corresponding full-injection configurations, indicating that the marker prompt can help surface the
+presence of new information but cannot replace including the shard content in the model’s active
+context. Additionally, configurations degrade sharply when the prompt block does not receive the
+shard content, underscoring the importance of placing new information into the primary input context.
+Finally, Figure 10 summarizes the same design choices on Qwen3-235B-A22B-Thinking-2507 and
+on both sharded MATH-500 and math subset (103 samples) of lost_in_conversation. Same
+configurations are reported for lost_in_conversation on Qwen3-32B on Figure 11. We observe a
+similar overall pattern, with shard→PTW becoming preferable at larger ksteps , while shard→P can
+be competitive when updates arrive very early.
+
+6 "...
+
+[SYSTEM: additional user input detected]\n"
+
+34
+
+Accuracy on sharded MATH-500
+
+0.9
+0.8
+0.7
+0.6
+0.5
+Qwen3-32B shard T
+Qwen3-32B shard W
+Qwen3-32B shard P
+
+0.4
+16
+
+Qwen3-32B shard TW
+Qwen3-32B shard PW
+
+32
+
+64
+
+Qwen3-32B shard PT
+Qwen3-32B shard PTW
+
+128
+
+256
+
+ksteps (log scale)
+
+512
+
+1024
+
+0.9
+
+Accuracy on sharded MATH-500
+
+Accuracy on sharded MATH-500
+
+Figure 8: Accuracy ablation over cache-insertion targets as a function of ksteps . We evaluate all
+combinations of inserting shards into the prompt, thinker, and writer cache blocks. The dotted
+horizontal line denotes the upper bound, where all shards are provided at the start. All experiments
+use Qwen3-32B on sharded MATH-500.
+
+0.8
+0.7
+
+upper bound
+Qwen3-32B shard
+Qwen3-32B shard
+Qwen3-32B shard
+Qwen3-32B shard
+
+0.6
+0.5
+16
+
+32
+
+64
+
+PW
+PT
+P reminder T
+P reminder W
+128
+
+256
+
+ksteps (log scale)
+
+512
+
+1024
+
+upper bound
+Qwen3-32B shard
+Qwen3-32B shard
+Qwen3-32B shard
+Qwen3-32B shard
+16
+
+32
+
+64
+
+PTW
+PT reminder W
+PW reminder T
+P reminder TW
+128
+
+256
+
+ksteps (log scale)
+
+512
+
+1024
+
+Figure 9: Accuracy ablation over cache-insertion targets as a function of ksteps . We evaluate setups
+where shards in some blocks are substituted with reminders. (Left) Two insertions in total. (Right)
+three insertions in total. The dashed lines denote reminder substitution experiments. The dotted
+horizontal line denotes the upper bound, where all shards are provided at the start. All experiments
+use Qwen3-32B on sharded MATH-500.
+
+35
+
+0.6
+0.4
+16
+
+32
+
+64
+
+128
+
+256
+
+512
+
+ksteps (log scale)
+shard P
+
+1024
+
+Accuracy on lost_in_conversation
+
+Accuracy on sharded MATH-500
+
+0.8
+
+0.8
+0.6
+0.4
+
+16
+
+shard P reminders TW
+
+32
+
+64
+
+128
+
+ksteps (log scale)
+
+256
+
+512
+
+shard PTW
+
+Figure 10: Accuracy with respect to ksteps . We report three setups: shard in prompts, shard in all three
+blocks, shard in prompt and reminder to the thinker and writer. Qwen3-235B-A22B-Thinking-2507
+on the following datasets: (Left) MATH-500 and (Right) lost_in_conversations. The dotted
+horizontal line denotes the upper bound, where all shards are provided at the start.
+
+0.8
+
+Accuracy
+
+0.6
+0.4
+shard P
+shard P reminders TW
+shard PTW
+
+0.2
+16
+
+32
+
+64
+
+128
+
+ksteps (log scale)
+
+256
+
+512
+
+Figure 11: Accuracy with respect to ksteps on Qwen3-32B. We report three setups: shard in
+prompts, shard in all three blocks, shard in prompt and reminder to the thinker and writer on
+lost_in_conversations. The dotted horizontal line denotes the upper bound, where all shards are
+provided at the start.
+
+36
+
+N
+
+Compute resources
+
+AsyncReasoning is a training-free inference-time method: no model training or fine-tuning was
+performed for this work. Consequently, all computational resources were used for inference, evaluation, latency measurements, ablations, and preliminary experiments. Our experiments evaluate
+existing reasoning LLMs under different inference schedules, including sequential thinking baselines,
+non-thinking baselines, interleaved variants, and AsyncReasoning variants with concurrent thinking
+and writing. Since AsyncReasoning does not introduce any gradient computation, optimizer state,
+or parameter updates, its compute cost is dominated by autoregressive decoding and KV-cache
+manipulation.
+The exact runtime of an individual experiment depends on the model size, benchmark and maximum
+generation budget. Smaller-scale experiments with Qwen3 models on MATH-500 and MMLU-Pro
+were typically run on a single 8-GPU server with NVIDIA A100, while larger-model experiments
+and some latency-focused sweeps were done on other GPUs: H100, H200, B300. All evaluation runs,
+including Qwen3-235B, fit into 16 CPU cores and 512 GiB system RAM.
+The total compute budget varies across experiments (e.g. MMLU-Pro has ≈12K samples, AIME-2025
+has 30 samples). Below, we provide several example runtimes for AsyncReasoning evaluations:
+1. Qwen3 235B A22B Thinking 2507 on MATH-500 took 152 B200-hours for AsyncReasoning,
+510 B200-hours for baseline-thinking, 139 B200-hours for non-thinking.
+2. Qwen3 32B SpokenMQA multistep-reasoning took 30-32 A100-hours for either reasoning type.
+We conservatively estimate that the main experiments took ≈600K mixed GPU hours, heavily
+dominated by the runtime of larger models (Qwen3-235B-A22B) in non-asynchronous mode on
+MMLU-Pro (≈ 12K samples) and k_steps sweeps. This includes pilot experiments, failed runs,
+implementation debugging, prompt/mode-switching development, and ablations not included in the
+final paper. The largest share of this budget was spent on repeated inference evaluations for reasoning
+benchmarks, where each method must be thoroughly evaluated.
+The reported numbers should be interpreted as conservative estimates of the research compute
+used during development, rather than the minimum compute required to reproduce the method.
+A substantial fraction of early experiments used non-optimized inference code while the efficient
+concurrent-attention implementation was still under development. As a result, several early runs
+under-utilized available GPUs due to Python overhead, non-optimal batching, custom attention
+debugging, and conservative scheduling choices. The optimized implementation included in the
+supplementary code is expected to require substantially less compute for reproducing the main
+experiments.
+
+O
+
+Limitations
+
+Technical limitations. AsyncReasoning is a training-free inference-time method, but it requires
+explicit control over the model’s KV cache, cache-block layout, and positional representations. In the
+RoPE setting, this includes applying stream-specific query rotations so that the same stored keys and
+values are interpreted under different Thinker and Writer views. As a result, practical deployment
+may require custom attention kernels or deeper integration into inference runtimes, rather than relying
+only on standard sequential decoding APIs.
+Mode-switching limitations. AsyncReasoning relies on the model’s ability to decide when the
+Writer can continue and when generation should pause for additional thinking. In our training-free
+setup, this decision is implemented through prompting, making it dependent on the base model,
+prompt format, decoding parameters, and task type. Weaker models may switch too early, producing
+answers before sufficient reasoning has accumulated, or switch too late, reducing latency gains. More
+robust switching could be achieved with learned routers, verifiers, or task-specific controllers, but
+these extensions are beyond the purely training-free setting studied here.
+Safety limitations. Although AsyncReasoning combined with a safety prompt can let the Thinker
+interrupt unsafe generations effectively in our experiments, it should not be treated as a complete
+safety guarantee. Since the Writer may in principle emit public tokens before the Thinker has finished
+deliberating, race conditions remain an inherent failure mode of asynchronous safety verification,
+37
+
+even if our experiments observe them rarely. Safety performance also remains model- and promptdependent. Therefore, AsyncReasoning should be combined with output-side safety filters, refusal
+policies, and hard stopping mechanisms that can immediately interrupt Writer generation.
+
+P
+
+Impact Statement
+
+Potential benefits. Real-time systems often trade off either interactivity (fast but shallow responses)
+or reasoning depth (slow, non-interactive read–think–answer). By allowing models to speak while
+still reasoning, AsyncReasoning can improve responsiveness in time-sensitive human–AI interaction,
+reduce the need to interrupt and discard partial reasoning when new information arrives, and make
+iterative clarification workflows more natural. These properties may be particularly beneficial for
+assistive technologies (e.g., accessibility-oriented voice interfaces), operational support tools that
+must react to changing user constraints, and interactive decision-support where users progressively
+refine goals and constraints.
+Safety and alignment considerations. A core risk in real-time generation is that lowering latency
+can also lower the opportunity for safety deliberation. This work explicitly studies safety-oriented
+prompting where the model reasons privately about safety implications while streaming benign
+content, and can pause potentially harmful outputs when additional internal deliberation is needed. In
+the best case, this can improve the safety–latency trade-off relative to purely non-thinking baselines by
+enabling more deliberative filtering without fully sacrificing interactivity. However, AsyncReasoning
+does not guarantee safer behavior: safety performance remains model- and prompt-dependent, and
+in some cases faster streaming could increase the chance that unsafe or misleading partial outputs
+are produced before the system detects the need to pause. Deployments should therefore treat
+AsyncReasoning as a complement to standard safety mitigations (policy filters, refusal training,
+monitoring, and red-teaming), not a replacement.
+Additional human inputs: opportunities and risks. Supporting mid-generation inputs can
+strengthen human oversight by enabling users to correct mistakes, add constraints, or halt undesired
+trajectories without restarting an interaction. At the same time, streaming inputs can introduce
+new failure modes: adversarial or accidental late-arriving instructions may steer the model toward
+policy-violating behavior, and partially generated content may be misinterpreted by users as final
+or fully-considered. Systems should clearly communicate when outputs are provisional, provide
+UI affordances for interruption/rollback, and log or surface when late inputs materially change the
+model’s plan.
+Misuse and dual-use. Improved real-time capability can be misused in settings such as persuasive
+social engineering, automated harassment at scale, or interactive assistance for wrongdoing. While
+the method itself is training-free and model-agnostic, enabling more responsive agentic behavior can
+increase the attractiveness of deploying powerful models in high-stakes contexts. Practical safeguards
+(rate limits, content moderation, audit trails, and conservative defaults for safety mode-switching) are
+important when integrating this technique into user-facing products.
+Privacy and data handling. Real-time and mid-stream inputs may include sensitive personal
+information (spoken or typed). Deployments should minimize retention of raw streams, apply
+encryption in transit and at rest, and provide clear user controls over logging and deletion. If used
+in voice assistant pipelines, additional privacy risks arise from continuous capture and transcription,
+which should be addressed at the system level (on-device processing where feasible, explicit recording
+indicators, and least-privilege access).
+Environmental and efficiency impacts. AsyncReasoning targets latency and interactivity rather
+than reducing total compute in all cases, and may encourage broader use of reasoning-heavy models
+in real-time applications. Wider adoption could increase overall inference demand; conversely,
+improved responsiveness may reduce repeated restarts and duplicated computation in interactive
+sessions.
+Overall, we view AsyncReasoning as enabling more natural interactive reasoning systems while
+introducing new safety, privacy, and misuse considerations that must be addressed with careful
+prompting, product design, and standard deployment safeguards.
+
+38
+
+NeurIPS Paper Checklist
+1. Claims
+Question: Do the main claims made in the abstract and introduction accurately reflect the
+paper’s contributions and scope?
+Answer: [Yes]
+Justification: The claims made in the abstract match the experimental results.
+Guidelines:
+• The answer [N/A] means that the abstract and introduction do not include the claims
+made in the paper.
+• The abstract and/or introduction should clearly state the claims made, including the
+contributions made in the paper and important assumptions and limitations. A [No] or
+[N/A] answer to this question will not be perceived well by the reviewers.
+• The claims made should match theoretical and experimental results, and reflect how
+much the results can be expected to generalize to other settings.
+• It is fine to include aspirational goals as motivation as long as it is clear that these goals
+are not attained by the paper.
+2. Limitations
+Question: Does the paper discuss the limitations of the work performed by the authors?
+Answer: [Yes]
+Justification: The paper explicitly discusses the limitations in Appendix O.
+Guidelines:
+• The answer [N/A] means that the paper has no limitation while the answer [No] means
+that the paper has limitations, but those are not discussed in the paper.
+• The authors are encouraged to create a separate “Limitations” section in their paper.
+• The paper should point out any strong assumptions and how robust the results are to
+violations of these assumptions (e.g., independence assumptions, noiseless settings,
+model well-specification, asymptotic approximations only holding locally). The authors
+should reflect on how these assumptions might be violated in practice and what the
+implications would be.
+• The authors should reflect on the scope of the claims made, e.g., if the approach was
+only tested on a few datasets or with a few runs. In general, empirical results often
+depend on implicit assumptions, which should be articulated.
+• The authors should reflect on the factors that influence the performance of the approach.
+For example, a facial recognition algorithm may perform poorly when image resolution
+is low or images are taken in low lighting. Or a speech-to-text system might not be
+used reliably to provide closed captions for online lectures because it fails to handle
+technical jargon.
+• The authors should discuss the computational efficiency of the proposed algorithms
+and how they scale with dataset size.
+• If applicable, the authors should discuss possible limitations of their approach to
+address problems of privacy and fairness.
+• While the authors might fear that complete honesty about limitations might be used by
+reviewers as grounds for rejection, a worse outcome might be that reviewers discover
+limitations that aren’t acknowledged in the paper. The authors should use their best
+judgment and recognize that individual actions in favor of transparency play an important role in developing norms that preserve the integrity of the community. Reviewers
+will be specifically instructed to not penalize honesty concerning limitations.
+3. Theory assumptions and proofs
+Question: For each theoretical result, does the paper provide the full set of assumptions and
+a complete (and correct) proof?
+Answer: [N/A]
+39
+
+Justification: The paper does not include theoretical results.
+Guidelines:
+• The answer [N/A] means that the paper does not include theoretical results.
+• All the theorems, formulas, and proofs in the paper should be numbered and crossreferenced.
+• All assumptions should be clearly stated or referenced in the statement of any theorems.
+• The proofs can either appear in the main paper or the supplemental material, but if
+they appear in the supplemental material, the authors are encouraged to provide a short
+proof sketch to provide intuition.
+• Inversely, any informal proof provided in the core of the paper should be complemented
+by formal proofs provided in appendix or supplemental material.
+• Theorems and Lemmas that the proof relies upon should be properly referenced.
+4. Experimental result reproducibility
+Question: Does the paper fully disclose all the information needed to reproduce the main experimental results of the paper to the extent that it affects the main claims and/or conclusions
+of the paper (regardless of whether the code and data are provided or not)?
+Answer: [Yes]
+Justification: The paper fully describes the proposed method, including all key components,
+enabling independent implementation. Experimental settings and hyperparameters are
+detailed to support reproducibility of the reported results.
+Guidelines:
+• The answer [N/A] means that the paper does not include experiments.
+• If the paper includes experiments, a [No] answer to this question will not be perceived
+well by the reviewers: Making the paper reproducible is important, regardless of
+whether the code and data are provided or not.
+• If the contribution is a dataset and/or model, the authors should describe the steps taken
+to make their results reproducible or verifiable.
+• Depending on the contribution, reproducibility can be accomplished in various ways.
+For example, if the contribution is a novel architecture, describing the architecture fully
+might suffice, or if the contribution is a specific model and empirical evaluation, it may
+be necessary to either make it possible for others to replicate the model with the same
+dataset, or provide access to the model. In general. releasing code and data is often
+one good way to accomplish this, but reproducibility can also be provided via detailed
+instructions for how to replicate the results, access to a hosted model (e.g., in the case
+of a large language model), releasing of a model checkpoint, or other means that are
+appropriate to the research performed.
+• While NeurIPS does not require releasing code, the conference does require all submissions to provide some reasonable avenue for reproducibility, which may depend on the
+nature of the contribution. For example
+(a) If the contribution is primarily a new algorithm, the paper should make it clear how
+to reproduce that algorithm.
+(b) If the contribution is primarily a new model architecture, the paper should describe
+the architecture clearly and fully.
+(c) If the contribution is a new model (e.g., a large language model), then there should
+either be a way to access this model for reproducing the results or a way to reproduce
+the model (e.g., with an open-source dataset or instructions for how to construct
+the dataset).
+(d) We recognize that reproducibility may be tricky in some cases, in which case
+authors are welcome to describe the particular way they provide for reproducibility.
+In the case of closed-source models, it may be that access to the model is limited in
+some way (e.g., to registered users), but it should be possible for other researchers
+to have some path to reproducing or verifying the results.
+5. Open access to data and code
+40
+
+Question: Does the paper provide open access to the data and code, with sufficient instructions to faithfully reproduce the main experimental results, as described in supplemental
+material?
+Answer: [Yes]
+Justification: The attached code allows for the reproduction of the results.
+Guidelines:
+• The answer [N/A] means that paper does not include experiments requiring code.
+• Please see the NeurIPS code and data submission guidelines (https://neurips.cc/
+public/guides/CodeSubmissionPolicy) for more details.
+• While we encourage the release of code and data, we understand that this might not
+be possible, so [No] is an acceptable answer. Papers cannot be rejected simply for not
+including code, unless this is central to the contribution (e.g., for a new open-source
+benchmark).
+• The instructions should contain the exact command and environment needed to run to
+reproduce the results. See the NeurIPS code and data submission guidelines (https:
+//neurips.cc/public/guides/CodeSubmissionPolicy) for more details.
+• The authors should provide instructions on data access and preparation, including how
+to access the raw data, preprocessed data, intermediate data, and generated data, etc.
+• The authors should provide scripts to reproduce all experimental results for the new
+proposed method and baselines. If only a subset of experiments are reproducible, they
+should state which ones are omitted from the script and why.
+• At submission time, to preserve anonymity, the authors should release anonymized
+versions (if applicable).
+• Providing as much information as possible in supplemental material (appended to the
+paper) is recommended, but including URLs to data and code is permitted.
+6. Experimental setting/details
+Question: Does the paper specify all the training and test details (e.g., data splits, hyperparameters, how they were chosen, type of optimizer) necessary to understand the results?
+Answer: [Yes]
+Justification: The paper provides all key experimental details, including hyperparameters
+and selection methodologies, both in the main text and appendix, ensuring reproducibility
+and clarity.
+Guidelines:
+• The answer [N/A] means that the paper does not include experiments.
+• The experimental setting should be presented in the core of the paper to a level of detail
+that is necessary to appreciate the results and make sense of them.
+• The full details can be provided either with the code, in appendix, or as supplemental
+material.
+7. Experiment statistical significance
+Question: Does the paper report error bars suitably and correctly defined or other appropriate
+information about the statistical significance of the experiments?
+Answer: [No]
+Justification: We report statistical significance only for setups where it is standard practice
+due to low sample sizes (e.g. AIME-2025). For the vast majority of our evaluation setups
+(10 models, 8 benchmarks), we only report average accuracy to save compute resources.
+That said, since the sample size is publicly known and the benchmarks use binary scores for
+each individual sample, the reader can infer bootstrap error bars from the reported accuracy.
+Guidelines:
+• The answer [N/A] means that the paper does not include experiments.
+• The authors should answer [Yes] if the results are accompanied by error bars, confidence
+intervals, or statistical significance tests, at least for the experiments that support the
+main claims of the paper.
+41
+
+• The factors of variability that the error bars are capturing should be clearly stated (for
+example, train/test split, initialization, random drawing of some parameter, or overall
+run with given experimental conditions).
+• The method for calculating the error bars should be explained (closed form formula,
+call to a library function, bootstrap, etc.)
+• The assumptions made should be given (e.g., Normally distributed errors).
+• It should be clear whether the error bar is the standard deviation or the standard error
+of the mean.
+• It is OK to report 1-sigma error bars, but one should state it. The authors should
+preferably report a 2-sigma error bar than state that they have a 96% CI, if the hypothesis
+of Normality of errors is not verified.
+• For asymmetric distributions, the authors should be careful not to show in tables or
+figures symmetric error bars that would yield results that are out of range (e.g., negative
+error rates).
+• If error bars are reported in tables or plots, the authors should explain in the text how
+they were calculated and reference the corresponding figures or tables in the text.
+8. Experiments compute resources
+Question: For each experiment, does the paper provide sufficient information on the computer resources (type of compute workers, memory, time of execution) needed to reproduce
+the experiments?
+Answer: [Yes]
+Justification: We report GPU types used in our experiments in Section 4.2 and Appendix F.
+However, the total runtime in each setup is hard to estimate due to our preemptible compute
+infrastructure. It is also difficult since the paper contains experiments across 8 benchmarks
+and 10 models on 3 GPU types. Instead, we report the total GPU hours required for several
+typical evaluations, along with the hardware specifications (e.g., GPU type) in Appendix N.
+Guidelines:
+• The answer [N/A] means that the paper does not include experiments.
+• The paper should indicate the type of compute workers CPU or GPU, internal cluster,
+or cloud provider, including relevant memory and storage.
+• The paper should provide the amount of compute required for each of the individual
+experimental runs as well as estimate the total compute.
+• The paper should disclose whether the full research project required more compute
+than the experiments reported in the paper (e.g., preliminary or failed experiments that
+didn’t make it into the paper).
+9. Code of ethics
+Question: Does the research conducted in the paper conform, in every respect, with the
+NeurIPS Code of Ethics https://neurips.cc/public/EthicsGuidelines?
+Answer: [Yes]
+Justification: The paper poses no risk of misuse, does not involve crowdsourcing or research
+with human subjects, etc.
+Guidelines:
+• The answer [N/A] means that the authors have not reviewed the NeurIPS Code of
+Ethics.
+• If the authors answer [No], they should explain the special circumstances that require a
+deviation from the Code of Ethics.
+• The authors should make sure to preserve anonymity (e.g., if there is a special consideration due to laws or regulations in their jurisdiction).
+10. Broader impacts
+Question: Does the paper discuss both potential positive societal impacts and negative
+societal impacts of the work performed?
+Answer: [Yes]
+42
+
+Justification: The paper discusses potential societal impact in Appendix P.
+Guidelines:
+• The answer [N/A] means that there is no societal impact of the work performed.
+• If the authors answer [N/A] or [No], they should explain why their work has no societal
+impact or why the paper does not address societal impact.
+• Examples of negative societal impacts include potential malicious or unintended uses
+(e.g., disinformation, generating fake profiles, surveillance), fairness considerations
+(e.g., deployment of technologies that could make decisions that unfairly impact specific
+groups), privacy considerations, and security considerations.
+• The conference expects that many papers will be foundational research and not tied
+to particular applications, let alone deployments. However, if there is a direct path to
+any negative applications, the authors should point it out. For example, it is legitimate
+to point out that an improvement in the quality of generative models could be used to
+generate Deepfakes for disinformation. On the other hand, it is not needed to point out
+that a generic algorithm for optimizing neural networks could enable people to train
+models that generate Deepfakes faster.
+• The authors should consider possible harms that could arise when the technology is
+being used as intended and functioning correctly, harms that could arise when the
+technology is being used as intended but gives incorrect results, and harms following
+from (intentional or unintentional) misuse of the technology.
+• If there are negative societal impacts, the authors could also discuss possible mitigation
+strategies (e.g., gated release of models, providing defenses in addition to attacks,
+mechanisms for monitoring misuse, mechanisms to monitor how a system learns from
+feedback over time, improving the efficiency and accessibility of ML).
+11. Safeguards
+Question: Does the paper describe safeguards that have been put in place for responsible
+release of data or models that have a high risk for misuse (e.g., pre-trained language models,
+image generators, or scraped datasets)?
+Answer: [N/A]
+Justification: The only released dataset artifact is our sharded version of MATH-500, which
+contains mathematical reasoning problems split into partial-input shards for evaluation.
+The released data is intended solely for reproducible benchmarking of asynchronous-input
+reasoning behavior. It does not contain personal, sensitive, proprietary, or safety-critical
+information, and we do not release any models.
+Guidelines:
+• The answer [N/A] means that the paper poses no such risks.
+• Released models that have a high risk for misuse or dual-use should be released with
+necessary safeguards to allow for controlled use of the model, for example by requiring
+that users adhere to usage guidelines or restrictions to access the model or implementing
+safety filters.
+• Datasets that have been scraped from the Internet could pose safety risks. The authors
+should describe how they avoided releasing unsafe images.
+• We recognize that providing effective safeguards is challenging, and many papers do
+not require this, but we encourage authors to take this into account and make a best
+faith effort.
+12. Licenses for existing assets
+Question: Are the creators or original owners of assets (e.g., code, data, models), used in
+the paper, properly credited and are the license and terms of use explicitly mentioned and
+properly respected?
+Answer: [Yes]
+Justification: The paper properly credits the original creators of all used assets (code, data,
+models) and explicitly mentions their respective licenses.
+Guidelines:
+43
+
+• The answer [N/A] means that the paper does not use existing assets.
+• The authors should cite the original paper that produced the code package or dataset.
+• The authors should state which version of the asset is used and, if possible, include a
+URL.
+• The name of the license (e.g., CC-BY 4.0) should be included for each asset.
+• For scraped data from a particular source (e.g., website), the copyright and terms of
+service of that source should be provided.
+• If assets are released, the license, copyright information, and terms of use in the
+package should be provided. For popular datasets, paperswithcode.com/datasets
+has curated licenses for some datasets. Their licensing guide can help determine the
+license of a dataset.
+• For existing datasets that are re-packaged, both the original license and the license of
+the derived asset (if it has changed) should be provided.
+• If this information is not available online, the authors are encouraged to reach out to
+the asset’s creators.
+13. New assets
+Question: Are new assets introduced in the paper well documented and is the documentation
+provided alongside the assets?
+Answer: [Yes]
+Justification: The attached source code includes the implementation of our proposed method
+and the evaluation pipeline, along with detailed instructions for running the experiments to
+ensure full reproducibility of the results.
+Guidelines:
+• The answer [N/A] means that the paper does not release new assets.
+• Researchers should communicate the details of the dataset/code/model as part of their
+submissions via structured templates. This includes details about training, license,
+limitations, etc.
+• The paper should discuss whether and how consent was obtained from people whose
+asset is used.
+• At submission time, remember to anonymize your assets (if applicable). You can either
+create an anonymized URL or include an anonymized zip file.
+14. Crowdsourcing and research with human subjects
+Question: For crowdsourcing experiments and research with human subjects, does the paper
+include the full text of instructions given to participants and screenshots, if applicable, as
+well as details about compensation (if any)?
+Answer: [N/A]
+Justification: The paper does not include any crowdsourcing or research including human
+subjects.
+Guidelines:
+• The answer [N/A] means that the paper does not involve crowdsourcing nor research
+with human subjects.
+• Including this information in the supplemental material is fine, but if the main contribution of the paper involves human subjects, then as much detail as possible should be
+included in the main paper.
+• According to the NeurIPS Code of Ethics, workers involved in data collection, curation,
+or other labor should be paid at least the minimum wage in the country of the data
+collector.
+15. Institutional review board (IRB) approvals or equivalent for research with human
+subjects
+Question: Does the paper describe potential risks incurred by study participants, whether
+such risks were disclosed to the subjects, and whether Institutional Review Board (IRB)
+approvals (or an equivalent approval/review based on the requirements of your country or
+institution) were obtained?
+44
+
+Answer: [N/A]
+Justification: The paper does not include any crowdsourcing or research including human
+subjects.
+Guidelines:
+• The answer [N/A] means that the paper does not involve crowdsourcing nor research
+with human subjects.
+• Depending on the country in which research is conducted, IRB approval (or equivalent)
+may be required for any human subjects research. If you obtained IRB approval, you
+should clearly state this in the paper.
+• We recognize that the procedures for this may vary significantly between institutions
+and locations, and we expect authors to adhere to the NeurIPS Code of Ethics and the
+guidelines for their institution.
+• For initial submissions, do not include any information that would break anonymity (if
+applicable), such as the institution conducting the review.
+16. Declaration of LLM usage
+Question: Does the paper describe the usage of LLMs if it is an important, original, or
+non-standard component of the core methods in this research? Note that if the LLM is used
+only for writing, editing, or formatting purposes and does not impact the core methodology,
+scientific rigor, or originality of the research, declaration is not required.
+Answer: [Yes]
+Justification: Since our work proposed an LLM inference algorithm, it naturally uses LLMs
+throughout the experiments. We also used llm-as-a-judge in some of the experiments,
+which is not a part of the core method. We also used LLM for sample rewriting to create
+MATH-500 sharded. Additionally, we used Claude Code to create interactive visuals that
+demonstrate AsyncReasoning in action.
+Guidelines:
+• The answer [N/A] means that the core method development in this research does not
+involve LLMs as any important, original, or non-standard components.
+• Please refer to our LLM policy in the NeurIPS handbook for what should or should not
+be described.
+
+45
+
+

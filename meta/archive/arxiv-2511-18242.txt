@@ -1,0 +1,2435 @@
+EgoVITA: Learning to Plan and Verify for
+Egocentric Video Reasoning
+Yogesh Kulkarni
+
+and Pooyan Fazli
+
+arXiv:2511.18242v3 [cs.CV] 30 Jun 2026
+
+Arizona State University
+ykulka10@asu.edu, pooyan@asu.edu
+https://people-robots.github.io/EgoVITA/
+
+Abstract. Egocentric video understanding requires procedural reasoning
+under partial observability and continuously shifting viewpoints. Current
+multimodal large language models (MLLMs) struggle with this setting,
+often generating plausible but visually inconsistent or weakly grounded
+responses. We introduce EgoVITA, a framework that decomposes egocentric video reasoning into a structured plan-then-verify process. The model
+first generates an egocentric plan: a causal sequence of anticipated
+actions from a first-person perspective. This plan is then evaluated by an
+exocentric verification stage that uses third-person reasoning over the
+same video to verify its spatiotemporal and logical consistency, without
+exocentric video input. This decomposition enables cross-perspective feedback without requiring paired ego-exo supervision. To train this reasoning
+process, we adopt Group Relative Policy Optimization (GRPO) with two
+dense reward signals: one that grounds anticipated actions in subsequent
+visual observations and another that reinforces consistent third-person
+verification. EgoVITA achieves state-of-the-art performance on egocentric
+reasoning benchmarks, outperforming Qwen2.5-VL-7B by +7.7 on EgoBlind and +4.4 on EgoOrient, while maintaining strong generalization on
+exocentric video tasks with only 52k training samples.
+Keywords: Egocentric Video Understanding · Procedural Reasoning ·
+Reinforcement Learning
+
+1
+
+Introduction
+
+Egocentric, or first-person, videos play a central role in applications such as
+life-logging, personal memory assistants [46], and assistive technologies [19, 43].
+Unlike exocentric footage, egocentric videos are captured from the actor’s viewpoint, resulting in continuous camera motion, partial observability, and frequent
+occlusions. Effective egocentric understanding therefore requires procedural reasoning to predict how actions unfold, how object states evolve, and how goals are
+achieved over time. Despite recent advances, multimodal large language models
+(MLLMs) remain weak in this setting. They often produce plausible yet incorrect
+descriptions [35], struggle with spatiotemporal reasoning [26, 34], and fail to
+maintain coherent object and goal representations [25, 32, 37, 48] across time.
+
+2
+
+Y. Kulkarni and P. Fazli
+
+Query: What will the person do next after picking up the knife?
+<ego_plan>
+
+<exo_verify>
+
+<answer>
+
+C1 : Cut the tomato
+C2 : Transfer to pan
+C3 : Cook it in the pan
+
+Plan is consistent: Tomato is
+visible on the cutting board.
+The pan is ready for cooking.
+
+The person will cut the tomato
+with the knife, transfer it to
+the pan, and cook it.
+
+Fig. 1: EgoVITA Framework. Given a video and query, the model first generates
+an egocentric plan, then verifies it through third-person reasoning over the same video
+before producing a final answer.
+
+These shortcomings reveal a key gap: current MLLMs lack explicit mechanisms
+to reason about how actions and object states evolve over time in first-person video.
+While supervised fine-tuning (SFT) on egocentric datasets can improve in-domain
+performance, it often degrades accuracy on standard exocentric benchmarks,
+highlighting the challenge of generalizing across viewpoints. Recent methods [31]
+attempt to overcome this by scaling to massive datasets, but rely on sparse,
+rule-based rewards that provide limited guidance for procedural reasoning and
+still suffer from catastrophic forgetting of exocentric performance.
+We hypothesize that these failures stem not from insufficient visual information
+but from the lack of explicit mechanisms to validate first-person predictions
+against broader scene constraints. When a model plans from an egocentric view
+(e.g., “I will reach for the cup”), it must also assess whether that plan is physically
+plausible (e.g., “a cup is within arm’s reach on the counter”). Such validation
+requires reasoning about scene layout, object affordances, and spatial relationships
+from a complementary third-person perspective. Recent work suggests that
+MLLMs can reason across viewpoints, demonstrating perspective-taking and
+perspective transformation abilities [4, 23, 50]. For instance, given a first-person
+video, a model may reinterpret the scene from an external observer’s perspective
+(e.g., “A person is reaching toward a cup on the counter”), indicating the ability
+to shift between egocentric and exocentric descriptions.
+Building on this, we introduce EgoVITA (Egocentric Video Intelligence and
+Thinking Agent), a framework that decomposes egocentric reasoning into two
+distinct stages: (1) an egocentric planning stage that predicts a causal sequence
+of first-person actions, and (2) an exocentric verification stage that audits
+this plan using third-person reasoning over the same egocentric video, without
+requiring exocentric input. This separation provides two advantages. First, the
+planning stage can specialize in egocentric procedural reasoning. Second, by
+retaining a dedicated verification component grounded in third-person reasoning,
+the framework preserves exocentric performance and mitigates catastrophic
+forgetting without requiring synchronized ego-exo video pairs [18].
+
+EgoVITA: Learning to Plan and Verify for Egocentric Video Reasoning
+
+3
+
+To train this plan-then-verify framework, we adopt reinforcement learning
+to provide trajectory-level supervision for multi-step reasoning. Specifically, we
+use Group Relative Policy Optimization (GRPO) [12], which evaluates multiple
+candidate trajectories per input and updates the policy based on their relative
+quality. Within this framework, we introduce two dense reward signals: Anticipatory Cross-Modal Grounding (ACMG), which grounds anticipated actions by
+encouraging their visual and temporal consistency with subsequent observations,
+and a confidence reward, which reinforces third-person validation of the predicted
+plan. In summary, our contributions are as follows:
+1. We propose EgoVITA, a framework that decomposes egocentric reasoning
+into an egocentric planner and an exocentric verifier, introducing explicit
+feedback between first-person prediction and third-person validation.
+2. We introduce two dense reward mechanisms, ACMG and a confidence reward,
+that promote anticipatory grounding of predicted actions and consistent
+third-person verification.
+3. We demonstrate that EgoVITA achieves strong performance across both
+egocentric and exocentric benchmarks, improving Qwen2.5-VL-7B by +7.7 on
+EgoBlind and +4.4 on EgoOrient, while maintaining competitive performance
+on exocentric video tasks within a single unified model.
+
+2
+
+Related Work
+
+Egocentric Video Understanding. Egocentric video reasoning is uniquely
+challenging due to rapid camera motion, frequent object occlusions [26, 33], and
+the need to infer the intentions of an unobserved, active person [31, 37]. As a
+result, recent MLLM research has focused mainly on creating benchmarks that
+highlight specific cognitive failures rather than developing new methods. These
+failures include deficits in long-term memory and procedural reasoning [38,46,47],
+fundamental temporal understanding [20, 34], spatial orientation [10, 17], and
+intention or Theory of Mind grounding [25, 32, 37]. Models also struggle with finegrained perception of dynamic object states [48] or scene-text [21, 53], and often
+show hallucinations [35] or provide unsafe answers in assistive contexts [19, 43].
+The few methods proposed, such as EgoThinker [31] and EgoVLM [39], employ
+reinforcement learning [22]. However, their reliance on simple, sparse rewards
+for output format and correctness limits long-term procedural reasoning and
+often causes catastrophic forgetting of general exocentric knowledge. To address
+this, we introduce a novel framework that leverages dense, predictive rewards to
+teach complex egocentric procedures while preserving exocentric generalization,
+tackling a key challenge in ego-exo knowledge transfer [15, 28, 51].
+Ego-Exo Video Understanding. Applying MLLMs trained on large corpora
+of exocentric images and videos to egocentric video faces a fundamental ego-exo
+gap [14]. This domain shift introduces several challenges, including viewpoint
+disparity that disrupts feature alignment [28], difficulty in matching objects
+across views [30], and complications in relative spatial reasoning [10]. Prior work
+
+4
+
+Y. Kulkarni and P. Fazli
+
+attempts to bridge this gap by learning view-invariant representations [28], using
+audio as a “sound bridge” [15], or employing SFT pipelines for direct knowledge
+transfer [44, 51]. While these approaches improve cross-view alignment, they
+struggle to teach dynamic procedural reasoning and often suffer from catastrophic
+forgetting of exocentric knowledge. EgoVITA overcomes these limitations by
+explicitly separating reasoning into an egocentric planning phase and an exocentric
+verification phase. This design enables the model to learn robust first-person
+understanding while using verification to preserve third-person generalization.
+Unlike prior work [18] that relies on synchronized ego-exo video pairs, EgoVITA
+achieves scalable cross-view consistency without requiring paired data.
+
+3
+
+EgoVITA
+
+We introduce EgoVITA, a reinforcement learning framework that decomposes
+egocentric video reasoning into two complementary components: an egocentric
+planner that performs procedural reasoning by predicting first-person action
+sequences, and an exocentric verifier that evaluates these plans from a thirdperson perspective for visual and logical consistency. We train EgoVITA in two
+phases. We first apply supervised fine-tuning (SFT) to initialize the structure
+of plan-then-verify. We then optimize the model using Group Relative Policy
+Optimization (GRPO) with two dense reward functions: Anticipatory CrossModal Grounding (ACMG), which encourages visual and temporal alignment
+between anticipated actions and subsequent visual observations, and a confidence
+reward, which reinforces consistent third-person validation. An overview of the
+framework is shown in Figure 1.
+3.1
+
+Problem Formulation
+
+We formulate egocentric video reasoning as a sequential decision-making problem, where a multimodal large language model (MLLM) acts as a policy πθ
+parameterized by weights θ. Given a video V and a text prompt X, the policy
+autoregressively generates a reasoning trajectory
+  Y = \langle y_1, \dots , y_T \rangle , \quad y_t \sim \pi _\theta (y_t \mid V, X, y_{<t}), \label {eq:autoregressive}
+
+(1)
+
+where each yt is a generated token. We structure the reasoning trajectory Y into
+three contiguous segments:
+  Y = \big ( Y^{\text {plan}},\, Y^{\text {verify}},\, Y^{\text {ans}} \big ),
+corresponding to the egocentric plan <ego_plan> , the exocentric verification
+<exo_verify> , and the final answer block <answer> , respectively.
+The quality of a reasoning trajectory Y is evaluated by a composite reward
+function R(Y ), which integrates signals encouraging alignment with future visual
+observations and consistency of third-person validation. The objective is to learn
+parameters θ that maximize the expected reward:
+  \theta ^* = \arg \max _\theta \; \mathbb {E}_{Y \sim \pi _\theta (\cdot \mid V,X)} [R(Y)]. \label {eq:objective}
+
+(2)
+
+EgoVITA: Learning to Plan and Verify for Egocentric Video Reasoning
+
+3.2
+
+5
+
+Reasoning Decomposition
+
+Egocentric Planning. Given a video V and query X, the model first generates
+an <ego_plan> : a temporally ordered sequence of action clauses {c1 , c2 , . . . , cK }
+describing the anticipated actions of the camera wearer (e.g., 1. Cut the tomato.
+2. Transfer to pan.). Each clause describes an anticipated action whose outcome
+can be validated against subsequent visual observations. By generating such
+procedural plans, the model is encouraged to reason about action ordering, object
+state transitions, and temporal dependencies from a first-person perspective.
+Exocentric Verification. The generated plan is then audited by an <exo_verify>
+stage, which reasons about the scene from a third-person perspective. Operating
+on the same video, it evaluates the egocentric plan without requiring exocentric
+video or paired ego-exo data. Given the egocentric plan, the model assesses
+whether the predicted actions are consistent with scene layout, object affordances,
+and observable context (e.g., “The knife is visible on the counter. The cutting
+board is within reach. Plan is consistent.”). This verification step evaluates the
+plausibility of the planned actions under a complementary perspective, rather
+than relying solely on first-person prediction.
+Answer. Finally, the model produces a final <answer> conditioned on both the
+egocentric plan and its exocentric verification. This decomposition grounds the
+response in both first-person procedural reasoning and third-person validation.
+
+3.3
+
+Training
+
+EgoVITA is trained in two phases. First, SFT initializes the model to produce
+plan-verify reasoning trajectories. Second, GRPO further optimizes the policy
+using dense reward signals. We describe each phase below.
+Stage I: SFT We first apply SFT to initialize the policy to generate egocentric
+plans <ego_plan> , exocentric verifications <exo_verify> , and final answers
+<answer> under cross-entropy supervision.
+We rely on human-annotated datasets as supervision. For egocentric planning,
+we use EgoProceL [3], which provides time-aligned action annotations labeled by
+human annotators for egocentric videos. We prompt Qwen2.5-VL-72B [2] to generate plan sequences conditioned on these annotations (prompt in Supplementary).
+For exocentric verification, we construct a dataset based on HD-EPIC [33], which
+contains human-labeled (action - timestamp) video annotations. Qwen2.5-VL-72B
+generates third-person chain-of-thought rationales grounded in these annotations
+(prompt in Supplementary). All generated reasoning traces are filtered and verified using Seed1.5-VL [13] to ensure quality. Both datasets are merged into a
+unified corpus D and trained with standard cross-entropy:
+  \mathcal {L}_{\mathrm {SFT}}(\theta ) = - \mathbb {E}_{(V, X, Y^*) \sim D} \left [ \log \pi _\theta (Y^* \mid V, X) \right ]. \label {eq:sft_loss}
+
+(3)
+
+where (V, X, Y ∗ ) denotes a video, prompt, and ground-truth reasoning sequence.
+
+6
+
+Y. Kulkarni and P. Fazli
+
+Stage II: GRPO After SFT, we further optimize the policy πθ using GRPO,
+which performs trajectory-level policy updates based on relative reward comparisons. In egocentric video reasoning, multiple plausible reasoning trajectories may
+exist for a given input due to scene ambiguity and viewpoint dynamics. GRPO addresses this by sampling a group of candidate trajectories per input and updating
+the policy according to their relative rewards. For each video-prompt pair (V, X),
+the policy πθ generates a group of k = 8 rollouts {Y1 , . . . , Yk }, where each trajectory includes a full <ego_plan> , <exo_verify> , and <answer> segments. Each
+Yi is scored using a composite reward function R(Yi ), which integrates alignment
+with future visual observations and consistency of third-person validation.
+GRPO Objective. Group-level rewards {R(Yi )}ki=1 are normalized to compute
+relative advantages:
+  \hat {A}(Y_i) = \frac {R(Y_i) - \mu _R}{\sigma _R + \epsilon }, \label {eq:advantage}
+(4)
+where µR and σR are the mean and standard deviation of the rewards within
+the sampled group. The GRPO objective is defined as:
+
+  \begin {split} \mathcal {J}_{\mathrm {GRPO}}(\theta ) = \mathbb {E}_{(V,X)} \Bigg [ \frac {1}{k} \sum _{i=1}^k \bigg ( & \min \left ( r_i(\theta ) \hat {A}(Y_i), \text {clip}\left (r_i(\theta ), 1{-}\epsilon , 1{+}\epsilon \right ) \hat {A}(Y_i) \right ) \\ & - \beta _{\mathrm {KL}} \log \frac {\pi _\theta (Y_i \mid V, X)}{\pi _{\mathrm {ref}}(Y_i \mid V, X)} \bigg ) \Bigg ], \end {split} \label {eq:grpo_objective}
+(5)
+
+where the probability ratio is
+  r_i(\theta ) = \frac {\pi _\theta (Y_i \mid V, X)}{\pi _{\theta _{\mathrm {old}}}(Y_i \mid V, X)}.
+
+(6)
+
+and βKL limits deviation from the reference policy πref (initialized from SFT).
+Composite Reward (R). The reward is a weighted sum of four components:
+  R = w_f R_{\mathrm {format}} + w_a R_{\mathrm {answer}} + w_g R_{\mathrm {ACMG}} + w_c R_{\mathrm {confidence}}, \label {eq:total_reward}
+
+(7)
+
+where:
+1. Format Reward (Rformat ) is a sparse binary signal that checks for correct
+tag usage and output structure,
+2. Answer Reward (Ranswer ) is a sparse reward measuring alignment between
+the generated answer and the ground-truth label,
+3. ACMG Reward (RACMG ) is a dense reward that promotes alignment
+between predicted plan clauses and future visual frames, encouraging temporal
+and visual grounding, and
+4. Confidence Reward (Rconfidence ) is a dense reward that reinforces consistent third-person validation of the predicted plan.
+Sparse rewards (Rformat , Ranswer ) provide binary pass/fail scores based on output
+structure and final correctness, while dense rewards (RACMG , Rconfidence ) provide
+continuous, fine-grained feedback that evaluates the quality of intermediate
+reasoning within the trajectory.
+
+EgoVITA: Learning to Plan and Verify for Egocentric Video Reasoning
+
+7
+
+🔥
+
+Large Language Model
+
+1.0
+Clause 1:
+Walk to bus stop
+via sidewalk
+
+Anticipation Head
+
+🔥
+
+T+2
+
+T+3
+
+Clause in <Ego_Plan>
+
+T+1
+
+T+N
+
+Vision Encoder
+
+🔥
+
+Clause 2:
+Locate braille
+schedule sign
+0.6
+Clause 3:
+Use phone app to
+identify bus M401
+0.4
+Clause 4:
+Verify bus number
+matches M401
+0.2
+Clause 5:
+Board the bus
+when it arrives
+
+t+1
+
+Predicted Visual
+Embedding
+
+Encoded
+Frames
+
+Anticipatory Cross-Modal Grounding Reward
+
+Fig. 2: ACMG Mechanism. Each plan
+clause is projected into a visual embedding space and matched against the embeddings of the next N frames. The clauselevel reward is the maximum cosine similarity over this temporal window.
+
+Cosine Similarity (ACMG Reward)
+
+0.8
+
+<ego_plan> Navigate to
+bus stop via sidewalk
+and find … </ego_plan>
+
+t+3
+
+t+5
+
+t+7
+
+t+9
+
+t+11
+
+t+13
+
+Future Frame Position
+
+t+15
+
+t+17
+
+t+19
+
+0.0
+
+Fig. 3: Temporal Alignment. Heatmap
+of clause-to-frame similarity, with white
+stars (⋆) marking peak matches. The diagonal pattern shows earlier clauses aligning
+with near-future frames and later clauses
+with subsequent frames, consistent with
+anticipatory temporal grounding.
+
+Anticipatory Cross-Modal Grounding (ACMG). To encourage egocentric
+plans to align with future visual observations, we introduce the ACMG reward.
+This dense reward measures the visual and temporal alignment between each
+plan clause and subsequent observations in the video (Figure 2). For each clause
+ci , we extract its final text hidden state htext
+from the language decoder of the
+i
+MLLM and project it into the visual embedding space via a small trainable MLP,
+referred to as the Anticipation Head. The output of this projection is a predicted
+future visual embedding, denoted as v̂i = MLP(htext
+).
+i
+Let vt+n denote the visual embedding of frame t + n, extracted from the
+visual encoder of the MLLM. We consider the next N = 16 frames following
+timestamp t as a temporal horizon. This window captures near-future action
+outcomes while limiting influence from distant events. The ACMG reward for
+each clause ci is defined as the maximum cosine similarity between the predicted
+embedding and the embeddings of these future frames (Figure 3):
+  R_{\mathrm {ACMG}}({c_i}) \;=\; \max _{{n} \in \{{1},\dots ,{N}\}} \frac {{\hat {v}_{i}}\cdot {v_{t+n}}}{\|{\hat {v}_{i}}\|\,\|{v_{t+n}}\|}. \label {eq:acmg}
+
+(8)
+
+The max operator selects the frame that best aligns with the predicted action,
+making the reward robust to small temporal offsets and variable action durations.
+The trajectory-level ACMG reward is computed by averaging across clauses:
+  R_{\mathrm {ACMG}} = \frac {1}{K} \sum _{i=1}^{K} R_{\mathrm {ACMG}}(c_i).
+
+(9)
+
+Ablation studies in the Supplementary Material validate the choice of the max
+operator and the temporal window size N = 16.
+
+8
+
+Y. Kulkarni and P. Fazli
+
+Confidence Reward. To improve the quality of <exo_verify> , we introduce
+a confidence reward Rconfidence that applies a relative preference signal over
+candidate verification trajectories.
+Teacher-guided phase. During the first 200 RL steps, each of the k = 8 rollout
+verifications is compared to a teacher-generated reference verification. The confidence reward encourages the policy to assign a higher likelihood to the teacher
+output relative to its own rollout:
+  R_{\mathrm {confidence}} = \gamma \Big [ \log \pi _\theta \!\left (y^{T} \mid V, X, Y^{\text {plan}}\right ) - \log \pi _\theta \!\left (y^{P} \mid V, X, Y^{\text {plan}}\right ) \Big ], \label {eq:confidence_teacher}
+
+(10)
+
+where γ is a scaling coefficient controlling the strength of the preference signal,
+and y T and y P denote the teacher and policy verification outputs, respectively. We
+use Qwen2.5-VL-72B [2] as a teacher model that generates exocentric verification
+rationales conditioned on the egocentric plan. This warm-up phase aligns the
+exocentric verifier with teacher-generated third-person audits conditioned on the
+predicted first-person plan.
+Self-ranking phase. After the warm-up period, each rollout verification is scored
+using the composite reward (Eq. 7). The highest-scoring verification y chosen and
+lowest-scoring verification y rejected are compared using a log-probability preference
+objective:
+
+  R_{\text {confidence}} = \begin {cases} \gamma \cdot (\log \pi _{\theta }(y_{\text {chosen}} \mid V, X, Y^{\text {plan}}) \\ \quad - \log \pi _{\theta }(y_{\text {rejected}} \mid V, X, Y^{\text {plan}})), & \text {if scores differ;} \\ 1, & \text {otherwise.} \end {cases}
+
+(11)
+
+This update increases the likelihood of third-person audits that better reconcile
+the predicted first-person plan with first-person visual observations.
+3.4
+
+Exocentric Regularization
+
+Training solely on egocentric data can lead to catastrophic forgetting, reducing
+performance on exocentric tasks. To mitigate this, we periodically interleave
+GRPO updates with a lightweight exocentric regularization step. Specifically,
+after every 200 RL iterations, we optimize the model on an auxiliary exocentric
+VideoQA dataset (MSR-VTT [45]) using a cross-entropy loss Lexo . This loss is
+combined with the GRPO objective:
+  \mathcal {L}_{\mathrm {total}} = \mathcal {L}_{\mathrm {GRPO}} + \lambda _{\mathrm {exo}}\mathcal {L}_{\mathrm {exo}}, \label {eq:total_loss}
+
+(12)
+
+where λexo controls the strength of the exocentric regularization term. We use
+MSR-VTT because its diverse third-person video content spans a broad range
+of everyday scenes, providing complementary supervision to counterbalance
+egocentric specialization. No additional exocentric signals are introduced during
+RL training. Ablation studies in the Supplementary Material analyze the effect
+of λexo and confirm that this regularization preserves exocentric performance
+while maintaining gains on egocentric reasoning tasks.
+
+EgoVITA: Learning to Plan and Verify for Egocentric Video Reasoning
+
+4
+
+9
+
+Experiments and Evaluation
+
+Implementation Details. We implement EgoVITA using the open-source MSSWIFT [52] library. In Stage I (SFT), we train on two datasets: EgoProceL [3] (5k
+samples) for egocentric planning and HD-EPIC [33] (7k samples) for exocentric
+verification. Chain-of-thought reasoning traces for both planning and verification
+are generated once using Qwen2.5-VL-72B [2], conditioned on ground-truth
+annotations. The SFT model is trained for one epoch with a learning rate of
+5e − 6. In Stage II (GRPO), we sample rollouts from HD-EPIC and EgoIT (40k
+samples) [46]. We set the policy temperature βKL = 0.1, the confidence scaling
+coefficient γ = 0.1, and the exocentric regularization coefficient λexo = 0.05. We
+apply EgoVITA to three state-of-the-art MLLMs: Qwen2.5-VL-7B [2], InternVL3.5-8B [42], and Qwen3-VL-8B [1]. All models are trained on 8 NVIDIA L40S
+GPUs using DoRA [27] adapters ( r = 8, \alpha = 16 ) on the vision encoder, projector,
+and language decoder. The Anticipation Head (MLP) is used only during Stage
+II to compute RACMG and is discarded at inference, adding no overhead to the
+final model. The reward weights are set to {wf , wa , wg , wc } = {0.1, 0.3, 0.3, 0.3}.
+The format reward receives a lower weight as it saturates early in training, while
+the remaining three signals are weighted equally to balance their influence during
+optimization. At inference, EgoVITA runs at 84.3 token/s with a time-to-firsttoken of 0.6 s on a single L40S GPU, adding only 0.1 s overhead compared to the
+base Qwen2.5-VL model.
+Benchmarks. We evaluate EgoVITA on several egocentric understanding benchmarks, including EgoBlind [43] (visual assistance for blind users), EgoPlan [6]
+(egocentric task planning), EgoThink [7] (first-person perspective thinking),
+EOC-Bench [48] (embodied cognition across past, present, and future), and
+EgoOrientBench [17] (object orientation understanding). We also evaluate on exocentric video understanding benchmarks: MVBench [24] (temporal perception-tocognition QA), Video-MME [9] (comprehensive video understanding), LVBench [41]
+(long-video reasoning), and TOMATO [36] (visual temporal reasoning).
+4.1
+
+Results
+
+We compare EgoVITA against four baselines: (1) the original foundation models,
+(2) the same models after SFT, (3) SFT models further trained with GRPO
+using only final-answer and format rewards, and (4) state-of-the-art MLLMs for
+egocentric video understanding.
+EgoVITA improves all foundation models. As shown in Table 1, EgoVITA
+consistently enhances egocentric performance across all three foundation models:
+Qwen2.5-VL gains +7.7 on EgoBlind, +3.7 on EgoThink, and +4.4 on EgoOrient.
+InternVL-3.5 improves by +3.6 on EgoBlind and +3.8 on EgoOrient, while the
+stronger Qwen3-VL achieves gains of +3.5 and +2.3 on the same tasks, suggesting
+that the improvements generalize across model capacities. These egocentric gains
+come without hurting exocentric performance, as all three improve or maintain
+their scores on exocentric benchmarks (e.g., InternVL gains +2.7 on Video-MME).
+
+10
+
+Y. Kulkarni and P. Fazli
+
+Table 1: Evaluation of EgoVITA on egocentric and exocentric benchmarks.
+Best scores are in bold, and improvements from EgoVITA are highlighted in green with
+95% confidence interval (CI) margins (±) via bootstrap. ‡ Improvement not statistically
+significant at the 0.05 level. ♢ Self-trained variant: SFT data and teacher confidence
+signals generated by Qwen3-VL-8B itself (no external 72B teacher).
+Egocentric Video Understanding
+Model
+
+EgoBlind
+
+EgoPlan
+
+EgoThink
+
+EOC-Bench
+
+Exocentric Video Understanding
+EgoOrient
+
+MVBench
+
+Video-MME
+
+LVBench
+
+Tomato
+
+InternVL-3.5 Family
+InternVL-3.5
+47.8
+34.0
+58.5
+37.1
+36.3
+71.4
+65.6
+44.4
+31.4
+68.2
+62.1
+41.2
+29.8
+SFT
+49.2
+34.8
+59.3
+38.1
+37.8
+GRPO (Format + Answer)
+49.8
+35.1
+59.6
+38.6
+38.4
+68.9
+63.2
+41.8
+30.1
+EgoVITA
+51.4 (+3.6±0.5) 35.9 (+1.9±0.5) 60.8 (+2.3±0.5) 39.7 (+2.6±0.6) 40.1 (+3.8±0.7) 73.8 (+2.4±0.6) 68.3 (+2.7±0.6) 47.1 (+2.7±0.7) 33.2 (+1.8±0.6)
+Qwen2.5-VL Family
+Qwen2.5-VL
+29.7
+30.2
+48.2
+41.6
+47.6
+65.2
+62.2
+42.8
+29.3
+63.2
+60.1
+40.2
+29.0
+SFT
+34.8
+31.3
+49.1
+41.8
+48.1
+GRPO (Format + Answer)
+35.6
+31.4
+49.0
+42.2
+48.6
+66.4
+62.9
+40.9
+29.8
+EgoVITA
+37.4 (+7.7±0.9) 32.9 (+2.7±0.6) 51.9 (+3.7±0.7) 44.1 (+2.5±0.6) 52.0 (+4.4±0.8) 66.8 (+1.6±0.5) 64.6 (+2.4±0.6) 43.6 (+0.8±0.5) 30.2 (+0.9±0.5)
+Qwen3-VL Family
+Qwen3-VL
+48.4
+33.7
+62.7
+46.8
+60.8
+68.4
+71.4
+56.1
+34.0
+SFT
+50.1
+34.2
+63.1
+47.5
+61.8
+68.2
+71.2
+56.3
+34.2
+GRPO (Format + Answer)
+50.8
+34.5
+63.4
+47.9
+62.3
+68.1
+71.1
+56.4
+34.3
+EgoVITA
+51.9 (+3.5±0.7) 35.0 (+1.3±0.5) 63.9 (+1.2±0.5) 48.6 (+1.8±0.6) 63.1 (+2.3±0.6) 69.2 (+0.8±0.5) 72.2 (+0.8±0.5) 56.5 (+0.4±0.4)‡ 34.5 (+0.5±0.4)
+EgoVITA♢
+
+50.2 (+1.8)
+
+34.1 (+0.4)
+
+63.0 (+0.3)
+
+Self-Trained
+47.4 (+0.6)
+
+61.5 (+0.7)
+
+68.3 (-0.1)
+
+71.5 (+0.1)
+
+56.0 (-0.1)
+
+33.9 (-0.1)
+
+Table 2: Comparison with State of the Art. All results are reproduced by us.
+Egocentric Video Reasoning
+Variant
+
+EgoBlind
+
+EgoPlan
+
+EOC-Bench
+
+Basic Exocentric Understanding
+EgoSchema
+
+MMMU
+
+DocVQA
+
+Qwen2-VL
+41.0
+32.5
+39.6
+64.2
+51.0
+79.5
+SFT
+44.2
+33.1
+40.8
+65.4
+49.8
+78.1
+GRPO (Format + Answer)
+45.6
+33.6
+41.4
+66.1
+50.4
+78.9
+EgoThinker [31]
+43.8
+34.1
+37.1
+68.2
+49.2 (-1.8)
+69.0 (-10.5)
+EgoVITA
+46.8 (+5.8±0.3) 34.6 (+2.1±0.4) 42.7 (+3.1±0.2) 67.9 (+3.7±0.5) 51.3 (+0.3±0.4) 80.1 (+0.6±0.3)
+
+MME (Perception)
+
+VQAv2
+
+1677
+1654
+1665
+1644 (-33)
+1682 (+5±7)
+
+80.4
+79.2
+79.8
+78.1 (-2.3)
+81.2 (+0.8±0.6)
+
+Furthermore, the self-trained variant using Qwen3-VL-8B (EgoVITA♢ ), where
+both SFT data and teacher confidence signals are generated by the same 8B
+model, still outperforms the Qwen3-VL baseline on all egocentric benchmarks.
+This suggests that the improvements are driven by the plan–verify training
+framework itself, rather than reliance on a larger external teacher.
+Comparison with state-of-the-art. Work on egocentric video reasoning with
+MLLMs is limited. EgoThinker [31] built upon Qwen2-VL [40] is the closest
+related method that enables a controlled backbone comparison. Table 2 compares
+EgoVITA and EgoThinker across standard egocentric reasoning benchmarks and
+general exocentric tasks, including MMMU [49], DocVQA [29], MME [8], and
+VQAv2 [11]. Although EgoThinker is trained with approximately 5M samples,
+it shows substantial performance degradation on several exocentric benchmarks
+(e.g., −10.5 on DocVQA and −1.8 on MMMU), suggesting limited cross-view
+retention under large-scale egocentric training. In contrast, EgoVITA achieves
+stronger egocentric performance (e.g., +5.8 over the base model on EgoBlind)
+using 52k training samples. Furthermore, the proposed dense reward design is
+associated with improved egocentric reasoning while maintaining competitive
+performance on exocentric benchmarks (e.g., +0.6 on DocVQA), indicating
+improved cross-view stability relative to large-scale egocentric fine-tuning.
+RL is essential. SFT improves output formatting but provides limited gains
+in egocentric reasoning and can degrade exocentric performance. For example,
+Qwen2.5-VL after SFT drops by −2.0 on MVBench and −2.1 on Video-MME,
+
+EgoVITA: Learning to Plan and Verify for Egocentric Video Reasoning
+
+11
+
+High
+Low
+Q: Based on the fixation pattern (eggplant à shelf à bag), what action will the user do next?
+
+Qwen2.5-VL: Flatten a few garlic cloves with a knife, then remove the skin.
+
+EgoVITA: Mince the garlic and set it aside.
+Q: Based on the fixation pattern (bowl à stove à counter), what action will the user do next?
+
+Qwen2.5-VL: Cut the vegetables by holding them firmly and slice them into strips.
+
+EgoVITA: Pick up the prepared egg mixture and stir it into the pan with chopsticks.
+
+Fig. 4: EgoVITA learns to “look ahead” in egocentric video. EAGLE [5]
+visualizations show that EgoVITA progressively concentrates attention on task-relevant
+objects (e.g., garlic, egg bowl, pan) and hand regions across frames, whereas Qwen2.5-VL
+shows scattered, temporally static activations over background elements (e.g., shelves,
+walls). The focused, temporally evolving attention patterns in EgoVITA are associated
+with correct action predictions (green), whereas the baseline often produces incorrect
+or visually inconsistent outputs (red).
+
+indicating a trade-off between egocentric specialization and exocentric retention.
+In contrast, applying RL through EgoVITA recovers exocentric performance,
+improving MVBench and Video-MME by +3.6/+4.5 points over SFT while
+also further increasing EgoBlind by +2.6 points. A similar trend is observed for
+InternVL-3.5, where RL improves Video-MME by +6.2 points and EgoBlind by
++2.2 points over SFT.
+Dense rewards matter. GRPO using only format and answer rewards provides
+limited gains over SFT, as these sparse signals primarily optimize final-output
+correctness. Adding the dense rewards (ACMG and Confidence) yields consistent
+additional improvements: +1.8 on EgoBlind and +3.4 on EgoOrient for Qwen2.5VL, and +1.6/+1.7 on the same tasks for InternVL-3.5. These results suggest that
+grounding plans in future visual observations and reinforcing cross-perspective
+verification both contribute to improved egocentric reasoning.
+
+Y. Kulkarni and P. Fazli
+Locate
+
+Move
+
+3.5
+
+Wrong Action (Same Bkg)
+Correct Action
+
+3.0
+
+Verify
+
+Text
+Predicted
+Actual
+
+Action
+
+Complete
+
+2.5
+
+Density
+
+ACMG Embedding Space (Dim 2)
+
+12
+
+2.0
+1.5
+1.0
+0.5
+
+ACMG Embedding Space (Dim 1)
+
+Fig. 5: ACMG Embedding Structure.
+t-SNE of text (blue), predicted (red),
+and actual (green) embeddings. Alignment
+within distinct action clusters indicates
+cross-modal grounding.
+
+0.0
+0.0
+
+0.2
+
+0.4
+
+0.6
+
+ACMG Reward (Cosine Similarity)
+
+0.8
+
+1.0
+
+Fig. 6: Static Bias Check. Reward density for matched vs. same-scene/wrongaction pairs. The gap (∆ = 0.33) shows
+sensitivity to temporal dynamics rather
+than static backgrounds
+
+Visual Attribution Analysis. We apply EAGLE [5] to visualize which regions
+contribute to action prediction (Figure 4). Qwen2.5-VL shows largely temporally
+static saliency, with attention frequently concentrated on background elements
+and limited focus on task-relevant objects. This behavior is accompanied by
+incorrect action predictions in several cases. In contrast, EgoVITA demonstrates
+temporally progressive attribution patterns that shift across frames, increasingly
+focusing on task-critical objects (e.g., garlic, egg bowl) as the action unfolds. This
+behavior is consistent with the influence of RACMG , which encourages alignment
+between predicted actions and future visual observations. The results suggest
+that the dense grounding signal promotes greater sensitivity to regions that are
+predictive of subsequent task dynamics, rather than static scene features.
+Semantic Structure Analysis. To examine if EgoVITA learns structured visuallinguistic representations, we categorize <ego_plan> clauses into five procedural
+steps (Move → Locate → Action → Verify → Complete) using GPT-4o [16].
+Figure 5 shows a t-SNE projection of the corresponding embeddings, revealing two key properties. First, between-cluster separation is visible: embeddings
+corresponding to different procedural stages form separable clusters, suggesting
+structured differentiation across task phases. Second, within-cluster alignment is
+strong: the MLP-predicted visual embeddings (red diamonds ♢) align closely with
+embeddings of future frames (green stars ⋆), indicating consistent cross-modal
+alignment between predicted plan clauses and subsequent visual observations.
+Robustness to Static Feature Bias. To evaluate whether ACMG captures
+temporal dynamics rather than static background features, we conduct a controlled analysis on 850 EgoPlan [6] samples (Figure 6). For each valid action
+clause, we pair it with “Wrong Action” frames from the same scene (identified by
+Qwen3-VL-30B-A3B [1]), controlling for static background and object identity
+while varying only the action. If RACMG relied primarily on static scene features,
+the score distributions would overlap. Instead, correct predictions yield a mean
+similarity of µ = 0.68, whereas same-scene wrong-action pairs drop to µ = 0.35
+
+EgoVITA: Learning to Plan and Verify for Egocentric Video Reasoning
+
+13
+
+Table 3: Task-level breakdown. EgoBlind categories from [43] are Tool Use (TU),
+Information Reading (IR), Navigation (NV), Safety Warning (SW), Social Communication (SC), and Other Resources (OR). EOC-Bench temporal dimensions from [48]
+are Past (Pst), Present (Prs), and Future (Fut). EgoOrientBench tasks from [17] are
+Choose (Cho), Verify (Ver), and Freeform (FF).
+EgoBlind
+Method
+
+EOC-Bench
+Avg
+
+EgoOrientBench
+
+TU
+
+IR
+
+NV
+
+SW
+
+SC
+
+OR
+
+Pst
+
+Prs
+
+Fut
+
+Avg
+
+Cho
+
+Ver
+
+FF
+
+Qwen2.5-VL 34.3
+36.3
+SFT
+GRPO
+36.7
+EgoVITA
+37.4
+
+35.0
+38.6
+39.2
+40.5
+
+12.8
+15.8
+16.3
+17.4
+
+30.8
+41.2
+42.9
+46.6
+
+37.8
+41.4
+41.9
+43.2
+
+27.5
+29.7
+33.7
+35.5
+34.8
+33.9
+36.6
+35.6
+34.2
+39.3 37.4 (+7.7) 36.5
+
+48.8
+49.1
+49.4
+50.2
+
+42.2
+41.6
+45.0
+42.4
+41.8
+45.5
+43.0
+42.2
+46.0
+45.6 44.1 (+2.5) 51.0
+
+62.0
+62.5
+63.0
+65.5
+
+35.8
+47.6
+36.3
+48.1
+36.8
+48.6
+39.5 52.0 (+4.4)
+
+Avg
+
+(∆ = 0.33). This separation indicates that the Anticipation Head is sensitive to
+action-dependent visual changes, suggesting that the reward emphasizes temporal
+variation rather than static scene content.
+Task-level analysis. Table 3 shows that the gains from EgoVITA are concentrated in specific categories rather than arising uniformly from SFT distillation.
+On EgoBlind, the largest improvements over SFT occur in Safety Warning (+5.4)
+and Other Resources (+3.8). On EOC-Bench, Future reasoning benefits most
+(+3.2). On EgoOrientBench, the Choose task shows a substantial improvement
+(+5.5). These non-uniform, category-specific gains beyond SFT indicate that the
+improvements stem from the proposed plan-then-verify framework and its dense
+reward design rather than general distillation.
+4.2
+
+Ablation Studies
+
+RQ1: Is teacher-guided initialization necessary? Table 4 isolates the effect
+of the 200-step teacher-guided initialization during the RL stage. The model
+achieves substantial gains (average +2.9) even without teacher supervision during
+RL. Since the SFT policy is initialized using human-annotated data, it already
+provides a reasonable starting point for self-ranking optimization. These results
+suggest that the improvements are primarily driven by the reward formulation
+rather than reliance on teacher guidance.
+RQ2: Are ACMG and confidence rewards complementary? Table 5
+examines the individual and combined effects of ACMG and the confidence reward.
+ACMG primarily improves performance on tasks requiring temporal grounding
+(e.g., EgoPlan +0.6), suggesting that aligning predicted plans with future visual
+observations benefits procedural reasoning. In contrast, the confidence reward
+yields gains on tasks emphasizing verification consistency (e.g., EOC-Bench
++1.3), indicating its role in refining third-person audits of the egocentric plan.
+When combined, the two rewards produce larger improvements (e.g., EOC-Bench
++1.9) than either component alone, suggesting that temporal grounding and
+verification-based preference signals provide complementary benefits.
+RQ3: Is disentangled reasoning into <ego_plan> and <exo_verify> necessary? Table 6 shows that removing either component degrades performance.
+
+14
+
+Y. Kulkarni and P. Fazli
+
+Table 4: Teacher-Guided Warm-up.
+Effect of removing the 200-step teacher
+phase from the confidence reward.
+
+Variant
+Qwen2.5-VL-7B
+
+Table 5: ACMG and confidence reward on Qwen2.5-VL. Removing either
+component degrades performance.
+
+Egocentric Benchmarks
+
+Variant
+
+EgoBlind
+
+EgoPlan
+
+29.7
+
+30.2
+
+GRPO (Format + Answer)
+31.4
++ ACMG only
+32.0
++ Confidence only
+32.3
+EgoVITA (Full)
+32.9 (+1.5)
+
+EgoThink EOC-Bench
+48.2
+
+No Teacher Warm-up 36.0 (+6.3) 31.8 (+1.6) 50.5 (+2.3)
+EgoVITA (Full)
+37.4 (+7.7) 32.9 (+2.7) 51.9 (+3.7)
+
+41.6
+43.0 (+1.4)
+44.1 (+2.5)
+
+EgoPlan
+
+EOC-Bench Video-MME
+42.2
+43.1
+43.5
+44.1 (+1.9)
+
+62.9
+63.4
+63.8
+64.6 (+1.7)
+
+Tomato
+29.8
+29.9
+30.0
+30.2 (+0.4)
+
+Table 6: Disentangled reasoning. Re- Table 7: Anticipatory (ACMG) vs.
+moving <ego_plan> harms egocentric Present Grounding. Comparison with
+reasoning, while removing <exo_verify> a present-frame baseline (grounding on
+frame t). Both improve performance, with
+reduces exocentric performance.
+ACMG yielding substantially larger gains.
+Variant
+
+EgoPlan
+
+EOC-Bench Video-MME
+
+GRPO (Format + Answer)
+31.4
+29.6
+w/o <ego_plan>
+w/o <exo_verify>
+31.5
+EgoVITA (Full)
+32.9 (+1.5)
+
+42.2
+40.1
+42.5
+44.1 (+1.9)
+
+62.9
+63.0
+61.2
+64.6 (+1.7)
+
+Tomato
+29.8
+29.7
+28.3
+30.2 (+0.4)
+
+Model
+
+EgoThink
+
+EOC-Bench
+
+Qwen2.5-VL-7B
+29.7
+30.2
+48.2
+Present
+33.8 (+4.1) 31.2 (+1.0) 50.1 (+1.9)
+ACMG
+37.4 (+7.7) 32.9 (+2.7) 51.9 (+3.7)
+
+EgoBlind
+
+EgoPlan
+
+41.6
+42.8 (+1.2)
+44.1 (+2.5)
+
+Eliminating <ego_plan> significantly degrades egocentric performance (e.g.,
+−1.8 on EgoPlan), indicating the importance of modeling action sequences before answer generation. Conversely, removing <exo_verify> reduces exocentric
+performance (e.g., −1.7 on Video-MME), suggesting that the verification stage
+contributes to maintaining general third-person reasoning capabilities. Together,
+these results indicate that the planning and verification components play complementary roles: <ego_plan> supports task-specific procedural reasoning, while
+<exo_verify> helps retain broader cross-view generalization. The full EgoVITA
+framework balances these components, achieving improved performance across
+both egocentric and exocentric benchmarks (e.g., +1.7 on Video-MME).
+RQ4: Why does anticipatory grounding (ACMG) improve procedural reasoning? Table 7 contrasts present-frame grounding with anticipatory
+grounding. Models trained with present-frame alignment primarily capture the
+current static scene, yielding limited improvements (e.g., +1.0 on EgoPlan).
+In contrast, ACMG aligns anticipated actions with future observations over a
+temporal horizon, encouraging consistency between planned actions and their
+subsequent outcomes. This anticipatory grounding is associated with larger gains
+(e.g., +2.7 on EgoPlan and +7.7 on EgoBlind). As illustrated in Figure 7 (Left),
+ACMG correctly anticipates the “sweep cane” action before the blind person
+reaches the curb.
+
+5
+
+Conclusion
+
+We presented EgoVITA, a framework for egocentric video reasoning that decomposes reasoning into a plan-then-verify process consisting of egocentric planning
+and exocentric verification. By coupling this structure with dense rewards for
+anticipatory grounding and third-person verification, EgoVITA learns to generate
+
+EgoVITA: Learning to Plan and Verify for Egocentric Video Reasoning
+
+15
+
+Query: As a blind person, how can I safely cross this
+intersection without assistance?
+
+Query: What systematic approach is being used for grapevine
+pruning in this video?
+
+Qwen2.5-VL-7B: Wait for the pedestrian signal to change, then
+walk straight across the crossing. You can rely on the sound of
+traﬃc stopping to know when it is safe
+
+Qwen2.5-VL-7B: The video shows the worker is thinning the
+canopy by removing green shoots. They are cutting randomly along
+the row, focusing on clearing leaves.
+
+<ego_plan> 1. Approach intersection while extending white cane
+to detect obstacles. 2. Identify curb edge through feedback from
+cane. 3. Sweep cane to detect vehicle vibrations and patterns. 4.
+Confirm crosswalk presence and safety through paving. 5. Cross
+with steady pace while maintaining cane sweeps. </ego_plan>
+
+<ego_plan> 1. Progress systematically along vine rows to next
+pruning section. 2. Identify dead/dry branches requiring removal
+on vines. 3. Cut branches at structural joints near main stems
+using pruning shears. 4. Check that branches are properly
+removed and no debris remains on vines 5. Complete current
+section and prepare to move to next row. </ego_plan>
+
+.
+
+<exo_verify> Plan is consistent: Cane positioning detects curb
+(frame 47), tactile paving visible (frame 52), and traffic patterns
+allow safe crossing. Visual confirmation shows clear crosswalk
+and minimal traffic in current direction. </exo_verify>
+<answer> Cross when traffic is clear, using cane to detect curb
+edge and tactile paving for guidance. Maintain steady pace with
+continuous cane sweep. </answer>
+
+<exo_verify> Plan is consistent: Video shows sequential row
+navigation (frame 3), targeted branch removal (frame 14), jointlevel cutting (frame 43), and methodical progression (frame 156).
+Matches standard vineyard pruning methodology for winter
+dormancy management. </exo_verify>
+<answer> Systematic row-by-row removal of dead branches at
+structural joints, clearing debris as they progress through the
+vineyard. </answer>
+
+Fig. 7: EgoVITA Qualitative Examples. Left: For a blind person, the <ego_plan>
+generates sequential, task-oriented actions. Right: For a procedural task, <ego_plan>
+outlines a structured step-by-step plan. In both cases, <exo_verify> evaluates consistency with relevant visual frames, producing a grounded <answer> . In contrast,
+Qwen2.5-VL produces unsafe visually inconsistent responses.
+
+procedurally coherent and visually grounded plans and verifications. Empirical
+results demonstrate improvements in egocentric reasoning while preserving performance on exocentric video understanding tasks, highlighting the effectiveness
+of cross-perspective reasoning without requiring paired ego-exo supervision. The
+ability to maintain exocentric performance while specializing in egocentric reasoning opens the possibility of a single unified model serving both first-person
+assistive applications and general video understanding.
+Future work will extend this framework to streaming egocentric scenarios,
+where the model must plan and verify incrementally as new frames arrive rather
+than reasoning over an entire video. Adaptive temporal windows that expand for
+long, multi-step activities and contract for rapid actions could improve grounding
+accuracy across diverse tasks. Finally, iterative plan-verify reasoning could enable
+predicted plans to be refined through repeated cross-perspective feedback when
+visual evidence is ambiguous or multiple plausible future plans exist.
+
+Acknowledgments
+This research was supported by the National Eye Institute (NEI) of the National
+Institutes of Health (NIH) under award number R01EY034562. The content is
+solely the responsibility of the authors and does not necessarily represent the
+official views of the NIH. We acknowledge Research Computing at Arizona State
+University for providing computing resources.
+
+16
+
+Y. Kulkarni and P. Fazli
+
+References
+1. Bai, S., Cai, Y., Chen, R., Chen, K., Chen, X., Cheng, Z., Deng, L., Ding, W.,
+Gao, C., Ge, C., Ge, W., Guo, Z., et al.: Qwen3-vl technical report. arXiv preprint
+arXiv:2511.21631 (2025)
+2. Bai, S., Chen, K., Liu, X., Wang, J., Ge, W., Song, S., Dang, K., Wang, P., Wang,
+S., Tang, J., et al.: Qwen2. 5-vl technical report. arXiv preprint arXiv:2502.13923
+(2025)
+3. Bansal, S., Arora, C., Jawahar, C.: My view is the best view: Procedure learning
+from egocentric videos. In: European Conference on Computer Vision (ECCV)
+(2022)
+4. Bu, Y., Wu, X., Zhao, Z., Cai, Y., Hsu, D., Liu, Q.: Walk in others’ shoes with a single
+glance: Human-centric visual grounding with top-view perspective transformation.
+In: Annual Meeting of the Association for Computational Linguistics (ACL) (2025)
+5. Chen, R., Guo, X., Liu, K., Liang, S.Y., Liu, S., Zhang, Q., Zhang, H., Cao,
+X.: Where mllms attend and what they rely on: Explaining autoregressive token
+generation. In: IEEE/CVF Conference on Computer Vision and Pattern Recognition
+(CVPR) (2026)
+6. Chen, Y., Ge, Y., Ge, Y., Ding, M., Li, B., Wang, R., Xu, R., Shan, Y., Liu, X.:
+Egoplan-bench: Benchmarking multimodal large language models for human-level
+planning. International Journal of Computer Vision (IJCV) (2026)
+7. Cheng, S., Guo, Z., Wu, J., Fang, K., Li, P., Liu, H., Liu, Y.: Egothink: Evaluating first-person perspective thinking capability of vision-language models. In:
+IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)
+(2024)
+8. Fu, C., Chen, P., Shen, Y., Qin, Y., Zhang, M., Lin, X., Yang, J., Zheng, X., Li, K.,
+Sun, X., et al.: Mme: A comprehensive evaluation benchmark for multimodal large
+language models. In: Neural Information Processing Systems (NeurIPS) (2023)
+9. Fu, C., Dai, Y., Luo, Y., Li, L., Ren, S., Zhang, R., Wang, Z., Zhou, C., Shen, Y.,
+Zhang, M., et al.: Video-mme: The first-ever comprehensive evaluation benchmark
+of multi-modal llms in video analysis. In: IEEE/CVF Conference on Computer
+Vision and Pattern Recognition (CVPR) (2025)
+10. Gholami, M., Rezaei, A., Weimin, Z., Zhang, Y., Akbari, M.: Spatial reasoning
+with vision-language models in ego-centric multi-view scenes. In: International
+Conference on Learning Representations (ICLR) (2026)
+11. Ging, S., Bravo, M.A., Brox, T.: Open-ended vqa benchmarking of vision-language
+models by exploiting classification datasets and their semantic hierarchy. In: International Conference on Learning Representations (ICLR) (2024)
+12. Guo, D., Yang, D., Zhang, H., Song, J., Zhang, R., Xu, R., Zhu, Q., Ma, S.,
+Wang, P., Bi, X., et al.: Deepseek-r1: Incentivizing reasoning capability in llms via
+reinforcement learning. arXiv preprint arXiv:2501.12948 (2025)
+13. Guo, D., Wu, F., Zhu, F., Leng, F., Shi, G., Chen, H., Fan, H., Wang, J., Jiang,
+J., Wang, J., et al.: Seed1. 5-vl technical report. arXiv preprint arXiv:2505.07062
+(2025)
+14. He, Y., Huang, Y., Chen, G., Pei, B., Xu, J., Lu, T., Pang, J.: Egoexobench: A
+benchmark for first-and third-person view video understanding in mllms. In: Neural
+Information Processing Systems (NeurIPS) (2025)
+15. Huang, S., Wu, J., Wei, X., Cai, Y., Jiang, D.S., Wang, Y.: Sound bridge: Associating
+egocentric and exocentric videos via audio cues. In: IEEE/CVF Conference on
+Computer Vision and Pattern Recognition (CVPR) (2025)
+
+EgoVITA: Learning to Plan and Verify for Egocentric Video Reasoning
+
+17
+
+16. Hurst, A., Lerer, A., Goucher, A.P., Perelman, A., Ramesh, A., Clark, A., Ostrow,
+A., Welihinda, A., Hayes, A., Radford, A., et al.: Gpt-4o system card. arXiv preprint
+arXiv:2410.21276 (2024)
+17. Jung, J.H., Kim, E.T., Kim, S., Lee, J.H., Kim, B., Chang, B.: Is ‘right’right?
+enhancing object orientation understanding in multimodal large language models
+through egocentric instruction tuning. In: IEEE/CVF Conference on Computer
+Vision and Pattern Recognition (CVPR) (2025)
+18. Jung, M., Xiao, J., Kim, J., Zhang, B.T., Yao, A.: Egoexo-con: Exploring viewinvariant video temporal understanding. arXiv preprint arXiv:2510.26113 (2025)
+19. Kim, J., Park, J., Park, J., Lee, S., Chung, J., Kim, J., Joung, J.H., Yu, Y.: Guidedog:
+A real-world egocentric multimodal dataset for blind and low-vision accessibilityaware guidance. In: Annual Meeting of the Association for Computational Linguistics
+(ACL) (2026)
+20. Kulkarni, Y., Fazli, P.: Videopasta: 7k preference pairs that matter for video-llm
+alignment. In: Conference on Empirical Methods in Natural Language Processing
+(EMNLP) (2025)
+21. Kulkarni, Y., Fazli, P.: Videosavi: Self-aligned video language models without
+human supervision. In: Conference on Language Modeling (COLM) (2025)
+22. Kulkarni, Y., Fazli, P.: Avatar: Reinforcement learning to see, hear, and reason over
+video. In: IEEE/CVF Conference on Computer Vision and Pattern Recognition
+(CVPR) (2026)
+23. Lee, P.Y., Je, J., Park, C., Uy, M.A., Guibas, L., Sung, M.: Perspective-aware
+reasoning in vision-language models via mental imagery simulation. In: International
+Conference on Computer Vision (ICCV) (2025)
+24. Li, K., Wang, Y., He, Y., Li, Y., Wang, Y., Liu, Y., Wang, Z., Xu, J., Chen, G., Luo,
+P., et al.: Mvbench: A comprehensive multi-modal video understanding benchmark.
+In: IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)
+(2024)
+25. Li, Y., Veerabadran, V., Iuzzolino, M.L., Roads, B.D., Celikyilmaz, A., Ridgeway,
+K.: Egotom: Benchmarking theory of mind reasoning from egocentric videos. arXiv
+preprint arXiv:2503.22152 (2025)
+26. Liang, S., Zhong, Y., Hu, Z.Y., Tao, Y., Wang, L.: Fine-grained spatiotemporal
+grounding on egocentric videos. In: International Conference on Computer Vision
+(ICCV) (2025)
+27. Liu, S.Y., Wang, C.Y., Yin, H., Molchanov, P., Wang, Y.C.F., Cheng, K.T., Chen,
+M.H.: Dora: Weight-decomposed low-rank adaptation. In: International Conference
+on Machine Learning (ICML) (2024)
+28. Luo, M., Xue, Z., Dimakis, A., Grauman, K.: Viewpoint rosetta stone: Unlocking
+unpaired ego-exo videos for view-invariant representation learning. In: IEEE/CVF
+Conference on Computer Vision and Pattern Recognition (CVPR) (2025)
+29. Mathew, M., Karatzas, D., Jawahar, C.: Docvqa: A dataset for vqa on document
+images. In: IEEE/CVF Winter Conference on Applications of Computer Vision
+(WACV) (2021)
+30. Mur-Labadia, L., Santos-Villafranca, M., Bermudez-Cameo, J., Perez-Yus, A.,
+Martinez-Cantin, R., Guerrero, J.J.: O-mama: Learning object mask matching
+between egocentric and exocentric views. In: International Conference on Computer
+Vision (ICCV) (2025)
+31. Pei, B., Huang, Y., Xu, J., He, Y., Chen, G., Wu, F., Qiao, Y., Pang, J.: Egothinker:
+Unveiling egocentric reasoning with spatio-temporal cot. In: Neural Information
+Processing Systems (NeurIPS) (2025)
+
+18
+
+Y. Kulkarni and P. Fazli
+
+32. Peng, T., Hua, J., Liu, M., Lu, F.: In the eye of mllm: Benchmarking egocentric
+video intent understanding with gaze-guided prompting. In: Neural Information
+Processing Systems (NeurIPS) (2025)
+33. Perrett, T., Darkhalil, A., Sinha, S., Emara, O., Pollard, S., Parida, K.K., Liu, K.,
+Gatti, P., Bansal, S., Flanagan, K., et al.: Hd-epic: A highly-detailed egocentric video
+dataset. In: IEEE/CVF Conference on Computer Vision and Pattern Recognition
+(CVPR) (2025)
+34. Plizzari, C., Tonioni, A., Xian, Y., Kulshrestha, A., Tombari, F.: Omnia de egotempo:
+Benchmarking temporal understanding of multi-modal llms in egocentric videos.
+In: IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)
+(2025)
+35. Seth, A., Tyagi, U., Selvakumar, R., Anand, N., Kumar, S., Ghosh, S., Duraiswami,
+R., Agarwal, C., Manocha, D.: Egoillusion: Benchmarking hallucinations in egocentric video understanding. In: Conference on Empirical Methods in Natural Language
+Processing (EMNLP) (2025)
+36. Shangguan, Z., Li, C., Ding, Y., Zheng, Y., Zhao, Y., Fitzgerald, T., Cohan, A.:
+Tomato: Assessing visual temporal reasoning capabilities in multimodal foundation
+models. In: International Conference on Learning Representations (ICLR) (2025)
+37. Sun, P., Xiao, J., Tse, T.H.E., Li, Y., Akula, A., Yao, A.: Visual intention grounding
+for egocentric assistants. In: International Conference on Computer Vision (ICCV)
+(2025)
+38. Tian, S., Wang, R., Guo, H., Wu, P., Dong, Y., Wang, X., Yang, J., Zhang, H., Zhu,
+H., Liu, Z.: Ego-r1: Chain-of-tool-thought for ultra-long egocentric video reasoning.
+IEEE Transactions on Pattern Analysis and Machine Intelligence (TPAMI) (2026)
+39. Vinod, A., Pandit, S., Vavre, A., Liu, L.: Egovlm: Policy optimization for egocentric
+video understanding. arXiv preprint arXiv:2506.03097 (2025)
+40. Wang, P., Bai, S., Tan, S., Wang, S., Fan, Z., Bai, J., Chen, K., Liu, X., Wang,
+J., Ge, W., et al.: Qwen2-vl: Enhancing vision-language model’s perception of the
+world at any resolution. arXiv preprint arXiv:2409.12191 (2024)
+41. Wang, W., He, Z., Hong, W., Cheng, Y., Zhang, X., Qi, J., Ding, M., Gu, X., Huang,
+S., Xu, B., et al.: Lvbench: An extreme long video understanding benchmark. In:
+International Conference on Computer Vision (ICCV) (2025)
+42. Wang, W., Gao, Z., Gu, L., Pu, H., Cui, L., Wei, X., Liu, Z., Jing, L., Ye, S., Shao,
+J., et al.: Internvl3. 5: Advancing open-source multimodal models in versatility,
+reasoning, and efficiency. arXiv preprint arXiv:2508.18265 (2025)
+43. Xiao, J., Huang, N., Qiu, H., Tao, Z., Yang, X., Hong, R., Wang, M., Yao, A.:
+Egoblind: Towards egocentric visual assistance for the blind people. In: Neural
+Information Processing Systems (NeurIPS) (2025)
+44. Xu, J., Huang, Y., Pei, B., Hou, J., Li, Q., Chen, G., Zhang, Y., Feng, R., Xie,
+W.: Egoexo-gen: Ego-centric video prediction by watching exo-centric videos. In:
+International Conference on Learning Representations (ICLR) (2025)
+45. Xu, J., Mei, T., Yao, T., Rui, Y.: Msr-vtt: A large video description dataset for
+bridging video and language. In: IEEE/CVF Conference on Computer Vision and
+Pattern Recognition (CVPR) (2016)
+46. Yang, J., Liu, S., Guo, H., Dong, Y., Zhang, X., Zhang, S., Wang, P., Zhou, Z.,
+Xie, B., Wang, Z., et al.: Egolife: Towards egocentric life assistant. In: IEEE/CVF
+Conference on Computer Vision and Pattern Recognition (CVPR) (2025)
+47. Ye, H., Zhang, H., Daxberger, E., Chen, L., Lin, Z., Li, Y., Zhang, B., You, H., Xu,
+D., Gan, Z., et al.: Mm-ego: Towards building egocentric multimodal llms for video
+qa. In: International Conference on Learning Representations (ICLR) (2025)
+
+EgoVITA: Learning to Plan and Verify for Egocentric Video Reasoning
+
+19
+
+48. Yuan, Y., Dang, R., Li, L., Li, W., Jiao, D., Li, X., Zhao, D., Wang, F., Zhang, W.,
+Xiao, J., et al.: Eoc-bench: Can mllms identify, recall, and forecast objects in an
+egocentric world? In: Neural Information Processing Systems (NeurIPS) (2025)
+49. Yue, X., Ni, Y., Zhang, K., Zheng, T., Liu, R., Zhang, G., Stevens, S., Jiang, D., Ren,
+W., Sun, Y., et al.: Mmmu: A massive multi-discipline multimodal understanding
+and reasoning benchmark for expert agi. In: IEEE/CVF Conference on Computer
+Vision and Pattern Recognition (CVPR) (2024)
+50. Zhan, X., Huang, W., Sun, H., Fu, X., Ma, C., Cao, S., Jia, B., Lin, S., Yin, Z., Bai,
+L., et al.: Actial: Activate spatial reasoning ability of multimodal large language
+models. In: Neural Information Processing Systems (NeurIPS) (2025)
+51. Zhang, H., Chu, Q., Liu, M., Wang, Y., Wen, B., Yang, F., Gao, T., Zhang, D.,
+Wang, Y., Nie, L.: Exo2ego: Exocentric knowledge guided mllm for egocentric video
+understanding. arXiv preprint arXiv:2503.09143 (2025)
+52. Zhao, Y., Huang, J., Hu, J., Wang, X., Mao, Y., Zhang, D., Jiang, Z., Wu, Z., Ai,
+B., Wang, A., et al.: Swift: a scalable lightweight infrastructure for fine-tuning. In:
+AAAI Conference on Artificial Intelligence (AAAI) (2025)
+53. Zhou, S., Xiao, J., Li, Q., Li, Y., Yang, X., Guo, D., Wang, M., Chua, T.S., Yao,
+A.: Egotextvqa: Towards egocentric scene-text aware video question answering.
+In: IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)
+(2025)
+
+EgoVITA: Learning to Plan and Verify for
+Egocentric Video Reasoning
+Supplementary Material
+
+1
+
+Ablation Studies
+
+Table 1: Ablation on ACMG Pooling Strategy. We compare Max Pooling (used
+in EgoVITA) against Mean Pooling for the RACM G reward. Results on Qwen2.5-VL-7B.
+Egocentric Benchmarks
+ACMG Variant
+
+EgoBlind
+
+EgoPlan
+
+EgoThink
+
+Qwen2.5-VL-7B
+
+29.7
+
+30.2
+
+48.2
+
+RACMG (Mean Pooling)
+33.5 (+3.8) 31.5 (+1.3) 50.1 (+1.9)
+RACM G (Max Pooling) (EgoVITA) 37.4 (+7.7) 32.9 (+2.7) 51.9 (+3.7)
+
+EOC-Bench
+41.6
+42.6 (+1.0)
+44.1 (+2.5)
+
+RQ1: Why Max Instead of Average Pooling for RACMG ? A valid concern is
+that max pooling (Eq. 8) could reward spurious, high-similarity outliers, whereas
+a mean pooling operation might better capture durational events (e.g., “walk
+to the bus stop”). In Table 1, we directly ablate this by replacing max pooling
+with mean pooling across the N = 16 future frames. The results show that mean
+pooling is significantly less effective, providing only a fraction of the performance
+gain (e.g., +3.8 vs. +7.7 on EgoBlind, and +1.9 vs. +3.7 on EgoThink).
+The mean operation’s weakness is that it dilutes the reward signal. A
+correct durational clause like “walk to the bus stop” will have high similarity
+with some, but not necessarily all, of the N = 16 future frames. Averaging across
+the entire window (including the non-matching frames) punishes this correct,
+but sparse, temporal alignment, resulting in a weak, non-descriptive reward. In
+contrast, max pooling is “robust to temporal shifts” because it finds the peak
+evidence that the predicted event did occur within the window, regardless of its
+exact timing or duration. This provides a much stronger and more stable learning
+signal for grounding, and the empirical results suggest this benefit outweighs the
+risk of spurious outliers.
+RQ2: Impact of Exocentric Regularization. Figure 1 demonstrates the
+importance of exocentric regularization for preventing catastrophic forgetting.
+Training on egocentric data via SFT causes an initial performance drop on
+exocentric benchmarks, as seen by the ‘RL Step 0’ (SFT) performance being
+below the ‘Base Model’ across all four tasks. This drop occurs because SFT
+overfits to the egocentric data distribution. Without intervention, this forgetting
+continues, as shown by the ‘w/o Regularization’, where performance progressively
+degrades. In contrast, EgoVITA’s regularization, which interleaves GRPO updates
+
+Y. Kulkarni and P. Fazli
+67
+66
+65
+64
+63
+62
+61
+
+w/ Regularization (EgoVITA)
+w/o Regularization
+Base Model (65.2)
+
+0
+
+100
+
+200
+300
+RL Training Steps
+
+Video-MME Performance
+
+MVBench Performance
+
+2
+
+w/ Regularization (EgoVITA)
+w/o Regularization
+Base Model (62.2)
+
+64
+62
+60
+58
+0
+
+400
+
+100
+
+w/ Regularization (EgoVITA)
+w/o Regularization
+Base Model (42.8)
+
+0
+
+100
+
+200
+300
+RL Training Steps
+
+(c) LVBench
+
+400
+
+(b) Video-MME
+Tomato Performance
+
+LVBench Performance
+
+(a) MVBench
+44
+43
+42
+41
+40
+39
+38
+
+200
+300
+RL Training Steps
+
+400
+
+w/ Regularization (EgoVITA)
+w/o Regularization
+Base Model (29.3)
+
+30.0
+29.5
+29.0
+28.5
+28.0
+0
+
+100
+
+200
+300
+RL Training Steps
+
+400
+
+(d) TOMATO
+
+Fig. 1: Ablation on Exocentric Regularization λexo . The plots show performance
+on four exocentric benchmarks (Qwen2.5-VL family). Training on egocentric data via
+SFT causes an initial performance drop, or catastrophic forgetting. Without regularization, this decline continues. EgoVITA’s exocentric regularization reverses this forgetting,
+recovering performance and ultimately improving upon the original base model.
+
+with training on a held-out exocentric dataset, reverses this trend. The model not
+only recovers from the initial SFT drop but ultimately improves upon the original
+base model’s performance. This confirms that our approach enables the model to
+specialize in egocentric reasoning while preserving and even enhancing its general
+exocentric understanding, tackling a key challenge in ego-exo knowledge transfer.
+RQ3: Does exocentric regularization help egocentric reasoning? Figure 2
+shows that moderate exocentric regularization (λexo =0.05) improves egocentric
+performance across all four benchmarks, peaking at 32.9 on EgoPlan and 51.9
+on EgoThink. This is because a small exocentric signal prevents the model from
+overfitting to the narrow egocentric training distribution, preserving the general
+visual reasoning capabilities that also benefit first-person understanding. However,
+stronger regularization (λexo ≥ 0.2) shifts the optimization toward exocentric
+objectives, diluting the egocentric reward signal and causing sharp performance
+drops. At λexo =0.5, performance approaches the GRPO baseline on most tasks,
+indicating that excessive regularization effectively neutralizes the dense reward
+training.
+RQ4: How does training different vision components affect egocentric
+reasoning? Table 2 shows that joint adaptation of all vision components is
+critical for strong performance. Training with a frozen vision pipeline yields the
+smallest gain (+2.4 on EgoBlind) as the visual features are static. Adapting
+only the projector improves alignment (+4.5), while adapting only the encoder
+yields a larger gain (+6.1) but can lead to conflicts between the encoder outputs
+and the downstream projector. The best performance (+7.7) is achieved by
+
+EgoBlind Performance
+
+38
+
+EgoVITA
+GRPO Base (35.6)
+Base Model (29.7)
+
+36
+34
+32
+30
+0
+
+0.01
+
+0.05
+
+0.1
+
+0.2
+
+EgoPlan Performance
+
+EgoVITA: Learning to Plan and Verify for Egocentric Video Reasoning
+
+0.5
+
+33.0
+32.5
+32.0
+31.5
+31.0
+30.5
+30.0
+
+EgoVITA
+GRPO Base (31.4)
+Base Model (30.2)
+
+0
+
+0.01
+
+0.05
+
+exo
+
+43.5
+43.0
+42.5
+42.0
+41.5
+0.1
+
+0.2
+
+0.5
+
+52
+EgoThink Performance
+
+EOC-Bench Performance
+
+44.0
+
+0.05
+
+0.2
+
+0.5
+
+(b) EgoPlan
+EgoVITA
+GRPO Base (42.2)
+Base Model (41.6)
+
+0.01
+
+0.1
+exo
+
+(a) EgoBlind
+
+0
+
+3
+
+EgoVITA
+GRPO Base (49.0)
+Base Model (48.2)
+
+51
+50
+49
+48
+
+0
+
+0.01
+
+0.05
+
+exo
+
+0.1
+
+0.2
+
+0.5
+
+exo
+
+(c) EOC-Bench
+
+(d) EgoThink
+
+Fig. 2: Effect of exocentric regularization strength λexo on egocentric benchmarks. Moderate regularization (λexo =0.05) yields peak egocentric performance across
+all four benchmarks, while stronger values degrade it.
+Table 2: Ablation on Trainable Vision Components. We analyze training the
+vision encoder (VE) and vision projector (MLP) with DoRA adapters. The LLM is
+always trained during GRPO.
+Components Trained
+Model
+
+VE MLP
+
+LLM
+
+Qwen2.5-VL-7B
+
+✗
+
+✗
+
+✗
+
+Frozen Vision Pipeline
+Adaptive Projector
+Adaptive Encoder
+EgoVITA (Full)
+
+✗
+✗
+✓
+✓
+
+✗
+✓
+✗
+✓
+
+✓
+✓
+✓
+✓
+
+Egocentric Benchmarks
+EgoBlind
+
+EgoPlan
+
+EgoThink
+
+29.7
+
+30.2
+
+48.2
+
+32.1 (+2.4) 30.8 (+0.6) 48.9 (+0.7)
+34.2 (+4.5) 31.5 (+1.3) 50.1 (+1.9)
+35.8 (+6.1) 32.1 (+1.9) 50.8 (+2.6)
+37.4 (+7.7) 32.9 (+2.7) 51.9 (+3.7)
+
+EOC-Bench
+41.6
+42.0 (+0.4)
+42.8 (+1.2)
+43.2 (+1.6)
+44.1 (+2.5)
+
+jointly training both encoder and projector (Full ), demonstrating that complete
+end-to-end visual adaptation is necessary for robust egocentric reasoning.
+RQ5: Sensitivity to Anticipation Window N . We analyze the sensitivity
+of RACMG to N , the number of future frames used for grounding, in Table 3.
+Performance is clearly sensitive to this hyperparameter. A small window, such
+as N = 4 or N = 8, yields lower gains. This is because the anticipation window
+is too myopic: a correct plan clause (e.g., “Grab the bottle”) may not have its
+corresponding visual outcome (the bottle being grabbed) appear within such a
+short temporal window, unfairly penalizing valid long-term plans. Conversely,
+a large window (N = 32) also degrades performance compared to our chosen
+value. RACMG relies on a max operation over the N future frames to find the
+best-aligned visual state. A window that is too large makes this signal noisy,
+increasing the risk of rewarding a spurious or coincidental visual match that is
+not causally linked to the <ego_plan> clause. Therefore, N = 16 represents an
+
+4
+
+Y. Kulkarni and P. Fazli
+Clause: "Walk alongside sidewalk to bus stop and locate the braille schedule"
+t+1
+Sim: 0.057
+
+Input Frame (t=0)
+
+BEST MATCH
+t+12
+Sim: 0.920
+
+t+11
+Sim: 0.900
+
+t+13
+Sim: 0.905
+
+ACMG Reward
+(Cosine Similarity)
+
+t+1
+
+1.0
+0.8
+0.6
+0.4
+0.2
+0.0
+
+t+3
+
+t+5
+
+t+7
+
+t+9
+
+t+11
+
+Future Frame Index
+
+t+13
+
+t+15
+
+t+17
+
+1.0
+0.5
+0.0
+
+t+19
+
+Cosine Similarity
+
+ACMG Similarity Over Time
+
+Peak at t+12
+
+Mean: 0.413
+
+0
+
+2
+
+4
+
+6
+
+8
+
+10
+
+Future Frame Index
+
+12
+
+14
+
+16
+
+18
+
+Fig. 3: RACMG Temporal Grounding for a Single Clause. Given the clause “Walk
+alongside sidewalk to bus stop and locate the braille schedule,” the Anticipation Head
+projects it into visual space and computes cosine similarity with future frames. The
+best match occurs at t + 12 (Sim: 0.920) when the braille sign appears. The heatmap
+and curve show similarity peaks at the temporally correct frame, demonstrating that
+RACMG rewards clauses that accurately predict future visual states.
+Table 3: Ablation on Anticipation Window (N ). We analyze the sensitivity of
+the ACMG reward to N , the number of future frames used for grounding. Results on
+Qwen2.5-VL-7B. N = 16 provides the best balance, as smaller windows are too myopic
+to capture delayed actions, while larger windows introduce noisy, spurious correlations.
+Egocentric Benchmarks
+N (Future Frames)
+Qwen2.5-VL-7B
+N = 4 (Too Myopic)
+N =8
+N = 16 (EgoVITA)
+N = 32 (Too Noisy)
+
+EgoBlind
+
+EgoPlan
+
+EgoThink
+
+29.7
+
+30.2
+
+48.2
+
+32.0 (+2.3) 31.0 (+0.8) 49.3 (+1.1)
+35.1 (+5.4) 32.1 (+1.9) 50.8 (+2.6)
+37.4 (+7.7) 32.9 (+2.7) 51.9 (+3.7)
+36.2 (+6.5) 32.5 (+2.3) 51.3 (+3.1)
+
+EOC-Bench
+41.6
+42.4 (+0.8)
+43.4 (+1.8)
+44.1 (+2.5)
+43.7 (+2.1)
+
+effective balance, providing a flexible enough window to handle temporal shifts
+in actions while remaining focused enough to reward precise, causal predictions.
+RQ6: How does RACMG reward vary across clause positions? We analyze
+500 <ego_plan> samples from EgoPlan [6], which naturally decompose into
+five semantic positions: (1) Move (approach), (2) Locate (target identification),
+(3) Action (perform task), (4) Verify (state confirmation), and (5) Complete
+(goal achievement). Clauses are tagged into the five action categories using
+GPT-4o [16]. These categories are not rigid but reflect a common semantic
+structure in procedural tasks. Figure 3 provides a detailed visualization of RACMG
+grounding for a single clause, while Figure 4 shows that RACMG provides positionsensitive grounding signals. Middle clauses (positions 2–3: corresponding to target
+localization and action execution) receive significantly higher RACMG rewards
+
+EgoVITA: Learning to Plan and Verify for Egocentric Video Reasoning
+
+ACMG Reward Distribution
+
+Move
+
+Locate
+
+Action
+
+Verify
+
+Complete
+
+=0.45
+
+=0.67
+
+=0.52
+
+=0.48
+
+=0.41
+
+1
+
+2
+
+3
+
+4
+
+5
+
+5
+
+1.0
+0.8
+0.6
+0.4
+Median
+Mean
+
+0.2
+0.0
+
+Clause Position in Plan
+
+Fig. 4: ACMG Reward Distribution by Clause Position. Box plots show ACMG
+reward distributions for the first five clauses in <ego_plan> sequences. Top labels
+indicate typical semantic roles at each position. Middle clauses (positions 2 − 3) achieve
+higher rewards and stronger correlation (ρ) with answer correctness, demonstrating
+that ACMG distinguishes between concrete action steps and abstract reasoning phases.
+
+Table 4: EgoVITA with Qwen3-VL as teacher.
+Egocentric Video Reasoning
+Variant
+Qwen2.5-VL
+SFT
+GRPO (Format + Answer)
+EgoVITA
+
+Ego-Exo-Bench
+31.7
+33.2
+33.8
+34.6 (+2.9)
+
+EgoBlind
+
+EgoPlan
+
+29.7
+30.2
+34.8
+31.3
+35.6
+31.4
+38.5 (+8.8) 33.2 (+3.0)
+
+Exocentric Video Understanding
+EOC-Bench
+
+MVBench
+
+Video-MME
+
+LVBench
+
+41.6
+41.8
+42.2
+45.4 (+3.8)
+
+65.2
+63.2
+66.4
+66.7 (+1.5)
+
+62.2
+60.1
+62.9
+64.8 (+2.6)
+
+42.8
+40.2
+40.9
+43.7 (+0.9)
+
+(mean = 0.68–0.71) and show stronger correlations with final answer correctness
+(ρ = 0.52–0.67) compared to navigation (position 1, ρ = 0.45) or completion
+steps (position 5, ρ = 0.41).
+This variation demonstrates that RACMG is adaptively selective, providing
+stronger grounding signals for visually concrete actions while appropriately moderating rewards for abstract planning phases. The correlation pattern validates
+that RACMG focuses on task-critical visual grounding, i.e., clauses with higher
+RACMG rewards are indeed more predictive of correct final answers, confirming
+that the reward mechanism aligns with meaningful task structure rather than
+providing noisy uniform feedback.
+RQ7: Is the framework sensitive to teacher model choice? Table 4
+demonstrates that EgoVITA’s gains are not dependent on a specific teacher
+model. When using Qwen3-VL-30B as the teacher instead of Qwen2.5-VL-72B,
+the framework achieves +8.8 on EgoBlind (compared to +7.7 with the original
+teacher), confirming that the improvements generalize across teacher models.
+Moreover, EgoVITA♢ in Table 1 of the main paper, which uses no external
+teacher, still outperforms the base Qwen3-VL-8B on all egocentric benchmarks.
+
+6
+
+Y. Kulkarni and P. Fazli
+
+Query: What approach to follow for post-meal kitchen
+cleanup?
+
+Query: What are the next steps the person followed in the
+baking process?
+
+Qwen2.5-VL-7B: Put all dishes directly into the dishwasher. The
+sink isn't needed for this process. The video shows the person
+putting dishes away in cabinets first. There's no need to check
+cleanliness since the dishwasher cleans everything.
+
+Qwen2.5-VL-7B: Add eggs to the flour first, then pour the leavening
+agent. The can contains baking powder that should be added last.
+The video shows the person using a whisk instead of a spoon.
+Immediately bake the mixture.
+
+<ego_plan> 1. Approach the sink area with used dishes 2. Check
+dishwasher space and cleaning tools 3. Wash and rinse all food
+residue from dishes 4. Confirm dishes are thoroughly clean
+before loading 5. Complete: Load all utensils and close
+dishwasher. </ego_plan>
+
+<ego_plan> 1. Position myself at the kitchen counter with the
+opened can 2. Find the appropriate measuring spoon from the
+drawer 3. Measure and add the required amount of powder to
+the flour 4. Confirm the correct quantity has been added to the
+mixture 5. Set aside the can and prepare for adding the next
+ingredient. </ego_plan>
+
+<exo_verify> Plan is consistent: Video shows movement to sink
+(frame 2), dishwasher space check (frame 5), active dish washing
+(frames 6-8), verification of clean dishes (frame 17), and
+completion with dishwasher loading (frames 19-21). Matches
+standard kitchen cleanup methodology for post-meal dish
+management. </exo_verify>
+<answer> Systematic post-meal cleanup with thorough washing
+of used dishes, verification of cleanliness, and proper dishwasher
+loading. </answer>
+
+<exo_verify> Plan is consistent: Video shows counter positioning
+with opened can (frame 2), drawer access to locate spoon (frame
+11), measuring and adding agent to flour (frames 15-19),
+verification of proper measurement (frame 18), and preparation
+for next step (frame 20). </exo_verify>
+<answer> Position at counter, locate measuring spoon, measure
+and add leavening agent, verify correct amount, and prepare for
+next ingredient addition. </answer>
+
+Fig. 5: EgoVITA Qualitative Examples.The baseline Qwen2.5-VL-7B [2] shows
+factual errors and temporal hallucinations (e.g., inventing “cabinet storage” steps or
+objects like “eggs” and “whisks”). In contrast, EgoVITA uses <ego_plan> to generate
+coherent action sequences and <exo_verify> to validate them against relevant video
+frames, producing visually grounded and temporally consistent responses.
+
+2
+
+Qualitative Examples
+
+We provide a direct comparison between EgoVITA and the Qwen2.5-VL-7B in
+Figure 5, illustrating how our two-stage architecture resolves common MLLM
+failure modes in egocentric reasoning.
+In the Kitchen Cleanup example (Left), the baseline fails to ground its reasoning in the visual evidence. It exhibits temporal hallucination by adding a “cabinet
+storage” step that never occurs and spatial misalignment by ignoring the actual
+sink washing process shown in the video. Consequently, it provides a plausible but
+incorrect recommendation to “skip checking cleanliness,” assuming the dishwasher
+does everything. EgoVITA, however, generates a grounded plan that prioritizes
+preconditions. The verification module explicitly cites the “active dish washing”
+in Frames 6-8 and the “dishwasher space check” in Frame 5, correcting the logic
+to ensure a systematic and visually consistent cleanup procedure.
+In the Baking Process example (Right), the baseline suffers from hallucinations,
+introducing factual errors (mentioning “eggs” not present in the scene) and
+spatial misalignment (claiming a “whisk” is used when the video clearly shows a
+spoon). It further fails in temporal reasoning by suggesting “immediate baking”
+without the necessary intermediate steps. EgoVITA avoids these pitfalls through
+its ACMG reward. By predicting the visual features of the next steps (e.g.,
+“Find the appropriate measuring spoon”), the model correctly identifies the finegrained spoon-flour interaction. The exocentric verification further confirms the
+
+EgoVITA: Learning to Plan and Verify for Egocentric Video Reasoning
+
+Query: What is the standard sterile procedure for preparing
+and observing the cell cultures shown?
+
+Query: What is the procedure for preparing the turkey
+sandwich shown?
+
+<ego_plan> 1. Retrieve dishes from incubator. 2. Sterilize
+reagents via ethanol and ﬂaming. 3. PipeOe media and swirl. 4.
+Transport to microscopy room. 5. Inspect under microscope.
+</ego_plan>
+
+<ego_plan> 1. Retrieve ingredients from fridge. 2. Prepare
+vegetables. 3. Layer meat and cheese on bread. 4. Add
+condiments and assemble. </ego_plan>
+
+<exo_verify The plan omits criQcal sterilizaQon steps like ﬂaming
+the boOle neck (00:58) and ethanol use (00:29). It also misses the
+swirling moQon (01:56) needed for even distribuQon. These
+omissions risk contaminaQon and uneven cell growth.
+</exo_verify>
+<answer> The procedure requires retrieving dishes, sterilizing
+reagents via ethanol and ﬂaming, adding media with swirling,
+and transporQng samples for microscopic inspecQon. </answer>
+
+7
+
+<exo_verify> Plan omits slicing tomatoes (01:15) and specific
+layering order (02:47). Visuals confirm mayo and ketchup
+application (04:02, 04:28) and recipe steps (00:36). </exo_verify>
+<answer> The person prepares a turkey sandwich by retrieving
+ingredients, slicing tomatoes, layering lettuce, turkey, and
+cheese, adding condiments, and assembling the sandwich.
+</answer>
+
+Fig. 6: Exocentric verification identifies flaws in egocentric plans. In both examples, <exo_verify> detects omitted steps and incorrect orderings in the <ego_plan>
+(e.g., missing sterilization steps in the lab procedure, missing slicing order in sandwich
+preparation). By reasoning from a third-person perspective, the model corrects these
+gaps, producing a more complete and grounded <answer> .
+
+“measuring” action at Frame 18, ensuring the response is strictly faithful to the
+observed video content.
+Figure 6 further demonstrates how the exocentric verification stage actively
+corrects the egocentric plan. In the cell culture example (Left), <exo_verify>
+identifies that the plan omits critical sterilization steps (flaming, ethanol use)
+and a swirling motion needed for even distribution, leading to a final answer
+that recovers these steps. In the sandwich example (Right), <exo_verify> flags
+missing slicing and layering details by cross-referencing specific timestamps,
+producing a more complete answer. These cases illustrate that the perspective
+transformation from ego to exo is not prompt role-play; it catches procedurally
+significant omissions that would otherwise propagate to the final response.
+
+3
+
+Failure Case and Rollout Analysis
+
+To analyze failure modes, we use Gemini-3.1-Flash to categorize 3,278 Qwen2.5VL training rollouts into six outcome types (Table 5). Types A and B correspond
+to successful cases, where the plan is either correct from the outset (56%) or
+corrected by <exo_verify> (15%). Type C captures cases where <exo_verify>
+confirms an incorrect plan (10%), while Type D represents failed correction
+attempts (6%). Types E and F isolate limitations of ACMG, where rewards are
+noisy due to outcomes falling beyond the N =16 window (10%) or biased by
+static scene features (3%). When <ego_plan> was incorrect (B+C+D, 993 cases),
+<exo_verify> rejected the plan in 69% of cases (B+D, 681) and confirmed it in
+only 31% (C, 312), indicating that the verifier generally corrects planner errors
+rather than merely rationalizing them. Figure 7 illustrates a combined Type
+
+8
+
+Y. Kulkarni and P. Fazli
+
+Query: What does the person do a-er applying ketchup
+to complete the sandwich?
+<ego_plan> 1. Place top bread slice. 2. Cut sandwich
+in halves. 3. Place it on the dish. 4. Clean up.
+</ego_plan>
+<exo_verify> Plan is consistent: bread placed
+(04:40); knives on plate (04:40); sink/counter ready
+for cleanup (04:50). </exo_verify>
+<answer> Top with bread, cut, plate, and clean up
+the kitchen. </answer>
+Fig. 7: Failure case. After the person exits, the sink remains visible within the N =16
+window. ACMG rewards the incorrect “cleanup” from persistent object co-occurrence.
+Maps to Types C+F in Table 5.
+Table 5: Rollout failure analysis. 3,278 rollouts tagged by Gemini-3.1-Flash.
+Type
+
+N
+
+%
+
+A. All correct
+B. Plan fixed by exo_verify
+C. Incorrect plan confirmed
+D. Fix attempted but failed
+
+1847
+487
+312
+194
+
+56
+15
+10
+6
+
+E. ACMG noisy (N =16 window)
+F. ACMG static feature bias
+
+341
+97
+
+10
+3
+
+C+F failure. After the person exits the scene, the sink remains visible within
+the N =16 temporal window, causing ACMG to reward the incorrect “cleanup”
+action based on persistent object co-occurrence. <exo_verify> then reinforces
+the error by confirming the same flawed reasoning.
+
+4
+
+Anticipation Head Architecture
+
+The Anticipation Head Table 6 is a lightweight, two-layer Multilayer Perceptron
+(MLP) designed to project the LLM’s hidden textual states into the shared
+visual embedding space. It consists of a down-projection linear layer, a GELU
+activation function, and a final linear layer that maps to the visual encoder’s
+output dimension. We apply Layer Normalization pre-activation to stabilize
+training. This simple design enables efficient cross-modal alignment without
+introducing significant computational overhead.
+
+EgoVITA: Learning to Plan and Verify for Egocentric Video Reasoning
+
+9
+
+Table 6: Anticipation Head Architecture. The MLP projects text embeddings
+(Dllm ) to the visual space (Dvis ).
+Stage
+
+Operation
+
+Output Shape
+
+Input
+–
+B × Dllm
+Layer 1
+Linear Projection B × Dhidden
+Activation
+GELU
+B × Dhidden
+Normalization LayerNorm
+B × Dhidden
+Layer 2
+Linear Projection B × Dvis
+
+5
+
+Prompt Templates
+
+To establish robust supervision for our two-stage RL framework, we generate
+high-quality training data using Qwen2.5-VL-72B [2]. For the egocentric planning
+stage, we utilize the prompt in Figure 8 to transform raw EgoProceL [3] temporal
+annotations into structured, step-by-step egocentric plans. Complementing this,
+the prompt in Figure 9 is applied to the HD-EPIC [33] dataset to generate
+third-person “exocentric verifications,” which teach the model to verify its plans
+against observable visual evidence.
+
+10
+
+Y. Kulkarni and P. Fazli
+
+Prompt for Egocentric Planning SFT Data Generation (EgoProceL)
+You are an expert in egocentric video understanding and procedural planning.
+You will be provided with a list of timestamped atomic actions annotated from a
+first-person video. Your task is to convert these raw annotations into a high-quality
+instruction-following training sample containing a query, options, and a grounded
+plan.
+Input Data: A list of timestamped actions (Start Time, End Time, Action
+Description).
+Your Task:
+1. Synthesize a User Query: Infer the overall goal of the video (e.g., “How do I
+make brownies?”) and formulate it as a question a user would ask for assistance.
+2. Generate Answer Options: Create 4 distinct multiple-choice options (A, B,
+C, D) that summarize the procedure:
+3. One Correct Option: An accurate summary of the sequential steps.
+4. Three Distractors: Plausible but incorrect summaries (e.g., incorrect order,
+missing critical steps, or describing a different but related task).
+5. Construct the Response: Generate the target output using the following
+strictly enforced format:
+6. <ego_plan>: A numbered, step-by-step plan. Each step must cite the specific
+timestamp interval from the input to ensure temporal grounding.
+7. : The final answer containing the correct option letter and its full text.
+Input Annotations: {50.48-54.7: break egg}, {64.19-76.3: mix eggs}, {87.13-91.1:
+add water}, ...
+Target Output Format:
+[User Query]: {Generated Query}
+[Options]: (A) {Option Text} (B) {Option Text} ...
+[Response]:
+<ego_plan>
+1. Break the egg into the bowl to start the batter (50.48 - 54.7).
+2. Mix the eggs thoroughly using a whisk (64.19 - 76.3).
+3. Add water to the mixture as specified (87.13 - 91.1). ...
+</ego_plan>
+<answer> (A) {Correct Option Text} </answer>
+
+Fig. 8: Prompt used to transform raw temporal annotations into structured SFT
+samples for egocentric planning. This prompts the teacher model (Qwen2.5-VL-72B) to
+generate a grounded <ego_plan> and a correct <answer> .
+
+EgoVITA: Learning to Plan and Verify for Egocentric Video Reasoning
+
+11
+
+Prompt for Exocentric Verification SFT Data Generation (HD-EPIC)
+You are an intelligent video reasoning assistant. You are provided with an egocentric
+video and a set of fine-grained, timestamped action annotations. Your goal is to
+synthesize a reasoning chain that not only plans the actions but also verifies them
+against visual evidence.
+Input Data:
+1. Video Context: An egocentric video clip.
+2. Annotations: A list of atomic actions with start/end timestamps (e.g., “13.7314.11: flip the bottom part of the coffee machine”).
+Your Task: Generate a structured output containing two distinct blocks:
+1. <ego_plan>: Convert the annotations into a coherent, first-person procedural
+plan. Merge closely related atomic actions into logical steps where appropriate.
+2. <exo_verify>: Act as an external auditor. For the plan you just generated,
+provide a visual verification rationale. Explicitly cite visual evidence (objects,
+hand-object interactions, and state changes) that confirms the plan is actually
+occurring in the video.
+Input Annotations: {14.2-14.55: Put mug under nozzle}, {14.81-15.08: Pick up
+coffee capsule}, {16.08-17.26: Slide capsule into gap}...
+Target Output Format:
+[User Query]: How do I prepare the coffee machine for brewing?
+[Response]:
+<ego_plan>
+1. Place the mug under the coffee machine nozzle (14.2 - 14.55).
+2. Pick up the coffee capsule from the left countertop (14.81 - 15.08).
+3. Insert the capsule into the machine’s slot (16.08 - 17.26). ...
+</ego_plan>
+<exo_verify>
+The plan is visually consistent. At 14.5s, the right hand is clearly
+visible placing the white mug under the spout. The interaction with
+the capsule is confirmed by the hand trajectory moving from the
+counter (14.9s) to the machine’s top slot (16.5s), followed by the
+lever being pulled down to lock it.
+</exo_verify>
+
+Fig. 9: Prompt used to generate exocentric verification data from HD-EPIC [33]
+annotations for third-person plan verification.
+
+

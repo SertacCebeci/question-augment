@@ -1,0 +1,3258 @@
+LYNX : Learning Dynamic Exits for
+Confidence-Controlled Reasoning
+Ömer Faruk Akgül*,1 , Yusuf Hakan Kalaycı*,1 ,
+Rajgopal Kannan2 , Willie Neiswanger1 , Viktor Prasanna1
+
+arXiv:2512.05325v1 [cs.CL] 5 Dec 2025
+
+1 University of Southern California, 2 DEVCOM ARL
+
+Abstract
+Large reasoning models achieve strong performance on complex tasks by generating extended chains of thought,
+but they often “overthink”: continuing to reason long after they internally have enough information to answer
+correctly. This wastes inference-time compute and can even hurt accuracy. Existing attempts to stop early either
+manipulate decoding with extra sampling and heuristics, rely on auxiliary verifier models, or operate only as
+post-hoc analysis pipelines without formal guarantees. We introduce LYNX, an online early-exit mechanism that
+turns a model’s own hidden-state awareness into confidence-controlled stopping decisions. LYNX attaches exit
+decisions to naturally occurring reasoning cues (e.g., “hmm”, “wait”) during generation, trains a lightweight
+probe on hidden states at those cue tokens using supervision from forced exits, and wraps the resulting scores in
+split conformal prediction to obtain distribution-free control over the rate of premature exits. Crucially, we train
+and calibrate this probe once on a generic mathematical corpus and then reuse it unchanged across benchmarks,
+decoding temperatures, and even non-mathematical tasks. Across three model families spanning 1.5B to 32B
+parameters (DeepSeek-R1-1.5B, QwQ-32B, and Llama-3.1-Nemotron-8B), a single mathematically trained probe
+per base model yields strong accuracy–efficiency tradeoffs. On GSM8K, LYNX matches or improves baseline
+accuracy while reducing tokens by 40–65%; on MATH-500 it improves accuracy by up to 12 points with roughly
+35–60% fewer tokens; on AIME 2024 it recovers baseline accuracy with more than 50% token savings; and
+on CommonsenseQA, a non-math benchmark, it transfers zero-shot with modest accuracy gains and up to
+70% fewer tokens. Compared to state-of-the-art early-exit methods, LYNX offers competitive or superior Pareto
+frontiers while remaining fully online, requiring no proxy models at inference, and providing explicit, user-tunable
+confidence guarantees. Code is available at https://github.com/farukakgul/LYNX.
+LYNX
+
+LYNX (optimal)
+
+DeepSeek-R1-1.5B
+MATH-500
+
+Efficiency gain
+QwQ-32B
+GSM8K
+
+100
+
+95.2
+
+94.8
+
+93.7
+
+92.7
+
+QwQ-32B
+MATH-500
+91.0
+
+90.4
+
+91.4
+
+90.8
+
+84.1
+
+Accuracy (%)
+
+80
+
+76.0
+
+78.5
+
+78.8
+
+78.7
+
+76.8
+
+74.6
+
+73.2
+3.3×
+
+76.2
+
+75.8
+
+4.5
+
+87.0
+79.8
+
+3.6×
+70.2
+
+68.0
+
+4.0
+3.5
+
+60.2
+
+3.0×
+
+60
+
+89.0
+
+3.0
+2.5×
+
+2.4×
+
+2.2×
+
+40
+
+1.9×
+1.7×
+
+1.5×
+
+1.4×
+
+20
+
+1.4×
+
+1.0×
+
+2.5
+2.0×
+
+1.8×
+
+1.0×
+
+1.0×
+
+1.2×
+
+1.3×
+
+1.5×
+1.0×
+
+1.2×
+
+1.3×
+
+1.4×
+
+2.0
+
+1.6×
+
+Efficiency Gain
+
+Baseline
+DeepSeek-R1-1.5B
+GSM8K
+
+1.5
+1.0
+
+0
+se
+
+e
+lin
+
+Ba
+
+7
+0.9
+
+5
+0.9
+
+0
+0.9
+
+0
+0.8
+
+0
+0.7
+
+se
+Ba
+
+e
+lin
+
+7
+0.9
+
+5
+0.9
+
+0
+0.9
+
+0
+0.8
+
+0
+0.7
+
+se
+
+e
+lin
+
+Ba
+
+7
+0.9
+
+5
+0.9
+
+0
+0.9
+
+0
+0.8
+
+0
+0.7
+
+Ba
+
+se
+
+e
+lin
+
+7
+0.9
+
+5
+0.9
+
+0
+0.9
+
+0
+0.8
+
+0
+0.7
+
+Confidence Level (1 − α)
+
+Figure 1: Accuracy–efficiency tradeoffs under LYNX: a single confidence parameter smoothly moves the
+model from baseline-level accuracy to substantially more efficient generations (1.5–3.3×).
+Corresponding author: Ömer Faruk Akgül akgul@usc.edu. *Equal contribution.
+
+LYNX : Learning Dynamic Exits for Confidence-Controlled Reasoning
+
+1. Introduction
+Reasoning-oriented large language models (LLMs) have recently achieved breakthrough performance on
+mathematical problem solving, logical puzzles, and competitive programming by generating long, explicit
+chains of thought (Wei et al., 2022, OpenAI, 2024). Models such as OpenAI’s o1 (OpenAI, 2024), DeepSeekR1 (Guo et al., 2025), Google DeepMind’s Gemini 2.5 (Google DeepMind, 2025), and Anthropic’s Claude
+3.7 Sonnet (Anthropic, 2025) routinely emit hundreds or thousands of tokens per problem, exploring and
+revising candidate solution paths before committing to a final answer. This test-time “thinking” is a major
+source of their strength, but it also raises a central question: how can we allocate this inference-time compute
+more intelligently, stopping early when further reasoning is unlikely to help?
+Recent empirical studies reveal that large reasoning models frequently exhibit three critical failure modes during extended chain-of-thought generation (Su et al., 2025). First, models often arrive at correct intermediate
+solutions but continue reasoning and talk themselves into incorrect final answers, a form of counterproductive
+overthinking. Second, even when maintaining correctness, models generate extensive redundant reasoning
+that provides no additional value, wasting computational resources without improving accuracy. Third, some
+problems trigger unbounded reasoning loops that exhaust the model’s context window before producing any
+answer, leading to complete failure. These observations suggest that intelligent early-exit mechanisms are
+not merely an efficiency optimization but a fundamental requirement for reliable deployment of reasoning
+models.
+In this paper we ask: Can we turn a model’s internal confidence signals into an online, cue-triggered early-exit
+rule with explicit statistical guarantees? We answer this in the affirmative with LYNX, a framework that enables
+reasoning models to leverage their own hidden-state awareness for confidence-controlled stopping decisions.
+Unlike existing approaches that manipulate decoding or rely on external verifier models, LYNX operates
+along three key axes:
+1. Cue-triggered exits. Reasoning models naturally emit structural cues during their thinking process,
+tokens like “hmm”, “wait”, “alternatively”, or paragraph breaks that mark transitions between reasoning
+segments. Rather than suppressing these cues, we treat them as decision points: whenever a cue appears,
+we consider stopping.
+2. Self-contained supervision. Instead of relying on a proxy LLM to extract and grade intermediate
+answers, we generate training labels by forcing exits at cue positions during data collection: we cut
+the chain of thought, prompt the base model to output its final answer, and compare against the
+ground-truth label. This yields a large set of cue-level examples where each hidden state is labeled as
+“safe to exit now” or “continue thinking”, using only the base model and task answers.
+3. Conformal confidence control. A fixed probe threshold is brittle across datasets and decoding settings.
+We therefore wrap probe scores in split conformal prediction (Vovk et al., 2005, Shafer and Vovk, 2008,
+Angelopoulos and Bates, 2021), turning them into an adaptive stop/continue rule with a user-chosen
+miscoverage level. This yields a distribution-free guarantee on the rate of premature exits under mild
+exchangeability assumptions.
+A central design goal of LYNX is deployability. Training a new probe and retuning thresholds for every benchmark would undermine the goal of efficient inference. Instead, for each base model, we train and calibrate
+LYNX once on a generic mathematical corpus and then freeze it. In our experiments, we instantiate LYNX
+on modern open-source reasoning models from three distinct families, including Qwen-based architectures
+(DeepSeek-R1-Distill-Qwen-1.5B, QwQ-32B) and Llama-based architectures (Llama-3.1-Nemotron-8B), using
+a moderate number of problems from a mathematical training corpus to (i) collect cue-triggered forced-exit
+2
+
+LYNX : Learning Dynamic Exits for Confidence-Controlled Reasoning
+
+labels and (ii) calibrate conformal thresholds. The resulting probe and thresholds are then applied unchanged
+across four math benchmarks and a non-math benchmark, demonstrating strong generalization across model
+scales (1.5B to 32B parameters), architectural families, task domains, and decoding temperatures.
+Our experiments show that this simple, reusable early-exit head yields strong accuracy–efficiency tradeoffs.
+On GSM8K, LYNX matches or improves baseline accuracy while reducing tokens by up to 60–65% across
+different models; on MATH-500, it improves accuracy by up to 12 points with approximately 35–60% fewer
+tokens; on AIME 2024, it recovers baseline accuracy with more than half the tokens removed; and on
+CommonsenseQA it transfers zero-shot with modest accuracy gains and substantial token savings. When
+compared to state-of-the-art early-exit methods under matched settings, LYNX consistently provides more
+favorable Pareto frontiers, while remaining fully online and providing explicit confidence guarantees.
+In summary, this paper makes the following contributions:
+1. We introduce LYNX , a novel online early-exit framework that combines cue-triggered decision points,
+self-contained probe training via forced exits, and conformalized confidence control to enable reasoning
+models to make statistically-guaranteed stopping decisions based on their own hidden states, without
+modifying decoding, injecting tokens, or requiring external verifiers.
+2. We demonstrate cross-architecture generalizability across three model families (Qwen and Llama),
+model scales (1.5B to 32B parameters), and task domains (mathematical and commonsense reasoning),
+showing that a single mathematically-trained probe per base model transfers effectively without per-task
+retraining.
+3. We establish superior accuracy–efficiency tradeoffs compared to state-of-the-art methods, with
+experiments showing LYNX matches or improves baseline accuracy while achieving 35–65% token
+reductions, and provide the first deployment-ready early-exit method with explicit, user-tunable
+confidence guarantees via conformal prediction.
+
+2. Related Work
+We situate LYNX within three complementary research areas: probing neural representations, inference-time
+optimization for reasoning, and conformal prediction for reliable decisions.
+Probing internal representations for verification. Probing uses simple classifiers trained on hidden states
+to extract information that models encode internally but may not explicitly output (Alain and Bengio, 2016,
+Hewitt and Liang, 2019). Zhang et al. demonstrate that reasoning models encode rich signals about solution
+correctness in their hidden states: a lightweight probe on activations at intermediate “final answer” tokens
+can predict answer correctness with strong calibration on mathematical benchmarks (Zhang et al., 2025).
+Related work on latent knowledge shows that hidden states contain information about truth and uncertainty
+even when not directly expressed in outputs (Burns et al., 2023). However, these verification pipelines are
+fundamentally post-hoc, requiring full trace generation, answer extraction using auxiliary models, offline
+labeling, and post-processing. LYNX bridges this gap by using probes online during generation: we train
+on hidden states at naturally occurring cues using self-contained supervision from forced exits, enabling
+confidence-controlled stopping decisions without external labeling.
+Inference-time optimization for efficient reasoning. Large reasoning models frequently overthink,
+generating unnecessarily long chains of thought that waste compute and sometimes hurt accuracy (Zhang
+et al., 2025, Yang et al., 2025, Jiang et al., 2025, Yong et al., 2025, Tan et al., 2025, Wang et al., 2025, Su
+et al., 2025). DEER (Yang et al., 2025) detects action-transition tokens as exit points, elicits trial answers,
+3
+
+LYNX : Learning Dynamic Exits for Confidence-Controlled Reasoning
+
+LYNX 
+DEER (Yang et al., 2025)
+Dynasor-CoT (Fu et al., 2025)
+NoWait (Wang et al., 2025)
+FlashThink (Jiang et al., 2025)
+Think-or-Not (Yong et al., 2025)
+Zhang et al. (Zhang et al., 2025)
+
+✓
+✓
+✓
+✓
+✓
+✓
+✗
+
+✓
+✓
+✓
+✓
+✗
+✓
+✗
+
+✓
+✗
+✗
+✗
+✗
+✗
+✗
+
+en
+ch
+
+.
+
+re
+d
+
+✓
+✓
+✓
+✗
+✗
+✗
+✗
+
+M
+
+ul
+
+tib
+
+ge
+tri
+g
+
+at
+.g
+St
+
+✓
+✓
+✗
+✓
+✗
+✗
+✗
+
+Cu
+e-
+
+ua
+ra
+nt
+ee
+
+da
+ta
+ai
+ne
+d
+Se
+
+lfco
+nt
+
+xy
+pr
+o
+No
+
+Method
+
+On
+lin
+e
+
+/i
+
+nlo
+
+LL
+M
+
+op
+
+(in
+f.)
+
+Table 1: Qualitative comparison of recent efficient-reasoning methods. “Online” indicates whether the
+method can decide to stop during generation; “No proxy LLM” whether inference uses only the base model;
+“Self-contained data” whether training labels can be obtained without external labelers; “Stat. guarantee”
+whether the method provides a distribution-free guarantee on early exit decisions; “Cue-triggered” whether
+the method attaches decisions to naturally occurring reasoning cues; and “Multi-bench.” whether a single
+configuration is reused across multiple benchmarks without per-task tuning.
+
+✓
+✗
+✓
+✓
+✓
+✗
+✗
+
+and uses entropy-based confidence scores over token probabilities to decide whether to stop. Think-or-Not
+(Yong et al., 2025) frames reasoning length as mode selection, using tree search over candidate continuations
+to estimate confidence. However, its efficiency gains can be misleading, as it performs speculative sampling
+during generation but reports only visible output tokens, hiding substantial inference costs. Other approaches
+include FlashThink (Jiang et al., 2025), which queries external verifiers on partial reasoning; NoWait (Wang
+et al., 2025), which suppresses self-reflection tokens; Dynasor-CoT (Fu et al., 2025), which monitors internal
+uncertainty signals; and Zero-Step Thinking (Tan et al., 2025), which routes between reasoning modes.
+While these methods achieve token savings, they typically manipulate generation through extra prompting,
+verifier queries, or speculative sampling; rely on hand-tuned thresholds requiring recalibration across models
+and temperatures; and provide no formal statistical control over incorrect early exits. By contrast, LYNX
+leaves decoding unchanged, operates solely on hidden states at natural cues, requires no auxiliary models at
+inference, and provides distribution-free guarantees via conformalized probe scores.
+Conformal prediction for reliable decisions. Conformal prediction provides finite-sample, distributionfree guarantees on prediction error, requiring only that test examples are exchangeable with a held-out
+calibration set (Vovk et al., 2005, Shafer and Vovk, 2008, Angelopoulos and Bates, 2021). Recent work applies
+conformal methods to language models: Quach et al. construct prediction sets over token sequences with
+coverage guarantees (Quach et al., 2023); and Savcisens et al. uses conformal probes to analyze the trilemma
+between accuracy, informativeness, and guaranteed coverage in LLM outputs (Savcisens and Eliassi-Rad,
+2025). In the standard setting, given a base predictor f , calibration set {( xi , yi )}in=1 , and nonconformity
+score S( x, y), one computes the empirical (1 − δ)-quantile q1−δ of calibration scores to form prediction sets
+C( xtest ) = {y : S( xtest , y) ≤ q1−δ } that satisfy Pr[ytest ∈ C( xtest )] ≥ 1 − δ. LYNX applies this framework
+to probe scores estimating whether a partial chain of thought is sufficient to answer correctly, yielding a
+conformalized threshold that implements a stop/continue rule with user-chosen confidence level c = 1 − δ
+and an explicit guarantee on incorrect early exits. To our knowledge, LYNX is the first early-exit method for
+reasoning models to provide such distribution-free statistical guarantees.
+
+4
+
+LYNX : Learning Dynamic Exits for Confidence-Controlled Reasoning
+
+Question: In a table tennis tournament every participant played every other participant exactly once. Although there were twice
+as many right-handed players as left-handed players, the number of games won by left-handed players was 40% more than the
+number of games won by right-handed players. What is the total number of games played?
+
+<think> T1
+
+CoT:
+
+T2
+
+Hmm
+
+Wait
+
+</think> \boxed{24}.
+
+Forced Exits
+hl1 (e)
+hl2 (e)
+hl3 (e)
+
+T3
+
+…
+
+</think> \boxed{36}.
+
+Hmm
+
+Tn
+
+</think> Final Answer: \boxed{36}
+
+</think> \boxed{36}.
+
+y1 = 0
+
+y2 = 1
+
+yn = 1
+
+x1(e)
+
+x2(e)
+
+xn(e)
+
+Probe Training
+
+Dtrain
+
+LLM Internal States
+
+Conformal Prediction
+Calibration (at 1-α)
+
+Dcalib
+
+Test Time Question: There are some lions in Londolozi at first. Lion cubs are born at the rate of 5 per month and lions die at the
+rate of 1 per month. If there are 148 lions in Londolozi after 1 year, how many lions were there in Londolozi at first?
+
+CoT:
+
+<think> T1
+
+Exit Decision by
+Conformal Probes
+
+Wait
+
+T2
+
+</think> \boxed{75}.
+
+Hmm
+
+T3
+
+</think> \boxed{100}.
+
+Hmm
+
+… Tn
+
+</think> Final Answer \boxed{100}
+
+</think> \boxed{100}.
+
+Compute saved by LYNX🐱!
+
+Figure 2: LYNX pipeline: (Offline) We collect forced-exit labels at naturally occurring cue tokens from
+mathematical problems, train a lightweight probe on hidden states at these cues, and calibrate conformal
+thresholds using a held-out set. (Online) During generation, whenever a cue appears, the probe scores its
+hidden state and a conformalized threshold decides whether to exit early or continue reasoning.
+
+3. Method
+Having established that (i) reasoning models encode internal correctness signals in hidden states, (ii) existing
+early-exit methods lack statistical guarantees and require per-task tuning, and (iii) conformal prediction
+can provide distribution-free control over prediction errors, we now describe how LYNX combines these
+insights into a practical early-exit framework. The key challenge is to transform post-hoc probing pipelines
+into an online decision mechanism with explicit confidence guarantees that generalizes across tasks without
+retraining.
+LYNX operates in two stages (Figure 2). Offline, we generate chains-of-thought on a mathematical corpus,
+identify natural cue tokens, construct forced exits at each cue to obtain supervision, and train a probe with
+conformal calibration on hidden states. Online, we run the base model unchanged; whenever a cue appears,
+the probe scores its hidden state, and a conformalized threshold decides whether to exit or continue. We
+formalize each component below, and provide a consolidated pseudo-code description in Algorithm 1 in
+Appendix A.
+
+5
+
+LYNX : Learning Dynamic Exits for Confidence-Controlled Reasoning
+
+3.1. Reasoning model and cue tokens
+Let x be a problem and let the autoregressive LLM f θ generate a sequence of tokens
+
+( x, t1 , t2 , . . . , tT ) = f θ ( x ),
+
+(1)
+
+with an explicit “thinking” segment typically delimited by special tokens such as <think> and </think>.
+For each position j, we denote by hℓ ( j) ∈ Rd the hidden state of layer ℓ at token t j . We write L for the total
+number of layers.
+Reasoning models like DeepSeek-R1 often emit self-reflective tokens, “hmm”, “wait”, sentence breaks, etc.,
+that mark transitions between reasoning segments (e.g., switching from exploration to verification, or revising
+a previous plan). We treat these as natural decision points and define a small set of cue token types
+
+S = {“hmm”, “wait”, “alternatively”},
+
+(2)
+
+and for a given trace we collect all positions
+E( x ) = {e ∈ {1, . . . , T } : te ∈ S}.
+
+(3)
+
+These cue positions are the only places where LYNX considers early exit. Between cues, generation proceeds
+exactly as in standard CoT decoding.
+3.2. Supervision via forced exits
+We assume a supervised training corpus Dtrain = {( xi , ai⋆ )}iN=1 , where ai⋆ is the gold answer for problem
+xi . For each ( xi , ai⋆ ), we perform a single long CoT rollout with the base model under a fixed decoding
+L . We
+configuration (temperature, max length, etc.), obtaining tokens {ti,j } Tj=i 1 and hidden states {hi,ℓ ( j)}ℓ=
+1
+then extract all cue positions Ei = {e ∈ {1, . . . , Ti } : ti,e ∈ S}.
+For every cue e ∈ Ei , we construct a counterfactual forced exit. Let prefi (e) denote the prompt consisting of
+xi and the generated tokens up to (but not including) ti,e . We append the model’s native answer cue (e.g.,
+</think> Final Answer: \boxed{) and let the base model generate a short answer-only continuation:
+âi (e) = Exitθ ( xi , e).
+We parse this continuation into a normalized answer parse( âi (e)) using the same rule-based extractor as in
+evaluation, and define a binary label
+[︀
+]︀
+yi (e) = 1 parse( âi (e)) = ai⋆ ∈ {0, 1}.
+(4)
+{︀
+}︀
+This procedure yields a dataset of cue-level examples Dcue = ( xi , e, yi (e)) : 1 ≤ i ≤ N, e ∈ Ei , where each
+example answers: “If we had exited at this cue, would the resulting answer have been correct?” Crucially,
+labels are obtained using only the base model and task answers; no external LLM or human annotation is
+required.
+We partition Dcue into a probe-training subset Dprobe and a calibration subset Dcal , which will be used for
+conformal threshold estimation.
+
+6
+
+LYNX : Learning Dynamic Exits for Confidence-Controlled Reasoning
+
+3.3. Probe representation and training
+At each cue ( xi , e) we turn the corresponding hidden states into a fixed-dimensional representation. Let
+hi,ℓ (e) ∈ Rd denote the hidden state at token ti,e in layer ℓ. Rather than relying on a single layer, we aggregate
+information from a small set of layers Lsel = {ℓ1 , ℓ2 , L} (two middle layers and the final layer), and define
+[︀
+]︀
+′
+zi (e) = hi,ℓ1 (e) ∥ hi,ℓ2 (e) ∥ hi,L (e) ∈ Rd ,
+(5)
+where ∥ denotes concatenation. Recent empirical studies have shown that different layers of LLMs encode
+reasoning patterns at varying levels of granularity, ranging from local token-level relationships to task-specific
+predictions. (Jawahar et al., 2019, Van Aken et al., 2019).
+′
+
+We then train a small multilayer perceptron (MLP) probe gψ : Rd → [0, 1] to estimate the probability that
+an early exit at this cue would be correct:
+⃒
+(︀
+)︀
+(︀
+)︀
+pi (e) = gψ zi (e) ≈ Pr yi (e) = 1 ⃒ zi (e) .
+(6)
+Concretely, gψ is a two-layer MLP with ReLU activations and a sigmoid output:
+(︀
+)︀
+ui (e) = ReLU W1 zi (e) + b1 ,
+(︀
+)︀
+pi (e) = σ W2 ui (e) + b2 ,
+
+(7)
+(8)
+
+with parameters ψ = (W1 , b1 , W2 , b2 ).
+Since cue-level labels are typically imbalanced, especially for the smaller models, (most forced exits early in
+reasoning are not yet safe), we use class-imbalance-aware binary cross-entropy. Let Dprobe = {(zk , yk )}nk=1
+be the probe-training set, with n1 positive and n0 negative examples. We define class weights w1 = 2nn 1 ,
+w0 = 2nn 0 , and train gψ by minimizing
+n
+)︁
+1 ∑︁ (︁
+w1 yk log pk + w0 (1 − yk ) log(1 − pk ) ,
+L(ψ) = −
+n
+
+(9)
+
+k =1
+
+where pk = gψ (zk ).
+3.4. Conformalized early-exit rule
+The probe gψ produces a scalar confidence score pi (e) ∈ [0, 1] for each cue, but how should we convert this
+into an exit decision? A fixed threshold (e.g., “exit if p ≥ 0.9”) is brittle across datasets and temperatures.
+Instead, we apply split conformal prediction (§2) to obtain a data-driven threshold with explicit statistical
+guarantees.
+User-specified confidence and threshold calibration. The user selects a target confidence level c ∈ (0, 1),
+which controls the tradeoff between efficiency and reliability: higher c means more conservative exits (fewer
+tokens saved, lower error rate), while lower c means more aggressive exits (more tokens saved, higher error
+rate). We set the miscoverage level δ = 1 − c and calibrate a threshold qδ as follows.
+From the calibration subset Dcal = {(z j , y j )}m
+j=1 , we compute nonconformity scores for correctly answered
+cues (y j = 1):
+s j = 1 − gψ (z j ) for all j with y j = 1.
+(10)
+7
+
+LYNX : Learning Dynamic Exits for Confidence-Controlled Reasoning
+
+Intuitively, s j is small when the probe is confident that exiting at this cue is safe. We then set
+(︀
+)︀
+qδ = Quantile {s j : y j = 1}, 1 − δ ,
+
+(11)
+
+the (1 − δ)-quantile of these scores.
+Inference-time policy. At test time, we generate CoT as usual. Whenever the model emits a cue token
+at position e for input x, we compute z( x, e) and p( x, e) = gψ (z( x, e)). We then apply the conformalized
+decision rule:
+Exit at cue e iff 1 − p( x, e) ≤ qδ .
+(12)
+If the condition fails, we continue decoding until the next cue or the natural end of the CoT.
+Statistical guarantee and practical considerations. Under the standard exchangeability assumption,
+that test examples are drawn from the same distribution as calibration data (Vovk et al., 2005, Shafer and
+Vovk, 2008), this split-conformal construction controls the fraction of incorrect early exits at approximately
+δ. Formally, if ( xtest , etest ) is exchangeable with Dcal and we exit at etest , then Pr[y(etest ) = 1] ≥ 1 − δ
+(Angelopoulos and Bates, 2021).
+In practice, strict exchangeability would require calibrating on a held-out portion of each test benchmark.
+However, standard reasoning benchmarks (AIME, AMC etc.) do not provide separate calibration splits, and
+creating such splits would reduce the number of available test examples. Instead, we calibrate LYNX once
+on a generic mathematical corpus and reuse the resulting thresholds across all downstream benchmarks.
+This design choice prioritizes deployability, enabling zero-shot transfer without per-task tuning, at the
+potential cost of some miscalibration under domain shift. Our experiments (§4) show that this single
+mathematically-trained probe generalizes effectively across multiple math benchmarks and even to nonmathematical commonsense reasoning tasks, suggesting that the probe learns domain-general signals of
+reasoning sufficiency rather than task-specific patterns. For applications requiring stricter guarantees,
+practitioners can recalibrate thresholds on a small held-out subset of their target distribution.
+For each base model and decoding temperature, we precompute thresholds for a grid of confidence levels
+(e.g., c ∈ {0.97, 0.95, 0.90, 0.80, 0.70}) during the offline calibration stage, allowing users to select their
+preferred accuracy-efficiency operating point at deployment time without additional computation.
+
+4. Experiments
+Having established LYNX’s theoretical framework, we now empirically show how our framework preserves
+reasoning accuracy while substantially reducing inference cost, with behavior that generalizes across model
+families, architectures, scales, and tasks.
+4.1. Experimental setup
+Models and LYNX instantiation. We evaluate LYNX on three open-source reasoning models spanning two architectural families and an order of magnitude in scale: DeepSeek-R1-Distill-Qwen-1.5B (DeepSeek-AI,
+2025), QwQ-32B (Team, 2025) (both Qwen-based), and Llama-3.1-Nemotron-Nano-8B-v1 (Bercovich
+et al., 2025) (Llama-based). All three models emit explicit <think> blocks and natural reasoning cues
+(“hmm”, “wait”, “alternatively”), making them suitable for cue-triggered early exit.
+8
+
+LYNX : Learning Dynamic Exits for Confidence-Controlled Reasoning
+
+For each base model, we instantiate a single LYNX head by training a probe and calibrating conformal
+thresholds on Hendrycks MATH (Hendrycks et al., 2021) at temperature T = 0.6, following the procedure in
+§3. Critically, this same probe is then deployed unchanged at both T = 0.6 and T = 0.0 across all evaluation
+benchmarks, testing LYNX’s robustness to decoding temperature shifts without retraining.
+Training and calibration data. We use Hendrycks MATH (Hendrycks et al., 2021), a challenging mathematical reasoning dataset with seven subject categories (Algebra, Counting & Probability, Geometry, Intermediate
+Algebra, Number Theory, Prealgebra, Precalculus) and five difficulty levels. For the DeepSeek-1.5B model,
+we draw 400 training and 200 calibration problems per category (2,800 train, 1,400 calibration total);
+for QwQ-32B and Nemotron-8B, we use 200 train and 100 calibration per category to balance compute
+constraints. On each problem we generate a single long CoT rollout at T = 0.6, extract cue positions,
+construct forced-exit labels as in §3.2, and split into probe-training (Dprobe ) and calibration (Dcal ) sets.
+Implementation details (probe architecture, optimization, hardware) are in Appendix B.
+
+Evaluation benchmarks.
+
+We evaluate on five benchmarks:
+
+• GSM8K (Cobbe et al., 2021): Grade-school math word problems (1,319 test examples).
+• MATH-500 (Lightman et al., 2023): 500-problem subset of competition mathematics.
+• AMC 2023 (amc): American Mathematics Competition problems (40 problems).
+• AIME 2024 (aim): American Invitational Mathematics Examination (30 problems).
+• CommonsenseQA: Non-mathematical multiple-choice commonsense reasoning.
+For mathematical tasks we use standard CoT prompting (“reason step by step, put the final answer in
+
+\boxed{}”) and parse numeric answers with task-specific normalization. For CommonsenseQA we use
+CoT-augmented multiple-choice prompts. We evaluate at two temperatures: T = 0.0 (deterministic, main
+results) and T = 0.6 (stochastic, Appendix C).
+
+Metrics. We report pass@1 accuracy (math) or multiple-choice accuracy (CommonsenseQA) and average generated tokens per example, including all thinking and answer tokens. Efficiency is quantified as:
+−Tokensbaseline
+∆Tokens = Tokensmethod
+. We sweep LYNX’s confidence parameter c ∈ {0.97, 0.95, 0.90, 0.80, 0.70}
+Tokensbaseline
+to trace accuracy–efficiency curves.
+4.2. Baselines and cost accounting
+We compare LYNX against DEER (Yang et al., 2025) and Think-or-Not (ToN) (Yong et al., 2025), the current
+state-of-the-art early-exit methods for reasoning models, chosen for their strong reported performance and
+public availability. DEER uses entropy-based confidence scores over token probabilities at action-transition
+tokens to decide whether to stop. ToN performs tree-search over candidate continuations, using token-level
+entropies to select between long and short reasoning modes. Both methods require hand-tuned thresholds per
+model and temperature, whereas LYNX provides a single confidence knob c with formal coverage guarantees.
+Cost accounting. For all methods we count total generated tokens by the base model, including any
+speculative branches or trial answers that do not appear in the final output. For LYNX and DEER this
+coincides with visible tokens, as our policy never induces extra generations. For ToN we include all internal
+9
+
+LYNX : Learning Dynamic Exits for Confidence-Controlled Reasoning
+
+Δ Accuracy vs. Baseline (\%)
+
+DeepSeek-R1-1.5B
+GSM8K
+5.0
+2.5
+
+c=0.95
+
+DeepSeek-R1-1.5B
+MATH-500
+
+c=0.97
+
+Baseline
+
+0
+
+−2.5
+
+c=0.80
+
+DEER
+
+−10.0
+
+1.0
+
+1.5
+
+2.0
+
+2.5
+
+3.0
+
+3.5
+
+−25
+
+c=0.70
+
+ToN
+
+1.0
+
+1.5
+
+2.0
+
+−17.5
+
+3.0
+
+3.5
+
+4.0
+
+−20.0
+
+ToN
+
+−17.5
+2.5
+
+c=0.70
+
+−12.5
+−15.0
+
+−15.0
+
+−20
+
+(higher speed-up,
+smaller accuracy drop)
+
+−7.5
+
+−12.5
+
+LYNX labels: c = confidence level
+
+c=0.80
+
+−10.0
+
+−10.0
+
+−15
+
+DEER
+ToN
+
+c=0.90
+
+−5.0
+
+−7.5
+c=0.70
+
+c=0.97
+
+DEER
+
+−2.5
+
+−5.0
+
+−10
+
+−7.5
+
+DEER
+c=0.80
+
+Baseline
+
+−5
+
+−5.0
+
+c=0.97
+
+Baseline
+c=0.95
+
+0.0
+
+c=0.95
+c=0.90
+
+c=0.97
+
+5
+c=0.70
+
+−2.5
+
+−15.0
+
+0.0
+
+10
+c=0.80
+
+QwQ-32B
+MATH-500
+
+Baseline
+
+c=0.95c=0.90
+c=0.90
+
+0.0
+
+−12.5
+
+QwQ-32B
+GSM8K
+
+1.0
+
+1.2
+
+1.4
+
+1.6
+
+1.8
+
+2.0
+
+2.2
+
+2.4
+
+ToN
+
+1.0
+
+1.2
+
+1.4
+
+1.6
+
+1.8
+
+2.0
+
+Speed-up (Efficiency Gain)
+
+Figure 3: Accuracy–efficiency Pareto frontiers for LYNX compared to DEER and Think-or-Not (ToN). Each
+panel plots speed-up (baseline tokens divided by method tokens) on the x-axis and change in accuracy vs.
+baseline (percentage points) on the y-axis. Across all settings, LYNX forms competitive or superior frontiers,
+with DEER slightly ahead only on QwQ-32B GSM8K.
+sampling costs. This provides a realistic proxy for inference cost. We use authors’ public implementations
+with matched prompts, decoding settings, and maximum CoT length (13,000 tokens). All methods are
+evaluated on the same hardware (Appendix B).
+
+5. Results
+We now demonstrate that LYNX achieves superior accuracy–efficiency tradeoffs compared to state-of-the-art
+baselines while providing interpretable, statistically-grounded control over early exits. Our analysis addresses
+three questions: (i) Does LYNX form better Pareto frontiers than DEER and ToN? (ii) Does the confidence
+knob c behave predictably across datasets, models, and temperatures? (iii) How do different model families
+and decoding settings affect early-exit performance?
+5.1. Main results
+Table 2 summarizes accuracy–efficiency tradeoffs at T = 0.0 for DeepSeek-R1-1.5B and QwQ-32B across
+all five benchmarks. For each dataset we report vanilla CoT (Baseline), DEER, ToN, and LYNX at multiple
+confidence levels c. Boldface configurations indicate recommended operating points that balance accuracy
+preservation with token efficiency: specifically, we highlight (i) the highest-performing baseline method per
+dataset, and (ii) for LYNX, the configuration that maximizes token savings while maintaining accuracy within
+2 percentage points of baseline, a conservative threshold demonstrating that substantial efficiency gains are
+achievable without sacrificing correctness. These highlighted points serve as interpretable defaults, though
+users can select any c along LYNX’s Pareto frontier depending on their accuracy-vs-efficiency priorities.
+Accuracy–efficiency dominance. Across GSM8K, MATH-500, and CommonsenseQA, LYNX consistently
+traces better Pareto frontiers than both baselines. On GSM8K with DeepSeek-1.5B, LYNX at c = 0.80 improves
+accuracy over baseline (76.80% vs 75.97%, +1.09pp) while reducing tokens by 66.2%. On MATH-500,
+c = 0.80 yields +3.24pp accuracy (70.20% vs 68.00%) with 60.1% fewer tokens, simultaneously addressing
+overthinking and improving correctness. For CommonsenseQA, c = 0.70 matches baseline accuracy (40.62%
+vs 40.54%) with 73.9% token reduction, demonstrating zero-shot transfer from mathematical training to
+non-mathematical reasoning.
+10
+
+LYNX : Learning Dynamic Exits for Confidence-Controlled Reasoning
+
+Similar patterns hold for QwQ-32B: on MATH-500, c = 0.95 maintains accuracy within 0.22pp while saving
+22.4% of tokens; on CommonsenseQA, c = 0.70 achieves 61.4% savings with minimal accuracy loss. Figure 3
+visualizes these tradeoffs: LYNX curves consistently envelope DEER and ToN operating points across both
+models on GSM8K and MATH-500.
+The confidence knob in practice. Although LYNX exposes a continuum of operating points via c, users need
+interpretable defaults. The boldface configurations in Table 2 follow a simple rule: maximize token savings
+subject to with minimal accuracy drop. Under this heuristic, optimal c typically lies in {0.80, 0.90, 0.95},
+saving 32–66% of tokens across benchmarks. Critically, c behaves monotonically, higher values yield more
+conservative exits and better accuracy preservation, exactly as predicted by the conformal framework (§3.4).
+This makes c a meaningful user-facing parameter rather than a brittle hyperparameter requiring per-task
+grid search.
+Comparison to DEER and Think-or-Not. DEER and ToN are strong baselines but exhibit characteristic
+weaknesses. On MATH-500 with DeepSeek-1.5B, DEER achieves 59.8% token savings but decreases accuracy
+(66.80% vs 68.00%), whereas LYNX simultaneously improves accuracy and saves tokens. The exception
+is AIME 2024, where DEER achieves notable accuracy gains; however, LYNX still provides competitive
+coverage-controlled operating points (e.g., c = 0.70 matches baseline accuracy with 55.5% savings). ToN
+consistently sits inside LYNX’s Pareto frontier once we account for its tree-search overhead, for example, on
+GSM8K it achieves only 49.0% savings (vs LYNX’s 66.2% at matched accuracy), despite substantial hidden
+sampling cost.
+Model family and scale generalization. Results hold across both Qwen-based models (1.5B and 32B
+parameters), demonstrating that LYNX scales to larger, more capable reasoning models without retraining.
+We further validate generalization to the Llama family (Nemotron-8B) in Appendix D, where LYNX achieves
+70–95% token reductions on GSM8K and MATH despite this model’s distinct architectural characteristics
+and tendency to use the full 13k token budget (Figure 5).
+Temperature robustness and baseline brittleness. A critical advantage of LYNX is deployment at multiple
+temperatures using a single probe trained at T = 0.6. Appendix C shows that LYNX maintains strong
+performance at T = 0.6 (e.g., 42.9% savings on GSM8K at matched accuracy), whereas entropy-based
+methods like DEER exhibit larger accuracy drops at higher temperatures due to increased output uncertainty.
+This highlights LYNX’s robustness to decoding configuration shifts, a key practical advantage for deployment
+where temperature may vary by use case.
+5.2. Qualitative analysis: When and why LYNX exits
+Figures 4–8 illustrate LYNX’s decision process across four representative failure modes of reasoning models:
+(1) Redundant verification (Fig. 4): The baseline generates 1,105 tokens with extensive re-checking after
+reaching the correct answer. LYNX exits at the second cue when the conformal predictive set collapses to
+{1}, using only 258 tokens (76.6% reduction) while maintaining correctness.
+(2) Repetitive reasoning (Fig. 6, Appendix): After solving a multi-step problem correctly, the baseline
+continues with 193 tokens of redundant verification. LYNX detects sufficiency at cue 6 and exits with 22.1%
+11
+
+LYNX : Learning Dynamic Exits for Confidence-Controlled Reasoning
+
+savings.
+(3) Context window exhaustion (Fig. 7, Appendix): On a challenging MATH problem, the baseline enters
+circular reasoning and exceeds the 16k token limit without producing an answer. LYNX monitors 24 cues,
+exits when ppos ≈ 0.999 at cue 24, and produces the correct answer using only 2,543 tokens, demonstrating
+that early exit can enable solving problems that would otherwise fail completely.
+(4) Overthinking to error (Fig. 8, Appendix): The model correctly calculates the answer but continues
+reasoning, talks itself out of the correct solution, and outputs an incorrect final answer. LYNX exits before
+this error cascade, preserving the initial correct reasoning.
+These examples illustrate that the conformal machinery provides not just aggregate statistical control but
+also interpretable, cue-level decisions: exits occur only when the calibrated predictive set deems the cue safe
+at confidence c = 1 − δ.
+
+6. Conclusion
+We introduced LYNX, a cue-triggered, conformal early-exit mechanism that turns reasoning models’ internal
+hidden-state awareness into confidence-controlled stopping decisions. For each base model, LYNX trains a
+single lightweight probe using self-contained supervision from forced exits and wraps the resulting scores in
+split conformal prediction to provide user-tunable guarantees on incorrect early exits. Across three model
+families (Qwen and Llama), three scales (1.5B–32B parameters), four mathematical benchmarks, and one
+non-mathematical task, a single mathematically-trained probe per model yields strong accuracy–efficiency
+tradeoffs: matching or improving baseline accuracy while reducing tokens by 40–95% depending on the
+chosen confidence level.
+Compared to state-of-the-art methods, LYNX offers competitive or superior Pareto frontiers while requiring
+no auxiliary models at inference, no decoding modifications, and providing explicit statistical guarantees.
+The method generalizes across temperatures without retraining and transfers zero-shot to non-mathematical
+domains, suggesting it captures domain-general signals of reasoning sufficiency rather than task-specific
+patterns.
+Limitations. Our study focuses on open-source models with explicit thinking segments and self-reflective
+cue tokens. Models without such structure may require alternative trigger definitions. Our conformal
+guarantees assume exchangeability between calibration and deployment data; under strong domain shift the
+effective coverage may deviate from nominal levels. We train separate heads per base model and temperatureindependent probes per family, and do not optimize the cost of forced-exit dataset construction, viewing it
+as amortized over downstream usage.
+Future work. Immediate directions include applying LYNX to code generation, multi-modal reasoning, and
+tool-augmented settings; learning latent decision points beyond hand-specified cues; co-training base models
+and probes for improved linear readability; and combining LYNX with external verifiers or self-consistency
+methods for additional reliability gains.
+
+12
+
+LYNX : Learning Dynamic Exits for Confidence-Controlled Reasoning
+
+Table 2: Accuracy–efficiency tradeoffs at temperature T = 0.0 for DeepSeek-R1-Distill-Qwen-1.5B and
+QwQ-32B. For each dataset we report vanilla chain-of-thought (Baseline), DEER, Think-or-Not (ToN), and
+LYNX for multiple confidence levels c. ∆Acc vs base and ∆Tokens vs base are relative changes (%) with
+respect to each model’s own Baseline. For ToN, the Tokens column reports total generated tokens.
+DeepSeek-R1-1.5B
+Dataset
+
+GSM8K
+
+MATH-500
+
+AMC 2023
+
+AIME 2024
+
+CommonsenseQA
+(Non-Math)
+
+QwQ-32B
+
+Method
+
+Conf
+
+Acc
+
+∆ vs base
+
+Avg.
+
+∆ vs base
+
+Acc
+
+∆ vs base
+
+Avg.
+
+∆ vs base
+
+Baseline
+
+–
+
+0.7597
+
+–
+
+1751.23
+
+–
+
+0.9522
+
+–
+
+1406.12
+
+–
+
+DEER
+ToN
+
+–
+–
+
+0.6914
+0.6793
+
+-8.99%
+-10.58%
+
+716.45
+893.04
+
+-59.1%
+-49.0%
+
+0.9431 -0.96%
+0.8021 -15.76%
+
+896.41
+1174.29
+
+-36.2%
+-16.5%
+
+LYNX
+LYNX
+LYNX
+LYNX
+LYNX
+
+0.97
+0.95
+0.90
+0.80
+0.70
+
+0.7847
+0.7877
+0.7870
+0.7680
+0.7316
+
++3.29%
++3.69%
++3.59%
++1.09%
+-3.70%
+
+1265.35
+1059.88
+792.24
+591.13
+529.66
+
+-27.7%
+-39.5%
+-54.8%
+-66.2%
+-69.8%
+
+0.9477
+0.9371
+0.9272
+0.9037
+0.8408
+
+-0.47%
+-1.59%
+-2.63%
+-5.09%
+-11.70%
+
+1210.53
+1046.63
+941.72
+770.66
+596.82
+
+-13.9%
+-25.6%
+-33.0%
+-45.2%
+-57.6%
+
+Baseline
+
+–
+
+0.6800
+
+–
+
+6090.96
+
+–
+
+0.9100
+
+–
+
+3945.49
+
+–
+
+DEER
+ToN
+
+–
+–
+
+0.6680
+0.5420
+
+-1.76%
+-20.29%
+
+2446.44
+3438.84
+
+-59.8%
+-43.5%
+
+0.9060
+0.7320
+
+-0.44%
+-19.56%
+
+3072.83
+2390.42
+
+-22.1%
+-39.4%
+
+LYNX
+LYNX
+LYNX
+LYNX
+LYNX
+
+0.97
+0.95
+0.90
+0.80
+0.70
+
+0.7460 +9.71%
+0.7620 +12.06%
+0.7580 +11.47%
+0.7020 +3.24%
+0.6020 -11.47%
+
+4511.43
+3930.17
+3212.87
+2427.41
+1669.69
+
+-25.9%
+-35.5%
+-47.3%
+-60.1%
+-72.6%
+
+0.9140 +0.44% 3379.23
+0.9080 -0.22% 3060.71
+0.8900 -2.20% 2816.04
+0.8700 -4.40% 2510.93
+0.7980 -12.31% 1968.30
+
+-14.4%
+-22.4%
+-28.6%
+-36.4%
+-50.1%
+
+Baseline
+
+–
+
+0.5250
+
+–
+
+9226.08
+
+–
+
+0.9000
+
+–
+
+6538.27
+
+–
+
+DEER
+ToN
+
+–
+–
+
+0.5750
+0.5000
+
++9.52%
+-4.76%
+
+4846.23
+5360.97
+
+-47.5%
+-41.9%
+
+0.8750 -2.78% 5545.88
+0.7000 -22.22% 3680.72
+
+-15.2%
+-43.7%
+
+LYNX
+LYNX
+LYNX
+LYNX
+LYNX
+
+0.97
+0.95
+0.90
+0.80
+0.70
+
+0.5500 +4.76% 7936.60
+0.6250 +19.05% 6865.05
+0.6000 +14.29% 5315.60
+0.5250
+0.00%
+4040.78
+0.4500 -14.29% 3654.85
+
+-14.0%
+-25.6%
+-42.4%
+-56.2%
+-60.4%
+
+0.8500 -5.56% 5363.12
+0.8250 -8.33% 4828.32
+0.8250 -8.33% 4439.62
+0.7750 -13.89% 3850.82
+0.6000 -33.33% 2973.38
+
+-18.0%
+-26.2%
+-32.1%
+-41.1%
+-54.5%
+
+Baseline
+
+–
+
+0.2333
+
+–
+
+13427.43
+
+–
+
+0.7000
+
+–
+
+9590.47
+
+–
+
+DEER
+ToN
+
+–
+–
+
+0.2000
+0.2333
+
+-14.27%
+0.00%
+
+9154.13
+11928.16
+
+-31.8%
+-11.2%
+
+0.6000
+0.5333
+
+-14.29%
+-23.81%
+
+9261.73
+9612.26
+
+-3.4%
++0.2%
+
+LYNX
+LYNX
+LYNX
+LYNX
+LYNX
+
+0.97
+0.95
+0.90
+0.80
+0.70
+
+0.2333
+0.2333
+0.2000
+0.2333
+0.2333
+
+0.00%
+0.00%
+-14.27%
+0.00%
+0.00%
+
+13322.60
+13004.03
+11635.80
+8501.83
+5981.83
+
+-0.8%
+-3.2%
+-13.3%
+-36.7%
+-55.5%
+
+0.6667 -4.76% 8440.90
+0.6333 -9.53% 7725.73
+0.6333 -9.53% 7308.63
+0.5000 -28.57% 6396.40
+0.4667 -33.33% 5691.37
+
+-12.0%
+-19.4%
+-23.8%
+-33.3%
+-40.7%
+
+Baseline
+
+–
+
+0.4054
+
+–
+
+2335.69
+
+–
+
+DEER
+ToN
+
+–
+–
+
+0.4136
+0.4431
+
++2.02%
++9.30%
+
+1085.95
+757.52
+
+-53.5%
+-67.6%
+
+LYNX
+LYNX
+LYNX
+LYNX
+LYNX
+
+0.97
+0.95
+0.90
+0.80
+0.70
+
+0.4062
+0.4038
+0.4095
+0.4120
+0.4062
+
++0.20%
+-0.39%
++1.01%
++1.63%
++0.20%
+
+2219.80
+2085.18
+1850.40
+1254.09
+609.70
+
+-5.0%
+-10.7%
+-20.8%
+-46.3%
+-73.9%
+
+0.8460
+
+–
+
+1021.04
+
+–
+
+0.8493 +0.39%
+0.8731 +3.20%
+
+622.98
+543.03
+
+-39.0%
+-46.8%
+
+0.8452 -0.09%
+0.8485 +0.30%
+0.8477 +0.20%
+0.8485 +0.30%
+0.8444 -0.19%
+
+911.14
+770.27
+667.02
+548.42
+394.24
+
+-10.8%
+-24.6%
+-34.7%
+-46.3%
+-61.4%
+
+13
+
+LYNX : Learning Dynamic Exits for Confidence-Controlled Reasoning
+
+Question: A robe takes 2 bolts of blue fiber and half that much white fiber. How many bolts in total does it take?
+Baseline (Full Generation)
+
+LYNX (Early Exit)
+
+Okay, so I have this problem here: A robe takes 2 bolts of
+blue fiber and half that much white fiber. How many bolts
+in total does it take? Hmm , let me try to figure this out
+step by step.
+First, I need to understand what the question is asking. It’s
+about figuring out the total number of bolts of fiber needed
+to make a robe. The robe uses two bolts of blue fiber and
+half as much white fiber. So, I guess I need to add the
+number of blue fiber bolts and white fiber bolts together to
+get the total number of fiber bolts required.
+Let me write that down to make it clearer. If the robe takes
+2 bolts of blue fiber, then the white fiber is half of that.
+So, the white fiber would be 2 divided by 2, right? Let me
+calculate that: 2 divided by 2 is 1. So, the white fiber is 1
+bolt.
+Now, to find the total number of bolts, I need to add the
+blue fiber and white fiber together. That would be 2 (blue)
+plus 1 (white). Adding those together gives me 3. So, the
+total number of bolts needed is 3.
+Wait , let me make sure I didn’t make a mistake. Sometimes,
+when dealing with fractions, it’s easy to slip up. So, 2 divided
+by 2 is definitely 1. Yeah, that seems right. So, adding 2
+and 1, that gives me 3. So, the total number of bolts is 3.
+I think that makes sense. The robe uses twice as much blue
+fiber as white fiber, so blue is 2 and white is 1. Adding them
+up gives 3.
+
+Okay, so I have this problem here: A robe takes 2 bolts of
+blue fiber and half that much white fiber. How many bolts
+in total does it take? Hmm q [Cue 1: ppos ≈ 0.84, set
+= {0, 1} → continue], let me try to figure this out step by
+step.
+First, I need to understand what the question is asking. It’s
+about figuring out the total number of bolts of fiber needed
+to make a robe. The robe uses two bolts of blue fiber and
+half as much white fiber. So, I guess I need to add the
+number of blue fiber bolts and white fiber bolts together to
+get the total number of fiber bolts required.
+Let me write that down to make it clearer. If the robe takes
+2 bolts of blue fiber, then the white fiber is half of that.
+So, the white fiber would be 2 divided by 2, right? Let me
+calculate that: 2 divided by 2 is 1. So, the white fiber is 1
+bolt.
+Now, to find the total number of bolts, I need to add the
+blue fiber and white fiber together. That would be 2 (blue)
+plus 1 (white). Adding those together gives me 3. So, the
+total number of bolts needed is 3.
+Wait ¥ [Cue 2: ppos ≈ 1.00, set = {1} at c = 0.95 →
+EXIT]
+Final Answer: 3
+Total tokens: 258 (-76.6% vs baseline)
+
+... (839 more tokens) ...
+Hmm , seems like every way I look at it, it’s 3. I don’t
+think I can get a different answer. So, I think that’s the
+right answer.
+Just to recap: 2 blue, half of that is 1 white, so 2 + 1 = 3.
+Yeah, that seems solid. [...] I’ve checked it multiple ways,
+considered different interpretations, made sure the math
+adds up, and everything points to 3 being the correct
+answer.
+Final Answer: 3
+Total tokens: 1,105
+
+Exit Decision Process:
+• Cue 1 (“hmm”): Probe score ppos ≈ 0.84. Conformal
+predictive set: {0, 1} (ambiguous) ⇒ no exit, model
+continues.
+• Cue 2 (“wait”): Probe score ppos ≈ 1.00. Conformal
+predictive set: {1} at confidence c = 0.95 ⇒ safe to
+exit.
+Outcome: Same correct answer ( 3 ) as baseline, but
+LYNX exits at the second cue and uses only the essential
+part of the chain-of-thought, saving 847 tokens.
+
+Figure 4: Example outputs comparing baseline generation with LYNX early exit on GSM8K. The baseline
+model generates 1,105 tokens with extensive overthinking, while LYNX monitors natural reasoning cues
+( hmm , wait ) and exits confidently after 258 tokens when the conformal predictive set contains only the
+correct answer. Both arrive at the same correct answer, but LYNX achieves 76.6% token reduction. The exit
+is triggered only when the conformal predictive set collapses to {1}, i.e., when the probe is calibrated to
+treat the cue as a safe exit at the chosen confidence level.
+
+14
+
+LYNX : Learning Dynamic Exits for Confidence-Controlled Reasoning
+
+References
+AIME_2024. https://huggingface.co/datasets/Maxwell-Jia/AIME_2024. Hugging Face dataset,
+accessed 2025-12-03.
+AMC-23. https://huggingface.co/datasets/knoveleng/AMC-23. Hugging Face dataset, accessed
+2025-12-03.
+Guillaume Alain and Yoshua Bengio. Understanding intermediate layers using linear classifier probes. arXiv
+preprint arXiv:1610.01644, 2016.
+Anastasios N. Angelopoulos and Stephen Bates. A gentle introduction to conformal prediction and distributionfree uncertainty quantification. arXiv preprint arXiv:2107.07511, 2021.
+Anthropic. Claude 3.7 sonnet and claude code. https://www.anthropic.com/claude, 2025.
+Akhiad Bercovich et al. Llama-nemotron: Efficient reasoning models, 2025. URL https://arxiv.org/
+abs/2505.00949.
+Collin Burns, Haotian Ye, Dan Klein, and Jacob Steinhardt. Discovering latent knowledge in language
+models without supervision. In International Conference on Learning Representations, 2023. URL https:
+//arxiv.org/abs/2212.03827.
+Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun, Lukasz Kaiser, Matthias
+Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano, Christopher Hesse, and John Schulman. Training
+verifiers to solve math word problems. arXiv preprint arXiv:2110.14168, 2021.
+DeepSeek-AI. Deepseek-r1: Incentivizing reasoning capability in llms via reinforcement learning, 2025. URL
+https://arxiv.org/abs/2501.12948.
+Yichao Fu, Junda Chen, Yonghao Zhuang, Zheyu Fu, Ion Stoica, and Hao Zhang. Reasoning without selfdoubt: More efficient chain-of-thought through certainty probing. In ICLR 2025 Workshop on Foundation
+Models in the Wild, 2025.
+Google DeepMind.
+
+Gemini 2.5: Our most intelligent ai model.
+
+https://deepmind.google/
+
+technologies/gemini/, 2025.
+
+Daya Guo, Dejian Yang, Haowei Zhang, Junxiao Song, Ruoyu Zhang, Runxin Xu, Qihao Zhu, Shirong Ma,
+Peiyi Wang, Xiao Bi, et al. Deepseek-r1: Incentivizing reasoning capability in llms via reinforcement
+learning. arXiv preprint arXiv:2501.12948, 2025.
+Dan Hendrycks, Collin Burns, Saurav Kadavath, Akul Arora, Steven Basart, Eric Tang, Dawn Song, and Jacob
+Steinhardt. Measuring mathematical problem solving with the math dataset. NeurIPS, 2021.
+John Hewitt and Percy Liang. Designing and interpreting probes with control tasks. arXiv preprint
+arXiv:1909.03368, 2019.
+Ganesh Jawahar, Benoît Sagot, and Djamé Seddah. What does bert learn about the structure of language?
+In ACL 2019-57th Annual Meeting of the Association for Computational Linguistics, 2019.
+Guochao Jiang, Guofeng Quan, Zepeng Ding, Ziqin Luo, Dixuan Wang, and Zheng Hu. Flashthink: An early
+exit method for efficient reasoning. arXiv preprint arXiv:2505.13949, 2025.
+15
+
+LYNX : Learning Dynamic Exits for Confidence-Controlled Reasoning
+
+Hunter Lightman, Vineet Kosaraju, Yura Burda, Harri Edwards, Bowen Baker, Teddy Lee, Jan Leike, John
+Schulman, Ilya Sutskever, and Karl Cobbe. Let’s verify step by step. arXiv preprint arXiv:2305.20050,
+2023.
+OpenAI. Openai o1 system card. arXiv preprint arXiv:2412.16720, 2024.
+Victor Quach, Adam Fisch, Tal Schuster, Adam Yala, Jae Ho Sohn, Tommi S Jaakkola, and Regina Barzilay.
+Conformal language modeling. arXiv preprint arXiv:2306.10193, 2023.
+Germans Savcisens and Tina Eliassi-Rad. The trilemma of truth in large language models. arXiv preprint
+arXiv:2506.23921, 2025.
+Glenn Shafer and Vladimir Vovk. A tutorial on conformal prediction. Journal of Machine Learning Research,
+9:371–421, 2008.
+Jinyan Su, Jennifer Healey, Preslav Nakov, and Claire Cardie. Between underthinking and overthinking: An
+empirical study of reasoning length and correctness in llms. arXiv preprint arXiv:2505.00127, 2025.
+Yuqiao Tan, Shizhu He, Kang Liu, and Jun Zhao. The zero-step thinking: An empirical study of mode
+selection as harder early exit in reasoning models. arXiv preprint arXiv:2510.19176, 2025.
+Qwen Team. Qwq-32b: Embracing the power of reinforcement learning, March 2025. URL https://
+qwenlm.github.io/blog/qwq-32b/.
+Betty Van Aken, Benjamin Winter, Alexander Löser, and Felix A Gers. How does bert answer questions? a
+layer-wise analysis of transformer representations. In Proceedings of the 28th ACM international conference
+on information and knowledge management, pages 1823–1832, 2019.
+Vladimir Vovk, Alexander Gammerman, and Glenn Shafer. Algorithmic Learning in a Random World. Springer,
+2005.
+Chenlong Wang, Yuanning Feng, Dongping Chen, Zhaoyang Chu, Ranjay Krishna, and Tianyi Zhou.
+Wait, we don’t need to “wait”! removing thinking tokens improves reasoning efficiency. arXiv preprint
+arXiv:2506.08343, 2025.
+Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten Bosma, Fei Xia, Ed Chi, Quoc V Le, Denny Zhou, et al.
+Chain-of-thought prompting elicits reasoning in large language models. Advances in neural information
+processing systems, 35:24824–24837, 2022.
+Chenxu Yang, Qingyi Si, Yongjie Duan, Zheliang Zhu, Chenyu Zhu, Zheng Lin, Li Cao, and Weiping Wang.
+Dynamic early exit in reasoning models. arXiv preprint arXiv:2504.15895, 2025.
+Xixian Yong, Xiao Zhou, Yingying Zhang, Jinlin Li, Yefeng Zheng, and Xian Wu. Think or not? exploring thinking efficiency in large reasoning models via an information-theoretic lens. arXiv preprint arXiv:2505.18237,
+2025.
+Angela Zhang et al. Reasoning models know when they’re right: Probing hidden states for self-verification.
+arXiv preprint arXiv:2504.05419, 2025.
+
+16
+
+LYNX : Learning Dynamic Exits for Confidence-Controlled Reasoning
+
+7. Appendix.
+A. Algorithmic Details of LYNX
+In this section we summarize the full LYNX pipeline, including offline cue-level supervision, probe training
+and conformal calibration, and the online cue-triggered exit policy, in a single algorithm. Algorithm 1 makes
+explicit the roles of the cue set S , probe-training set Dprobe , calibration set Dcal , the probe gψ , the conformal
+threshold qδ , and the user-facing confidence level c = 1 − δ, corresponding to the components described in
+§3.1–§3.4.
+
+B. Implementation Details
+Hardware and compute. All experiments run on 4× NVIDIA RTX A6000 (Blackwell, 96GB) GPUs. Maximum CoT length is set to 13,000 tokens for all models and methods.
+Probe architecture. The probe gψ is a two-layer MLP with hidden dimensions [256, 64] and GELU activation,
+taking as input concatenated hidden states from three layers (two middle, one final) at each cue token. We
+optimize with Adam (lr=1e-3, weight decay=1e-4), class-weighted binary cross-entropy, and early stopping
+on a held-out validation split of Dprobe .
+Training and calibration data sizes. For DeepSeek-R1-1.5B: 400 training + 200 calibration problems per
+Hendrycks MATH category (2,800 train, 1,400 calibration total). For QwQ-32B and Nemotron-8B: 200 train
++ 100 calibration per category to balance compute (1,400 train, 700 calibration total).
+
+C. Results at Temperature T = 0.6
+Table 3 reports accuracy–efficiency tradeoffs at T = 0.6 for DeepSeek-1.5B and QwQ-32B. At this higher
+temperature, baseline models exhibit increased stochasticity in generation, which affects entropy-based
+methods like DEER more severely than LYNX.
+Key observations. LYNX maintains strong performance at T = 0.6: on GSM8K with DeepSeek-1.5B,
+c = 0.90 achieves near-baseline accuracy (77.86% vs 78.39%, -0.68pp) with 42.9% token savings. On
+MATH-500, c = 0.95 preserves accuracy within 2.2pp while reducing tokens by 32.0%. CommonsenseQA
+shows 54.6% savings at matched accuracy with c = 0.70.
+Critically, DEER and ToN exhibit larger accuracy degradation at T = 0.6 compared to T = 0.0. On GSM8K,
+DEER’s accuracy drops by 13.83pp at T = 0.6 vs 8.99pp at T = 0.0. This suggests entropy-based confidence
+estimation becomes less reliable under increased sampling stochasticity, whereas LYNX’s probe-based approach
+remains robust. The same mathematically-trained probe deployed at both temperatures demonstrates LYNX’s
+generalization across decoding configurations without per-temperature retuning.
+
+17
+
+LYNX : Learning Dynamic Exits for Confidence-Controlled Reasoning
+
+D. Generalization to Llama-Nemotron
+Figure 5 reports results for Llama-3.1-Nemotron-Nano-8B-v1 at T = 0.0. This model presents a distinct
+challenge: it consistently uses the full 13k token budget across most problems, suggesting a tendency toward
+verbose, potentially circular reasoning patterns. As noted in the DEER paper, Nemotron exhibits lower
+confidence in generating intermediate answers, resulting in significantly lower early-stopping rates compared
+to Qwen-based models.
+LYNX performance. Despite this challenging profile, LYNX achieves dramatic efficiency gains: 91.9–96.6%
+token reductions on GSM8K (depending on c), 76.4–92.9% on MATH, and 93.1% on CommonsenseQA. On
+GSM8K, c = 0.98 reaches 85.50% accuracy (+31.54pp vs baseline 65.00%) while using only 1,046 tokens, a
+91.9% reduction from the 12,965-token baseline. On MATH, c = 0.95 achieves 83.00% accuracy (+0.97pp)
+with 85.4% fewer tokens.
+A key driver of these accuracy gains, especially on GSM8K and CommonsenseQA, is Nemotron’s difficulty
+in producing a final boxed answer within the 13k-token context window. Many baseline rollouts simply
+run out of context and are therefore marked incorrect. By contrast, LYNX exits once the calibrated probe
+deems a cue safe, cutting off these pathological long trajectories and converting them into short, successful
+question–answer runs. This allows LYNX to simultaneously reduce tokens by more than 90% and improve
+accuracy by large margins relative to the Nemotron baseline on these benchmarks.
+These results suggest that Nemotron’s verbose generation may stem from a form of overthinking or rambling
+that LYNX’s early-exit mechanism effectively addresses. By detecting when sufficient reasoning has occurred,
+LYNX can curtail unhelpful late-stage verbosity, a potential advantage for models that are prone to such
+patterns. This also demonstrates LYNX’s robustness across architectural families: the same probe training
+pipeline succeeds on both Qwen and Llama-based models despite their distinct reasoning behaviors.
+
+E. Additional Experimental Details
+E.1. Token accounting details
+Token counts always refer to generated tokens measured under the base model’s tokenizer:
+• Baseline: Total tokens in CoT + final answer.
+• DEER: Total tokens in CoT + final answer, using authors’ implementation.
+• ToN: Total tokens including both visible output and internal tree-search sampling.
+• LYNX: Total tokens including pre-exit CoT + short answer-only rollout at the exit cue.
+The “Tokens” column in all tables reports mean total tokens per question; ∆Tokens is relative change vs
+Baseline.
+E.2. Cross-dataset patterns
+Smooth confidence–efficiency tradeoff. Higher confidence levels c reliably yield better accuracy preservation at the cost of fewer token savings. As c decreases, LYNX moves smoothly along empirical Pareto frontiers,
+enabling straightforward deployment-time tuning.
+18
+
+LYNX : Learning Dynamic Exits for Confidence-Controlled Reasoning
+
+LYNX
+
+LYNX (optimal)
+
+GSM8K (subset of 200)
+
+Math-500
+
+100
+
+AMC 2023
+25100
+
+50100
+85.5
+
+84.0
+
+83.5
+
+70.5
+
+65.0
+
+60
+
+27.2×
+
+40
+12.4×
+
+20
+
+14.0× 15.3×
+
+ine
+
+sel
+
+Ba
+
+64.0
+29.3×
+
+8
+
+7
+
+5
+
+0
+
+0.9
+
+0
+
+0.9
+
+0.7
+
+65.0
+
+15 60
+
+6.8×
+
+ine
+
+sel
+
+3.1×
+
+2.9×
+
+3.5×
+
+8
+60.0
+6.0×
+
+3.7×
+
+2
+
+1.0×
+
+0
+8
+
+0.9
+
+7
+
+0.9
+
+5
+
+0
+
+0.9
+
+0
+
+0.9
+
+0
+
+0.8
+
+0.7
+
+AIME 2024
+
+ine
+
+8
+
+0.9
+
+sel
+
+Ba
+
+7
+
+0.9
+
+5
+
+0.9
+
+CommonsenseQA
+
+100
+
+6
+4
+
+5 20
+
+1.0×
+
+Ba
+
+62.5
+5.6×
+
+10 40
+
+8.6×
+5.5×
+
+4.2×
+
+0
+
+0.8
+
+59.2
+14.1×
+
+72.5
+
+12.1×
+
+20 40
+
+17.7×
+
+80.0
+
+20 80
+65.8
+
+10 20
+
+0.9
+
+77.0
+
+10
+
+87.5
+
+85.0
+
+83.0
+
+30 60
+
+0
+0.9
+
+84.8
+
+40 80
+
+1.0×
+
+0
+
+85.8
+
+82.2
+
+78.0
+
+80
+
+Accuracy (%)
+
+Efficiency gain
+
+100
+
+25
+
+0
+
+0.9
+
+0
+
+0.8
+
+0
+
+0.7
+
+Efficiency Gain
+
+Baseline
+
+5
+80
+
+80
+
+20
+
+4
+60
+
+46.7
+
+40
+1.6×
+
+20
+
+60
+
+3.1×
+
+53.3
+36.7
+
+36.7
+
+1.8×
+
+1.8×
+
+44.4
+
+3
+
+2.6×
+
+40
+
+33.3
+2.0×
+20.0
+
+16.7
+
+2
+
+0
+ine
+
+sel
+
+Ba
+
+8
+
+0.9
+
+7
+
+0.9
+
+5
+
+0.9
+
+0
+
+0.9
+
+0
+
+0.8
+
+1.0×
+
+0
+
+ine
+
+sel
+
+Ba
+
+62.1
+
+61.1
+14.5×
+
+9.4×
+
+20
+
+0
+
+0.7
+
+62.2
+
+34.4
+
+1.0×
+
+1
+
+50.7
+
+55.9
+
+1.2×
+8
+
+0.9
+
+1.5×
+7
+
+0.9
+
+1.8×
+5
+
+0.9
+
+10
+5
+
+3.4×
+
+0
+
+0.9
+
+15
+
+0
+
+0.8
+
+0
+
+0.7
+
+Confidence Level (1 − δ)
+
+Figure 5: Accuracy–efficiency tradeoffs at temperature T = 0.0 for Llama-3.1-Nemotron-Nano-8B-v1.
+Each panel shows baseline chain-of-thought decoding and LYNX at multiple confidence levels c = 1 − δ. Bars
+report accuracy, and the overlaid line reports efficiency gain (baseline tokens divided by method tokens).
+LYNX achieves large token savings on all datasets while substantially improving or preserving accuracy
+relative to the Nemotron baseline.
+Temperature-dependent behavior. At T = 0.0, LYNX often improves accuracy over baseline (particularly
+GSM8K, MATH-500), suggesting deterministic decoding can drive models into brittle overthinking patterns
+that early exits regularize by cutting off unhelpful late-chain reasoning. At T = 0.6, accuracy is typically
+preserved rather than improved, but token savings remain substantial.
+Transfer across tasks and domains. Despite training exclusively on Hendrycks MATH, the same probe
+transfers successfully to GSM8K, AMC 2023, and AIME 2024 (all mathematical but different styles) and
+CommonsenseQA (non-mathematical), indicating domain-general signals of reasoning correctness rather
+than MATH-specific memorization.
+High-confidence robustness. Configurations c ∈ {0.90, 0.95, 0.97} consistently maintain accuracy within
+0–2pp of baseline while reducing token usage by 20–50%, providing strong deployment-ready operating
+points with both accuracy guarantees and immediate efficiency gains.
+This illustrates how the same conformal machinery that underlies the global coverage guarantee also drives
+the concrete decisions in individual rollouts: exits are never triggered “just” because the probe is confident
+in a point estimate, but only when the calibrated predictive set deems the cue a safe exit at the chosen
+confidence level c = 1 − δ.
+19
+
+LYNX : Learning Dynamic Exits for Confidence-Controlled Reasoning
+
+Algorithm 1 LYNX: Cue-triggered conformal early exit
+Require: Base model f θ , training set Dtrain = {( xi , ai⋆ )}, cue set S , confidence level c ∈ (0, 1)
+Ensure: Probe gψ and conformal threshold qδ implementing an early-exit policy at confidence c = 1 − δ
+Offline stage: collect cue-level supervision
+1: for each ( xi , ai⋆ ) ∈ Dtrain do
+2:
+Generate a long chain-of-thought rollout (ti,1 , . . . , ti,Ti ) with f θ and record hidden states hi,ℓ ( j)
+3:
+Extract cue positions Ei = {e : ti,e ∈ S}
+4:
+for each cue e ∈ Ei do
+5:
+Form prefix prefi (e) consisting of xi and tokens up to ti,e−1
+6:
+Append the model’s answer prompt (e.g., </think> Final Answer: \boxed{), and call
+âi (e) ← Exitθ ( xi , e)
+Parse the answer ãi (e)[︀← parse( â]︀i (e))
+Define label yi (e) ← 1 ãi (e) = ai⋆ ∈ {0, 1}
+9:
+Build representation zi (e) from hidden states at e (e.g., zi (e) = [hi,ℓ1 (e)∥hi,ℓ2 (e)∥hi,L (e)])
+10:
+Add (zi (e), yi (e)) to the cue-level dataset Dcue
+11:
+end for
+12: end for
+13: Split Dcue into probe-training set Dprobe and calibration set Dcal
+Offline stage: train probe and calibrate conformal threshold
+′
+14: Train a small MLP probe gψ : Rd → [0, 1] on Dprobe with class-weighted binary cross-entropy, so that
+p = gψ (z) ≈ Pr[y = 1 | z]
+15: Set δ ← 1 − c
+16: For all (z j , y j ) ∈ Dcal with y j = 1, compute scores s j ← 1 − gψ (z j )
+17: Let qδ be the empirical (1 − δ )-quantile of { s j : y j = 1}
+Online stage: conformal early-exit policy
+18: function LYNX-Eval(x)
+19:
+Initialize the prompt with x and start generating a chain-of-thought with f θ
+20:
+for each generated token position e = 1, 2, . . . do
+21:
+if te ∈ S then
+▷ cue-triggered decision point
+22:
+Form representation z(e) from hidden states at e
+23:
+p ← gψ (z(e)); s ← 1 − p
+24:
+if s ≤ qδ then
+▷ conformal stop rule at confidence c
+25:
+Append the model’s answer prompt and call â ← Exitθ ( x, e)
+26:
+return final answer parse( â)
+27:
+end if
+28:
+end if
+29:
+end for
+30:
+return answer obtained from the full chain-of-thought (no early exit triggered)
+31: end function
+7:
+8:
+
+20
+
+LYNX : Learning Dynamic Exits for Confidence-Controlled Reasoning
+
+Question: A new program had 60 downloads in the first month. The number of downloads in the second month was
+three times as many as the downloads in the first month, but then reduced by 30% in the third month. How many
+downloads did the program have total over the three months?
+
+Baseline (Full Generation)
+
+LYNX (Early Exit)
+
+Okay, so I need to figure out the total number of downloads
+for this program over three months. Let me read the problem
+again and break it down step by step.
+First month: 60 downloads. That seems straightforward.
+Then, the second month’s downloads were three times as
+many as the first month. Hmm , okay, so if the first month
+was 60, then the second month would be 3 times 60. Let
+me write that down to keep track.
+First month downloads: 60.
+Second month downloads: 3 * 60. Hmm, 3 times 60 is...
+180. So, 180 downloads in the second month.
+Wait , but then the third month description says that the
+downloads were reduced by 30%. Okay, so the third month’s
+downloads are 30% less than the second month. So, first, I
+need to find out what 30% of 180 is, and then subtract that
+from 180 to get the downloads for the third month. Let me
+calculate that.
+30% of 180: To find 30%, I can multiply 180 by 0.3. So,
+180 * 0.3. Let me do that math. 180 divided by 10 is 18,
+so 0.3 is 30% of 180. So, 180 - 54 is 126. Wait, hold on,
+180 - 30% of 180. So, 180 - 54 is 126. So, 126 downloads
+in the third month.
+Now, I need to find the total downloads over the three
+months. So, I have to add up the downloads from each
+month. That would be first month, second month, and third
+month.
+So, that’s 60 (first month) + 180 (second month) + 126
+(third month). Let me add them step by step.
+First, 60 + 180 is... 240. Then, 240 + 126. Let me do that:
+240 + 100 is 340, then plus 26 is 366. So, total downloads
+over three months would be 366.
+
+Okay, so I need to figure out the total number of downloads
+for this program over three months. Let me read the problem
+again and break it down step by step.
+First month: 60 downloads. That seems straightforward.
+Then, the second month’s downloads were three times as
+many as the first month. Hmm q [Cue 1: ppos ≈ 0.03,
+set = {0, 1} → continue], okay, so if the first month was 60,
+then the second month would be 3 times 60. Let me write
+that down to keep track.
+First month downloads: 60.
+Second month downloads: 3 * 60. Hmm, 3 times 60 is...
+180. So, 180 downloads in the second month.
+Wait q [Cue 2: ppos ≈ 0.06, set = {0, 1} → continue],
+but then the third month description says that the downloads
+were reduced by 30%. Okay, so the third month’s downloads
+are 30% less than the second month. ...
+Now, I need to find the total downloads over the three
+months. So, I have to add up the downloads from each
+month. That would be first month, second month, and third
+month.
+So, that’s 60 (first month) + 180 (second month) + 126
+(third month). Let me add them step by step.
+First, 60 + 180 is... 240. Then, 240 + 126. Let me do that:
+240 + 100 is 340, then plus 26 is 366. So, total downloads
+over three months would be 366.
+Hmm ¥ [Cue 6: ppos ≈ 1.00, set = {1} at c = 0.95 →
+EXIT]
+Final Answer: 366
+
+... (193 more tokens of repeated checking and rephrasing)
+...
+Wait , let me double-check my calculations because that
+seems a bit high. Maybe I made a mistake in the third
+month’s downloads. Let me go over that again.
+Second month: 3 * 60 = 180. Third month: 180 reduced
+by 30%. So, 30% of 180 is 54, so 180 - 54 is 126. So, that
+part seems correct.
+Adding 60 + 180 + 126. Let me add them another way to
+verify. 60 + 180 is 240, and 240 + 126. Hmm , 240 +
+100 is 340, and 340 + 26 is 366. That still seems correct.
+Final Answer: 366
+Total tokens: 875
+
+Total tokens: 682 (-22.1% vs baseline)
+
+Exit Decision Process (per cue event):
+• Cue 1 (“hmm”): ppos ≈ 0.03. Predictive set: {0, 1}
+(ambiguous) ⇒ no exit.
+• Cue 2 (“wait”): ppos ≈ 0.06. Predictive set: {0, 1}
+(ambiguous) ⇒ no exit.
+...
+• Cue 4 (“hmm”): ppos ≈ 1.00. Predictive set shrinks
+to {1} at confidence c = 0.95 ⇒ safe to exit.
+Outcome: Same correct answer ( 366 ) as the baseline.
+LYNX exits when the conformal set becomes singleton and
+uses 682 tokens versus 875 for the baseline, saving 193
+tokens (≈ 22.1% of the generation) of largely redundant
+re-checking.
+
+Figure 6: Example 2 showing LYNX exit behavior on a GSM8K question. The exit is triggered only when the
+conformal predictive set collapses to {1}, i.e., when the probe is calibrated to treat the cue as a safe exit at
+the chosen confidence level.
+21
+
+LYNX : Learning Dynamic Exits for Confidence-Controlled Reasoning
+
+Question: There exist real numbers x and y, both greater than 1, such that logx (y x ) = logy ( x4y ) = 10. Find xy.
+
+Baseline (Context Window Exceeded)
+
+LYNX (Early Exit)
+
+Okay, so I have this problem here: there are real numbers
+x and y, both greater than 1, such that logx (y x ) = 10 and
+logy ( x4y ) = 10. I need to find the product xy. Hmm , let
+me try to figure this out step by step.
+First, I remember that logarithms can be tricky, but maybe I
+can use some logarithm properties to simplify these equations.
+The problem gives me two equations: [...]
+I think I can use the power rule of logarithms here, which
+says that logb ( ac ) = c · logb ( a). Let me apply that to both
+equations.
+Starting with the first equation: logx (y x ) = x · logx (y) = 10.
+So, that simplifies to x · logx (y) = 10.
+Similarly, the second equation: logy ( x4y ) = 4y · logy ( x ) =
+10. So, that becomes 4y · logy ( x ) = 10.
+Now, I have two equations: (1) x · logx (y) = 10, and (2)
+4y · logy ( x ) = 10.
+
+Okay, so I have this problem here: there are real numbers
+x and y, both greater than 1, such that logx (y x ) = 10 and
+logy ( x4y ) = 10. I need to find the product xy. Hmm q
+[Cue 1: ppos ≈ 0.04, set = {0, 1} → continue], let me try
+to figure this out step by step.
+First, I remember that logarithms can be tricky, but maybe I
+can use some logarithm properties to simplify these equations.
+[...]
+Starting with the first equation: logx (y x ) = x · logx (y) = 10.
+So, that simplifies to x · logx (y) = 10.
+Similarly, the second equation: logy ( x4y ) = 4y · logy ( x ) =
+10. So, that becomes 4y · logy ( x ) = 10.
+
+Hmm , I notice that both equations involve logx (y) and
+logy ( x ). Maybe I can express one in terms of the other. I
+remember that logb ( a) is equal to 1/ loga (b). So, logx (y) =
+1/ logy ( x ). Let me denote logy ( x ) as some variable to
+make it easier. Let’s say: Let’s let a = logy ( x ). Then,
+logx (y) = 1/a.
+Substituting back into the equations: (1) x · (1/a) = 10,
+and (2) 4y · a = 10.
+So, equation 1 becomes x/a = 10, which means x = 10a.
+Equation 2 becomes 4y · a = 10, which simplifies to y · a =
+10/4 = 2.5, so y = 2.5/a.
+
+Hmm q [Cue 2: ppos ≈ 0.10, set = {0, 1} → continue],
+I notice that both equations involve logx (y) and logy ( x ).
+Maybe I can express one in terms of the other. I remember
+that logb ( a) = 1/ loga (b). So, logx (y) = 1/ logy ( x ).
+Let me denote logy ( x ) as k. Then, logx (y) = 1/k.
+Substituting back: x · (1/k ) = 10 ⇒ x = 10k, and 4y · k =
+10 ⇒ y = 10/(4k ) = 5/(2k ).
+... (2,100 more tokens with focused reasoning) ...
+Now, I can compute xy:
+·5
+50k
+50
+5
+xy = 10k · 2k
+= 10k
+2k = 2k = 2 = 25.
+Wait ¥ [Cue 24: ppos ≈ 0.999, set = {1} at c = 0.80 →
+EXIT]
+Final Answer: 25 Total tokens: 2,543 (84.1% saved vs.
+16k limit)
+
+... (5,300 more tokens attempting algebraic manipulations)
+Wait , maybe I can try numerical methods. Let me define
+f ( a) = a · ln(2.5) − ln( a) · ( a + 1) − ln(10) and try to find
+where f ( a) = 0.
+... (8,200 more tokens of repetitive numerical trials and
+circular reasoning) ...
+Wait , maybe I can use the fact that x and y are expressed
+in terms of k [...]
+GENERATION TERMINATED
+Model exceeded 16k token context window limit during
+generation. No final answer produced.
+Total tokens: 16,000 (FAILED)
+
+Critical Advantage of Early Exit:
+• Baseline enters circular reasoning loops, exceeding the
+16k token context window without an answer.
+• LYNX monitors 24 natural reasoning cues throughout
+generation.
+• At Cue 24 (ppos ≈ 0.999), conformal set collapses to
+{1} at c = 0.80 ⇒ confident exit.
+Outcome: Baseline fails completely, while LYNX
+produces correct answer ( 25 ) using only 2,543 tokens—demonstrating that early exit enables solving problems that would otherwise exceed context limits.
+
+Figure 7: Qualitative example demonstrating LYNX’s critical advantage on a challenging MATH problem.
+The baseline model enters circular reasoning and exceeds the 16k token context window without producing
+an answer. In contrast, LYNX monitors 24 natural reasoning cues ( hmm , wait ) and exits confidently when
+the conformal predictive set collapses to {1} at the 24th cue. LYNX produces the correct answer using only
+2,543 tokens (84.1% reduction vs. context limit), demonstrating that early exit enables solving problems
+that would otherwise fail due to context constraints.
+22
+
+LYNX : Learning Dynamic Exits for Confidence-Controlled Reasoning
+
+Question: Dolly has two books. Pandora has one. If both Dolly and Pandora read each others’ books as well as their
+own, how many books will they collectively read by the end?
+Baseline (Overthinking & Error)
+
+LYNX (Early Exit)
+
+Okay, so I just came across this problem, and I want to
+figure it out step by step. Let me read it again: Dolly has
+two books, and Pandora has one. Both of them read each
+other’s books as well as their own. The question is, how
+many books will they collectively read by the end?
+Hmm , alright. Let’s break this down. First, I need to
+understand exactly what’s being asked. It’s about counting
+the total number of books that Dolly and Pandora will read
+when they each read each other’s books and their own.
+So, Dolly has two books. Let me call them Book A and
+Book B. Pandora has one book, which I can call Book C.
+Now, both of them will read each other’s books. That means
+Dolly will read both of Pandora’s books and her own, right?
+So, Dolly has to read Book C (Pandora’s book) and Book A
+and Book B (her own). Similarly, Pandora will read both of
+Dolly’s books and her own. So, Pandora will read Book A
+and Book B, as well as Book C.
+Wait , so let me clarify this. Dolly has two books: A and
+B. She also has one book: C. So, when Dolly reads each
+other’s books, she reads A, B, and C. Similarly, Pandora has
+books A and B, and reads C as well.
+Therefore, each of them is reading all three books. So,
+Dolly reads three books, and Pandora reads three books. So,
+together, how many books are they reading? Well, if each
+reads three books, that would seem like six books in total.
+But hold on , let me make sure I’m not double-counting.
+Each book is being read by both Dolly and Pandora, right?
+So, Book A is read by both, Book B is read by both, and
+Book C is read by both. So, even though each of them
+is reading all three books, the total number of books they
+collectively read is still three...
+
+Okay, so I just came across this problem, and I want to
+figure it out step by step. Let me read it again: Dolly has
+two books, and Pandora has one. Both of them read each
+other’s books as well as their own. The question is, how
+many books will they collectively read by the end?
+Hmm q [Cue 1: ppos ≈ 0.58, set = {0, 1} → continue],
+alright. Let’s break this down. First, I need to understand
+exactly what’s being asked. It’s about counting the total
+number of books that Dolly and Pandora will read when they
+each read each other’s books and their own.
+So, Dolly has two books. Let me call them Book A and
+Book B. Pandora has one book, which I can call Book C.
+Now, both of them will read each other’s books. That means
+Dolly will read both of Pandora’s books and her own, right?
+So, Dolly has to read Book C (Pandora’s book) and Book A
+and Book B (her own). Similarly, Pandora will read both of
+Dolly’s books and her own. So, Pandora will read Book A
+and Book B, as well as Book C.
+Wait ¥ [Cue 2: ppos ≈ 1.00, set = {1} at c = 0.80 →
+EXIT]
+Final Answer: 6 (Correct)
+
+... (325 more tokens of confusion between "distinct" vs
+"collective" counts) ...
+So, the total distinct books are just three. So, the answer is
+three.
+Final Answer: 3 (Incorrect)
+
+Total tokens: 377 (-50.5% vs baseline)
+
+Preventing Overthinking:
+• Baseline Failure: The model correctly calculates 3
+books per person but then overthinks the word "collectively," confuses it with "distinct" books, and hallucinates an incorrect answer ( 3 ).
+• LYNX Success: At Cue 2 (“Wait”), the probe detects
+that the current state (Dolly: 3, Pandora: 3) is sufficient to answer the question correctly.
+• Outcome: LYNX exits before the model spirals into
+the "distinct books" confusion, achieving the correct
+answer ( 6 ) and saving 50% of the compute.
+
+Total tokens: 762
+
+Figure 8: Example illustrating how LYNX prevents "overthinking" on a logic puzzle. The baseline model
+generates sound reasoning initially but triggers a "Wait" cue and subsequently talks itself out of the correct
+answer, confusing "collective reads" with "distinct books." LYNX monitors the generation, detects that the
+internal state at the "Wait" cue (ppos ≈ 1.00) is robust enough to exit, and produces the correct answer ( 6 )
+while determining that the subsequent reasoning (which led to the error in the baseline) was unnecessary.
+
+23
+
+LYNX : Learning Dynamic Exits for Confidence-Controlled Reasoning
+
+Table 3: Accuracy–efficiency tradeoffs at temperature T = 0.6 for DeepSeek-R1-Distill-Qwen-1.5B and
+QwQ-32B. For each dataset we report vanilla chain-of-thought (Baseline), DEER, Think-or-Not (ToN), and
+LYNX for multiple confidence levels c. ∆Acc vs base and ∆Tokens vs base are relative changes (%) with
+respect to each model’s own Baseline.
+DeepSeek-R1-1.5B
+Dataset
+
+GSM8K
+
+MATH-500
+
+AMC 2023
+
+AIME 2024
+
+CommonsenseQA
+(Non-Math)
+
+QwQ-32B
+
+Method
+
+Conf
+
+Acc
+
+∆ vs base
+
+Avg.
+
+∆ vs base
+
+Acc
+
+∆ vs base
+
+Avg.
+
+∆ vs base
+
+Baseline
+
+–
+
+0.7839
+
+–
+
+1036.79
+
+–
+
+0.9500
+
+–
+
+1450.68
+
+–
+
+DEER
+ToN
+
+–
+–
+
+0.6755
+0.6641
+
+-13.83%
+-15.28%
+
+649.49
+751.75
+
+-37.4%
+-27.5%
+
+0.9439
+0.8104
+
+-0.64%
+-14.69%
+
+983.77
+1194.89
+
+-32.2%
+-17.6%
+
+LYNX
+LYNX
+LYNX
+LYNX
+LYNX
+
+0.97
+0.95
+0.90
+0.80
+0.70
+
+0.7832
+0.7817
+0.7786
+0.7460
+0.7036
+
+-0.09%
+-0.28%
+-0.68%
+-4.83%
+-10.24%
+
+832.48
+721.28
+592.45
+518.81
+472.69
+
+-19.7%
+-30.4%
+-42.9%
+-50.0%
+-54.4%
+
+0.9356
+0.9249
+0.8999
+0.8249
+0.6839
+
+-1.52%
+-2.64%
+-5.27%
+-13.17%
+-28.01%
+
+1095.10
+974.08
+808.08
+603.34
+451.89
+
+-24.5%
+-32.9%
+-44.3%
+-58.4%
+-68.8%
+
+0.9100
+
+–
+
+Baseline
+
+–
+
+0.8180
+
+–
+
+4598.35
+
+–
+
+3895.07
+
+–
+
+DEER
+ToN
+
+–
+–
+
+0.6800
+0.5980
+
+-16.87%
+-26.89%
+
+2701.16
+3159.85
+
+-41.3%
+-31.3%
+
+0.9160 +0.66%
+0.7160 -21.32%
+
+3039.63
+2517.44
+
+-22.0%
+-35.4%
+
+LYNX
+LYNX
+LYNX
+LYNX
+LYNX
+
+0.97
+0.95
+0.90
+0.80
+0.70
+
+0.8060
+0.8000
+0.7700
+0.6800
+0.5720
+
+-1.47%
+-2.20%
+-5.87%
+-16.87%
+-30.07%
+
+3599.51
+3128.06
+2600.05
+1866.73
+1453.57
+
+-21.7%
+-32.0%
+-43.5%
+-59.4%
+-68.4%
+
+0.8920
+0.8780
+0.8400
+0.7920
+0.6600
+
+-1.98%
+-3.52%
+-7.69%
+-12.97%
+-27.47%
+
+3067.14
+2811.12
+2443.15
+1925.46
+1365.26
+
+-21.3%
+-27.8%
+-37.3%
+-50.6%
+-64.9%
+
+Baseline
+
+–
+
+0.7500
+
+–
+
+7118.93
+
+–
+
+0.9000
+
+–
+
+6505.08
+
+–
+
+DEER
+ToN
+
+–
+–
+
+0.6500
+0.5000
+
+-13.33%
+-33.33%
+
+5273.05
+3875.55
+
+-25.9%
+-45.6%
+
+0.9000
+0.7500
+
+0.00%
+-16.67%
+
+6237.00
+3554.87
+
+-4.1%
+-45.4%
+
+LYNX
+LYNX
+LYNX
+LYNX
+LYNX
+
+0.97
+0.95
+0.90
+0.80
+0.70
+
+0.7500
+0.7000
+0.7250
+0.6250
+0.4250
+
+0.00%
+-6.67%
+-3.33%
+-16.67%
+-43.33%
+
+5725.05
+4754.60
+3423.63
+2543.48
+2070.98
+
+-19.6%
+-33.2%
+-51.9%
+-64.3%
+-70.9%
+
+0.8750
+0.8500
+0.7750
+0.6750
+0.5750
+
+-2.78%
+-5.56%
+-13.89%
+-25.00%
+-36.11%
+
+4817.25
+4551.03
+4042.70
+3144.23
+2562.03
+
+-25.9%
+-30.0%
+-37.9%
+-51.7%
+-60.6%
+
+Baseline
+
+–
+
+0.1667
+
+–
+
+12189.00
+
+–
+
+0.6000
+
+–
+
+10115.93
+
+–
+
+DEER
+ToN
+
+–
+–
+
+0.3000 +79.96% 8303.06
+0.2000 +19.98% 10408.63
+
+-31.9%
+-14.6%
+
+0.6667 +11.12%
+0.5000 -16.67%
+
+8767.23
+8111.83
+
+-13.3%
+-19.8%
+
+LYNX
+LYNX
+LYNX
+LYNX
+LYNX
+
+0.97
+0.95
+0.90
+0.80
+0.70
+
+0.1667
+0.1667
+0.1333
+0.1333
+0.1000
+
+0.00%
+0.00%
+-20.04%
+-20.04%
+-40.01%
+
+10817.13
+9963.00
+7814.43
+5503.27
+3900.03
+
+-11.3%
+-18.3%
+-35.9%
+-54.9%
+-68.0%
+
+0.6000
+0.6000
+0.5000
+0.4667
+0.3333
+
+0.00%
+0.00%
+-16.67%
+-22.22%
+-44.45%
+
+7343.97
+6743.93
+5940.80
+5262.70
+4248.90
+
+-27.4%
+-33.3%
+-41.3%
+-48.0%
+-58.0%
+
+Baseline
+
+–
+
+0.4218
+
+–
+
+803.10
+
+–
+
+0.8501
+
+–
+
+950.51
+
+–
+
+DEER
+ToN
+
+–
+–
+
+0.4275
+0.4529
+
++1.35%
++7.37%
+
+590.80
+559.95
+
+-26.4%
+-30.3%
+
+0.8477 -0.28%
+0.8706 +2.41%
+
+643.47
+607.19
+
+-32.3%
+-36.1%
+
+LYNX
+LYNX
+LYNX
+LYNX
+LYNX
+
+0.97
+0.95
+0.90
+0.80
+0.70
+
+0.4226
+0.4242
+0.4292
+0.4324
+0.4210
+
++0.19%
++0.57%
++1.75%
++2.51%
+-0.19%
+
+752.80
+738.90
+691.10
+599.90
+365.00
+
+-6.3%
+-8.0%
+-13.9%
+-25.3%
+-54.6%
+
+0.8567
+0.8518
+0.8501
+0.8337
+0.8346
+
+733.78
+653.96
+541.47
+402.35
+331.83
+
+-22.8%
+-31.2%
+-43.0%
+-57.7%
+-65.1%
+
++0.78%
++0.20%
+0.00%
+-1.93%
+-1.82%
+
+24
+
+

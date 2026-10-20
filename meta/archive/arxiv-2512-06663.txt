@@ -1,0 +1,1054 @@
+CoT4Det: A Chain-of-Thought Framework for
+Perception-Oriented Vision-Language Tasks
+
+Yu Qi Yumeng Zhang Chenting Gong Xiao Tan
+Weiming Zhang Wei Zhang Jingdong Wang
+
+arXiv:2512.06663v1 [cs.CV] 7 Dec 2025
+
+Baidu Inc.
+
+Abstract
+Large Vision-Language Models (LVLMs) have demonstrated remarkable success
+in a broad range of vision-language tasks, such as general visual question answering and optical character recognition (OCR). However, their performance
+on perception-centric tasks—such as object detection, semantic segmentation,
+and depth estimation—remains significantly inferior to that of task-specific expert models. For example, Qwen2.5-VL-7B-Instruct achieves only 19% mAP on
+COCO2017 val, particularly struggling with dense scenes and small object recall.
+In this work, we introduce Chain-of-Thought for Detection (CoT4Det), a simple
+but efficient strategy that reformulates perception tasks into three interpretable
+steps: classification, counting, and grounding—each more naturally aligned with
+the reasoning capabilities of LVLMs. Extensive experiments demonstrate that
+our method significantly improves perception performance without compromising
+general vision language capabilities. With a standard Qwen2.5-VL-7B-Instruct,
+CoT4Det boosts mAP from 19.0% to 33.0% on COCO2017 val and achieves competitive results across a variety of perception benchmarks, outperforming baselines
+by +2% on RefCOCO series and +19% on Flickr30k entities.
+
+Figure 1: An illustration of the proposed CoT4Det framework. The object detection task is reformulated into a multi-step reasoning process comprising (1) object category classification, (2) instance
+counting, and (3) spatial grounding. The proposed model demonstrates improved performance in
+challenging visual scenarios, including small objects, crowded scenes, and open-vocabulary settings.
+
+1
+
+Introduction
+
+Large Vision Language Models (LVLM) [41, 11, 50, 3, 2, 9, 14, 1, 28, 15, 52, 37], which integrate
+powerful large language models (LLMs) with vision encoders, have recently demonstrated impressive
+generalization across a wide spectrum of multimodal tasks, including visual question answering
+(VQA) and optical character recognition (OCR). Their success stems from the ability to unify
+diverse vision-language tasks under a shared generative framework, enabling zero-shot and few-shot
+capabilities with minimal task-specific engineering.
+Despite recent progress, general LVLMs still struggle with perception-centric tasks. We evaluated
+the performance of several general purpose [4, 57, 11, 52] and detection-focused [63, 7, 38] LVLMs
+on the MS COCO [33] dataset by requiring them to detect objects within images. Among them,
+Qwen2.5-VL-7B [4], one of the strongest publicly available general purpose LVLMs, achieves only
+a 19% mAP in COCO, significantly lower than expert task detectors that incorporate advanced
+components such as region proposal networks (RPNs) [46] and task-adapted decoders [67, 5].
+A common solution explored in recent works [56, 45, 47, 43] is to augment LVLMs with external
+task-specific decoders. For instance, VisionLLM v2 [56] integrates a DETR-style decoder to predict
+object boxes. While effective, this hybrid design introduces significant architectural complexity and
+impairs modularity. As LVLM scale, maintaining end-to-end training and ensuring compatibility
+between perception modules and language models becomes increasingly difficult.
+To better understand why LVLMs perform poorly in perception-centric tasks, we conducted a study on
+Qwen2.5-VL-7B. Through both quantitative and qualitative analyses on object detection benchmarks,
+we identify three major issues that hinder LVLM performance in such scenarios:
+• Redundant Predictions: LVLMs frequently generate duplicate bounding boxes at identical
+or nearby locations until the maximum output length is reached. This behavior is systematic
+rather than random, suggesting a lack of spatial diversity in the model’s decoding process.
+• Failure to Reject Non-Existent Objects: When the queried object is absent from the image,
+the model often still outputs a bounding box for the most probable class based on learned
+priors. This overconfident behavior results in false positives.
+• Low Recall in Dense and Small Object Scenarios: LVLMs consistently underperform in
+scenes containing small or densely distributed objects. Simply increasing the input resolution
+fails to improve recall, suggesting that the bottleneck lies not in visual input quality but in
+the LLM’s inherent limitations in modeling fine-grained spatial details.
+
+Figure 2: Common failure cases of LVLMs in object localization tasks, including redundant predictions, inability to reject nonexistent objects, and low recall in dense scenes.
+2
+
+Inspired by recent advances in chain-of-thought prompting for reasoning tasks [55, 24], we propose
+Chain-of-Thought for Detection (CoT4Det)—a simple yet effective paradigm that addresses
+these limitations by decomposing complex perception tasks into a series of interpretable sub-steps:
+classification, counting, and grounding. Rather than directly generating a list of object coordinates,
+CoT4Det guides LVLMs through a structured reasoning process that is more naturally aligned
+with their language-centric capabilities. Experimental results show that ChatRex achieves strong
+performance in object detection tasks, including COCO[33], LVIS[17], RefCOCO/+/g [23, 65, 39]
+and Flickr30k Entities [44], while also maintains general vision-language capabilities, as measured
+by standard VQA tasks. To summarize, our contributions are as follows:
+• We identify key failure modes of general-purpose LVLMs on perception tasks and propose
+CoT4Det, a novel framework that decomposes object detection into three interpretable
+steps—classification, counting, and grounding—to better align with the reasoning strengths
+of LVLMs.
+• We design a simple yet effective training pipeline that continues training from a strong
+general-purpose LVLM. By mixing detection data with general vision-language data (e.g.,
+image captioning and VQA), our approach improves detection performance while preserving
+general multimodal capabilities.
+• We achieve significant performance gains across multiple object detection and grounding
+benchmarks, without modifying the model architecture or introducing task-specific modules.
+
+2
+
+Related Work
+
+2.1
+
+General MLLMs
+
+Multimodal Large Language Models (MLLMs) have shown impressive generalization across various
+vision-language tasks, following the success of large language models (LLMs) in NLP. Early systems
+like LLaVA [34], MiniGPT-4 [72], and InstructBLIP [13] use visual instruction tuning to align
+vision features with LLMs. More recent models—such as DeepSeek-VL2 [57], Qwen2.5-VL [60],
+and InternVL2.5 [10]—achieve stronger performance via larger-scale pretraining and architectural
+refinements. Recent trends include: (i) improving fine-grained perception through high-resolution
+inputs, e.g., LLaVA-HR [36], MG-LLaVA [70], and NVLM [12]; (ii) improving instruction quality
+and data diversity during pretraining [32, 40, 59]; and (iii) expanding to multi-image [20, 29] or
+video-based tasks [31, 58]. Despite their strong image-level reasoning abilities, these models are still
+limited in structured, pixel-level perception tasks.
+2.2
+
+Perception-Oriented MLLMs
+
+Several recent efforts have aimed to extend MLLMs to perception tasks such as object detection and
+visual grounding. One strategy is to convert dense prediction into autoregressive sequence generation.
+Inspired by Pix2Seq [8], works like Kosmos-2 [42], Shikra [7], Ferret [63], and CogVLM [53]
+represent bounding boxes as quantized tokens, making them compatible with LLM decoders. Griffon [66] and SoM [61] extend this idea for spatial grounding via structured prompts. Another line of
+research incorporates external perception modules into MLLMs, as seen in LISA [27], GLaMM [45],
+VisionLLMv2 [56], and PerceptionGPT [43]. These hybrid methods enhance detection accuracy but
+compromise model simplicity and generality. Groma [38] and ChatRex [22] propose retrieval-style
+formulations to mitigate coordinate regression challenges.
+2.3
+
+Chain-of-Thought Reasoning
+
+Chain-of-Thought (CoT) prompting [55, 24] has become a widely adopted technique for improving
+reasoning capabilities in large language models (LLMs). By decomposing complex tasks into a
+series of intermediate reasoning steps, CoT has been shown to significantly enhance performance on
+arithmetic, commonsense, and symbolic reasoning benchmarks. Variants such as self-consistency [54],
+least-to-most prompting [71], and program-aided CoT [16] further improve reasoning robustness and
+accuracy. CoT has also been extended to multilingual [26], mathematical [49], and embodied AI [18]
+settings. Recent works explore its integration into multimodal contexts: MM-CoT [68] applies
+step-wise reasoning to VQA, while Multi-modal ReAct [62] combines action and reasoning in agent
+3
+
+settings. However, CoT’s utility in spatially dense vision tasks such as object detection remains largely
+unexplored. Unlike classification or VQA, these tasks require low-level spatial precision, making
+direct CoT application nontrivial. Our proposed CoT4Det fills this gap by reformulating dense
+perception into three interpretable steps—classification, counting, and grounding—each naturally
+aligning with the reasoning-friendly structure of LLMs, and demonstrating strong results without
+architectural changes.
+
+3
+
+Method
+
+3.1
+
+Task Formulations
+
+Unlike conventional object detection systems that directly regress bounding box coordinates, CoT4Det
+reformulates the dense perception task into a step-by-step reasoning process, better aligned with the
+inherent strengths of LVLMs. Specifically, we decompose the task into three stages: classification,
+counting, and grounding. Each stage is expressed through natural language instructions, enabling
+interpretable and modular predictions.
+Question Format. To ensure compatibility with Qwen2.5-VL-style prompting, we maintain a
+consistent input interface. To address the Failure to Reject Non-Existent Objects issue, we randomly
+sample both positive and negative categories when constructing the <set of categories>. This
+encourages the model to reject non-existent instances. Notably, the length of <set of categories>
+can scale to thousands of classes, promoting better context retention and improved generalization
+across diverse categories. The input format is:
+<image>\n Locate every <set of categories> in the image.
+
+Answer Format. The output is structured into three semantically aligned reasoning stages: classification, fcounting, and grounding.
+The classification stage serves to distinguish between positive and negative categories, directly
+addressing the Failure to Reject Non-Existent Objects issue observed in prior LVLMs. By explicitly
+identifying which classes are present in the image, the model is encouraged to suppress false positives
+arising from prior biases.
+The counting stage plays a critical role in mitigating redundant predictions. By predicting the
+expected number of instances for each identified category, the model aligns its generation process
+with a target cardinality, effectively guiding spatial diversity and reducing duplication.
+In the grounding stage, the model generates 2D bounding boxes in the original pixel coordinate
+space, rather than normalized coordinates. Predictions are strictly ordered by the input category list,
+and within each category, object instances are arranged from left to right based on their horizontal
+position in the image. The output format is illustrated below:
+Category Classification:
+class_1, class_2
+Category Counting:
+class_1: 3; class_2: 1
+Grounding Boxes:
+[
+{"bbox_2d": [x1, y1, x2, y2], "label": "class_1"},
+{"bbox_2d": [x1, y1, x2, y2], "label": "class_1"},
+{"bbox_2d": [x1, y1, x2, y2], "label": "class_1"},
+{"bbox_2d": [x1, y1, x2, y2], "label": "class_2"}
+]
+
+3.2
+
+Data Construction
+
+To train CoT4Det, we construct a unified training corpus that blends structured detection annotations
+with general vision-language supervision.
+4
+
+Data Type
+DET-word level
+
+DET-phrase level
+DET-sentence level
+
+VQA
+
+Datasets
+
+Num of Samples
+
+Sample Weight
+
+Objects365 [48]
+V3Det [51]
+MS COCO [33]
+LVIS [17]
+Visual Genome [25]
+RefCOCO/+/g[23, 65, 39]
+GIRT [37]
+Groma-Instruct [38]
+Flickr30k Entities [44]
+LLaVA-OneVision [29]
+ALLAVA-4V-Instruct [6]
+OmniAlign-V [69]
+GQA [19]
+
+1.7M
+183k
+118k
+100k
+86k
+65k
+20M
+35k
+30k
+4.5M
+1.4M
+205k
+82k
+
+18.3%
+2.7%
+1.7%
+1.5%
+1.3%
+1.0%
+18.3%
+0.5%
+0.4%
+26.2%
+19.6%
+3.0%
+1.2%
+
+Table 1: Overview of the training data used in CoT4Det. The datasets are mixed with balanced
+sample weights to jointly support fine-grained object grounding and general multimodal reasoning
+capabilities.
+
+Detection-style Annotations. We organize the detection data into three prompt types based on
+granularity: word-level, phrase-level, and sentence-level.
+• Word-level prompts are derived from large-scale object detection datasets, including MS
+COCO [33], Objects365 [48], LVIS [17], and V3Det [51]. These datasets provide finegrained bounding box annotations with object category labels. In this setting, prompts are
+formulated as isolated category names, encouraging the model to identify instances of a
+single or multiple object classes without complex contextual descriptions.
+• Phrase-level prompts are constructed using datasets such as Visual Genome [25] and
+RefCOCO/+/g [23, 65, 39]. These datasets include referring expressions or attribute-rich
+phrases that point to specific regions in the image. Unlike word-level prompts, phrase-level
+instructions carry localized spatial or relational context, offering more detailed grounding
+supervision.
+• Sentence-level prompts are sourced from Groma-Instruct [38], GIRT [37], and Flickr30k
+Entities [44]. These datasets contain full descriptive sentences that mention multiple entities
+within a broader narrative context. Sentence-level prompts combine classification, spatial
+reasoning, and language comprehension in a unified form, thus enabling the model to learn
+complex inter-object reasoning and entity disambiguation.
+General Vision-Language Data. To preserve and enhance the model’s general multimodal reasoning
+ability, we include vision-language pairs from captioning and visual question answering (VQA)
+tasks. This includes data from LLaVA-OneVision [29], GQA [19], ALLAVA-4V-Instruct [6] and
+OmniAlign-V [69]. These samples are mixed with detection data in a controlled ratio to ensure
+stability of training and balanced modality. Detailed dataset statistics and sampling ratios are provided
+in Table 1.
+3.3
+
+Training Strategy
+
+We initialize our model from the publicly available Qwen2.5-VL-7B-Instruct checkpoint and
+apply continued training to enhance its performance on perception-oriented tasks. To isolate and
+evaluate the effectiveness of our proposed Chain-of-Thought for Detection (CoT4Det) framework,
+we freeze the vision encoder throughout training and update only the parameters of the language
+model. This design choice ensures that improvements originate from better reasoning and grounding
+capabilities, rather than enhanced visual feature extraction.
+The model is trained with a maximum sequence length of 8192 tokens, enabling it to capture long
+and structured reasoning chains required for our multi-stage outputs. We use a batch size of 64 and
+an initial learning rate of 1 × 10−5 , optimized using AdamW.
+To preserve general vision-language capabilities while improving grounding performance, we adopt
+a hybrid training corpus with a 50-50 ratio of detection-style and vision-language data (see Table 1).
+5
+
+The dataset composition includes annotations at multiple levels of linguistic granularity (word, phrase,
+sentence), along with VQA and instruction-following supervision. Sample weights are calibrated to
+balance between large-scale datasets (e.g., GIRT, Objects365) and fine-grained ones (e.g., RefCOCO,
+V3Det), ensuring stable and effective training.
+
+4
+
+Experiments
+
+We evaluate CoT4Det on both object grounding and general vision-language understanding tasks.
+Section 4.1 and Section 4.2 present results on grounding benchmarks, while Section 4.3 reports
+performance on general VQA. In Section 4.4, we conduct ablations to analyze the effect of the
+multi-stage reasoning design and input image resolution.
+4.1
+
+Object Detection Evaluation
+
+Evaluation Metrics. We begin by examining existing evaluation protocols for object detection
+in Large Vision-Language Models (LVLMs) and identify two major inconsistencies with standard
+practices in expert detectors:
+• Incompatibility with mAP. Mean Average Precision (mAP) [33] is the de facto standard
+for evaluating object detectors, reflecting both precision and recall by integrating the area
+under the precision-recall curve. However, LVLMs typically generate a limited number of
+high-confidence predictions and avoid producing large volumes of low-confidence boxes,
+unlike conventional detectors. In real-world applications, these low-confidence outputs are
+often filtered out entirely.
+• Unrealistic prompt design during evaluation. Prior works such as ChatRex and Qwen2.5-VL
+evaluate detection performance using prompts that include only the ground-truth categories
+present in the image. While this design simplifies the task and boosts reported performance,
+it deviates significantly from real-world scenarios, where models must infer object categories
+from a broad vocabulary.
+To account for this, we evaluate CoT4Det under two distinct settings and report Precision and Recall
+directly, rather than relying solely on mAP:
+• Ground-truth category setting: only the ground-truth object classes are provided in the
+prompt, to ensure fair comparison with prior work.
+• Full-category setting: the full category list is provided (e.g., all 80 COCO classes), requiring
+the model to both classify and localize objects without prior category filtering—closely
+mirroring deployment conditions.
+Evaluation Results. As shown in Table 2, CoT4Det significantly outperforms previous models
+across both the COCO and LVIS benchmarks under both evaluation settings.
+• In the ground-truth category setting, where only existing classes in the image are provided
+as prompt, CoT4Det achieves a Precision of 76.2% and a Recall of 64.4% on COCOVal, surpassing Qwen2.5-VL-7B by +7.5 and +15.9 points, respectively. The mAP also
+improves from 26.3% to 34.6%, representing a notable +8.3 point gain. On LVIS-Mini Val,
+CoT4Det achieves consistent improvements across rare, common, and frequent categories,
+with respective gains of +9.6, +8.0, and +8.4 AP points, demonstrating enhanced robustness
+in long-tailed distributions.
+• In the more challenging full-category setting, where all 80 COCO categories are used
+without prior filtering, CoT4Det maintains strong performance with 69.1% precision, 61.9%
+recall, and a mAP of 32.7. These results reflect substantial gains of +8.2, +22.4, and +13.6
+over the Qwen2.5 baseline, highlighting the effectiveness of the classification and counting
+stages in suppressing false positives and guiding spatial reasoning. On LVIS-Mini Val,
+CoT4Det dramatically improves over Qwen2.5-VL-7B by over +5 ∼ 10 AP points in every
+category group, suggesting that our chain-of-thought strategy scales well to large vocabulary
+detection.
+6
+
+Method
+
+Type
+P@0.5
+
+GLIP [30]
+T-Rex2 [21]
+Grounding DINO [35]
+Shikra-7B [7]
+Ferret-7B [63]
+Groma-7B [38]
+InternVL2-7B [11]
+Qwen2-VL-7B [52]
+Qwen2.5-VL-7B [4]
+CoT4DET-7B
+∆
+Perception-R1 [64]
+Qwen2.5-VL-7B [4]
+CoT4DET-7B
+∆
+
+Open-set
+Detection Model
+
+MLLM
+Ground-truth category setting
+
+MLLM
+Full-category setting
+
+COCO-Val
+R@0.5 mAP
+
+P@0.5
+
+R@0.5
+
+LVIS-Mini Val
+mAP AP-R
+
+AP-C
+
+AP-F
+
+-
+
+-
+
+49.8
+46.5
+48.4
+
+-
+
+-
+
+37.3
+47.6
+33.0
+
+28.2
+45.4
+22.2
+
+34.3
+46.0
+30.7
+
+41.5
+49.5
+38.8
+
+40.3
+66.3
+69.9
+45.3
+59.3
+68.7
+76.2
++7.5
+
+21.5
+33.5
+28.9
+24.5
+43.9
+48.5
+64.4
++15.9
+
+26.3
+34.6
++8.3
+
+52.8
+72.9
+76.3
+51.6
+77.0
+71.2
+75.3
++4.1
+
+14.5
+25.2
+10.9
+13.1
+34.7
+41.2
+53.9
++12.7
+
+25.4
+33.7
++8.3
+
+30.7
+40.3
++9.6
+
+30.3
+38.3
++8.0
+
+20.0
+28.4
++8.4
+
+60.9
+69.1
++8.2
+
+39.5
+61.9
++22.4
+
+31.9
+19.1
+32.7
++13.6
+
+53.1
+72.2
++19.1
+
+45.9
+54.6
++8.7
+
+25.7
+32.9
++7.2
+
+27.5
+33.0
++5.5
+
+28.3
+38.8
++10.3
+
+23.0
+27.7
++4.7
+
+Table 2: Comparison of different models on object detection benchmarks (COCO and LVIS). For
+MLLMs, we report precision (P@0.5) and recall (R@0.5) at IoU=0.5. For LVIS, AP-R/C/F denote
+rare, common, and frequent category performance, respectively.
+Method
+
+Type
+val
+
+Grounding DINO [35]
+Shikra-7B [7]
+Groma-7B [38]
+InternVL2-7B [11]
+Qwen2-VL-7B [52]
+Qwen2.5-VL-7B [4]
+CoT4DET-7B
+∆
+
+Open-set Detection Model
+
+MLLM
+
+RefCOCO
+testA testB
+
+val
+
+RefCOCO+
+testA testB
+
+RefCOCOg
+val
+test
+
+Flickr30k
+Entities.
+
+89.2
+
+91.9
+
+86.0
+
+81.1
+
+87.4
+
+74.7
+
+84.2
+
+84.9
+
+-
+
+87.0
+89.5
+87.1
+91.7
+90.0
+91.6
++1.6
+
+90.6
+92.1
+91.1
+93.6
+92.5
+94.2
++1.7
+
+80.2
+86.3
+80.7
+87.3
+85.4
+88.1
++2.7
+
+81.6
+83.9
+79.8
+85.8
+84.2
+86.5
++2.3
+
+87.4
+88.9
+87.9
+90.5
+89.1
+91.8
++2.7
+
+72.1
+78.1
+71.4
+79.5
+76.9
+80.1
++3.2
+
+82.3
+86.4
+82.7
+87.3
+87.2
+88.6
++1.4
+
+82.2
+87.0
+82.7
+87.8
+87.2
+88.9
++2.7
+
+63.8
+83.5
++19.7
+
+Table 3: Performance on referring expression comprehension tasks: RefCOCO, RefCOCO+, and
+RefCOCOg. A prediction is considered correct if its IoU with the ground truth is greater than 0.5.
+Overall, these results validate that CoT4Det enhances both recall and localization precision, especially
+in complex scenes and open-vocabulary settings, and provides a more reliable detection pipeline
+without requiring architectural modifications.
+4.2
+
+Grounding Evaluation
+
+To evaluate the grounding ability of CoT4Det under more linguistically complex scenarios, we
+conduct experiments on widely-used referring expression comprehension (REC) benchmarks: RefCOCO, RefCOCO+, and RefCOCOg. These datasets represent increasing challenges in phrase-level
+grounding, ranging from short expressions (e.g., "the man") to relational or attribute-rich descriptions
+(e.g., "the man wearing a red shirt on the left"). We also include results on Flickr30k Entities, which
+measures sentence-level grounding by linking entire sentences to grounded regions in an image.
+We compare our model against a broad set of baselines, including both open-set detection models
+(e.g., Grounding DINO [35]) and Multimodal Large Language Models (MLLMs) such as Shikra [7],
+Groma [38], InternVL2 [11], and the Qwen2.x-VL series [52, 4].
+As shown in Table 3, CoT4Det achieves state-of-the-art performance across all splits of RefCOCO,
+RefCOCO+, and RefCOCOg. In particular, our model improves over Qwen2.5-VL-7B by +1.6, +2.3,
+and +1.4 points on the val splits of the three REC datasets respectively. These results demonstrate that
+structured reasoning via CoT4Det not only enhances spatial precision but also improves the model’s
+understanding of complex linguistic references, offering substantial gains over previous MLLMs on
+both phrase-level and sentence-level grounding benchmarks.
+4.3
+
+General VQA Evaluation
+
+To verify that CoT4Det retains general vision-language understanding capabilities, we evaluate it on
+MME and MMBench (EN/CN), which assess multimodal reasoning across diverse scenarios. We
+follow standard protocols, reporting overall score for MME (max 2500) and accuracy for MMBench
+7
+
+Model
+
+MME
+
+MMBench-EN
+
+LLaVA-OV-7B [29]
+InternVL2-8B [11]
+Qwen2-VL-7B [52]
+InternVL2.5-8B [10]
+Qwen2.5-VL-7B [4]
+CoT4DET-7B
+
+1998
+2210
+2326
+2344
+2347
+2289
+
+80.8
+81.7
+83.0
+84.6
+83.5
+81.9
+
+MMBench-CN
+81.2
+80.5
+82.6
+83.4
+80.7
+
+Table 4: Comparison of general vision-language models on MME and MMBench benchmarks. CoT4Det
+maintains competitive general understanding capabilities compared to larger and stronger baselines.
+
+SFT
+
+CoT
+
+Res.
+P@0.5
+
+COCO-Val
+R@0.5 mAP
+
+APsmall
+
+✗
+✓
+✓
+
+✗
+✗
+✓
+
+Any.
+Any.
+Any.
+
+60.9
+67.9
+69.2
+
+39.5
+53.3
+59.3
+
+19.1
+25.5
+29.6
+
+6.0
+7.1
+10.7
+
+✗
+✓
+✓
+
+✗
+✗
+✓
+
+1333
+1333
+1333
+
+62.2
+69.3
+69.1
+
+41.7
+54.1
+62.9
+
+20.2
+27.0
+32.7
+
+8.1
+9.9
+16.7
+
+Table 5: Ablation on COCO-Val showing
+the impact of continued supervised finetuning (SFT), chain-of-thought (CoT) reasoning, and input resolution.
+
+in both English and Chinese. As shown in Table 4, CoT4Det-7B achieves competitive results: 2289
+on MME, 81.9% on MMBench-EN, and 80.7% on MMBench-CN. Although slightly lower than the
+original Qwen2.5-VL-7B, this minor drop reflects our focus on grounding. These results confirm that
+our model maintains strong general multimodal reasoning while substantially improving perception
+tasks.
+4.4
+
+Ablation Studies
+
+To understand the contribution of each component in CoT4Det, we conduct a series of ablation
+experiments on the COCO-Val dataset using Qwen2.5-VL-7B as the base model.
+Effect of Continued Supervised Fine-Tuning (SFT). We first evaluate the impact of continued
+fine-tuning with our training corpus. As shown in Table 5, supervised training alone improves mAP
+from 19.1 to 25.5 (+6.4), confirming that the model benefits from additional task-specific supervision
+even without reasoning decomposition.
+Effect of Chain-of-Thought (CoT) Reasoning. Adding CoT decomposition further improves both
+precision and recall, yielding +4.1 mAP gain over SFT alone. This confirms that the step-wise
+reasoning strategy is critical in guiding the model to generate more accurate and structured outputs.
+Effect of Input Resolution. Previous studies and our own observations reveal that LVLMs struggle
+in dense and small object scenarios, and simply increasing input resolution often fails to improve
+recall—implying that the bottleneck lies not in visual input quality, but in the LLM’s limited capacity
+to model fine-grained spatial details.
+Our ablation confirms this hypothesis: when no structured reasoning is applied, raising resolution
+yields only marginal gains (APsmall : 6.0 → 8.1). However, once CoT reasoning is introduced,
+the impact of resolution becomes significantly amplified. Under the same high-resolution input
+(width=1333), APsmall jumps to 16.7—more than double that of the non-CoT counterpart.
+These results suggest that CoT4Det serves as a critical reasoning scaffold that unlocks the latent
+fine-grained information encoded in high-resolution visual features. Rather than being bottlenecked
+by the LLM’s spatial limitations, the CoT formulation transforms dense perception into a structured
+and interpretable process, allowing the model to fully leverage the benefits of higher-resolution vision
+encoding.
+4.5
+
+Qualitative Analysis
+
+Figure 3 highlights the advantage of CoT4Det in handling dense scenes and small objects. Compared
+to Qwen2.5-VL-7B-Instruct, our method detects substantially more valid instances in crowded
+environments, such as pedestrian crossings and public spaces, where small and overlapping objects
+(e.g., persons, umbrellas, bags) are common. CoT4Det reduces redundant box generation and
+improves spatial precision, even under severe occlusion or clutter. These improvements confirm
+that chain-of-thought decomposition provides a structured inductive bias that better aligns with the
+challenges of fine-grained perception in real-world scenes.This visual improvement correlates with
+the +10.7 APsmall gain observed in our ablation Table 5.
+
+8
+
+Figure 3: Qualitative comparison between Qwen2.5-VL-7B-Instruct and our CoT4Det-7B across
+several dense scenes with abundant small objects. CoT4Det demonstrates superior capability in
+detecting small and tightly clustered objects—such as people in crowds, umbrellas, or chairs in indoor
+environments—while significantly reducing redundant predictions and false positives. Ground truth
+annotations are shown for reference
+
+5
+
+Conclusion
+
+In this work, we propose CoT4Det, a simple yet effective Chain-of-Thought framework for addressing
+the limitations of Large Vision-Language Models (LVLMs) in fine-grained perception tasks. By
+reformulating object detection into three interpretable stages—classification, counting, and grounding—our approach aligns better with the reasoning capabilities of language models. Extensive
+experiments demonstrate that CoT4Det significantly improves performance on challenging benchmarks, including COCO, LVIS, RefCOCOg, and Flickr30k Entities, without modifying the model
+architecture or sacrificing general vision-language capabilities. Our findings suggest that structured
+reasoning is a promising direction for enabling LVLMs to perform accurate and scalable perception.
+
+6
+
+Limitations
+
+While CoT4Det shows strong performance improvements, several limitations remain. First, the
+method still underperforms specialized detection models on fine-grained dense prediction, particularly
+in high-precision applications. Second, the framework relies on high-quality language reasoning and
+is sensitive to prompt design and category set composition. Third, the vision encoder is kept frozen
+during training, potentially limiting the upper bound of performance. Finally, although the model
+generalizes well across benchmarks, it has only been tested on medium-scale LVLMs; scaling to
+larger models or new modalities such as video requires further investigation.
+9
+
+References
+[1] Pravesh Agrawal, Szymon Antoniak, Emma Bou Hanna, Devendra Chaplot, Jessica Chudnovsky, Saurabh
+Garg, Theophile Gervet, Soham Ghosh, Amélie Héliou, Paul Jacob, et al. Pixtral 12b. arXiv preprint
+arXiv:2410.07073, 2024.
+[2] Jean-Baptiste Alayrac, Jeff Donahue, Pauline Luc, Antoine Miech, Iain Barr, Yana Hasson, Karel Lenc,
+Arthur Mensch, Katherine Millican, Malcolm Reynolds, et al. Flamingo: a visual language model for
+few-shot learning. In NeurIPS, 2022.
+[3] Jinze Bai, Shuai Bai, Shusheng Yang, Shijie Wang, Sinan Tan, Peng Wang, Junyang Lin, Chang Zhou, and
+Jingren Zhou. Qwen-vl: A frontier large vision-language model with versatile abilities. arXiv preprint
+arXiv:2308.12966, 2023.
+[4] Shuai Bai, Keqin Chen, Xuejing Liu, Jialin Wang, Wenbin Ge, Sibo Song, Kai Dang, Peng Wang, Shijie
+Wang, Jun Tang, et al. Qwen2. 5-vl technical report. arXiv preprint arXiv:2502.13923, 2025.
+[5] Nicolas Carion, Francisco Massa, Gabriel Synnaeve, Nicolas Usunier, Alexander Kirillov, and Sergey
+Zagoruyko. End-to-end object detection with transformers. In ECCV, 2020.
+[6] Guiming Hardy Chen, Shunian Chen, Ruifei Zhang, Junying Chen, Xiangbo Wu, Zhiyi Zhang, Zhihong
+Chen, Jianquan Li, Xiang Wan, and Benyou Wang. Allava: Harnessing gpt4v-synthesized data for a lite
+vision-language model. arXiv preprint arXiv:2402.11684, 2024.
+[7] Keqin Chen, Zhao Zhang, Weili Zeng, Richong Zhang, Feng Zhu, and Rui Zhao. Shikra: Unleashing
+multimodal llm’s referential dialogue magic. arXiv:2306.15195, 2023.
+[8] Ting Chen, Saurabh Saxena, Lala Li, David J Fleet, and Geoffrey Hinton. Pix2seq: A language modeling
+framework for object detection. In ICLR, 2022.
+[9] Xi Chen, Xiao Wang, Soravit Changpinyo, AJ Piergiovanni, Piotr Padlewski, Daniel Salz, Sebastian
+Goodman, Adam Grycner, Basil Mustafa, Lucas Beyer, et al. Pali: A jointly-scaled multilingual languageimage model. In ICLR, 2022.
+[10] Zhe Chen, Weiyun Wang, Yue Cao, Yangzhou Liu, Zhangwei Gao, Erfei Cui, Jinguo Zhu, Shenglong Ye,
+Hao Tian, Zhaoyang Liu, et al. Expanding performance boundaries of open-source multimodal models
+with model, data, and test-time scaling. arXiv preprint arXiv:2412.05271, 2024.
+[11] Zhe Chen, Weiyun Wang, Hao Tian, Shenglong Ye, Zhangwei Gao, Erfei Cui, Wenwen Tong, Kongzhi
+Hu, Jiapeng Luo, Zheng Ma, et al. How far are we to gpt-4v? closing the gap to commercial multimodal
+models with open-source suites. arXiv:2404.16821, 2024.
+[12] Wenliang Dai, Nayeon Lee, Boxin Wang, Zhuoling Yang, Zihan Liu, Jon Barker, Tuomas Rintamaki,
+Mohammad Shoeybi, Bryan Catanzaro, and Wei Ping. Nvlm: Open frontier-class multimodal llms. arXiv
+preprint arXiv:2409.11402, 2024.
+[13] Wenliang Dai, Junnan Li, Dongxu Li, Anthony Meng Huat Tiong, Junqi Zhao, Weisheng Wang, Boyang
+Li, Pascale Fung, and Steven Hoi. Instructblip: Towards general-purpose vision-language models with
+instruction tuning. In NeurIPS, 2023.
+[14] Wenliang Dai, Junnan Li, Dongxu Li, Anthony Meng Huat Tiong, Junqi Zhao, Weisheng Wang, Boyang
+Li, Pascale Fung, and Steven C. H. Hoi. Instructblip: Towards general-purpose vision-language models
+with instruction tuning. In NeurIPS, 2023.
+[15] Matt Deitke, Christopher Clark, Sangho Lee, Rohun Tripathi, Yue Yang, Jae Sung Park, Mohammadreza
+Salehi, Niklas Muennighoff, Kyle Lo, Luca Soldaini, et al. Molmo and pixmo: Open weights and open
+data for state-of-the-art multimodal models. arXiv:2409.17146, 2024.
+[16] Luyu Gao, Aman Madaan, Shuyan Zhou, Uri Alon, Pengfei Liu, Yiming Yang, Jamie Callan, and Graham
+Neubig. Pal: Program-aided language models. In International Conference on Machine Learning, pages
+10764–10799. PMLR, 2023.
+[17] Agrim Gupta, Piotr Dollar, and Ross Girshick. Lvis: A dataset for large vocabulary instance segmentation.
+In CVPR, 2019.
+[18] Wenlong Huang, Pieter Abbeel, Deepak Pathak, and Igor Mordatch. Language models as zero-shot
+planners: Extracting actionable knowledge for embodied agents. In International conference on machine
+learning, pages 9118–9147. PMLR, 2022.
+
+10
+
+[19] Drew A Hudson and Christopher D Manning. Gqa: A new dataset for real-world visual reasoning and
+compositional question answering. In CVPR, 2019.
+[20] Dongfu Jiang, Xuan He, Huaye Zeng, Con Wei, Max Ku, Qian Liu, and Wenhu Chen. Mantis: Interleaved
+multi-image instruction tuning. arXiv:2405.01483, 2024.
+[21] Qing Jiang, Feng Li, Zhaoyang Zeng, Tianhe Ren, Shilong Liu, and Lei Zhang. T-rex2: Towards generic
+object detection via text-visual prompt synergy. In European Conference on Computer Vision, pages 38–57.
+Springer, 2025.
+[22] Qing Jiang, Gen Luo, Yuqin Yang, Yuda Xiong, Yihao Chen, Zhaoyang Zeng, Tianhe Ren, and Lei Zhang.
+Chatrex: Taming multimodal llm for joint perception and understanding. arXiv preprint arXiv:2411.18363,
+2024.
+[23] Sahar Kazemzadeh, Vicente Ordonez, Mark Matten, and Tamara Berg. Referitgame: Referring to objects
+in photographs of natural scenes. In EMNLP, 2014.
+[24] Takeshi Kojima, Shixiang Shane Gu, Machel Reid, Yutaka Matsuo, and Yusuke Iwasawa. Large language
+models are zero-shot reasoners. Advances in neural information processing systems, 35:22199–22213,
+2022.
+[25] Ranjay Krishna, Yuke Zhu, Oliver Groth, Justin Johnson, Kenji Hata, Joshua Kravitz, Stephanie Chen,
+Yannis Kalantidis, Li-Jia Li, David A Shamma, et al. Visual genome: Connecting language and vision
+using crowdsourced dense image annotations. IJCV, 2017.
+[26] Huiyuan Lai and Malvina Nissim. mcot: Multilingual instruction tuning for reasoning consistency in
+language models. arXiv preprint arXiv:2406.02301, 2024.
+[27] Xin Lai, Zhuotao Tian, Yukang Chen, Yanwei Li, Yuhui Yuan, Shu Liu, and Jiaya Jia. Lisa: Reasoning
+segmentation via large language model. arXiv preprint arXiv:2308.00692, 2023.
+[28] Dongxu Li, Yudong Liu, Haoning Wu, Yue Wang, Zhiqi Shen, Bowen Qu, Xinyao Niu, Guoyin Wang,
+Bei Chen, and Junnan Li. Aria: An open multimodal native mixture-of-experts model. arXiv preprint
+arXiv:2410.05993, 2024.
+[29] Feng Li, Renrui Zhang, Hao Zhang, Yuanhan Zhang, Bo Li, Wei Li, Zejun Ma, and Chunyuan Li.
+Llava-next-interleave: Tackling multi-image, video, and 3d in large multimodal models. arXiv preprint
+arXiv:2407.07895, 2024.
+[30] Liunian Harold Li, Pengchuan Zhang, Haotian Zhang, Jianwei Yang, Chunyuan Li, Yiwu Zhong, Lijuan
+Wang, Lu Yuan, Lei Zhang, Jenq-Neng Hwang, et al. Grounded language-image pre-training. In
+Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition, pages 10965–
+10975, 2022.
+[31] Bin Lin, Yang Ye, Bin Zhu, Jiaxi Cui, Munan Ning, Peng Jin, and Li Yuan. Video-llava: Learning united
+visual representation by alignment before projection. arXiv preprint arXiv:2311.10122, 2023.
+[32] Ji Lin, Hongxu Yin, Wei Ping, Pavlo Molchanov, Mohammad Shoeybi, and Song Han. Vila: On pretraining for visual language models. In Proceedings of the IEEE/CVF Conference on Computer Vision and
+Pattern Recognition, pages 26689–26699, 2024.
+[33] Tsung-Yi Lin, Michael Maire, Serge J. Belongie, James Hays, Pietro Perona, Deva Ramanan, Piotr Dollár,
+and C. Lawrence Zitnick. Microsoft COCO: common objects in context. In ECCV, volume 8693, pages
+740–755, 2014.
+[34] Haotian Liu, Chunyuan Li, Qingyang Wu, and Yong Jae Lee. Visual instruction tuning. In NeurIPS, 2023.
+[35] Shilong Liu, Zhaoyang Zeng, Tianhe Ren, Feng Li, Hao Zhang, Jie Yang, Qing Jiang, Chunyuan Li,
+Jianwei Yang, Hang Su, et al. Grounding dino: Marrying dino with grounded pre-training for open-set
+object detection. arXiv preprint arXiv:2303.05499, 2023.
+[36] Gen Luo, Yiyi Zhou, Yuxin Zhang, Xiawu Zheng, Xiaoshuai Sun, and Rongrong Ji. Feast your eyes:
+Mixture-of-resolution adaptation for multimodal large language models. arXiv preprint arXiv:2403.03003,
+2024.
+[37] Tengchao Lv, Yupan Huang, Jingye Chen, Lei Cui, Shuming Ma, Yaoyao Chang, Shaohan Huang,
+Wenhui Wang, Li Dong, Weiyao Luo, et al. Kosmos-2.5: A multimodal literate model. arXiv preprint
+arXiv:2309.11419, 2023.
+
+11
+
+[38] Chuofan Ma, Yi Jiang, Jiannan Wu, Zehuan Yuan, and Xiaojuan Qi. Groma: Localized visual tokenization
+for grounding multimodal large language models. arXiv preprint arXiv:2404.13013, 2024.
+[39] Junhua Mao, Jonathan Huang, Alexander Toshev, Oana Camburu, Alan L Yuille, and Kevin Murphy.
+Generation and comprehension of unambiguous object descriptions. In CVPR, pages 11–20, 2016.
+[40] Brandon McKinzie, Zhe Gan, Jean-Philippe Fauconnier, Sam Dodge, Bowen Zhang, Philipp Dufter, Dhruti
+Shah, Xianzhi Du, Futang Peng, Floris Weers, Anton Belyi, Haotian Zhang, Karanjeet Singh, Doug
+Kang, Ankur Jain, Hongyu Hè, Max Schwarzer, Tom Gunter, Xiang Kong, Aonan Zhang, Jianyu Wang,
+Chong Wang, Nan Du, Tao Lei, Sam Wiseman, Guoli Yin, Mark Lee, Zirui Wang, Ruoming Pang, Peter
+Grasch, Alexander Toshev, and Yinfei Yang. MM1: methods, analysis & insights from multimodal LLM
+pre-training. arXiv: 2403.09611, 2024.
+[41] OpenAI. Gpt-4v(ision) system card. https://cdn.openai.com/papers/GPTV_System_Card.pdf,
+2023.
+[42] Zhiliang Peng, Wenhui Wang, Li Dong, Yaru Hao, Shaohan Huang, Shuming Ma, and Furu Wei. Kosmos-2:
+Grounding multimodal large language models to the world. arXiv preprint arXiv:2306.14824, 2023.
+[43] Renjie Pi, Lewei Yao, Jiahui Gao, Jipeng Zhang, and Tong Zhang. Perceptiongpt: Effectively fusing visual
+perception into llm. In CVPR, 2024.
+[44] Bryan A Plummer, Liwei Wang, Chris M Cervantes, Juan C Caicedo, Julia Hockenmaier, and Svetlana
+Lazebnik. Flickr30k entities: Collecting region-to-phrase correspondences for richer image-to-sentence
+models. In ICCV, 2015.
+[45] Hanoona Rasheed, Muhammad Maaz, Sahal Shaji, Abdelrahman Shaker, Salman Khan, Hisham Cholakkal,
+Rao M Anwer, Eric Xing, Ming-Hsuan Yang, and Fahad S Khan. Glamm: Pixel grounding large multimodal
+model. In CVPR, 2024.
+[46] Shaoqing Ren, Kaiming He, Ross Girshick, and Jian Sun. Faster r-cnn: Towards real-time object detection
+with region proposal networks. In NeurIPS, 2015.
+[47] Zhongwei Ren, Zhicheng Huang, Yunchao Wei, Yao Zhao, Dongmei Fu, Jiashi Feng, and Xiaojie Jin.
+Pixellm: Pixel reasoning with large multimodal model. In CVPR, 2024.
+[48] Shuai Shao, Zeming Li, Tianyuan Zhang, Chao Peng, Gang Yu, Xiangyu Zhang, Jing Li, and Jian Sun.
+Objects365: A large-scale, high-quality dataset for object detection. In ICCV, 2019.
+[49] Zayne Sprague, Fangcong Yin, Juan Diego Rodriguez, Dongwei Jiang, Manya Wadhwa, Prasann Singhal,
+Xinyu Zhao, Xi Ye, Kyle Mahowald, and Greg Durrett. To cot or not to cot? chain-of-thought helps mainly
+on math and symbolic reasoning. arXiv preprint arXiv:2409.12183, 2024.
+[50] Gemini Team, Rohan Anil, Sebastian Borgeaud, Yonghui Wu, Jean-Baptiste Alayrac, Jiahui Yu, Radu
+Soricut, Johan Schalkwyk, Andrew M Dai, Anja Hauth, et al. Gemini: a family of highly capable
+multimodal models. arXiv: 2312.11805, 2023.
+[51] Jiaqi Wang, Pan Zhang, Tao Chu, Yuhang Cao, Yujie Zhou, Tong Wu, Bin Wang, Conghui He, and Dahua
+Lin. V3det: Vast vocabulary visual detection dataset. In Proceedings of the IEEE/CVF International
+Conference on Computer Vision, pages 19844–19854, 2023.
+[52] Peng Wang, Shuai Bai, Sinan Tan, Shijie Wang, Zhihao Fan, Jinze Bai, Keqin Chen, Xuejing Liu, Jialin
+Wang, Wenbin Ge, et al. Qwen2-vl: Enhancing vision-language model’s perception of the world at any
+resolution. arXiv:2409.12191, 2024.
+[53] Weihan Wang, Qingsong Lv, Wenmeng Yu, Wenyi Hong, Ji Qi, Yan Wang, Junhui Ji, Zhuoyi Yang,
+Lei Zhao, Xixuan Song, et al. Cogvlm: Visual expert for pretrained language models. arXiv preprint
+arXiv:2311.03079, 2023.
+[54] Xuezhi Wang, Jason Wei, Dale Schuurmans, Quoc Le, Ed Chi, Sharan Narang, Aakanksha Chowdhery, and
+Denny Zhou. Self-consistency improves chain of thought reasoning in language models. arXiv preprint
+arXiv:2203.11171, 2022.
+[55] Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten Bosma, Fei Xia, Ed Chi, Quoc V Le, Denny Zhou,
+et al. Chain-of-thought prompting elicits reasoning in large language models. NeurIPS, 35:24824–24837,
+2022.
+[56] Jiannan Wu, Muyan Zhong, Sen Xing, Zeqiang Lai, Zhaoyang Liu, Wenhai Wang, Zhe Chen, Xizhou Zhu,
+Lewei Lu, Tong Lu, et al. Visionllm v2: An end-to-end generalist multimodal large language model for
+hundreds of vision-language tasks. In NeurIPS, 2024.
+
+12
+
+[57] Zhiyu Wu, Xiaokang Chen, Zizheng Pan, Xingchao Liu, Wen Liu, Damai Dai, Huazuo Gao, Yiyang Ma,
+Chengyue Wu, Bingxuan Wang, et al. Deepseek-vl2: Mixture-of-experts vision-language models for
+advanced multimodal understanding. arXiv preprint arXiv:2412.10302, 2024.
+[58] Fuzhao Xue, Yukang Chen, Dacheng Li, Qinghao Hu, Ligeng Zhu, Xiuyu Li, Yunhao Fang, Haotian Tang,
+Shang Yang, Zhijian Liu, et al. Longvila: Scaling long-context visual language models for long videos.
+arXiv preprint arXiv:2408.10188, 2024.
+[59] Le Xue, Manli Shu, Anas Awadalla, Jun Wang, An Yan, Senthil Purushwalkam, Honglu Zhou, Viraj
+Prabhu, Yutong Dai, Michael S Ryoo, et al. xgen-mm (blip-3): A family of open large multimodal models.
+arXiv preprint arXiv:2408.08872, 2024.
+[60] An Yang, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu, Chengyuan Li, Dayiheng
+Liu, Fei Huang, Haoran Wei, et al. Qwen2. 5 technical report. arXiv preprint arXiv:2412.15115, 2024.
+[61] Jianwei Yang, Hao Zhang, Feng Li, Xueyan Zou, Chunyuan Li, and Jianfeng Gao. Set-of-mark prompting
+unleashes extraordinary visual grounding in gpt-4v. arXiv:2310.11441, 2023.
+[62] Zhengyuan Yang, Linjie Li, Jianfeng Wang, Kevin Lin, Ehsan Azarnasab, Faisal Ahmed, Zicheng Liu,
+Ce Liu, Michael Zeng, and Lijuan Wang. Mm-react: Prompting chatgpt for multimodal reasoning and
+action. arXiv preprint arXiv:2303.11381, 2023.
+[63] Haoxuan You, Haotian Zhang, Zhe Gan, Xianzhi Du, Bowen Zhang, Zirui Wang, Liangliang Cao, Shih-Fu
+Chang, and Yinfei Yang. Ferret: Refer and ground anything anywhere at any granularity. arXiv:2310.07704,
+2023.
+[64] En Yu, Kangheng Lin, Liang Zhao, Jisheng Yin, Yana Wei, Yuang Peng, Haoran Wei, Jianjian Sun, Chunrui
+Han, Zheng Ge, et al. Perception-r1: Pioneering perception policy with reinforcement learning. arXiv
+preprint arXiv:2504.07954, 2025.
+[65] Licheng Yu, Patrick Poirson, Shan Yang, Alexander C Berg, and Tamara L Berg. Modeling context in
+referring expressions. In ECCV, pages 69–85, 2016.
+[66] Yufei Zhan, Yousong Zhu, Zhiyang Chen, Fan Yang, Ming Tang, and Jinqiao Wang. Griffon: Spelling out
+all object locations at any granularity with large language models. In European Conference on Computer
+Vision, pages 405–422. Springer, 2025.
+[67] Hao Zhang, Feng Li, Shilong Liu, Lei Zhang, Hang Su, Jun Zhu, Lionel M Ni, and Heung-Yeung
+Shum. Dino: Detr with improved denoising anchor boxes for end-to-end object detection. arXiv preprint
+arXiv:2203.03605, 2022.
+[68] Zhuosheng Zhang, Aston Zhang, Mu Li, Hai Zhao, George Karypis, and Alex Smola. Multimodal
+chain-of-thought reasoning in language models. arXiv preprint arXiv:2302.00923, 2023.
+[69] Xiangyu Zhao, Shengyuan Ding, Zicheng Zhang, Haian Huang, Maosong Cao, Weiyun Wang, Jiaqi Wang,
+Xinyu Fang, Wenhai Wang, Guangtao Zhai, et al. Omnialign-v: Towards enhanced alignment of mllms
+with human preference. arXiv preprint arXiv:2502.18411, 2025.
+[70] Xiangyu Zhao, Xiangtai Li, Haodong Duan, Haian Huang, Yining Li, Kai Chen, and Hua Yang. Mg-llava:
+Towards multi-granularity visual instruction tuning. arXiv preprint arXiv:2406.17770, 2024.
+[71] Denny Zhou, Nathanael Schärli, Le Hou, Jason Wei, Nathan Scales, Xuezhi Wang, Dale Schuurmans,
+Claire Cui, Olivier Bousquet, Quoc Le, et al. Least-to-most prompting enables complex reasoning in large
+language models. arXiv preprint arXiv:2205.10625, 2022.
+[72] Deyao Zhu, Jun Chen, Xiaoqian Shen, Xiang Li, and Mohamed Elhoseiny. Minigpt-4: Enhancing
+vision-language understanding with advanced large language models. arXiv:2304.10592, 2023.
+
+13
+
+

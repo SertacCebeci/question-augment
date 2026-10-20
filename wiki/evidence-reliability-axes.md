@@ -1,0 +1,68 @@
+---
+description: "Evidence reliability is three separable properties of a document (credible-looking, on-topic, true); breaking each one makes an answerer fail differently, not just less often."
+aliases: ["document reliability dimensions", "trustworthiness relevance factuality", "source reliability axes"]
+sources: ["doi-10-48550-arxiv-2607-13920"]
+---
+# Evidence-reliability axes
+
+Evidence is not reliable or unreliable as one quantity. DeepStress (Rousseau, Damnati and Béchet, 2026) splits the reliability of a retrieved document into three attributes that can be set independently. Trustworthiness is "whether the source appears credible based on its style, structure and URL, regardless of its factuality."[^b1] Relevance is "whether the source meaningfully addresses the model-generated query rather than covering unrelated content."[^b2] Factuality is "whether the claims contained in the source are factually correct."[^b3] A document can look credible and be false, be true and off-topic, or be on-topic and false. The three are kept apart on purpose.
+
+## Mechanism
+
+The experimenter sets, for a scenario, the probability that each attribute takes its good value. For each search call the simulator samples one binary label per attribute, and the label becomes an instruction to a generator that writes the returned document.[^b4] Where the document is meant to be factual, the generator is grounded in dataset evidence: "we ground generation in dataset-provided evidence."[^b5] Where it is meant to be irrelevant, the generator is given "an unrelated question sampled from the dataset", so the document is coherent and grounded but answers another question.[^b6] Each call returns one document, which is a deliberate restriction: the paper "restrict[s] each search call to a single document (top_k = 1)."[^b4]
+
+Because the three labels are sampled per call, the axes can be stressed one at a time or together, and a run's evidence is a mixture of good and bad documents. This is what lets the same answerer be tested against different kinds of bad evidence rather than one generic noisy result list.
+
+## What each axis does
+
+The paper reports that the three axes do not produce the same failure.
+
+- Trustworthiness. "some systems are almost unaffected, while others change their behavior substantially."[^b7] Several open-weight agents keep their accuracy as credibility falls; the paper says "These models rely heavily on the information provided in their context, even when sources have clear surface cues of low credibility."[^b8] For another system, lower trust moved failure into format: "the rate of traces without a valid answer tag increases from 10.8% to 34.6%."[^b9]
+- Relevance. "the correct-answer rate drops sharply for all systems."[^b10] The failures differ by system: some answer wrongly, some abstain, some run out of tool budget.
+- Factuality. Here the failures are more confident. "SpiqaDR abstains much less at 0% factuality than at 0% relevance (15.2% versus 38.0%)," and "DR-Tulu reaches 59.1% incorrect answers at 0% factuality, compared with 33.8% at 0% relevance."[^b11][^b12]
+
+From the last pair the paper draws its one comparative claim: "irrelevant documents are easier to reject than relevant but false documents."[^b13] The claim rests on two systems and on the paper's own word "suggests", so it is a pattern in these runs and not an established law.
+
+The factuality setting also tests something else. At 0% factuality, "all relevant documents contain incorrect information, so the agent cannot recover the answer from the simulated documents alone."[^b14] Agents still answer a share of HotpotQA questions correctly in that setting, and the paper reads this as a sign that "many HotpotQA questions can be answered from parametric knowledge."[^b18]
+
+## Why it matters
+
+The axes say which question an answerer has to ask of its evidence. A credibility cue, an on-topic check and a truth check are three different tests, and an answerer that runs one of them has not run the others. For someone designing how a question is answered from retrieved text, this means that "is the source reliable" is not one question. My inference, not the paper's: the right response to an irrelevant document (set it aside) and to a relevant false one (notice that it conflicts with what is known) are different, so the axis that failed should shape the answer's form, which is what the failure pattern above suggests.
+
+## Transfer
+
+What survives outside this simulator is the decomposition itself: a document's bad-evidence status has at least these three separable parts, and they can fail independently. What does not survive is the measured split between systems, which depends on the agents, the two datasets and the generator. Trustworthiness is also defined by appearance: "regardless of its factuality." A credible-looking page that is false is trustworthy in this sense, so the axis does not measure truth.
+
+## Limits
+
+- The documents are generated by an LLM from sampled labels, so they are a model of bad evidence, not a sample of real web pages. The paper checks the labels by hand, and reports "high agreement with the intended trustworthiness labels (96.4%)"; factuality is the weaker check, since "Accuracy is lower for factuality (85.5%)."[^b15][^b17]
+- One document per call is not how a real search returns results. How the axes interact across a list of many documents was not tested.[^b4]
+- The "irrelevant" documents are coherent texts about another question. A random off-topic document would be easier to reject, so the finding that irrelevant documents are easier to reject than false ones depends on this construction.[^b6]
+- The three labels are sampled independently per document, so the mixtures in a run are not chosen to model any particular source population.
+- The study covers "simple search agents that use a single search loop and one type of search tool."[^b16]
+
+## Related
+
+- [[evidence-conflict-type]] — kinds of disagreement between sources; this note is about single documents degraded on three attributes.
+- [[evidence-insufficiency-regimes]] — the ways evidence falls short of answering; the axes here are the ways a single document can be bad.
+- [[reliability-discounted-abstention-credit]] — the product of the three axes is the reliability that sets the credit for a withheld answer.
+- [[parametric-suppression]] — the 0%-factuality condition is a behavioural test of the same conflict between parametric and retrieved knowledge that the layer-level note describes.
+
+[^b1]: doi-10-48550-arxiv-2607-13920 — "whether the source appears credible based on its style, structure and URL, regardless of its factuality"
+[^b2]: doi-10-48550-arxiv-2607-13920 — "whether the source meaningfully addresses the model-generated query rather than covering unrelated content"
+[^b3]: doi-10-48550-arxiv-2607-13920 — "whether the claims contained in the source are factually correct"
+[^b4]: doi-10-48550-arxiv-2607-13920 — "we restrict each search call to a single document (top_k = 1)"
+[^b5]: doi-10-48550-arxiv-2607-13920 — "we ground generation in dataset-provided evidence"
+[^b6]: doi-10-48550-arxiv-2607-13920 — "we replace the generation target with an unrelated question sampled from the dataset"
+[^b7]: doi-10-48550-arxiv-2607-13920 — "some systems are almost unaffected, while others change their behavior substantially"
+[^b8]: doi-10-48550-arxiv-2607-13920 — "These models rely heavily on the information provided in their context, even when sources have clear surface cues of low credibility"
+[^b9]: doi-10-48550-arxiv-2607-13920 — "the rate of traces without a valid answer tag increases from 10.8% to 34.6%"
+[^b10]: doi-10-48550-arxiv-2607-13920 — "the correct-answer rate drops sharply for all systems"
+[^b11]: doi-10-48550-arxiv-2607-13920 — "SpiqaDR abstains much less at 0% factuality than at 0% relevance (15.2% versus 38.0%)"
+[^b12]: doi-10-48550-arxiv-2607-13920 — "DR-Tulu reaches 59.1% incorrect answers at 0% factuality, compared with 33.8% at 0% relevance"
+[^b13]: doi-10-48550-arxiv-2607-13920 — "irrelevant documents are easier to reject than relevant but false documents"
+[^b14]: doi-10-48550-arxiv-2607-13920 — "At 0% factuality, all relevant documents contain incorrect information, so the agent cannot recover the answer from the simulated documents alone"
+[^b15]: doi-10-48550-arxiv-2607-13920 — "Accuracy is lower for factuality (85.5%)"
+[^b16]: doi-10-48550-arxiv-2607-13920 — "We study simple search agents that use a single search loop and one type of search tool"
+[^b17]: doi-10-48550-arxiv-2607-13920 — "high agreement with the intended trustworthiness labels (96.4%)"
+[^b18]: doi-10-48550-arxiv-2607-13920 — "many HotpotQA questions can be answered from parametric knowledge"

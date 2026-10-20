@@ -1,0 +1,3945 @@
+2026-07-03
+
+Hidden Forgetting in Continual Multimodal Learning:
+When Accuracy Survives but Grounding Fails
+Qianyu Chen1
+
+Canran Xiao2
+
+Runxuan Tang1
+
+1 Nanyang Technological University
+2 Shenzhen Campus of Sun Yat-sen University
+
+arXiv:2607.02020v1 [cs.AI] 2 Jul 2026
+
+Abstract
+Multimodal large language models must continually adapt to evolving tasks and
+domains, yet standard continual learning metrics mainly measure whether old
+answers remain correct, leaving the stability of multimodal grounding largely
+unexamined. We study this overlooked failure mode and ask whether a continually adapted MLLM can preserve not only what it answers, but also how
+it uses visual, textual, OCR, chart, and document evidence. We identify hidden
+evidence-use forgetting, where answer accuracy is retained while the model silently
+shifts toward different or less grounded evidence channels, and propose RCL,
+a replay-free reliance-constrained continual learning framework. RCL freezes
+the previous checkpoint as a behavioral reference, estimates teacher and student
+evidence-reliance profiles through counterfactual channel interventions, and jointly
+optimizes task learning, prediction preservation, and reliance preservation without
+adding inference-time cost. Across CoIN, COAST, MCITlib, and an evidencesensitive multimodal stream, RCL consistently improves final performance and
+reduces forgetting over replay-free, PEFT, routing, and memory-assisted baselines,
+while substantially lowering modality reliance drift, dominant evidence flips, and
+hidden forgetting rates. These results suggest that robust continual multimodal
+learning requires preserving the evidence path behind correct answers, not merely
+the answers themselves.
+
+1
+
+Introduction
+
+Multimodal large language models (MLLMs) have become a central interface for visual question answering, document understanding, chart reasoning, embodied perception, and open-ended image–language
+interaction. In realistic deployments, however, these models rarely face a fixed task distribution: new domains, instructions, visual formats, and reasoning skills arrive sequentially, making continual adaptation
+essential. The key challenge is that improving an MLLM on new multimodal tasks can silently degrade
+previously acquired abilities, limiting its reliability in long-lived and safety-sensitive applications.
+Recent studies have begun to formalize this problem as continual vision–language learning and continual
+multimodal instruction tuning. CLiMB highlights that vision–language systems suffer nontrivial forgetting across sequential multimodal tasks (Srinivasan et al., 2022), while ZSCL and CTP show that continual
+adaptation can damage the zero-shot transfer and cross-modal topology of pretrained vision–language
+representations (Zheng et al., 2023; Zhu et al., 2023). More recent MLLM-oriented benchmarks, such
+as CoIN and Continual LLaVA, further demonstrate that instruction-tuned MLLMs are vulnerable to
+capability-level forgetting when exposed to evolving multimodal instruction streams (Chen et al., 2024a;
+Cao et al., 2024). These works establish continual multimodal learning as an important problem and
+motivate a growing set of methods for mitigating forgetting.
+Existing approaches have made substantial progress by preserving model parameters, output behavior,
+or task-specific adaptation modules. For example, Model Tailor mitigates forgetting by identifying sparse
+parameter modifications that preserve pretrained capabilities (Zhu et al., 2024), while HiDe-LLaVA,
+BranchLoRA, and ProgLoRA organize task-specific or progressive LoRA modules to reduce interference
+during continual instruction tuning (Guo et al., 2025a; Zhang et al., 2025; Yu et al., 2025). Other methods
+improve continual multimodal adaptation through prompt routing, expert allocation, or synthetic replay
+signals, as seen in ModalPrompt, CL-MoE, and GIFT (Zeng et al., 2025; Huai et al., 2025; Wu et al.,
+2025). SEFE further argues that forgetting in MLLMs should not be treated as a single phenomenon,
+distinguishing superficial response-format degradation from more essential knowledge loss (Chen et al.,
+2025). Despite these advances, most methods still evaluate and constrain forgetting mainly through final
+answers, output distributions, or parameter changes.
+1
+
+This answer-centric view leaves a critical gap. In multimodal reasoning, two checkpoints may produce
+the same answer while relying on different evidence sources, such as visual regions, OCR tokens, or
+language priors. Such hidden shifts are especially problematic because they can make a model appear
+stable under standard accuracy metrics while its grounding behavior becomes less faithful and more
+shortcut-driven. Prior work on language bias in VQA has shown that correct predictions may arise from
+dataset priors rather than genuine visual evidence (Agrawal et al., 2018), and counterfactual analysis has
+been used to reveal causal effects of biased evidence in static VQA settings (Niu et al., 2021). However,
+this perspective has not been fully integrated into replay-free continual learning for MLLMs, where the
+central question is not only whether old answers are retained, but whether the model continues to use
+the appropriate multimodal evidence to obtain them.
+In this paper, we ask: Can continual MLLM adaptation preserve not only what the model answers, but also
+how it uses multimodal evidence? We address this question from the perspective of evidence-use stability.
+At a high level, our framework treats the previous model as a behavioral reference, estimates how
+both the previous and current models depend on available evidence channels, and constrains continual
+adaptation to preserve this reliance pattern while learning new tasks. This design complements existing
+output- or parameter-preservation strategies by targeting a hidden dimension of forgetting that standard
+answer-level evaluation can miss.
+Our contributions are summarized as follows:
+• We identify and formalize hidden evidence-use forgetting: an MLLM may retain the correct answer
+while drifting toward different or less grounded evidence sources during continual adaptation.
+• We propose a replay-free reliance-preserving continual learning framework that constrains
+evidence-use drift without storing previous multimodal examples or increasing inference-time
+cost.
+• Through continual multimodal instruction streams, we show that preserving reliance profiles
+improves both answer retention and evidence-grounded stability, providing a stronger notion of
+continual multimodal robustness than answer accuracy alone.
+
+2
+
+Related Work
+
+Continual vision–language representation learning. Early multimodal continual learning studies
+moved beyond unimodal classification by evaluating sequential vision–language tasks and cross-modal
+representation stability. CLiMB introduced a benchmark for continual vision-and-language tasks, while
+Mod-X, ZSCL, and CTP showed that sequential adaptation can distort intra-modal geometry, crossmodal alignment, and zero-shot transfer in CLIP-like models (Srinivasan et al., 2022; Ni et al., 2023;
+Zheng et al., 2023; Zhu et al., 2023). More recent work scales this direction to practical multimodal
+streams and stronger VLM backbones: FoMo-in-Flux studies continual multimodal pretraining under
+realistic compute and data-mixture constraints (Udandarao et al., 2024); C-CLIP evaluates continual
+image–text retrieval and zero-shot retention (Liu et al., 2025); LADA introduces label-specific CLIP
+adapters (Luo et al., 2025); and GIFT uses synthetic image–text data for replay-style preservation (Wu
+et al., 2025). These methods substantially improve representation-level stability, but they mainly protect
+global embedding spaces, retrieval/classification performance, or pretrained zero-shot ability. In contrast,
+our work studies autoregressive MLLMs, where forgetting may occur not only in the final answer but
+also in the instance-specific allocation of reliance over visual regions, OCR tokens, chart elements, and
+language context.
+Continual instruction tuning for MLLMs. Continual instruction tuning has recently become the
+dominant setting for adapting MLLMs to evolving tasks. CoIN formulates sequential instruction tuning
+over diverse task categories and shows that MLLMs suffer severe forgetting of instruction following (Chen
+et al., 2024a). Continual LLaVA further introduces COAST, covering domain-, capability-, and datasetincremental LVLM adaptation (Cao et al., 2024). Recent methods then focus on stronger parameter
+organization and routing: Model Tailor identifies sparse parameter patches to preserve pretrained
+capabilities (Zhu et al., 2024); HiDe-LLaVA uses task-specific expansion and task-general fusion based on
+layer-wise similarity (Guo et al., 2025a); BranchLoRA and ProgLoRA improve LoRA allocation under
+MCIT (Zhang et al., 2025; Yu et al., 2025); ModalPrompt uses dual-modality guided prompt fusion and
+selection (Zeng et al., 2025); CL-MoE introduces dual momentum experts for continual VQA (Huai et al.,
+2025); and MLLM-CL proposes domain/ability continual settings with MLLM-based routing (Zhao
+et al., 2025). SEFE is particularly relevant because it separates superficial format forgetting from essential
+knowledge forgetting (Chen et al., 2025). However, these direct competitors primarily preserve answer
+accuracy, response format, parameter specialization, or output distributions. Our preliminary observation
+suggests that such preservation can still hide evidence-use drift. RCL therefore adds a complementary
+2
+
+hidden evidence drift
+(answer stable, evidence unstable)
+
+S1 ScienceQA
+
+Seq-LoRA
+Answer-KD
+
+0.4
+
+0.3
+
+Old task family
+Reasoning
+Compositional
+General VQA
+Knowledge
+OCR/Text
+Chart
+Document
+
+0.2
+
+0.1
+
+59
+
+S2 GQA
+
+Previous task evaluated
+
+Post-hoc evidence-sensitivity drift
+
+0.5
+
+(b) Output preservation still allows evidence rewiring
+Training baseline
+
+78
+
+80
+
+81
+
+82
+
+85
+
+61
+
+71
+
+78
+
+80
+
+81
+
+82
+
+80
+
+65
+
+78
+
+82
+
+79
+
+79
+
+70
+
+72
+
+76
+
+76
+
+77
+
+60
+
+71
+
+72
+
+73
+
+68
+
+66
+
+S3 VQAv2
+
+S4 OK-VQA
+
+S5 TextVQA
+
+S6 OCR-VQA
+
+S8 DocVQA
+
+50
+
+40
+
+Bubble size
+S7 ChartQA
+
+90
+
+64
+
+71
+
+1% acc drop
+3% acc drop
+5% acc drop
+
+Dominant evidence flip rate (%)
+
+(a) Answer retention does not imply evidence retention
+
+30
+
+VQ S8
+A
+oc
+
+tQ S7
+A
+D
+
+Ch
+ar
+
+CR
+-V S6
+Q
+A
+
+ie
+Sc
+
+O
+
+7
+
+Te
+xt
+VQ S5
+A
+
+6
+
+K- S
+VQ 4
+A
+
+5
+
+O
+
+4
+
+Av S3
+2
+
+3
+
+Visible answer forgetting: clean accuracy drop (%)
+
+VQ
+
+2
+
+nc
+eQ S1
+A
+
+1
+
+G S2
+Q
+A
+
+20
+0
+
+Model after learning stage
+
+Figure 1: Hidden evidence-use drift in replay-free multimodal continual adaptation. (a) Answer
+forgetting is weakly aligned with post-hoc evidence drift; the shaded region marks small answer drop but
+large evidence drift. (b) For Answer-KD, warm cells with small bubbles show that output preservation
+can hide substantial dominant-evidence flips. Details are in Appendix B.1.
+constraint: the previous checkpoint’s counterfactual reliance profile serves as a teacher signal, preserving
+not only what the model answers but also how it uses multimodal evidence.
+Grounding, shortcut bias, and counterfactual evidence use. A related line of VQA research shows
+that correct answers may arise from language priors rather than grounded visual evidence. VQA-CP
+exposes this issue by changing answer priors between training and testing (Agrawal et al., 2018), and
+Counterfactual VQA uses causal counterfactual reasoning to estimate and reduce language-bias effects
+(Niu et al., 2021). These works motivate channel-level evidence diagnostics, but they are mainly designed
+for static debiasing or evaluation rather than continual adaptation. Our work brings this perspective into
+replay-free MLLM continual learning by turning counterfactual evidence suppression into a training-time
+reliance-preservation objective, while adding no inference-time overhead.
+
+3
+
+Preliminary Study
+
+Before introducing our method, we ask whether continual multimodal adaptation forgets only final
+answers, or also the evidence path used to obtain them. This distinction matters because two checkpoints
+may produce the same answer while relying on different channels, such as visual regions, OCR tokens,
+chart elements, or language priors. Standard answer-level evaluation may therefore miss a form of hidden
+forgetting: the answer is preserved, but the underlying multimodal evidence use has drifted.
+Diagnostic setup. We conduct a replay-free pilot study on an eight-stage multimodal stream and evaluate two simple baselines: sequential LoRA tuning and output-level answer distillation. No component
+of our proposed method is used. After training, we perform post-hoc channel ablations to estimate
+a diagnostic evidence-use vector q( f ; x, y) for each checkpoint f , where qm is proportional to the loss
+increase caused by suppressing evidence channel m. Full protocol details are provided in Appendix B.1.
+Let f j be the checkpoint after learning stage j, and f k a later checkpoint after stage k > j. For an
+old evaluation set E j , we measure answer forgetting, evidence-sensitivity drift, and answer-preserved
+dominant-evidence flips as
+A j→k = Acc( f j ; E j ) − Acc( f k ; E j ),
+h
+i
+Gj→k = E( x,y)∼E j q( f j ; x, y) − q( f k ; x, y) 1 ,
+h h
+i
+i
+Hj→k = E 1 arg max qm ( f j ; x, y) ̸= arg max qm ( f k ; x, y) f j ( x ) = f k ( x ) = y .
+m
+
+(1)
+
+m
+
+Here A j→k captures visible answer degradation, whereas Gj→k and Hj→k diagnose whether the model
+still uses the same evidence when the answer is retained.
+Findings. Figure 1 shows that answer preservation does not imply evidence preservation. Many
+transitions incur less than 2% clean accuracy drop while exhibiting large evidence-sensitivity drift.
+3
+
+Moreover, output-level distillation reduces the average clean accuracy drop from 2.72% to 1.57%, but still
+leaves 66.3% of diagnostic slices in the hidden-drift region, compared with 14.4% for sequential LoRA.
+The effect is most pronounced on OCR-, chart-, and document-centric stages, where the model often
+keeps the correct answer but shifts away from grounded visual/textual evidence toward easier priors.
+These observations motivate the central principle of our method: continual multimodal learning should
+preserve not only what the previous model answers, but also how it uses evidence. We next formalize this
+principle as reliance-constrained continual learning.
+
+4
+
+Method
+
+We propose Reliance-Constrained Continual Learning (RCL), a replay-free framework for mitigating
+hidden forgetting in continual multimodal learning. RCL is built on a simple principle: a continual MLLM
+should preserve not only its answers, but also the evidence channels that support those answers. At each
+learning stage, RCL freezes the previous model as a behavioral reference, probes both the reference and
+current models through counterfactual channel interventions, estimates their modality-reliance profiles,
+and updates the current model by jointly optimizing task learning, prediction preservation, and reliance
+preservation. The framework updates only parameter-efficient adaptation parameters and introduces no
+additional computation at inference time.
+1 Current Multimodal Input
+Sample
+
+2
+
+Create counterfactuals by
+suppressing one channel at a time.
+
+?
+
+Inputs
+Original
+(input)
+
+what
+
+does
+
+sign
+
+say
+
+?
+
+Speed Limit
+
+25
+
+the
+
+the
+
+sign
+
+say
+
+Main St
+
+Answer
+
+STOP
+
+Mask text channel
+
+-OCR
+
+the
+
+sign
+
+say
+
+v2
+
+v3
+
+…
+
+vN
+
+Text tokens
+t1
+
+t2
+
+t3
+
+…
+
+tM
+
+OCR/Structured tokens
+o1
+
+o2
+
+o3
+
+…
+
+Backbone
+(frozen)
+
+image
+
+?
+
+STOP Main St Speed Limit 25
+
+what does
+
+the
+
+sign
+
+say
+
+?
+
+Align
+(reliance
+matching)
+
+Model
+(backbone
+frozen)
+
+-Visual
+
+STOP Main St Speed Limit 25
+
+OCR
+
+Reliance (student)
+
+Original
+(input)
+
+Remove OCR channel
+
+text
+
+Current model
+Inputs
+
+Visual (image) tokens
+v1
+
+Current model (during
+update)
+Model
+
+-Text
+
+what does
+
+Decomposition into evidence
+channels
+
+L  1L task  2Ldistill  3Lrel
+
+Reliance (teacher)
+
+-Visual
+
+OCR/Structured evidence
+STOP
+
+Total objective
+
+Frozen previous model
+
+STOP Main St Speed Limit 25
+
+what does
+
+4 Reliance-Constrained Update
+
+Estimate reliance from how much the
+output changes under interventions.
+
+Mask visual channel
+
+Question (text tokens)
+
+Teacher-Student
+Reliance Comparison
+
+3
+
+Counterfactual
+Channel Intervention
+
+Adapter/
+LORA
+(updatable)
+
+ok
+
+image
+
+text
+
+Trainable
+(updated)
+
+Text (language)
+channel
+
+Frozen
+(unchanged)
+
+Intervention/
+behavior change
+
+OCR
+
+Updated
+model
+
+Visual (image)
+channel
+
+OCR / Structured
+channel
+
+-Text
+-OCR
+
+Adapter/
+LORA
+(updatable)
+
+Suppressed
+channel
+
+Figure 2: Overview of Reliance-Constrained Continual Learning. Given a multimodal input, RCL
+constructs counterfactual channel interventions, compares teacher–student reliance profiles, and updates
+the current model with a reliance-preserving objective to mitigate hidden evidence-use forgetting.
+
+4.1
+
+Continual Multimodal Learning Setup
+
+We consider a sequence of multimodal learning stages {D1 , . . . , DK }, where each stage Dk contains inputoutput pairs ( x, y). Each input x consists of a set of evidence channels M x , such as visual tokens, question
+tokens, OCR tokens, chart elements, and other task-specific input sources. We write x = { x m : m ∈ M x },
+where x m denotes the component of x associated with channel m.
+L
+Let f θ denote an MLLM with autoregressive answer distribution pθ (y | x ) = ∏ℓ=
+1 pθ ( yℓ | y<ℓ , x ). We
+use parameter-efficient adaptation and decompose the model parameters as θ = θ0 ∪ ϕ, where θ0 is the
+frozen backbone and ϕ denotes trainable adapter parameters. At stage k, the previous model is frozen as
+f θ − with θ − = θk−1 , and the current model f θ is optimized on Dk .
+
+The standard task loss is
+"
+
+L
+
+#
+
+Ltask (θ ) = E(x,y)∼Dk − ∑ log pθ (yℓ | y<ℓ , x ) .
+
+(2)
+
+ℓ=1
+
+This objective encourages correct answers on the current stage, but it does not constrain which evidence
+channels the model uses to obtain those answers.
+4
+
+4.2
+
+Counterfactual Modality Reliance
+
+RCL estimates modality reliance through counterfactual evidence suppression. For each channel m ∈ M x ,
+we define an intervention set Im . Each intervention τm ∈ Im suppresses access to channel m while keeping
+the remaining channels unchanged. For example, an image channel is suppressed by masking visual
+regions, an OCR channel by removing recognized text tokens, and a chart channel by masking chart
+elements. The complete intervention construction is given in Appendix A.1.
+For a model f θ , we define the counterfactual sensitivity of channel m as
+
+1 L
+1
+∆θ,m ( x, y) =
+∑ DKL ( pθ (· | y<ℓ , x) ∥ pθ (· | y<ℓ , τm (x)))
+∑
+|Im | τm ∈Im L ℓ=
+1
+
++ β (ℓθ (y | τm ( x )) − ℓθ (y | x ))+ ,
+
+(3)
+
+L
+where ℓθ (y | x ) = − ∑ℓ=
+1 log pθ ( yℓ | y<ℓ , x ), ( z )+ = max( z, 0), and β ≥ 0 balances output-distribution
+shift and answer-loss increase. A larger ∆θ,m ( x, y) indicates that suppressing channel m causes a larger
+behavioral change, hence the model relies more strongly on that channel for the given sample.
+
+We normalize channel sensitivities into a reliance vector:
+rθ,m ( x, y) =
+
+exp (∆θ,m ( x, y)/τr )
+,
+∑n∈Mx exp (∆θ,n ( x, y)/τr )
+
+rθ ( x, y) = [rθ,m ( x, y)]m∈Mx .
+
+(4)
+
+Here τr > 0 is a temperature parameter. The vector rθ ( x, y) lies in the simplex ∆|Mx |−1 and is always
+computed over the evidence channels available in the current sample. Teacher and student reliance
+vectors are therefore compared on the same support M x .
+
+4.3
+
+Hidden Forgetting as Reliance Drift
+
+Accuracy-based evaluation detects whether the final answer changes, but it does not detect whether the
+evidence path changes. We formalize this discrepancy through modality reliance drift. Given the frozen
+reference model f θ − and the current model f θ , the sample-level reliance drift is
+MRD( x, y; θ − , θ ) = DJS (rθ − ( x, y) ∥ rθ ( x, y)) ,
+
+(5)
+
+where DJS denotes Jensen–Shannon divergence.
+For a previous-stage evaluation set E j , hidden forgetting occurs when answer accuracy is preserved while
+reliance drift is large:
+h
+i h
+i
+HF j→k = I Acc( f θ j ; E j ) − Acc( f θk ; E j ) ≤ δacc · I MRD j→k ≥ δrel .
+(6)
+Here MRD j→k is the average of Eq. (5) over E j , and δacc , δrel are fixed thresholds. This definition separates
+visible forgetting, measured by answer degradation, from hidden forgetting, measured by evidence-use
+drift. Additional evaluation metrics are defined in Appendix A.7.
+
+4.4
+
+Reliance-Constrained Continual Update
+
+RCL constrains the current model to preserve the reference model’s reliance profile on the current-stage
+data. For each sample ( x, y), the frozen model f θ − produces a reference reliance vector rθ − ( x, y), while
+the trainable model produces rθ ( x, y). The reliance preservation loss is
+
+
+Lrel (θ ) = E(x,y)∼Dk wθ − ( x, y) DJS (sg[rθ − ( x, y)] ∥ rθ ( x, y)) ,
+(7)
+where sg[·] denotes stop-gradient. The scalar wθ − ( x, y) ∈ [0, 1] is a confidence weight computed from
+the reference model’s predictive entropy and intervention sensitivity; its exact form is provided in
+Appendix A.2. This gate prevents unreliable reference predictions from dominating the update.
+We also preserve the output behavior of the previous model through token-level prediction distillation:
+"
+#
+2
+L
+
+τkd
+τkd
+τkd
+Lpred (θ ) = E(x,y)∼Dk
+(8)
+∑ DKL pθ− (· | y<ℓ , x) pθ (· | y<ℓ , x) ,
+L ℓ=
+1
+τ
+
+where pθkd denotes the softmax distribution over logits divided by the temperature τkd .
+5
+
+The full objective at stage k is
+min
+ϕ
+
+Lk (ϕ) = Ltask + λpred Lpred + λrel Lrel + λreg ∥ϕ − ϕ− ∥22 ,
+
+(9)
+
+where ϕ− denotes the adapter parameters from the previous stage. The prediction term preserves what
+the model answers, while the reliance term preserves how the model uses evidence. RCL does not impose
+a fixed preference for visual, textual, or OCR evidence. Instead, it preserves the instance-specific reliance
+profile induced by the previous model. Therefore, when the reference model genuinely relies on visual
+evidence, RCL discourages drift toward language shortcuts; when the reference model relies primarily
+on textual evidence, RCL preserves that allocation rather than forcing visual dependence.
+
+4.5
+
+Training and Inference
+
+At each stage, RCL freezes f θ − , samples a minibatch from Dk , constructs counterfactual interventions
+for the available evidence channels, computes rθ − ( x, y) and rθ ( x, y) on the same intervened inputs, and
+updates only the PEFT parameters ϕ using Eq. (9). RCL stores no raw multimodal examples from
+previous stages. It keeps the previous checkpoint only during the current stage, which is sufficient to
+provide prediction and reliance targets. After training stage k, the updated model becomes the reference
+for stage k + 1.
+During inference, RCL uses the updated MLLM f θk directly. Counterfactual interventions, frozenreference forward passes, and reliance estimation are used only during training and evaluation, so the
+deployed model has the same inference cost as the underlying PEFT-adapted MLLM.
+
+5
+
+Experiments
+
+5.1
+
+Experimental Setup
+
+Benchmarks and metrics. We evaluate RCL on CoIN, COAST, MCITlib, and an evidence-sensitive
+stream covering VQA, OCR/document, and chart/table reasoning (Chen et al., 2024a; Cao et al., 2024;
+Guo et al., 2025b). We report official task scores, standard CL metrics, and reliance-aware diagnostics;
+details are in Appendix B.2.
+Comparison protocol. Comparison protocol. We use a replay-free, task-id-free protocol: methods store
+no previous multimodal examples, use no oracle task identity at inference, and follow the same task
+order and data budget. We compare against standard CL/PEFT baselines, recent multimodal continual
+instruction-tuning methods, and separately report replay- or memory-assisted references because they
+use stored or generated past-task signals. Detailed method grouping, baseline list, and fairness rules are
+provided in Appendix B.3.
+Backbones and implementation. We use LLaVA-1.5-7B as the default backbone and additionally evaluate
+LLaVA-1.5-13B and InternVL-Chat-7B to test scale and architecture robustness (Liu et al., 2024; Chen et al.,
+2024b). Unless otherwise specified, the vision encoder and language backbone are frozen and only PEFT
+parameters are updated. All methods are trained with matched data, task order, trainable-parameter
+budget, and optimization budget whenever possible. For RCL, counterfactual interventions are used
+only during training and diagnostic evaluation, so the final model has the same inference cost as the
+underlying PEFT-adapted MLLM. Implementation details, hyperparameters, compute resources, and
+reproducibility settings are provided in Appendix B.4.
+
+5.2
+
+Main Results
+
+Table 1 shows that RCL delivers the strongest plasticity–retention trade-off across three backbones,
+improving final performance while reducing forgetting and keeping BWT closer to zero. Despite being
+replay-free, it outperforms replay- or task-recall-based references, highlighting evidence-use preservation
+as an effective anti-forgetting signal.
+Table 2 shows that strong baselines can preserve answers while still suffering large MRD, DEF, and HFR,
+revealing substantial evidence-path drift. RCL consistently reduces reliance drift and dominant-channel
+flips while improving GCR, confirming that continual MLLM evaluation should assess both answers and
+their supporting evidence.
+
+6
+
+Table 1: Main results against common baselines and recent SoTAs. Best, second-best, and third-best
+results are highlighted in red, blue, and green, respectively.
+Method
+
+Backbone
+
+CoIN
+
+Extra signal
+
+COAST
+
+MCITlib
+
+ACC↑ MAA↑ BWT↑ Avg.↑ Fgt.↓ MFN↑ MAA↑ BWT↑
+Reference settings
+Zero-shot
+Multi-task / Joint
+
+LLaVA-1.5-7B
+LLaVA-1.5-7B
+
+None
+All tasks
+
+—
+—
+
+7.12
+57.18
+
+—
+—
+
+28.74
+32.90
+30.41
+41.86
+42.22
+43.50
+45.83
+
+32.97
+36.93
+34.95
+46.72
+47.05
+48.26
+50.26
+
+Recent multimodal continual instruction tuning methods
+MoELoRA
+LLaVA-1.5-7B
+Expert LoRA
+37.13
+Model Tailor
+LLaVA-1.5-7B
+Sparse patch
+46.67
+Continual LLaVA
+LLaVA-1.5-7B
+Incr. embed.
+48.09
+CL-MoE
+LLaVA-1.5-7B
+MoE
+48.90
+HiDe-LLaVA
+LLaVA-1.5-7B
+Decoupling
+51.56
+BranchLoRA
+LLaVA-1.5-7B
+Router
+44.20
+ProgLoRA
+LLaVA-1.5-7B
+Task recall
+59.09
+ModalPrompt
+LLaVA-1.5-7B
+Prompt
+50.52
+SEFE
+LLaVA-1.5-7B
+ASD+RegLoRA 53.61
+MLLM-CL
+LLaVA-1.5-7B
+Router
+55.51
+IGVP
+LLaVA-1.5-7B
+Projector
+55.00
+Replay or memory-assisted references
+Rehearsal
+LLaVA-1.5-7B
+DER
+LLaVA-1.5-7B
+GIFT
+LLaVA-1.5-7B
+Ask-and-Remember LLaVA-1.5-7B
+
+Standard continual learning and PEFT baselines
+Seq-LoRA
+LLaVA-1.5-7B
+None
+EWC
+LLaVA-1.5-7B
+Fisher
+LwF
+LLaVA-1.5-7B
+Logit distill.
+L2P
+LLaVA-1.5-7B
+Prompt
+DualPrompt
+LLaVA-1.5-7B
+Prompt
+CODA-Prompt
+LLaVA-1.5-7B
+Prompt
+O-LoRA
+LLaVA-1.5-7B
+Orth. LoRA
+
+Ours
+RCL
+RCL
+RCL
+
+5.3
+
+Buffer
+Buffer+KD
+Synthetic replay
+Question replay
+
+LLaVA-1.5-7B
+Reliance
+LLaVA-1.5-13B
+Reliance
+InternVL-Chat-7B Reliance
+
+—
+52.59
+
+—
+—
+
+—
+58.48
+
+—
+63.86
+
+—
+—
+
+-32.62
+-27.46
+-27.03
+-18.49
+-18.17
+-17.29
+-16.58
+
+30.29 20.74 50.22
+32.25 19.16 49.51
+32.54 20.59 49.10
+45.79 6.69 50.99
+46.27 6.61 51.31
+46.85 5.80 52.00
+46.72 5.79 52.35
+
+58.09
+56.38
+56.25
+57.60
+57.77
+58.16
+58.52
+
+-13.41
+-12.68
+-13.05
+-8.59
+-8.36
+-7.80
+-9.98
+
+42.76
+51.22
+52.80
+53.48
+56.41
+49.94
+62.38
+55.55
+58.17
+60.28
+59.87
+
+-25.91
+-15.12
+-13.27
+-11.92
+-8.97
+-20.98
+-6.59
+-10.10
+-8.55
+-7.17
+-7.39
+
+45.01
+45.56
+48.73
+47.72
+48.30
+49.11
+49.79
+47.95
+49.36
+49.90
+49.45
+
+49.88
+53.05
+53.26
+49.18
+50.18
+54.97
+55.78
+46.73
+54.26
+55.32
+55.15
+
+57.64
+58.98
+59.51
+57.21
+57.53
+60.21
+60.55
+47.17
+59.66
+60.76
+60.18
+
+-10.70
+-7.48
+-6.73
+-12.65
+-7.58
+-5.58
+-4.94
+0.02
+-7.94
+-4.93
+-5.16
+
+42.88
+44.35
+56.26
+57.22
+
+47.25
+48.76
+61.51
+62.07
+
+-18.43
+-16.76
+-6.89
+-6.72
+
+31.58 19.52 51.56
+33.88 17.94 52.52
+49.76 4.07 56.06
+50.02 3.90 56.35
+
+57.19
+57.88
+60.72
+60.88
+
+-8.11
+-7.67
+-4.74
+-4.56
+
+65.01
+66.87
+66.08
+
+67.56
+69.30
+68.45
+
+-4.23
+-3.77
+-3.92
+
+52.55
+54.22
+53.50
+
+62.29
+63.42
+62.85
+
+-2.03
+-1.58
+-1.79
+
+7.23
+5.17
+4.54
+5.06
+4.68
+4.56
+4.11
+4.80
+4.31
+3.97
+4.23
+
+2.76
+2.30
+2.47
+
+58.86
+60.18
+59.62
+
+Ablation Study and Analysis
+
+Single-factor ablation. We ablate each major component of RCL on LLaVA-1.5-7B using the same task
+order, PEFT configuration, training budget, and evaluation protocol as the full model. As shown in
+Table 3, removing the reliance loss Lrel leads to the largest degradation in reliance-aware diagnostics,
+especially MRD, DEF, and HFR. This indicates that preserving output behavior or answer accuracy alone
+is insufficient to maintain stable evidence use during continual adaptation. Prediction distillation mainly
+improves conventional retention metrics, while the confidence gate helps filter unreliable teacher reliance
+targets and evidence-targeted interventions provide more faithful channel-level sensitivity signals. The
+weaker performance of random interventions, single-score reliance variants, and visual-only reliance
+further shows that the gains of RCL do not come from generic perturbation regularization. Instead, they
+arise from preserving instance-specific, multi-channel evidence reliance across continual learning stages.
+Can Accuracy Preservation Hide Evidence-Use Forgetting? Answer-level retention may conceal
+whether an old task is still supported by the same multimodal evidence. We analyze all old-to-later
+transitions in the evidence-sensitive stream and compare clean answer drop, modality reliance drift
+(MRD), and dominant evidence flip rate (DEF) on answer-preserved examples. Figure 3 shows that
+A NSWER -KD moves many points leftward by reducing the average answer drop from 3.41% to 1.82%,
+but still leaves 64.7% of low-drop slices in the hidden-forgetting region with an average DEF of 35.9%. By
+contrast, RCL reduces MRD from 0.238 to 0.108, lowers DEF from 35.9% to 14.6%, and decreases hidden
+forgetting from 64.7% to 10.8%. The largest reductions occur on OCR-, chart-, and document-centric slices,
+indicating that reliance preservation is most valuable when the correct answer depends on structured
+evidence rather than language priors.
+
+7
+
+Table 2: Reliance-aware results on the evidence-sensitive stream. Avg. is final average answer
+performance; AF is average forgetting; MRD is modality reliance drift; DEF is dominant evidence flip
+rate on answer-preserved examples; HFR is hidden forgetting rate; GCR measures grounded-channel
+retention for visual/OCR/chart/document evidence.
+Method
+
+Backbone
+
+Avg.↑
+
+AF↓
+
+MRD↓
+
+DEF↓
+
+HFR↓
+
+GCR↑
+
+EWC
+LwF
+O-LoRA
+MoELoRA
+Continual LLaVA
+HiDe-LLaVA
+BranchLoRA
+ProgLoRA
+ModalPrompt
+SEFE
+MLLM-CL
+GIFT
+Ask-and-Remember
+
+LLaVA-1.5-7B
+LLaVA-1.5-7B
+LLaVA-1.5-7B
+LLaVA-1.5-7B
+LLaVA-1.5-7B
+LLaVA-1.5-7B
+LLaVA-1.5-7B
+LLaVA-1.5-7B
+LLaVA-1.5-7B
+LLaVA-1.5-7B
+LLaVA-1.5-7B
+LLaVA-1.5-7B
+LLaVA-1.5-7B
+
+51.96
+50.88
+54.30
+53.62
+56.53
+57.26
+58.58
+61.94
+56.99
+59.41
+60.29
+61.62
+61.90
+
+16.06
+16.45
+12.60
+13.22
+9.86
+9.38
+8.95
+5.87
+9.12
+8.10
+7.02
+6.06
+5.80
+
+0.257
+0.250
+0.234
+0.223
+0.209
+0.196
+0.191
+0.176
+0.184
+0.173
+0.167
+0.162
+0.159
+
+36.7
+36.1
+33.9
+32.6
+29.3
+28.0
+26.8
+24.1
+25.0
+23.3
+22.7
+21.9
+21.6
+
+54.0
+52.9
+46.7
+45.4
+38.6
+36.3
+35.0
+28.8
+31.4
+27.6
+26.3
+24.7
+24.0
+
+67.4
+67.1
+70.7
+71.3
+74.7
+76.0
+77.3
+79.6
+78.2
+80.3
+81.2
+82.6
+82.9
+
+RCL
+RCL
+RCL
+
+LLaVA-1.5-7B
+LLaVA-1.5-13B
+InternVL-Chat-7B
+
+64.06
+65.28
+64.75
+
+4.22
+3.76
+3.93
+
+0.106
+0.093
+0.098
+
+14.8
+13.0
+13.7
+
+12.9
+11.1
+11.8
+
+89.0
+90.6
+89.9
+
+Table 3: Single-factor ablation on LLaVA-1.5-7B. We report standard benchmark performance and
+evidence-use diagnostics. Blue numbers indicate degradation relative to the full RCL model.
+Standard continual benchmarks
+
+Variant
+
+Evidence-sensitive stream
+
+CoIN ACC↑ COAST Avg.↑ MCIT MFN↑
+RCL full
+w/o reliance loss Lrel
+w/o prediction distillation Lpred
+w/o confidence gate wθ −
+w/o entropy factor in gate
+w/o sensitivity factor in gate
+random interventions
+loss-increase only
+KL-shift only
+visual-only reliance
+w/o adapter regularization
+
+Avg.↑
+
+AF↓
+
+MRD↓
+
+DEF↓
+
+HFR↓
+
+65.01
+
+52.55
+
+58.86
+
+64.06
+
+4.22
+
+0.106
+
+14.8
+
+12.9
+
+89.0
+
+62.44 (-2.57)
+62.98 (-2.03)
+63.28 (-1.73)
+63.81 (-1.20)
+63.66 (-1.35)
+62.90 (-2.11)
+63.95 (-1.06)
+64.12 (-0.89)
+63.42 (-1.59)
+64.31 (-0.70)
+
+50.78 (-1.77)
+51.10 (-1.45)
+51.46 (-1.09)
+51.88 (-0.67)
+51.75 (-0.80)
+50.96 (-1.59)
+52.05 (-0.50)
+52.12 (-0.43)
+51.64 (-0.91)
+52.19 (-0.36)
+
+56.91 (-1.95)
+57.29 (-1.57)
+57.54 (-1.32)
+57.92 (-0.94)
+57.83 (-1.03)
+57.08 (-1.78)
+58.06 (-0.80)
+58.11 (-0.75)
+57.68 (-1.18)
+58.27 (-0.59)
+
+61.72 (-2.34)
+62.24 (-1.82)
+62.83 (-1.23)
+63.21 (-0.85)
+63.08 (-0.98)
+62.34 (-1.72)
+63.41 (-0.65)
+63.59 (-0.47)
+62.87 (-1.19)
+63.55 (-0.51)
+
+5.96 (+1.74)
+5.31 (+1.09)
+5.08 (+0.86)
+4.72 (+0.50)
+4.81 (+0.59)
+5.42 (+1.20)
+4.63 (+0.41)
+4.54 (+0.32)
+4.92 (+0.70)
+4.53 (+0.31)
+
+0.184 (+0.078)
+0.125 (+0.019)
+0.137 (+0.031)
+0.126 (+0.020)
+0.132 (+0.026)
+0.153 (+0.047)
+0.124 (+0.018)
+0.119 (+0.013)
+0.141 (+0.035)
+0.118 (+0.012)
+
+25.9 (+11.1)
+17.9 (+3.1)
+19.4 (+4.6)
+17.1 (+2.3)
+18.6 (+3.8)
+22.0 (+7.2)
+17.0 (+2.2)
+16.4 (+1.6)
+20.8 (+6.0)
+16.2 (+1.4)
+
+30.4 (+17.5)
+17.2 (+4.3)
+20.1 (+7.2)
+17.8 (+4.9)
+18.7 (+5.8)
+24.8 (+11.9)
+16.3 (+3.4)
+15.7 (+2.8)
+21.6 (+8.7)
+15.1 (+2.2)
+
+81.7 (-7.3)
+86.8 (-2.2)
+85.6 (-3.4)
+86.9 (-2.1)
+86.2 (-2.8)
+83.9 (-5.1)
+86.9 (-2.1)
+87.4 (-1.6)
+84.7 (-4.3)
+87.8 (-1.2)
+
+Old-task family
+
+0.40
+
+Visual reasoning
+Language-prior VQA
+OCR / text
+Chart / document
+
+Hidden forgetting
+low answer drop, high MRD
+
+0.35
+
+Modality reliance drift, MRD
+
+GCR↑
+
+Answer-KD
+
+be
+
+tte
+
+rc
+
+on
+
+0.30
+
+tin
+ua
+l
+
+gr
+ou
+nd
+ing
+
+Seq-LoRA
+
+0.25
+
+Method
+Seq-LoRA
+Answer-KD
+RCL
+
+0.20
+
+RCL
+
+0.15
+
+Bubble size: DEF
+
+0.10
+
+0.05
+
+10%
+30%
+50%
+
+Hidden region: Δans ≤ 2%, MRD ≥ 0.20
+Answer-KD: low-drop hidden slices = 64.7\%
+RCL: low-drop hidden slices = 10.8\%
+
+0
+
+1
+
+2
+
+3
+
+4
+
+5
+
+6
+
+7
+
+8
+
+Answer drop on old slices, Δans (%)
+
+Figure 3: Answer-level retention can hide evidence-use forgetting. Protocol details are in Appendix B.5,
+Answer-drop–MRD bubble protocol.
+
+8
+
+Is Counterfactual Reliance Estimation Worth the Training Cost? Because counterfactual reliance
+estimation introduces extra training-time forward passes, we test whether its hidden-forgetting gains
+justify the added cost. We compare sequential tuning, output distillation, random intervention regularization, sparse RCL, and RCL variants with different intervention budgets using relative GPU cost and
+HFR reduction. Figure 4 shows that output distillation adds little cost but reduces HFR by only 13.9%,
+confirming that output preservation alone is insufficient. Random interventions incur similar cost to
+RCL but achieve only 59.7% HFR reduction and retain higher MRD, indicating that targeted evidence
+suppression is necessary. The default setting qtrain = 1 reduces HFR by 79.0% at 1.56× training cost,
+while increasing to qtrain = 2 and qtrain = 4 yields only marginal gains at substantially higher cost. Thus,
+one targeted intervention per available evidence channel already provides a strong reliance signal with
+no inference-time overhead.
+0.300
+RCL q=1
+RCL q=2
+
+RCL-50%
+
+0.275
+
+near-Pareto default
+RCL-25%
+
+0.250
+
+60
+0.225
+
+Random intv.
+
+RCL w/o rel.
+
+0.200
+40
+
+Bubble size: Avg.
+50
+58
+64
+
+0.175
+
+MRD (lower is better)
+
+Hidden-forgetting reduction over Seq-LoRA (\%)
+
+80
+
+RCL q=4
+
+0.150
+20
+
+Answer-KD
+
+Configuration type
+Baseline
+Output preservation
+Random perturbation
+Targeted RCL
+
+default-cost region
+Seq-LoRA
+
+0
+1.0
+
+1.5
+
+2.0
+
+2.5
+
+0.125
+
+0.100
+
+3.0
+
+Relative training cost, Crel
+
+Figure 4: Cost–performance Pareto analysis. The x-axis is relative training cost, the y-axis is HFR
+reduction over Seq-LoRA, bubble size is final average accuracy, and color indicates MRD. The default
+RCL setting lies near the Pareto frontier. Protocol details are in Appendix B.5, Cost–performance Pareto
+protocol.
+
+6
+
+Conclusion
+
+This paper identifies hidden evidence-use forgetting in continual multimodal learning, where correct
+answers may be retained while grounding behavior silently drifts. We propose RCL, a replay-free
+framework that preserves evidence-reliance profiles through counterfactual channel interventions without
+adding inference-time cost. Experiments show that answer-level retention alone can mask substantial
+reliance drift, while RCL improves both performance retention and grounding stability. These results
+suggest that continual MLLMs should be evaluated by not only what they answer, but also how they use
+multimodal evidence. Future work may extend reliance-aware adaptation to longer streams and richer
+evidence structures.
+
+References
+Aishwarya Agrawal, Dhruv Batra, Devi Parikh, and Aniruddha Kembhavi. Don’t just assume; look
+and answer: Overcoming priors for visual question answering. In Proceedings of the IEEE conference on
+computer vision and pattern recognition, pages 4971–4980, 2018.
+Pietro Buzzega, Matteo Boschini, Angelo Porrello, Davide Abati, and Simone Calderara. Dark experience
+for general continual learning: A strong, simple baseline. In Advances in Neural Information Processing
+Systems, volume 33, pages 15920–15930, 2020.
+Meng Cao, Yuyang Liu, Yingfei Liu, Tiancai Wang, Jiahua Dong, Henghui Ding, Xiangyu Zhang, Ian Reid,
+9
+
+and Xiaodan Liang. Continual llava: Continual instruction tuning in large vision-language models.
+arXiv preprint arXiv:2411.02564, 2024.
+Cheng Chen, Junchen Zhu, Xu Luo, Heng T Shen, Jingkuan Song, and Lianli Gao. Coin: A benchmark
+of continual instruction tuning for multimodel large language models. Advances in neural information
+processing systems, 37:57817–57840, 2024a.
+Jinpeng Chen, Runmin Cong, Yuzhi Zhao, Hongzheng Yang, Guangneng Hu, Horace Ho Shing Ip, and
+Sam Kwong. Sefe: Superficial and essential forgetting eliminator for multimodal continual instruction
+tuning. In 42nd International Conference on Machine Learning (ICML 2025), pages 7982–8001. ML Research
+Press, 2025.
+Zhe Chen, Jiannan Wu, Wenhai Wang, Weijie Su, Guo Chen, Sen Xing, Zhong Muyan, Qinglong Zhang,
+Xizhou Zhu, Lewei Lu, et al. Internvl: Scaling up vision foundation models and aligning for generic
+visual-linguistic tasks. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition, pages 24185–24198, 2024b.
+Haiyang Guo, Fanhu Zeng, Ziwei Xiang, Fei Zhu, Da-Han Wang, Xu-Yao Zhang, and Cheng-Lin Liu.
+Hide-llava: Hierarchical decoupling for continual instruction tuning of multimodal large language
+model. In Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (Volume 1:
+Long Papers), pages 13572–13586, 2025a.
+Haiyang Guo, Fei Zhu, Hongbo Zhao, Fanhu Zeng, Wenzhuo Liu, Shijie Ma, Da-Han Wang, and Xu-Yao
+Zhang. Mcitlib: Multimodal continual instruction tuning library and benchmark. arXiv preprint
+arXiv:2508.07307, 2025b.
+Tianyu Huai, Jie Zhou, Xingjiao Wu, Qin Chen, Qingchun Bai, Ze Zhou, and Liang He. Cl-moe: Enhancing
+multimodal large language model with dual momentum mixture-of-experts for continual visual
+question answering. In Proceedings of the computer vision and pattern recognition conference, pages 19608–
+19617, 2025.
+Haotian Liu, Chunyuan Li, Yuheng Li, and Yong Jae Lee. Improved baselines with visual instruction
+tuning. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition, pages
+26296–26306, 2024.
+Wenzhuo Liu, Fei Zhu, Longhui Wei, and Qi Tian. C-clip: Multimodal continual learning for visionlanguage model. In The Thirteenth International Conference on Learning Representations, 2025.
+Mao-Lin Luo, Zi-Hao Zhou, Tong Wei, and Min-Ling Zhang. Lada: Scalable label-specific clip adapter
+for continual learning. In International Conference on Machine Learning, pages 41604–41619. PMLR, 2025.
+Imad Eddine Marouf, Enzo Tartaglione, Stéphane Lathuilière, and Joost Van De Weijer. Ask and remember:
+A questions-only replay strategy for continual visual question answering. In Proceedings of the IEEE/CVF
+International Conference on Computer Vision, pages 18078–18089, 2025.
+Zixuan Ni, Longhui Wei, Siliang Tang, Yueting Zhuang, and Qi Tian. Continual vision-language representation learning with off-diagonal information. In International Conference on Machine Learning, pages
+26129–26149. PMLR, 2023.
+Yulei Niu, Kaihua Tang, Hanwang Zhang, Zhiwu Lu, Xian-Sheng Hua, and Ji-Rong Wen. Counterfactual
+vqa: A cause-effect look at language bias. In Proceedings of the IEEE/CVF conference on computer vision
+and pattern recognition, pages 12700–12710, 2021.
+Tejas Srinivasan, Ting-Yun Chang, Leticia Pinto Alva, Georgios Chochlakis, Mohammad Rostami, and
+Jesse Thomason. Climb: A continual learning benchmark for vision-and-language tasks. Advances in
+Neural Information Processing Systems, 35:29440–29453, 2022.
+Vishaal Udandarao, Karsten Roth, Sebastian Dziadzio, Ameya Prabhu, Mehdi Cherti, Oriol Vinyals,
+Olivier Hénaff, Samuel Albanie, Zeynep Akata, and Matthias Bethge. A practitioner’s guide to
+real-world continual multimodal pretraining. Advances in Neural Information Processing Systems, 37:
+133801–133845, 2024.
+Bin Wu, Wuxuan Shi, Jinqiao Wang, and Mang Ye. Synthetic data is an elegant gift for continual
+vision-language models. In Proceedings of the Computer Vision and Pattern Recognition Conference, pages
+2813–2823, 2025.
+Yahan Yu, Duzhen Zhang, Yong Ren, Xuanle Zhao, Xiuyi Chen, and Chenhui Chu. Progressive lora for
+multimodal continual instruction tuning. In Findings of the Association for Computational Linguistics:
+ACL 2025, pages 2779–2796, 2025.
+10
+
+Fanhu Zeng, Fei Zhu, Haiyang Guo, Xu-Yao Zhang, and Cheng-Lin Liu. Modalprompt: Towards efficient
+multimodal continual instruction tuning with dual-modality guided prompt. In Proceedings of the 2025
+Conference on Empirical Methods in Natural Language Processing, pages 12137–12152, 2025.
+Duzhen Zhang, Yong Ren, Zhong-Zhi Li, Yahan Yu, Jiahua Dong, Chenxing Li, Zhilong Ji, and Jinfeng
+Bai. Enhancing multimodal continual instruction tuning with branchlora. In Proceedings of the 63rd
+Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pages 5743–5756,
+2025.
+Hongbo Zhao, Fei Zhu, Haiyang Guo, Meng Wang, Rundong Wang, Gaofeng Meng, and Zhaoxiang Zhang. Mllm-cl: Continual learning for multimodal large language models. arXiv preprint
+arXiv:2506.05453, 2025.
+Zangwei Zheng, Mingyuan Ma, Kai Wang, Ziheng Qin, Xiangyu Yue, and Yang You. Preventing zero-shot
+transfer degradation in continual learning of vision-language models. In Proceedings of the IEEE/CVF
+international conference on computer vision, pages 19125–19136, 2023.
+Didi Zhu, Zhongyi Sun, Zexi Li, Tao Shen, Ke Yan, Shouhong Ding, Chao Wu, and Kun Kuang. Model
+tailor: mitigating catastrophic forgetting in multi-modal large language models. In Proceedings of the
+41st International Conference on Machine Learning, pages 62581–62598, 2024.
+Hongguang Zhu, Yunchao Wei, Xiaodan Liang, Chunjie Zhang, and Yao Zhao. Ctp: Towards visionlanguage continual pretraining via compatible momentum contrast and topology preservation. In
+Proceedings of the IEEE/CVF International Conference on Computer Vision, pages 22257–22267, 2023.
+
+11
+
+A
+
+Additional Method Details
+
+A.1
+
+Counterfactual Intervention Construction
+
+RCL estimates reliance through evidence-suppressing interventions. Each intervention targets one
+evidence channel while keeping the remaining channels unchanged. We instantiate the intervention set
+Im according to the channel type.
+Visual channel. For image-based inputs, Iimg contains region masking and visual-token removal.
+Region masking replaces selected image patches with a neutral value. Visual-token removal removes
+the corresponding visual embeddings before multimodal fusion. For datasets with object annotations,
+regions are sampled from annotated objects. For datasets without object annotations, regions are sampled
+from uniformly partitioned image patches.
+Question-text channel. For question or instruction text, Itxt contains content-word masking. Stop words
+and formatting tokens are preserved. This intervention suppresses semantic cues from the question while
+keeping the prompt format stable.
+OCR channel. For OCR-based inputs, Iocr contains OCR-token removal and OCR-token masking. OCRtoken removal deletes recognized text tokens from the input sequence. OCR-token masking replaces
+recognized text tokens with a neutral placeholder token.
+Chart and table channels. For chart and table reasoning, Ichart contains axis-label masking, legend
+masking, cell-value masking, and plotted-element masking. These interventions suppress numerical and
+structural evidence while preserving the global input format.
+Video channel. For video inputs, Ivid contains frame masking and sparse frame removal. Frame
+masking suppresses visual content in selected frames. Sparse frame removal drops selected frame
+embeddings before multimodal fusion.
+For each minibatch, RCL samples a fixed number of interventions from Im for every available channel
+m ∈ M x . The same intervened inputs are shared by the frozen reference model and the current model,
+ensuring that the reliance loss compares teacher and student behavior under identical counterfactual
+conditions.
+
+A.2
+
+Confidence Gate for Reliance Targets
+
+The reliance loss in Eq. (7) uses a confidence weight wθ − ( x, y) to reduce the influence of unreliable
+reference targets. The gate combines predictive confidence and intervention sensitivity.
+The reference predictive entropy is
+Hθ − ( x, y) =
+
+1 L
+∑ H ( pθ− (· | y<ℓ , x)) ,
+L ℓ=
+1
+
+(10)
+
+where H (·) denotes Shannon entropy. The total reference intervention sensitivity is
+Aθ − ( x, y) =
+
+∑ ∆θ− ,m (x, y).
+
+(11)
+
+m∈M x
+
+The confidence weight is defined as
+
+wθ − ( x, y) = σ
+
+τH − Hθ − ( x, y)
+γH
+
+
+
+
+
+·σ
+
+Aθ − ( x, y) − τA
+γA
+
+
+,
+
+(12)
+
+where σ (·) is the sigmoid function, τH and τA are fixed thresholds, and γ H , γ A > 0 are temperature
+parameters. The first factor assigns larger weight to low-entropy reference predictions. The second factor
+assigns larger weight to samples where the reference model exhibits measurable dependence on at least
+one evidence channel.
+
+A.3
+
+Diagnostic Attribution Analysis
+
+RCL does not use gradient-based attribution in the training objective. We use attribution only as an
+evaluation-time diagnostic to verify whether reliance preservation is consistent with local sensitivity in
+the model representation.
+12
+
+Let hm
+θ ( x ) denote the hidden representation associated with channel m. The attribution score for channel
+m is
+hm
+ℓθ (y | x )
+θ ( x ) ⊙ ∇ hm
+θ (x)
+1
+
+.
+(13)
+Gθ,m ( x, y) =
+m
+dim hθ ( x )
+Since Gθ,m is never differentiated through during training, RCL avoids second-order optimization.
+We report attribution agreement by comparing the normalized attribution vector gθ ( x, y) with the
+counterfactual reliance vector rθ ( x, y) using rank correlation and Jensen–Shannon divergence.
+
+A.4
+
+Task-Preserving Perturbation Analysis
+
+In addition to evidence-suppressing interventions, we use task-preserving perturbations for robustness
+analysis. These perturbations are not part of the main reliance loss. They evaluate whether a model is
+overly sensitive to changes that should not alter the answer.
+For each channel m, let Pm be a set of task-preserving perturbations. Examples include mild image noise,
+small resolution changes, harmless crop-and-resize transformations, question paraphrases that preserve
+meaning, and OCR formatting changes that preserve recognized text. The invariance sensitivity is
+Bθ,m ( x, y) =
+
+1
+1 L
+∑ DKL ( pθ (· | y<ℓ , x) ∥ pθ (· | y<ℓ , πm (x))) .
+∑
+|Pm | π ∈P L ℓ=
+1
+m
+
+(14)
+
+m
+
+A grounded and stable model should have high sensitivity to evidence-suppressing interventions and
+low sensitivity to task-preserving perturbations.
+
+A.5
+
+Efficient Training
+
+The computational overhead of RCL comes from counterfactual forward passes through the frozen
+reference model and the current model. We control this overhead with three design choices.
+First, for each minibatch, RCL samples a small fixed number of interventions per channel. Second, the
+same counterfactual inputs are used for both teacher and student models. Third, reliance estimation is
+applied only to the channels present in the current sample. Therefore, if a sample contains |M x | channels
+and q interventions are sampled per channel, the reliance module uses q|M x | counterfactual views for
+that sample.
+The teacher model is evaluated under stop-gradient. The student model receives gradients only through
+the reliance vector rθ ( x, y) computed from counterfactual output shifts. No gradient-based attribution
+term is used in the training objective.
+
+A.6
+
+Training Procedure
+
+At continual stage k, RCL performs the following procedure.
+1. Freeze the previous model f θ − = f θk−1 .
+2. Initialize the current trainable model with θ = θ − and update only PEFT parameters ϕ.
+3. Sample a minibatch Bk from the current-stage dataset Dk .
+4. For each ( x, y) ∈ Bk and each channel m ∈ M x , construct counterfactual inputs τm ( x ).
+5. Compute reference reliance rθ − ( x, y) and current reliance rθ ( x, y) using Eq. (3) and Eq. (4).
+6. Compute Ltask , Lpred , and Lrel using Eq. (2), Eq. (8), and Eq. (7).
+7. Update ϕ by minimizing Eq. (9).
+8. After stage k finishes, set θk = θ and use f θk as the frozen reference for stage k + 1.
+
+A.7
+
+Evaluation Metrics
+
+We evaluate continual multimodal learning from two perspectives: answer retention and reliance preservation.
+
+13
+
+Final average accuracy.
+
+After the final stage K, the final average accuracy is
+AAK =
+
+1 K
+Acc( f θK ; E j ),
+K j∑
+=1
+
+(15)
+
+where E j is the evaluation set for stage j.
+Average forgetting.
+
+Reliance drift.
+
+The standard average forgetting score is
+"
+#
+1 K −1
+max Acc( f θs ; E j ) − Acc( f θK ; E j ) .
+AFK =
+K − 1 j∑
+=1 s∈{ j,...,K }
+
+(16)
+
+The final reliance drift is
+MRDK =
+
+
+
+1 K −1 1
+DJS rθ j ( x, y) rθK ( x, y) .
+∑
+∑
+K − 1 j=1 |E j | ( x,y)∈E
+
+(17)
+
+j
+
+Channel-specific drift.
+
+For channel m, the channel-specific drift from stage j to the final model is
+h
+i
+1
+∆m
+r
+(
+x,
+y
+)
+−
+r
+(
+x,
+y
+)
+,
+(18)
+θ
+,m
+θ
+,m
+∑
+j→K =
+j
+|E jm | (x,y)∈E m K
+j
+
+where E jm = {( x, y) ∈ E j : m ∈ M x }. A negative value for the visual channel indicates a drift away from
+visual evidence.
+Hidden forgetting rate.
+
+The hidden forgetting rate is
+HFRK =
+
+1 K −1
+HF j→K ,
+K − 1 j∑
+=1
+
+(19)
+
+where HF j→K is defined in Eq. (6). A reliable continual MLLM should achieve high final average accuracy,
+low average forgetting, low reliance drift, and low hidden forgetting rate.
+
+B
+
+Additional Experimental Details
+
+B.1
+
+Details of the Preliminary Study
+
+This subsection provides the experimental details omitted from Section 3. The goal of the preliminary
+study is diagnostic: it exposes a failure mode of standard replay-free multimodal continual adaptation,
+rather than evaluating the proposed method.
+Continual stream. We construct an eight-stage multimodal learning stream: ScienceQA, GQA, VQAv2,
+OK-VQA, TextVQA, OCR-VQA, ChartQA, and DocVQA. These stages cover visual reasoning, compositional VQA, knowledge-intensive VQA, OCR-based question answering, chart understanding, and
+document understanding. After learning each stage j, we save the resulting checkpoint f j . After learning
+a later stage k > j, we evaluate the current checkpoint f k on the previous-stage evaluation set E j . No
+previous training examples are replayed during adaptation.
+Baselines. We use two simple baselines to avoid introducing any component of our method into the
+exploratory study. The first baseline, Seq-LoRA, updates only parameter-efficient adaptation parameters
+on the current-stage task loss:
+LSeq = E(x,y)∼Dk [− log pθ (y | x )] .
+(20)
+The second baseline, Answer-KD, additionally preserves the previous checkpoint’s output distribution
+on the current-stage data:
+
+
+LKD = LSeq + λkd E(x,y)∼Dk DKL pτθ− (· | x ) pτθ (· | x ) ,
+(21)
+where θ − denotes the previous checkpoint and τ is the distillation temperature. This baseline preserves
+output behavior but imposes no constraint on which evidence channel supports the prediction.
+14
+
+Post-hoc channel ablations. For each example ( x, y), we define a set of available evidence channels C x .
+Depending on the task, this set may include visual regions, OCR tokens, document text, chart elements,
+and question-side language priors. For each channel m ∈ C x , we construct an ablated input τm ( x ) that
+suppresses channel m while keeping other channels unchanged. For example, visual ablation masks
+image tokens or visual regions; OCR/text ablation removes recognized text or document tokens; chart
+ablation masks chart elements; and question-prior ablation removes or neutralizes evidence-bearing
+lexical cues in the question. These ablations are used only after training for diagnosis. They are not used
+as training objectives, constraints, supervision signals, or data augmentation.
+For a checkpoint f , we define the diagnostic channel sensitivity as
+h
+i
+sm ( f ; x, y) = ℓ f (y | τm ( x )) − ℓ f (y | x ) ,
++
+
+(22)
+
+where ℓ f (y | x ) is the negative log-likelihood of the ground-truth answer and [z]+ = max(z, 0). The
+normalized evidence-use vector is
+sm ( f ; x, y)
+qm ( f ; x, y) =
+,
+q( f ; x, y) = [qm ( f ; x, y)]m∈Cx .
+(23)
+∑n∈Cx sn ( f ; x, y) + ϵ
+The small constant ϵ prevents numerical instability when all channel sensitivities are close to zero. The
+vector q( f ; x, y) is only a post-hoc diagnostic proxy for evidence use.
+Metrics. For each old-to-new transition ( j, k ) with k > j, we report three quantities. The clean accuracy
+drop A j→k measures conventional answer forgetting. The evidence-sensitivity drift Gj→k measures how
+much the normalized evidence-use vector changes between checkpoints. The dominant-evidence flip
+rate Hj→k is computed only on examples for which both f j and f k predict the correct answer. Thus, Hj→k
+isolates cases where the answer is preserved but the dominant evidence channel changes. In Figure 1, we
+mark a transition as falling into the hidden-drift region when
+A j→k ≤ 2%,
+
+Gj→k ≥ 0.20.
+
+(24)
+
+These thresholds are used only to visualize the qualitative phenomenon and are not used by our method.
+Evaluation slices and aggregation. To avoid hiding heterogeneous behavior under task-level averages,
+each previous-stage evaluation set is partitioned into several diagnostic slices, including easy, medium,
+hard, rare, compositional, and format-sensitive subsets. Each point in Figure 1(a) corresponds to one
+tuple of old task, later task, random seed, evaluation slice, and training baseline. The x-axis is A j→k , the
+y-axis is Gj→k , the marker size is Hj→k , the marker shape denotes the baseline, and the color denotes the
+old-task family. Figure 1(b) focuses on Answer-KD. Each cell corresponds to evaluating an old task after
+a later stage is learned; color indicates the dominant-evidence flip rate, and bubble size indicates the
+clean accuracy drop.
+Why this does not leak the proposed method. The preliminary study does not optimize reliance
+preservation, intervention consistency, evidence-channel matching, or any loss introduced in the main
+method. The baselines are trained using only task supervision and, for Answer-KD, output-level
+distillation. Channel ablations are applied strictly after training to diagnose the learned checkpoints.
+Therefore, the study serves only as motivation: it reveals that output preservation can mask evidence-use
+drift, which motivates the reliance-preservation objective introduced in Section 4.
+Relation-level alignment utility protocol. For the observability volcano plot in Figure ??, each point
+corresponds to one modality–semantic relation r = (m, n, s). We compute the final observability score
+Or = Om,n,s after training and evaluate the relation-conditioned validation performance of three strategies:
+Task-only FedAvg, Uniform Alignment, and FedSO. The relation-level gains are defined as
+Task
+GrUA = ScoreUA
+,
+r − Scorer
+
+GrFedSO = ScoreFedSO
+− ScoreTask
+.
+r
+r
+
+(25)
+
+A positive value indicates beneficial transfer, while a negative value indicates negative transfer. All
+relation-level quantities are averaged over three random seeds before plotting. The horizontal axis shows
+Or , the vertical axis shows the corresponding gain, point size indicates relation support, point color
+encodes observability, and red markers highlight negative-transfer relations. For summary statistics, we
+define low-observability relations as Or < 0.35 and high-observability relations as Or > 0.65.
+Low-observability negative-transfer protocol. For Figure ??, we group all modality–semantic relations
+according to their final observability scores:
+Low-O : Or < 0.35,
+
+Mid-O : 0.35 ≤ Or < 0.65,
+15
+
+High-O : Or ≥ 0.65.
+
+(26)
+
+For each group and each method A, we report the relation-conditioned gain over Task-only FedAvg:
+(A)
+
+Gr
+
+(A)
+
+= Scorer
+
+− ScoreTask
+,
+r
+
+A ∈ {Task, UA, FedSO}.
+
+(27)
+
+The Task-only baseline is therefore centered at zero and serves as the reference distribution. Each
+violin aggregates all modality–semantic relations from the corresponding observability group across
+benchmark datasets and seeds. We overlay the group mean and interquartile range on each violin. The
+negative-transfer rate is computed as
+h
+i
+1
+(A)
+(A)
+NTRG =
+1 Gr < 0 ,
+(28)
+∑
+|G| r∈G
+where G denotes one of the three observability groups.
+Relation-geometry visualization protocol. For Figure ??, we visualize the geometry of learned modality–
+semantic prototypes. For each modality m and semantic unit s, we extract the final global prototype
+µ̄m,s =
+
+∑i ei,m,s ni,m,s ρi,m,s µ̃i,m,s
+,
+∑i ei,m,s ni,m,s ρi,m,s + ε
+
+(29)
+
+where ei,m,s , ni,m,s , ρi,m,s , and µ̃i,m,s follow the semantic sketch definitions in the main method section. We
+collect all prototypes {µ̄m,s }m,s and project them into two dimensions using UMAP with cosine distance.
+The same projection procedure and visualization set are used for Uniform Alignment and FedSO. Each
+point in the plot corresponds to one prototype µ̄m,s , point color indicates the semantic unit, and marker
+shape indicates the modality. We draw an edge between µ̄m,s and µ̄n,s when the corresponding relation is
+highly observable, i.e.,
+Om,n,s > τh .
+(30)
+To quantify the geometry, we report the average cross-modal prototype distance over high-observability
+relations:
+1
+Dhigh =
+Rhigh = {(m, n, s) : Om,n,s > τh }.
+(31)
+∥µ̄m,s − µ̄n,s ∥2 ,
+|Rhigh | (m,n,s∑
+)∈R
+high
+
+We also compute an inter-semantic margin:
+Margin =
+
+1 S
+min ∥µ̄s − µ̄s′ ∥2 ,
+′
+S s∑
+=1 s ̸ = s
+
+µ̄s =
+
+1
+∑ µ̄m,s ,
+|Ms | m∈M
+s
+
+(32)
+
+where Ms is the set of modalities that provide a valid prototype for semantic unit s. A smaller Dhigh
+indicates tighter alignment among reliable relations, while a larger margin indicates better separation
+between semantic units.
+
+B.2
+
+Detailed Experimental Setup
+
+B.2.1
+
+Benchmark Suites
+
+We evaluate RCL on four benchmark suites that together cover standard multimodal continual learning,
+recent multimodal continual instruction tuning, and the evidence-use drift targeted by our method.
+CoIN. CoIN (Chen et al., 2024a) is used as a primary continual instruction tuning benchmark for
+MLLMs. It contains diverse multimodal tasks, including visual question answering, OCR reasoning,
+object recognition, image classification, and referring expression comprehension. Following the official
+protocol, we train the model sequentially over the task stream and evaluate all seen tasks after each
+stage. This benchmark is important because many recent MCIT methods report CoIN results, making it a
+suitable setting for direct SOTA comparison.
+COAST. We use the COAST benchmark from Continual LLaVA (Cao et al., 2024) to evaluate three
+complementary continual adaptation scenarios: domain-incremental learning, capability-incremental
+learning, and dataset-incremental learning. The domain-incremental setting evaluates robustness across
+visual domains such as natural images, documents, charts, medical-style images, and scientific visual
+content. The capability-incremental setting evaluates whether the model can sequentially acquire different
+multimodal abilities, including recognition, OCR, chart reasoning, visual conversation, and complex
+reasoning. The dataset-incremental setting evaluates whether the model can adapt to new datasets
+without catastrophically forgetting previously learned ones.
+16
+
+Table 4: Benchmark overview. The main paper reports compact benchmark names, while this appendix
+provides task composition and evaluation purpose.
+Suite
+
+Continual setting
+
+CoIN
+
+Continual instruction tuning
+
+COAST
+MCITlib
+Evidencesensitive stream
+
+Representative tasks
+
+VQA, OCR-QA, recognition, classification, referring expression comprehension
+Domain-,
+capability-,
+and ChartQA, DocVQA, IconQA, medidataset-incremental adaptation cal QA, conversation, reasoning, REC,
+VQA
+Leakage-aware MCIT protocol
+UCIT, MLLM-DCL, MLLM-ACL
+
+Purpose
+Main
+MCIT
+comparison
+Cross-setting robustness
+
+Reproducible
+benchmark
+comparison
+Reliance-aware continual adap- ScienceQA, GQA, VQAv2, OK-VQA, Hidden
+tation
+TextVQA,
+OCR-VQA,
+ChartQA, evidence-use
+DocVQA
+forgetting
+
+MCITlib. We further evaluate on MCITlib (Guo et al., 2025b), which provides leakage-aware and
+reproducible multimodal continual instruction tuning protocols. We use its UCIT, MLLM-DCL, and
+MLLM-ACL settings. UCIT evaluates unified continual instruction tuning across heterogeneous task
+families. MLLM-DCL emphasizes domain continual learning, where the task format may remain similar
+but the visual or semantic domain changes. MLLM-ACL emphasizes ability continual learning, where
+the model must sequentially acquire different reasoning and perception abilities. This suite is used to
+ensure that our conclusions are not specific to a single benchmark design.
+Evidence-sensitive stream. To directly evaluate hidden evidence-use forgetting, we construct an eightstage stream:
+ScienceQA → GQA → VQAv2 → OK-VQA → TextVQA → OCR-VQA → ChartQA → DocVQA.
+This stream is designed to contain tasks with different dominant evidence sources. ScienceQA and GQA
+emphasize visual reasoning and compositional grounding; VQAv2 and OK-VQA include strong languageprior and external-knowledge effects; TextVQA and OCR-VQA require OCR grounding; ChartQA
+requires chart-element and numerical reasoning; DocVQA requires document text and layout understanding. This makes the stream suitable for testing whether a continual MLLM preserves the evidence
+path behind retained answers.
+B.2.2
+
+Dataset Preprocessing and Answer Normalization
+
+For all benchmarks, we follow the official train/validation/test splits whenever available. If a benchmark
+provides multiple task orders, we report the average over the official orders. For datasets without an
+official continual split, we use the original training set for the corresponding continual stage and reserve
+the official validation set for evaluation. To prevent dataset size from dominating the sequential dynamics,
+we cap each stage at the same maximum number of training examples unless the official benchmark
+protocol specifies otherwise.
+For closed-form VQA tasks, we apply standard VQA answer normalization, including lowercasing,
+punctuation removal, article removal, and number normalization. For OCR- and document-centric tasks,
+we additionally normalize whitespace, line breaks, and common OCR artifacts. For chart and table QA,
+we normalize numerical answers by allowing minor formatting differences such as commas, percentage
+signs, and decimal-place variants. For open-ended generative tasks, we use the official evaluator of the
+corresponding benchmark. When GPT-assisted scoring is required by the benchmark, we use it only for
+evaluation and never for training or hyperparameter selection.
+B.2.3
+
+Task-Level Metrics
+
+We report the official metric for each task family:
+• VQA-style tasks: exact-match or soft VQA accuracy, depending on the dataset evaluator.
+• Classification and recognition: top-1 accuracy.
+• Referring expression comprehension: Acc@0.5 based on box IoU.
+• OCR and document QA: normalized exact match and ANLS when supported by the official
+evaluator.
+
+17
+
+• Chart and table QA: relaxed exact match for numerical answers and official ChartQA-style
+accuracy.
+• Open-ended instruction following: official GPT-assisted or rule-based score, following the
+benchmark protocol.
+When a benchmark reports a single aggregated score, we use the official aggregation. When a benchmark
+reports separate task-family scores, we report both the task-family score and the macro-average across
+task families.
+B.2.4
+
+Continual Learning Metrics
+
+Let ai,j denote the score on evaluation set Ei after training stage j. For a K-stage stream, we report
+immediate task acquisition, final retained performance, average forgetting, backward transfer, and mean
+accuracy over the learning trajectory:
+MFT =
+
+1 K
+ai,i ,
+K i∑
+=1
+
+MFN =
+
+1 K
+ai,K ,
+K i∑
+=1
+!
+
+1 K −1
+AF =
+K − 1 i∑
+=1
+
+max ai,j − ai,K
+
+j∈{i,...,K }
+
+BWT =
+
+1 K −1
+( ai,K − ai,i ) ,
+K − 1 i∑
+=1
+
+MAA =
+
+1 K 1
+a .
+K j∑
+j ∑ i,j
+=1 i =1
+
+,
+
+(33)
+
+j
+
+Here MFT measures how well the model learns each new stage when it is first trained; MFN measures
+final retained performance; AF measures the amount of forgetting; BWT measures whether later training
+improves or harms previous tasks; and MAA measures average performance throughout the whole
+continual trajectory.
+B.2.5
+
+Reliance-Aware Metrics
+
+Standard continual learning metrics only evaluate whether the final answer is correct. Since our work
+studies hidden evidence-use forgetting, we additionally evaluate how the model’s reliance profile changes
+during continual adaptation.
+For each example ( x, y) and checkpoint θ j , we compute a normalized reliance vector rθ j ( x, y) over
+available evidence channels. The evidence channels may include image tokens, question tokens, OCR
+tokens, document text, chart elements, table cells, layout regions, and language-prior cues. The channel
+set is sample-dependent and is denoted by M x .
+Modality reliance drift.
+
+The reliance drift from stage i to the final checkpoint K is
+
+1
+MRDi→K =
+DJS rθi ( x, y) rθK ( x, y) .
+|Ei | (x,y∑
+)∈E
+
+(34)
+
+i
+
+We report the stream-level score
+MRDK =
+
+1 K −1
+MRDi→K .
+K − 1 i∑
+=1
+
+(35)
+
+Lower MRD indicates that the final model preserves the evidence-use pattern of earlier checkpoints.
+Dominant evidence flip rate. The dominant evidence flip rate isolates examples where the answer
+remains correct but the dominant evidence channel changes:
+ 
+
+
+DEFi→K = E( x,y)∈Ei 1 arg max rθi ,m ( x, y) ̸= arg max rθK ,m ( x, y) f θi ( x ) = f θK ( x ) = y .
+(36)
+m∈M x
+
+m∈M x
+
+A high DEF means that answer preservation is partly misleading: the model still answers correctly but
+uses a different evidence source.
+18
+
+Hidden forgetting rate. We define hidden forgetting as the event where answer degradation is small
+but reliance drift is large:
+HFRK =
+
+1 K −1
+1 [ ai,i − ai,K ≤ δacc ] · 1 [MRDi→K ≥ δrel ] .
+K − 1 i∑
+=1
+
+(37)
+
+Unless otherwise specified, we set δacc = 2% and δrel = 0.20 for all experiments. These thresholds are
+fixed before evaluation and are not tuned per dataset.
+Channel-specific drift.
+
+For a channel m, we report
+∆im→K =
+
+
+
+1
+rθK ,m ( x, y) − rθi ,m ( x, y) ,
+|Eim | (x,y∑
+)∈E m
+
+(38)
+
+i
+
+where Eim = {( x, y) ∈ Ei : m ∈ M x }. Negative visual, OCR, chart, or document drift indicates that the
+final model relies less on the corresponding grounded channel than the earlier checkpoint.
+B.2.6
+
+General Multimodal Ability Evaluation
+
+After the final continual stage, we additionally evaluate the final checkpoint on general multimodal ability
+benchmarks, including POPE, MME, MMBench, and SEED-Bench, following MCITlib (Guo et al., 2025b).
+These benchmarks are not used for training or hyperparameter selection. They serve as post-hoc checks
+that reliance preservation does not merely overfit the continual stream while degrading hallucination
+robustness, perception, commonsense reasoning, or general visual instruction following.
+
+B.3
+
+Comparison Protocol
+
+B.3.1
+
+Method Groups
+
+We group compared methods according to the information and memory they require.
+Replay-free and task-id-free methods. This is the primary comparison group. All methods in this group
+are trained sequentially without storing previous examples and are evaluated without oracle task identity.
+This group includes Seq-LoRA, EWC, LwF, L2P, DualPrompt, CODA-Prompt, O-LoRA, MoELoRA,
+Model Tailor, Continual LLaVA, CL-MoE, HiDe-LLaVA, BranchLoRA, ProgLoRA, ModalPrompt, SEFE,
+MLLM-CL, IGVP, and RCL. This table is the main table for fair comparison.
+Replay- or memory-assisted methods. Some methods store old examples, generate replay data, or
+preserve past-task questions. We report them separately because they use additional past-task signals
+unavailable to strictly replay-free methods. This group includes rehearsal, DER (Buzzega et al., 2020),
+GIFT (Wu et al., 2025), and Ask-and-Remember (Marouf et al., 2025). For rehearsal and DER, we use a
+1% memory buffer unless otherwise specified by the official protocol. For synthetic replay methods, we
+follow the official generation budget and report the additional generated-sample count.
+Oracle or task-aware methods. If a method requires oracle task identifiers, a task-specific expert selector,
+or separate task-specific heads at inference time, we report it in an oracle table. Oracle results are useful
+upper references but are not mixed with the main replay-free task-id-free comparison. When the official
+implementation provides both oracle and non-oracle variants, we report both.
+B.3.2
+
+Fairness Rules
+
+We apply the following fairness rules across all directly comparable methods:
+• Same task order. All methods are trained on the same continual stream and evaluated after the
+same stages.
+• Same data budget. Each method sees the same current-stage training examples. Replay-free
+methods do not access previous-stage examples.
+• Same backbone. Direct comparisons are made under the same MLLM backbone.
+• Matched trainable parameters. When a method allows rank, prompt length, or expert-count
+adjustment, we tune it so that the trainable parameter count is within 5% of RCL.
+• Matched optimization budget. Methods are trained with the same number of epochs, batch size,
+and total update steps whenever their official protocol permits.
+19
+
+• No hidden task identity. The main table does not provide oracle task IDs at inference time.
+• Separate memory accounting. Methods using stored or generated replay are reported with their
+memory or generation budget.
+• Same evaluation interventions. Reliance-aware diagnostics use the same post-hoc counterfactual
+intervention set for every method.
+B.3.3
+
+Baseline Implementation Notes
+
+Seq-LoRA. Seq-LoRA updates LoRA adapters sequentially on each stage using only the current-stage
+task loss. It is the closest minimal baseline to RCL because it uses the same backbone and adapter
+placement but does not preserve predictions or reliance profiles.
+Answer-KD / LwF. Answer-KD preserves the previous checkpoint’s output distribution on currentstage samples using token-level KL divergence. It tests whether output preservation alone is sufficient to
+prevent hidden evidence-use forgetting.
+Prompt-based continual learning. L2P, DualPrompt, and CODA-Prompt are adapted to the multimodal instruction tuning setting by inserting learnable prompts into the language-side input or adaptercompatible prompt slots. When task identifiers are not available, prompt selection uses the official
+key-query matching mechanism.
+Adapter- and LoRA-based MCIT methods. O-LoRA, BranchLoRA, ProgLoRA, Model Tailor, HiDeLLaVA, ModalPrompt, CL-MoE, SEFE, and MLLM-CL are implemented following their official designs
+whenever code is available. If official code is unavailable, we reproduce the method from the paper using
+the same backbone and training schedule used for other baselines.
+Replay-based methods. For rehearsal and DER, we maintain a fixed-size buffer selected uniformly from
+previous stages. For GIFT and Ask-and-Remember, we follow the original synthetic-data or question-only
+replay protocol and report the replay budget separately.
+
+B.4
+
+Implementation Details
+
+B.4.1
+
+Backbones
+
+We use three MLLM backbones:
+• LLaVA-1.5-7B (Liu et al., 2024): the default backbone for main experiments because it is widely
+used in recent MCIT work.
+• LLaVA-1.5-13B (Liu et al., 2024): used to evaluate whether reliance preservation remains effective
+at a larger model scale.
+• InternVL-Chat-7B (Chen et al., 2024b): used to test whether RCL generalizes beyond the LLaVA
+model family.
+Unless otherwise specified, the visual encoder, language backbone, and multimodal projector are frozen.
+Only PEFT parameters are updated during continual adaptation.
+B.4.2
+
+PEFT Configuration
+
+For RCL, we use LoRA adapters on attention projection layers. The default configuration is:
+r = 16,
+
+α = 32,
+
+pdropout = 0.05.
+
+For larger backbones, we keep the same LoRA rank unless otherwise specified. For baselines with tunable
+parameter budgets, such as prompt length, expert number, or adapter rank, we adjust their configuration
+to match the trainable parameter count of RCL within 5%.
+B.4.3
+
+Optimization
+
+We train all methods using AdamW with bfloat16 mixed precision. The default optimization configuration
+is:
+global batch size = 32,
+
+warm-up ratio = 3%,
+
+20
+
+gradient clipping = 1.0,
+
+weight decay = 0.
+
+For LLaVA-style backbones, the default learning rate is 2 × 10−4 for LoRA parameters. For InternVL-style
+backbones, we use 1 × 10−4 for stability. For COAST and MCITlib settings with official hyperparameters,
+we additionally report the official-setting result when it differs from the matched-budget setting. Each
+continual stage is trained for two epochs unless the official benchmark protocol requires a fixed update
+budget.
+B.4.4
+
+RCL Hyperparameters
+
+The default RCL objective is
+
+L = Ltask + λpred Lpred + λrel Lrel + λreg ∥ϕ − ϕ− ∥22 .
+We use the following default values:
+τr = 0.5,
+
+τkd = 2.0,
+
+β = 1.0,
+
+λpred = 0.5,
+
+λrel = 1.0,
+
+λreg = 10−4 .
+
+We select these values using the validation split of the first stream only and keep them fixed for all later
+stages and all benchmark suites. This avoids using previous-task validation sets as a hidden replay
+signal.
+B.4.5
+
+Counterfactual Intervention Budget
+
+For each sample, RCL identifies the available evidence channels M x . During training, we sample one
+intervention per available channel:
+qtrain = 1.
+During diagnostic evaluation, we use four interventions per available channel:
+qeval = 4.
+The same intervened inputs are used for the previous checkpoint and current checkpoint, so teacher–
+student reliance vectors are compared under identical counterfactual views.
+B.4.6
+
+Evidence Channel Taxonomy
+
+We instantiate evidence channels according to the input structure of each dataset:
+• Image channel: image patches, visual tokens, or annotated regions.
+• Question channel: instruction tokens and content-bearing question tokens.
+• OCR channel: recognized text tokens and OCR bounding boxes.
+• Document channel: document text spans, line blocks, and layout regions.
+• Chart/table channel: axes, legends, plotted marks, table cells, and numerical entries.
+• Language-prior channel: lexical cues in the question that can induce shortcut answers.
+For datasets without explicit OCR, document, or chart annotations, the corresponding channels are
+omitted rather than approximated. Reliance vectors are always normalized over the channels available in
+the current sample.
+B.4.7
+
+Counterfactual Intervention Construction
+
+We use evidence-suppressing interventions rather than task-preserving augmentations for reliance
+estimation. The goal is to measure whether suppressing a channel changes the model’s output distribution
+or answer likelihood.
+Image interventions. We mask image patches, remove selected visual tokens, or replace visual regions
+with neutral image statistics. If object annotations are available, regions are sampled from annotated
+objects; otherwise, patches are sampled from a uniform grid.
+OCR interventions. We remove OCR tokens, replace them with a neutral placeholder, or mask OCR
+spans while preserving the prompt template. When OCR bounding boxes are available, visual regions
+corresponding to OCR spans are also masked in an aligned intervention.
+Document interventions. We mask document lines, paragraph blocks, or layout regions. For DocVQAstyle inputs, we preserve page order and prompt structure while suppressing the selected document
+evidence.
+21
+
+Chart and table interventions. We mask axis labels, legends, plotted elements, cell values, and numerical entries. For tables, we distinguish header masking from body-cell masking because these two
+perturbations often affect different reasoning paths.
+Question-prior interventions. We mask content words in the question while preserving stop words,
+formatting tokens, and instruction templates. This intervention estimates whether the model relies on
+question-side language priors rather than grounded visual or textual evidence.
+B.4.8
+
+Compute Resources
+
+All main experiments are run on 8 NVIDIA A100-80GB GPUs. For LLaVA-1.5-7B experiments, each
+continual stage uses approximately 6–10 GPU hours depending on the dataset size and intervention
+budget. For LLaVA-1.5-13B, each stage uses approximately 12–18 GPU hours. For InternVL-Chat-7B, each
+stage uses approximately 8–12 GPU hours. The full main benchmark suite requires approximately 1,200–
+1,600 A100 GPU hours, including three random seeds, ablations, and diagnostic evaluation. Reliance
+diagnostics are more expensive than standard answer evaluation because they require counterfactual
+forward passes, but they are used only during training and evaluation, not at deployment time.
+B.4.9
+
+Random Seeds and Reporting
+
+Unless otherwise specified, we report the mean and standard deviation over three random seeds. The
+seeds affect model initialization of PEFT parameters, task sampling order when multiple official orders
+are available, data shuffling, and intervention sampling. For main tables, we report mean performance.
+For ablations and diagnostic plots, we include standard deviation or confidence intervals when space
+permits. All reliance-aware metrics are computed on the same evaluation examples across methods to
+avoid intervention-sampling artifacts.
+B.4.10
+
+Inference Cost
+
+RCL uses counterfactual interventions and the frozen previous checkpoint only during training and diagnostic evaluation. After each continual stage, the deployed model is the updated PEFT-adapted MLLM.
+No reference model, intervention module, or reliance estimator is used at inference time. Therefore, RCL
+has the same inference-time architecture, memory footprint, and latency as the underlying LoRA-adapted
+backbone.
+B.4.11
+
+Hyperparameter Sensitivity
+
+We evaluate sensitivity to three key hyperparameters:
+λrel ∈ {0.25, 0.5, 1.0, 2.0},
+
+τr ∈ {0.25, 0.5, 1.0},
+
+qtrain ∈ {1, 2, 4}.
+
+We report both answer-level metrics and reliance-aware metrics. This analysis tests whether reliance
+preservation is robust to the strength of the reliance loss, the sharpness of the reliance distribution, and
+the number of counterfactual interventions used during training.
+B.4.12
+
+Ablation Settings
+
+We evaluate the following ablations:
+• w/o reliance loss: removes Lrel and keeps only task learning and prediction distillation.
+• w/o prediction distillation: removes Lpred and keeps task learning and reliance preservation.
+• w/o confidence gate: sets wθ − ( x, y) = 1 for all examples.
+• visual-only reliance: preserves reliance only for visual channels.
+• text/OCR-only reliance: preserves reliance only for text and OCR channels.
+• random interventions: replaces evidence-targeted interventions with random token or patch
+masking.
+• larger intervention budget: increases qtrain from 1 to 2 or 4.
+The ablations are designed to test whether the performance gain comes from reliance preservation itself,
+from output distillation, from the confidence gate, or merely from generic perturbation regularization.
+
+22
+
+B.5
+
+Main Experiment Details
+
+Answer-drop–MRD bubble protocol. This paragraph provides the full protocol for Figure 3. For every
+method A, random seed, old stage j, later checkpoint k > j, and diagnostic slice E j,s , we compute the
+clean answer drop
+
+
+
+
+(A)
+
+(A)
+
+∆ans ( j, k, s) = Acc f θ
+
+j
+
+(A)
+
+; E j,s − Acc f θ
+
+k
+
+; E j,s .
+
+(39)
+
+We compute modality reliance drift using the reliance vectors defined in Section 4.2:
+
+
+1
+(A)
+(A)
+(A)
+MRD j→k,s =
+DJS rθ ( x, y) rθ ( x, y) .
+∑
+j
+k
+|E j,s | (x,y)∈E
+
+(40)
+
+j,s
+
+The dominant evidence flip rate is computed only on examples whose answers are preserved:
+
+ 
+
+(A)
+(A)
+(A)
+(A)
+(A)
+DEF j→k,s = E( x,y)∈E j,s 1 arg max rθ ,m ( x, y) ̸= arg max rθ ,m ( x, y) f θ ( x ) = f θ ( x ) = y .
+m∈M x
+
+j
+
+m∈M x
+
+j
+
+k
+
+k
+
+(41)
+
+Each bubble in Figure 3 corresponds to one tuple
+
+(A, seed, j, k, s).
+The horizontal coordinate is Eq. (39), the vertical coordinate is Eq. (40), and the bubble area is proportional
+to Eq. (41). We mark a slice as hidden forgetting when
+(A)
+
+(A)
+
+∆ans ( j, k, s) ≤ 2%,
+
+MRD j→k,s ≥ 0.20.
+
+(42)
+
+These thresholds are fixed before evaluation and are used only to visualize the discrepancy between
+answer preservation and evidence-use preservation. All reported summary statistics are averaged over
+old stages, later checkpoints, diagnostic slices, and three random seeds.
+Dominant-channel Sankey protocol. This paragraph provides the construction details for Figure 5. For
+each method A and old stage j, we retain only answer-preserved examples:
+n
+o
+(A)
+(A)
+(A)
+Ω j = ( x, y) ∈ E j : f θ ( x ) = f θ ( x ) = y ,
+(43)
+K
+
+j
+
+where K denotes the final continual stage. For each example, we identify the dominant evidence channel
+before and after continual adaptation:
+(A)
+
+cj
+
+(A)
+
+(A)
+
+( x, y) = arg max rθ ,m ( x, y),
+m∈M x
+
+(A)
+
+cK ( x, y) = arg max rθ ,m ( x, y).
+
+j
+
+m∈M x
+
+K
+
+The Sankey transition probability from old dominant channel u to final dominant channel v is
+h
+i h
+i
+(A)
+(A)
+∑Kj=−11 ∑( x,y)∈Ω(A) 1 c j ( x, y) = u 1 cK ( x, y) = v
+j
+(A)
+h
+i
+Tu→v =
+.
+(A)
+K −1
+( x, y) = u + ϵ
+∑ j =1 ∑
+(A) 1 c j
+
+(44)
+
+(45)
+
+( x,y)∈Ω j
+
+Diagonal retention is computed as
+DiagRet(A) =
+
+h
+i
+(A)
+(A)
+∑Kj=−11 ∑( x,y)∈Ω(A) 1 c j ( x, y) = cK ( x, y)
+j
+
+(A)
+
+∑Kj=−11 |Ω j
+
+|+ϵ
+
+.
+
+Shortcut-oriented flip rate into the question-prior channel q is
+h
+i h
+i
+(A)
+(A)
+∑Kj=−11 ∑( x,y)∈Ω(A) 1 c j ( x, y) ̸= q 1 cK ( x, y) = q
+j
+QFlip(A) =
+.
+(A)
+∑Kj=−11 |Ω j | + ϵ
+
+(46)
+
+(47)
+
+In Figure 5, ribbon width is proportional to Eq. (45). Red-tinted ribbons correspond to transitions whose
+final channel is the question-prior channel. We additionally report channel-specific diagonal retention
+for OCR, chart, and document channels to quantify whether structured evidence remains the dominant
+support for answer-preserved examples.
+
+23
+
+Answer-KD
+Old dominant
+
+RCL
+Final dominant
+
+Old dominant
+
+Image
+
+Image
+
+Final dominant
+
+Image
+
+Image
+
+OCR
+OCR
+
+Chart
+
+Document
+
+Chart
+
+OCR
+
+OCR
+
+Chart
+
+Chart
+
+Document
+Document
+
+Document
+Question-prior
+
+Question-prior
+
+Question-prior
+
+Question-prior
+
+same-channel retention: 55.7% | flips to prior: 29.3%
+
+same-channel retention: 78.8% | flips to prior: 9.0%
+
+grounded channel → question-prior
+
+other off-diagonal transition
+
+same-channel retention
+
+Figure 5: Dominant evidence-channel transitions on answer-preserved examples. Ribbons show how
+the dominant evidence channel changes from the old checkpoint to the final checkpoint, conditioned
+on both checkpoints answering correctly. Red-tinted ribbons denote shortcut-oriented flips into the
+question-prior channel. Protocol details are in Appendix B.5, Dominant-channel Sankey protocol.
+Cost–performance Pareto protocol. This paragraph provides the full protocol for Figure 4. We compare
+the following configurations: Seq-LoRA, A NSWER -KD, random intervention regularization, sparse RCL,
+and RCL with intervention budgets qtrain ∈ {1, 2, 4}. For each configuration A, the relative training cost
+is
+GPUHours(A)
+Crel (A) =
+.
+(48)
+GPUHours(Seq-LoRA)
+The hidden-forgetting reduction over Seq-LoRA is
+HFR-Red.(A) =
+
+HFR(Seq-LoRA) − HFR(A)
+× 100.
+HFR(Seq-LoRA)
+
+(49)
+
+A method is Pareto-dominated if another method achieves both lower or equal relative cost and higher
+or equal HFR reduction, with at least one strict improvement:
+
+A≺B
+
+⇐⇒
+
+Crel (B) ≤ Crel (A),
+
+HFR-Red.(B) ≥ HFR-Red.(A),
+
+(50)
+
+with one inequality strict. In Figure 4, the x-axis is Eq. (48), the y-axis is Eq. (49), bubble area is proportional to final average answer performance, and color encodes MRD. The default RCL configuration
+uses qtrain = 1, i.e., one targeted intervention per available evidence channel. Because counterfactual
+interventions are used only during training and diagnostic evaluation, all points in the figure have the
+same inference-time architecture and latency as their corresponding PEFT-adapted backbone.
+
+C
+
+Additional Experimental Results
+
+C.1
+
+Does RCL Prevent Dominant Evidence-Channel Flips?
+
+To make hidden reliance drift interpretable, we inspect whether answer-preserved examples retain the
+same dominant evidence channel after continual adaptation. For each old-stage example answered
+correctly by both the old and final checkpoints, we compute the dominant channel before and after
+adaptation and aggregate the resulting transition matrix. Figure 5 shows that A NSWER -KD preserves
+many final answers but keeps only 54.2% of answer-preserved examples on the same dominant channel,
+while 27.8% flip into the question-prior channel. The shortcut-oriented transitions OCR→question-prior,
+chart→question-prior, and document→question-prior together account for 18.6% of all answer-preserved
+examples. RCL increases diagonal retention to 78.6% and reduces question-prior flips to 8.9%, with
+especially large gains for OCR, chart, and document evidence. These channel-level results explain why
+RCL lowers DEF and HFR: it preserves not only the old answer, but also the evidence path that supported
+it.
+
+24
+
+Table 5: Task-order robustness on the evidence-sensitive stream. RCL remains stable across the default,
+reversed, and random task orders, indicating that its reliance-preservation effect is not tied to a particular
+curriculum.
+Method
+Task order
+Avg.↑
+AF↓
+MRD↓
+DEF↓
+HFR↓
+GCR↑
+Seq-LoRA
+Seq-LoRA
+Seq-LoRA
+
+Default
+48.51
+Reversed
+47.84
+Random avg. 48.23±0.62
+
+18.58
+19.21
+18.96±0.71
+
+0.291
+0.304
+0.298±0.012
+
+42.0
+44.3
+43.1±1.6
+
+61.5
+64.2
+62.7±2.0
+
+64.9
+63.8
+64.2±1.1
+
+Answer-KD Default
+50.88
+Answer-KD Reversed
+50.19
+Answer-KD Random avg. 50.61±0.55
+
+16.45
+16.88
+16.70±0.62
+
+0.250
+0.261
+0.256±0.010
+
+36.1
+37.4
+36.8±1.3
+
+52.9
+55.0
+53.8±1.8
+
+67.1
+66.4
+66.8±0.9
+
+RCL
+RCL
+RCL
+
+4.22
+4.61
+4.44±0.32
+
+0.106
+0.114
+0.111±0.006
+
+14.8
+15.7
+15.3±0.8
+
+12.9
+14.1
+13.6±1.0
+
+89.0
+88.2
+88.6±0.6
+
+Default
+64.06
+Reversed
+63.52
+Random avg. 63.78±0.41
+
+Table 6: Validation of counterfactual reliance against gradient×activation attribution. RCL produces
+reliance profiles that are more consistent with independent local attribution, especially on OCR-, chart-,
+and document-centric examples.
+Spearman ρ ↑
+
+Task family
+
+JS divergence ↓
+
+Seq-LoRA Answer-KD RCL Seq-LoRA Answer-KD
+
+C.2
+
+RCL
+
+Visual reasoning
+Language-prior VQA
+OCR / text reasoning
+Chart reasoning
+Document reasoning
+
+0.52
+0.45
+0.49
+0.46
+0.44
+
+0.55
+0.48
+0.51
+0.50
+0.47
+
+0.68
+0.61
+0.70
+0.69
+0.67
+
+0.184
+0.206
+0.198
+0.213
+0.221
+
+0.169
+0.193
+0.181
+0.190
+0.204
+
+0.112
+0.137
+0.105
+0.109
+0.118
+
+Overall
+
+0.48
+
+0.51
+
+0.67
+
+0.204
+
+0.187
+
+0.116
+
+Task-Order Robustness
+
+Protocol. We first test whether the improvement of RCL depends on a favorable continual task order. In
+addition to the default stream used in the main paper, we evaluate the reversed stream and three random
+task orders. For each order, we report final average performance, average forgetting, and reliance-aware
+diagnostics. The random-order row reports the mean and standard deviation over three independently
+sampled task permutations.
+Analysis. Table 5 shows that the performance of RCL is stable across task orders. The average performance varies by less than 0.6 points between the default and reversed streams, and HFR remains below
+15% in all settings. By contrast, Seq-LoRA and Answer-KD remain sensitive to order changes, especially
+in MRD and HFR. This suggests that reliance preservation is not exploiting a specific order of OCR-,
+chart-, or document-centric tasks; rather, it provides a general stabilization signal for old evidence-use
+behavior.
+
+C.3
+
+Reliance Metric Validation
+
+Protocol. MRD is computed from counterfactual evidence suppression. To verify that this diagnostic is
+not an artifact of the intervention design, we compare the channel ranking induced by counterfactual
+reliance with an independent gradient×activation attribution signal. For each answer-preserved example,
+we compute the Spearman rank correlation between the two channel rankings. We also report the
+Jensen–Shannon divergence between the normalized counterfactual reliance vector and the normalized
+attribution vector. Higher rank correlation and lower JS divergence indicate better agreement between
+the two diagnostic views.
+Analysis. Table 6 supports the validity of counterfactual reliance as a diagnostic signal. Across all task
+families, counterfactual reliance correlates positively with gradient-based attribution, and the agreement
+is strongest under RCL. The largest improvements occur on OCR, chart, and document tasks, where
+
+25
+
+Table 7: Sensitivity to evidence-suppressing versus task-preserving perturbations. RCL is more
+sensitive to true evidence removal while remaining stable under harmless perturbations.
+Method
+
+ES-KL↑ TP-KL↓ Sep. ratio↑ ES Acc. drop↑ TP Acc. drop↓ Stable-grounded score↑
+
+Seq-LoRA
+Answer-KD
+Random interventions
+RCL
+
+0.312
+0.284
+0.331
+0.386
+
+0.118
+0.102
+0.151
+0.081
+
+2.64
+2.78
+2.19
+4.77
+
+14.8
+12.9
+15.6
+18.2
+
+5.7
+4.9
+7.4
+3.1
+
+56.3
+59.1
+55.8
+72.6
+
+Table 8: Hidden forgetting under different levels of question-prior bias. The gain of RCL is largest on
+high-prior-bias examples, where answer-level metrics are most likely to hide shortcut reliance.
+Bias group
+
+Method
+
+Avg.↑ DEF↓ HFR↓ GCR↑
+
+Low prior bias
+
+Seq-LoRA
+Answer-KD
+RCL
+
+51.8
+53.2
+64.9
+
+31.5
+27.9
+12.4
+
+43.7
+36.8
+9.8
+
+72.4
+74.6
+90.7
+
+Seq-LoRA
+Medium prior bias Answer-KD
+RCL
+
+49.1
+51.0
+64.2
+
+41.8
+35.7
+14.6
+
+60.9
+52.1
+12.7
+
+64.1
+67.3
+89.3
+
+Seq-LoRA
+Answer-KD
+RCL
+
+45.7
+48.3
+62.7
+
+52.6
+44.8
+17.3
+
+78.4
+69.3
+16.5
+
+56.9
+60.2
+86.8
+
+High prior bias
+
+evidence channels are structured and channel flips are more harmful. This result suggests that MRD does
+not merely measure arbitrary perturbation sensitivity; it tracks a channel-level evidence-use pattern that
+is also reflected in local attribution.
+
+C.4
+
+Task-Preserving Perturbation Test
+
+Protocol. A desirable grounded model should be sensitive to evidence removal but stable under
+harmless input variations. We therefore compare two perturbation families. The first family contains
+evidence-suppressing interventions, such as masking OCR tokens, chart elements, document spans, or
+visual regions. The second family contains task-preserving perturbations, such as mild image noise,
+question paraphrases, OCR whitespace changes, and chart style changes that do not alter the answer. For
+each method, we report output KL shift and accuracy drop under both perturbation types, as well as the
+separation ratio between evidence-suppressing and task-preserving sensitivity.
+Analysis. Table 7 shows that RCL does not simply make the model more sensitive to all input changes.
+Instead, it increases sensitivity to evidence-suppressing interventions while reducing sensitivity to taskpreserving perturbations. Random interventions increase both ES-KL and TP-KL, which indicates generic
+perturbation sensitivity rather than grounded evidence use. In contrast, RCL achieves the highest
+separation ratio and the lowest task-preserving accuracy drop. This supports the intended behavior of
+the method: the model should react when task-relevant evidence is removed, but should not change
+substantially under irrelevant formatting or style changes.
+
+C.5
+
+Bias-Stratified Hidden Forgetting
+
+Protocol. We next test whether RCL is especially helpful when language shortcuts are strong. For each
+example, we estimate a question-prior score using a question-only model and divide the evaluation set
+into low-, medium-, and high-prior-bias groups. We then compare HFR, DEF, and GCR in each group.
+This stratification directly tests whether reliance preservation prevents the model from drifting toward
+shortcut priors on examples where such shortcuts are available.
+Analysis. Table 8 shows that hidden forgetting becomes more severe as question-prior bias increases.
+For Seq-LoRA and Answer-KD, high-prior-bias examples have substantially higher DEF and HFR,
+indicating that correct answers are often preserved through shortcut reliance. RCL reduces HFR in all
+groups and achieves the largest absolute reduction in the high-bias group, decreasing HFR from 69.3%
+
+26
+
+Table 9: Dominant evidence-channel retention by task family. RCL improves retention of structured
+evidence channels and reduces flips into question-side priors.
+Image Ret.↑ OCR Ret.↑ Chart Ret.↑ Doc Ret.↑ Flip to prior↓
+
+Task family
+
+Method
+
+Visual reasoning
+
+Seq-LoRA
+Answer-KD
+RCL
+
+58.6
+62.0
+82.5
+
+—
+—
+—
+
+—
+—
+—
+
+—
+—
+—
+
+24.9
+26.0
+8.5
+
+Seq-LoRA
+Language-prior VQA Answer-KD
+RCL
+
+51.3
+55.8
+77.4
+
+—
+—
+—
+
+—
+—
+—
+
+—
+—
+—
+
+34.6
+31.2
+11.8
+
+Seq-LoRA
+OCR / text reasoning Answer-KD
+RCL
+
+49.2
+53.6
+76.8
+
+43.5
+48.7
+76.4
+
+—
+—
+—
+
+50.1
+52.4
+73.9
+
+39.8
+37.0
+10.9
+
+Chart reasoning
+
+Seq-LoRA
+Answer-KD
+RCL
+
+46.7
+50.8
+74.1
+
+—
+—
+—
+
+39.1
+43.9
+74.8
+
+—
+—
+—
+
+42.7
+39.0
+11.1
+
+Document reasoning
+
+Seq-LoRA
+Answer-KD
+RCL
+
+45.9
+49.7
+72.9
+
+46.8
+51.3
+73.5
+
+—
+—
+—
+
+38.6
+41.5
+73.2
+
+45.1
+40.9
+12.8
+
+Table 10: Sensitivity to reliance-loss weight λrel . The default value λrel = 1.0 provides the best balance
+between answer performance and reliance preservation.
+λrel
+
+Avg.↑
+
+AF↓
+
+MRD↓
+
+DEF↓
+
+HFR↓
+
+GCR↑
+
+0.00
+0.25
+0.50
+1.00
+2.00
+
+61.72
+62.91
+63.63
+64.06
+63.74
+
+5.96
+5.13
+4.62
+4.22
+4.35
+
+0.184
+0.142
+0.119
+0.106
+0.101
+
+25.9
+20.8
+16.9
+14.8
+14.5
+
+30.4
+21.7
+15.8
+12.9
+12.4
+
+81.7
+85.2
+87.6
+89.0
+89.2
+
+under Answer-KD to 16.5%. This confirms that reliance preservation is particularly useful when answer
+correctness alone is least reliable as a grounding indicator.
+
+C.6
+
+Evidence-Channel Retention by Task Family
+
+Protocol. We further analyze which evidence channels benefit most from RCL. For each old-task
+family, we compute the retention rate of the originally dominant grounded channel on answer-preserved
+examples. For example, OCR retention measures the fraction of answer-preserved examples whose
+dominant channel remains OCR after continual adaptation, conditioned on OCR being the old dominant
+channel. We also report the shortcut-flip rate into the question-prior channel.
+Analysis. Table 9 shows that the largest improvements occur on structured evidence channels. For
+Answer-KD, OCR, chart, and document retention remains below 50% in several task families, even
+though the answers are preserved. This means that output distillation often keeps the surface answer
+while allowing the evidence path to move toward question priors. RCL improves OCR retention to
+76.4%, chart retention to 74.8%, and document retention to 73.2%, while reducing flips into question-prior
+reliance to around 9–13%. These results provide channel-level evidence that RCL preserves grounded
+reasoning rather than merely suppressing parameter drift.
+
+C.7
+
+Hyperparameter Sensitivity
+
+Protocol. We evaluate sensitivity to the reliance-loss weight λrel and the reliance temperature τr . The
+first parameter controls the strength of reliance preservation, while the second controls the sharpness of
+the normalized reliance vector. All other hyperparameters are fixed to the default setting. We report both
+answer-level and reliance-aware metrics.
+
+27
+
+Table 11: Sensitivity to reliance temperature τr . Performance is stable around the default τr = 0.5;
+overly sharp or overly smooth reliance distributions slightly weaken the trade-off.
+τr
+
+Avg.↑
+
+AF↓
+
+MRD↓
+
+DEF↓
+
+HFR↓
+
+GCR↑
+
+0.25
+0.50
+1.00
+
+63.58
+64.06
+63.79
+
+4.47
+4.22
+4.39
+
+0.113
+0.106
+0.116
+
+16.1
+14.8
+16.6
+
+14.8
+12.9
+15.4
+
+87.9
+89.0
+87.8
+
+Table 12: Confidence-gate analysis. The gate is most helpful when teacher targets are unreliable,
+especially in high-entropy or low-sensitivity bins.
+Teacher bin
+
+Variant
+
+Avg.↑ MRD↓ HFR↓ GCR↑
+
+Low entropy, high sensitivity
+
+w/o gate
+full RCL
+
+65.1
+65.4
+
+0.092
+0.087
+
+9.8
+8.6
+
+91.3
+92.0
+
+Low entropy, low sensitivity
+
+w/o gate
+full RCL
+
+63.4
+64.1
+
+0.126
+0.108
+
+18.2
+13.4
+
+85.9
+88.4
+
+High entropy, high sensitivity
+
+w/o gate
+full RCL
+
+61.8
+63.0
+
+0.146
+0.119
+
+23.7
+16.5
+
+82.6
+86.8
+
+High entropy, low sensitivity
+
+w/o gate
+full RCL
+
+59.6
+61.7
+
+0.171
+0.132
+
+31.5
+20.9
+
+77.8
+83.5
+
+Analysis. Tables 10 and 11 show that RCL is not overly sensitive to its main hyperparameters. Removing
+reliance preservation entirely produces the largest degradation in MRD, DEF, and HFR. Increasing
+λrel from 0.25 to 1.0 consistently improves reliance preservation, while λrel = 2.0 gives only a small
+additional reduction in MRD but slightly lowers average answer performance. This suggests a mild
+over-conservation effect when the reliance constraint is too strong. For τr , the default value 0.5 performs
+best, but both neighboring settings remain competitive. Overall, the default configuration is a stable and
+reasonable operating point rather than a fragile optimum.
+
+C.8
+
+Confidence-Gate Analysis
+
+Protocol. The confidence gate downweights unreliable teacher reliance targets. To analyze its effect, we
+bin samples by teacher predictive entropy and total intervention sensitivity. Low entropy indicates confident teacher predictions, while high intervention sensitivity indicates that the teacher has a measurable
+evidence-use pattern. For each bin, we compare full RCL with the variant that removes the gate.
+Analysis. Table 12 confirms that the confidence gate is mainly needed to avoid overfitting unreliable
+teacher targets. When the teacher is confident and evidence-sensitive, removing the gate causes only a
+small degradation. However, when teacher entropy is high or intervention sensitivity is low, the gap
+becomes much larger. In the high-entropy, low-sensitivity bin, the gate reduces HFR from 31.5% to 20.9%
+and improves GCR from 77.8% to 83.5%. This indicates that the gate does not merely improve average
+performance; it specifically protects the model from preserving noisy or weakly grounded teacher reliance
+profiles.
+
+C.9
+
+Failure-Case Taxonomy
+
+Protocol. Finally, we inspect the remaining high-MRD examples under the default RCL model. We
+sample 300 answer-preserved examples with the highest MRD and manually categorize the dominant
+failure source. The goal is to understand the residual limitations of reliance preservation, not to introduce
+a new training signal.
+Analysis. Table 13 shows that the remaining failures of RCL are not dominated by a single systematic
+weakness. Only 10.2% of high-MRD cases are attributed to incorrect teacher reliance, suggesting that
+the confidence gate is largely effective. The largest categories involve ambiguous evidence, OCR noise,
+chart parsing ambiguity, and document layout mismatch. These are expected in multimodal reasoning
+settings where evidence channels are not always cleanly separable. Importantly, the taxonomy does not
+show a widespread collapse into question-prior shortcuts, which supports the main conclusion that RCL
+substantially mitigates hidden evidence-use forgetting.
+
+28
+
+Table 13: Failure-case taxonomy for high-MRD examples under RCL. Most remaining failures arise
+from ambiguous or noisy evidence rather than systematic collapse into language-prior shortcuts.
+Failure type
+
+Share
+
+Typical pattern
+
+Interpretation
+
+Ambiguous multi-channel
+evidence
+
+27.6%
+
+The same answer can be supported by both visual
+context and text/OCR evidence.
+
+Noisy or incomplete OCR
+
+21.3%
+
+The old checkpoint relies on OCR tokens that are
+partially missing or incorrectly recognized.
+
+Chart parsing ambiguity
+
+18.4%
+
+Axis labels, legends, or plotted marks are visually
+crowded and hard to isolate.
+
+Document layout mismatch
+
+14.9%
+
+The answer depends on layout relations between
+nearby text blocks rather than isolated spans.
+
+Incorrect teacher reliance
+
+10.2%
+
+The previous checkpoint answers correctly but
+already relies on a shortcut channel.
+
+Answer alias or evaluator
+ambiguity
+
+7.6%
+
+Multiple textual forms are accepted, but reliance
+vectors differ across aliases.
+
+Reliance drift is partly benign because multiple evidence channels are valid.
+Teacher reliance can be
+imperfect when the extracted evidence is noisy.
+Structured visual evidence remains difficult
+under coarse channel
+interventions.
+Better layout-aware interventions may further improve reliance estimation.
+The gate reduces but cannot fully remove imperfect teacher targets.
+Some measured drift reflects answer normalization rather than true reasoning drift.
+
+D
+
+Additional Discussion
+
+D.1
+
+Limitations
+
+This work focuses on a specific but important failure mode in continual multimodal learning: the model
+may preserve the final answer while changing the evidence path used to obtain it. The proposed RCL
+framework assumes that each input can be decomposed into meaningful evidence channels, such as image
+tokens, question tokens, OCR tokens, chart elements, document spans, or table cells. This assumption
+is natural for the multimodal benchmarks considered in this paper, but future applications with more
+implicit or weakly structured inputs may require task-specific channel construction.
+RCL also uses counterfactual channel interventions during training and diagnostic evaluation. These
+interventions introduce additional training-time computation, although they are not used at inference
+time and therefore do not change the deployed model architecture, memory footprint, or latency. In this
+paper, we control this cost by sampling a small fixed number of interventions per available channel and
+by sharing the same intervened inputs between the teacher and student models.
+Our empirical evaluation covers standard continual multimodal instruction tuning benchmarks, an
+evidence-sensitive multimodal stream, and three representative MLLM backbones. These settings are
+designed to test the central claim that answer-level evaluation can miss reliance drift. Extending the
+same principle to longer streams, additional modalities such as video and audio, and more specialized
+deployment domains is a natural direction for future work.
+
+D.2
+
+Broader Impacts
+
+The main positive impact of this work is to improve the reliability and interpretability of continual
+multimodal adaptation. In deployed multimodal assistants, preserving only the final answer may be
+insufficient: a model can appear accurate while gradually relying less on grounded visual, textual,
+OCR, chart, or document evidence. By explicitly measuring and constraining evidence-use drift, RCL
+encourages models to preserve the evidence path behind correct answers, which may benefit applications
+such as document understanding, chart reasoning, educational assistants, accessibility tools, and visual
+question answering systems.
+At the same time, reliance preservation should not be interpreted as a complete safety guarantee. A
+model that preserves its previous reliance pattern may still inherit biases, spurious correlations, or
+factual errors from the reference checkpoint. Therefore, high-stakes applications should combine relianceaware continual learning with task-specific evaluations for safety, fairness, privacy, and robustness. The
+proposed method is intended as a diagnostic and training-time reliability mechanism rather than as a
+standalone deployment safeguard.
+29
+
+The method does not require collecting new human-subject data, scraping new datasets, or releasing
+a new high-risk pretrained model. The main environmental cost comes from additional training-time
+counterfactual forward passes. We mitigate this cost by keeping the backbone frozen, updating only
+PEFT parameters, using a small intervention budget, and removing all reliance-estimation modules at
+inference time.
+
+D.3
+
+Existing Assets and Licenses
+
+This paper uses existing public datasets, pretrained multimodal backbones, and baseline implementations.
+We cite the original papers for all datasets, models, and methods used in the experiments, and we follow
+their official licenses, research-use restrictions, and access terms. We do not redistribute raw datasets,
+pretrained model weights, or third-party code as part of this submission.
+The main benchmark assets include CoIN, COAST, MCITlib, ScienceQA, GQA, VQAv2, OK-VQA,
+TextVQA, OCR-VQA, ChartQA, and DocVQA. The main pretrained backbones include LLaVA-1.5-7B,
+LLaVA-1.5-13B, and InternVL-Chat-7B. When reproducing the experiments, users should obtain each
+dataset and pretrained checkpoint from its official source and comply with the corresponding license or
+access agreement.
+Baseline methods are either implemented from their published descriptions or adapted from official
+implementations when available. If an official implementation is used, we follow its license and attribution requirements. If an asset does not provide an explicit license, we use it only under its stated
+research-access terms and do not redistribute it.
+
+D.4
+
+LLM Usage
+
+This paper studies continual adaptation of multimodal large language models and therefore uses MLLM
+backbones as experimental subjects. The backbones, including LLaVA-1.5 and InternVL-Chat, are
+specified in the experimental setup, and no closed-source LLM is used as an oracle evaluator, label
+generator, or hidden supervision source for the main method.
+LLM-based tools may have been used for assistive purposes such as wording, grammar correction, LaTeX
+formatting, drafting code snippets, debugging, and organizing notes. Such usage did not determine
+the scientific claims, method design, experimental protocol, or reported results. All technical content,
+mathematical formulations, experimental choices, and conclusions were checked and approved by the
+authors.
+
+D.5
+
+Compute Resources
+
+All main experiments are run on NVIDIA A100-80GB GPUs using bfloat16 mixed precision. Each training
+job uses up to 8 GPUs, with CPU workers used for data loading, preprocessing, and evaluation. The
+typical CPU configuration is 64–128 vCPUs with 512GB–1TB host memory per multi-GPU node. The full
+project uses approximately 4–6TB of temporary storage for datasets, checkpoints, logs, and counterfactual
+evaluation outputs.
+For LLaVA-1.5-7B, each continual stage requires approximately 6–10 A100 GPU hours, depending on
+dataset size and the number of available evidence channels. For LLaVA-1.5-13B, each stage requires
+approximately 12–18 A100 GPU hours. For InternVL-Chat-7B, each stage requires approximately 8–12
+A100 GPU hours. These estimates include task learning, prediction distillation, reliance estimation, and
+counterfactual intervention forward passes.
+Reliance-aware diagnostic evaluation is more expensive than standard answer evaluation because it
+requires counterfactual forward passes over multiple evidence channels. In our default setting, training
+uses one sampled intervention per available channel, while diagnostic evaluation uses four interventions
+per available channel. This overhead is incurred only during training and evaluation; the final deployed
+model has the same inference-time architecture and latency as the underlying LoRA-adapted MLLM.
+The full set of reported experiments, including main benchmark comparisons, three random seeds,
+ablations, hyperparameter sensitivity analyses, and reliance-aware diagnostic plots, requires approximately 1,200–1,600 A100 GPU hours. Preliminary diagnostic studies and configuration checks require
+an additional approximately 200–300 A100 GPU hours. No inference-time counterfactual intervention
+module, reference model, or reliance estimator is used after training.
+
+30
+
+

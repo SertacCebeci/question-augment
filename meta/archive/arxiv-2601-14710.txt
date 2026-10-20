@@ -1,0 +1,3148 @@
+Case-Guided Sequential Assay Planning in Drug Discovery
+†
+
+Tianchi Chen1,* , Jan Bima2 , Sean L. Wu1 , Otto Ritter2 , Bingjia Yang3 , and Xiang Yu3,
+1
+
+arXiv:2601.14710v1 [cs.LG] 21 Jan 2026
+
+Decision Science, Merck & Co., Inc., USA
+2
+Decision Science, MSD Czech Republic
+3
+Pharmacokinetics, Dynamics, Metabolism & Bioanalytical, Merck & Co., Inc., USA
+
+Abstract
+Optimally sequencing experimental assays in drug discovery is a high-stakes planning problem under severe uncertainty and resource constraints. A primary obstacle for standard reinforcement learning (RL) is the absence of an
+explicit environment simulator or transition data (s, a, s′ ); planning must rely solely on a static database of historical
+outcomes. We introduce the Implicit Bayesian Markov Decision Process (IBMDP), a model-based RL framework
+designed for such simulator-free settings. IBMDP constructs a case-guided implicit model of transition dynamics
+by forming a nonparametric belief distribution using similar historical outcomes. This mechanism enables Bayesian
+belief updating as evidence accumulates and employs ensemble MCTS planning to generate stable policies that balance information gain toward desired outcomes with resource efficiency. We validate IBMDP through comprehensive
+experiments. On a real-world central nervous system (CNS) drug discovery task, IBMDP reduced resource consumption by up to 92% compared to established heuristics while maintaining decision confidence. To rigorously assess
+decision quality, we also benchmarked IBMDP in a synthetic environment with a computable optimal policy. Our
+framework achieves significantly higher alignment with this optimal policy than a deterministic value iteration alternative that uses the same similarity-based model, demonstrating the superiority of our ensemble planner. IBMDP
+offers a practical solution for sequential experimental design in data-rich but simulator-poor domains.
+
+1
+
+Introduction
+
+To discover new drugs, scientists make sequential decisions to conduct multiple assays, often constrained by limited
+time, budget, and materials [Paul et al., 2010, Hughes et al., 2011]. The process typically begins with sparse evidence
+from historical assay outcomes on past compounds. Executing an assay for a new drug candidate compound yields an
+observation of the assay consuming monetary and time resources, each probing a distinct facet of developability of the
+compound (e.g., potency, ADME, safety) [Segall, 2012]. For example, an in vitro assay may be cheap and fast but only
+weakly informative downstream, whereas an in vivo assay is slower and more expensive yet more decisive for Go/NoGo decisions. Under tight budget and schedule constraints, the central question is whether to run another assay or
+stop now. Ideally, each chosen assay reduces posterior uncertainty while increasing the likelihood that the compound
+satisfies predefined developability criteria. This is a planning problem under uncertainty, further complicated by the
+absence of transition tuples (s, a, s′ )—only historical assay outcomes from past compounds are available. In practice,
+rule-based playbooks and expert heuristics are often risk-averse or myopic, leading to inefficient use of constrained
+resources and suboptimal portfolio outcomes.
+To address these challenges, we propose the Implicit Bayesian Markov Decision Process (IBMDP), a reinforcement learning (RL) framework for case-guided sequential assay planning that uses assay outcomes of historical compounds to construct an implicit probabilistic model of information gain acquired from assays. At each step, IBMDP
+forms a categorical distribution over historical compound records using a variance-normalized distance kernel and
+samples plausible assay outcomes consistent with the current partial evidence, thereby updating the candidate’s observed state. This implicit, nonparametric transition model emphasizes contexts most relevant to the candidate without
+requiring an explicit mechanistic simulator. Planning is performed with Monte Carlo Tree Search with Double Progressive Widening (MCTS-DPW) [Browne et al., 2012, Couëtoux et al., 2011], and we run an ensemble of MCTS planners
+* Corresponding author: tianchi.chen@merck.com
+† Corresponding author: yuxiang822@gmail.com
+
+1
+
+Figure 1: Sequential decisions in drug discovery through a data-driven, analog-guided simulator for planning, which
+maintains a Bayesian belief over the most relevant historical compound analogs.
+to reduce variance from both stochastic sampling and tree search; majority voting across runs yields a MaximumLikelihood Action-Sets Path (MLASP) that is stable across uncertainty levels. When simulating possible courses of
+actions during search, IBMDP takes into account the resulting reduction in uncertainty towards desirable states (e.g.,
+high drug likeliness in vivo) and recommends the next assay only when the uncertainty reduction reaches a sufficient
+magnitude towards the desirable states. From the Partially Observable MDP (POMDP) perspective, while standard
+methods maintain explicit probability distributions over hidden states and update them via Bayes’ rule, IBMDP makes
+decisions by sampling from past experiences weighted by similarity to the current observed state (Appendix A). While
+IBMDP trades formal convergence guarantees for practical applicability in simulator-free settings, it provides empirically robust policies through ensemble MCTS planning (Appendix A.6).
+Contributions. (i) RL planning with evidence-adaptive dynamics: Unlike traditional RL with fixed transition
+functions, IBMDP’s implicit dynamics evolve as observations accumulate—the similarity-based belief continuously
+adapts, creating non-stationary but principled state transitions from static historical data. (ii) Similarity-weighted
+Bayesian belief mechanism: We transform historical outcomes into an adaptive generative model where transition probabilities dynamically shift based on accumulated evidence, enabling planning without explicit dynamics
+or (s, a, s′ ) trajectories. (iii) Robust ensemble MCTS despite non-stationary dynamics: Our ensemble approach
+with majority voting (MLASP) produces stable policies even with evolving transition models, optimally balancing
+information gain with resource efficiency.
+
+2
+
+Preliminaries
+
+Compounds, Assays, and Historical Data Let A = {a1 , . . . , aM } be the set of available assays and X =
+{x1 , . . . , xN } be the set of historical compounds, each with a fixed molecular representation. For a historical compound xi and an assay aj , the observed outcome is denoted by yi,j . The complete historical dataset is represented as
+a set of tuples:
+D = {(xi , yi )}N
+i=1 ,
+where yi = (yi,1 , . . . , yi,M ) is the vector of all assay outcomes for compound xi . The new drug candidate compound
+for which we are planning is denoted x⋆ ≡ xN +1 . We also have access to per-assay predictor models, such as
+Quantitative Structure-Activity Relationship (QSAR) models, which are functions fj : x 7→ ŷj = fj (x) that can be
+queried for the candidate x⋆ during the planning phase [Chen et al., 2024]. For convenience, Appendix F collects all
+symbols used throughout the paper in the Global Notation Reference.
+Target Property Let g be the primary scalar target of interest, such as a definitive in vivo endpoint that determines
+a compound’s success. The historical values for this target form the set G = {gi }N
+i=1 . In many applications, the target
+property may correspond to one of the available assays. That is, for some specific assay index j ∈ {1, . . . , M }, we
+have gi ≡ yi,j for all compounds. Crucially, to prevent data leakage, the set of target values G is never used in the
+
+2
+
+computation of similarity or distance metrics during planning. We define Ig = {i : gi is available} as the set of
+indices for historical compounds where the target value has been measured.
+State and Actions We formulate the assay planning problem for the candidate x⋆ as a finite-horizon MDP with a
+discount factor γ ∈ [0, 1) and a maximum horizon T . At any decision step t, we maintain an index set of assays that
+have already been performed, Mt ⊆ {1, . . . , M }, and the set of unmeasured assays, Ut := {1, . . . , M } \ Mt . The
+process starts with an empty set of measured assays, M0 = ∅.
+
+The state at step t summarizes all accumulated knowledge about the candidate compound: st = x⋆ , {y⋆,j }j∈Mt .
+The action set at step t, At , consists of choosing a batch of up to m currently unmeasured assays to perform, or
+deciding to stop the experiment. Formally: At = P≤m (Ut ) ∪ {eox}. Here, P≤m (Ut ) is the set of all subsets of Ut
+with size at most m, and ‘eox‘ (end-of-experiment) is the terminal action. The parameter m ≤ M is a user-specified
+throughput limit that caps how many assays can be run in parallel at a single step. Executing an action At ⊆ Ut reveals
+the outcomes {y⋆,j }j∈At and updates the measured and unmeasured sets for the next step, t + 1.
+Reward Function Each action incurs a cost based on the resources it consumes (e.g., time, materials, monetary
+expense). Let cj ∈ Rq≥0 be the cost vector for an individual assay aj . The cost for a batch action At is the sum of the
+P
+costs of the individual assays within it, i.e., c(st , At ) = aj ∈At cj . Let ρ ∈ Rq≥0 be a user-defined vector of weights
+that specifies the trade-offs between different resources. The scalar step reward, R(st , At ), is defined as:
+(
+−ρT c(st , At ), if At ∈ At \ {eox},
+R(st , At ) =
+0,
+if At = eox.
+Uncertainty and Goal-Likelihood Functionals To ensure resources are directed toward viable drug candidates,
+we define two key state-dependent scalar functions based on similarity weights wi (st ) over historical records (to be
+formally defined in a later section). First, we renormalize the weights to consider only the historical compounds for
+which the target value g is available:
+w̃i (st ) = P
+
+wi (st )
+ℓ∈Ig wℓ (st )
+
+for i ∈ Ig .
+
+Note that when |Ig | ≪ N , this renormalization may lead to variance underestimation as it restricts the effective sample
+size. This limitation is discussed in the experimental analysis. Using these normalized weights, we define:
+1. State-Uncertainty (H(st )): The weighted variance of the target property g over the relevant historical data,
+which serves as a measure of uncertainty about the candidate’s potential outcome.
+X
+X
+2
+H(st ) =
+w̃i (st ) gi − ḡ(st ) , where ḡ(st ) =
+w̃i (st ) gi .
+(1)
+i∈Ig
+
+i∈Ig
+
+2. Goal-Likelihood (L(st )): The weighted probability that the candidate’s target property falls within a predefined
+desirable range [gmin , gmax ].
+X
+L(st ) =
+w̃i (st ) 1[ gi ∈ [gmin , gmax ] ].
+(2)
+i∈Ig
+
+Here, 1[·] denotes the indicator function, which returns 1 when its argument is true and 0 otherwise.
+Constrained Objective The optimal policy π ∗ is one that maximizes the total expected reward, subject to constraints
+on terminal uncertainty and stepwise feasibility. Specifically, we aim to solve:
+" T
+#
+X
+
+∗
+t
+π ∈ arg max Eπ
+γ R st , π(st )
+π
+
+subject to
+
+t=0
+
+(
+H(sT ) ≤ ϵ, ϵ ∈ [0, 1],
+L(st ) ≥ τ, ∀t = 0, . . . , T − 1,
+
+3
+
+(3)
+
+where ϵ > 0 is the maximum tolerable uncertainty at the terminal state sT , and τ ∈ (0, 1) is the minimum acceptable
+goal-likelihood at every intermediate step. The feasibility constraint L(st ) ≥ τ ensures that the planning process
+remains on a trajectory toward a successful outcome, while the terminal constraint H(sT ) ≤ ϵ guarantees that a
+decision is made with sufficient confidence.
+
+3
+
+Implicit Model of Environment Dynamics
+A
+
+t
+The key challenge is updating the state transition st −−→
+st+1 —i.e., how the state evolves after executing a batch
+of assays—when no explicit simulator is available and only historical data D can be leveraged to infer dynamics.
+We address this by constructing an implicit, generative model of the environment’s dynamics. This model uses a
+similarity metric [Bellet et al., 2013] to dynamically re-weight historical compound profiles, forming a belief over
+plausible outcomes for the candidate compound x⋆ . This avoids explicit parameterization of transition probabilities
+and implicitly propagates uncertainty by sampling from historical compound analogs most relevant to the current state
+of x⋆ .
+
+Similarity Weight Computation The transition model is centered on a similarity weight, wi (st ), assigned to each
+historical compound record Di = (xi , yi ) ∈ D. These weights quantify the relevance of each historical case to the
+current state, st . The weights are computed using a variance-normalized exponential kernel:
+wi (st ) = exp (−λw · d(st , Di )) ,
+
+(4)
+
+where d(st , Di ) is a distance metric. The distance is computed over the set of all features known for the candidate x⋆
+at step t, which we denote as the feature set Kt . This set includes all initial QSAR predictions and the outcomes of all
+measured assays in Mt . The distance compares these known values for the candidate to the corresponding values for
+the historical compound xi :
+X
+(ϕk (st ) − ϕk (Di ))2
+d(st , Di ) =
+λk ·
+,
+(5)
+σk2
+k∈Kt
+
+Here, ϕk (·) is an extractor function that returns the value of the k-th feature from a given state or historical record.
+For the candidate, ϕk (st ) is either a QSAR prediction or a measured assay outcome {y⋆,j }j∈Mt . For the historical
+compound, ϕk (Di ) is the corresponding recorded value. The term σk2 is the empirical variance of feature k across the
+PN
+PN
+historical dataset D, computed as σk2 = N1 i=1 (ϕk (Di ) − ϕ̄k )2 where ϕ̄k = N1 i=1 ϕk (Di ). The parameter λk is a
+feature-specific weight, and λw is a global temperature parameter. The variance normalization ensures a dimensionless
+comparison across features with different scales.
+Similarity-Based State Transition The transition from state st to st+1 after executing an action (a batch of assays)
+At ⊆ Ut is simulated through a weighted sampling process. First, a historical case is sampled from D with probability
+proportional to its similarity weight:
+
+I ∼ Categorical
+
+w1 (st )
+wN (st )
+,...,
+Z
+Z
+
+
+,
+
+where Z =
+
+N
+X
+
+wi (st ).
+
+i=1
+
+Let the selected historical case be DI = (xI , yI ). The outcomes for the assays in the action batch At are then
+”revealed” by taking the corresponding values from this sampled case:
+{y⋆,j := yI,j }j∈At .
+The new state st+1 is formed by augmenting the previous state with these newly generated outcomes. Formally,
+Mt+1 = Mt ∪ At , and the new state is:
+
+st+1 = x⋆ , {y⋆,j }j∈Mt+1 .
+This generative process ensures that the simulated outcomes for the new assays are consistent with a plausible, historically observed compound profile, thereby preserving correlations between assays.
+
+4
+
+Implicit Transition Modeling via Sampling The sampling mechanism described above defines an implicit transition probability distribution P (st+1 |st , At ). This distribution is a mixture model where each component corresponds
+to one of the historical cases in D. The probability of transitioning to a specific next state st+1 is the total weight of
+all historical cases that would produce that state:
+P (st+1 |st , At ) =
+
+N
+X
+wi (st )
+i=1
+
+Z
+
+· 1[st+1 = st ⊕ {(aj , yi,j )}j∈At ],
+
+(6)
+
+where ⊕ denotes the state update operation that augments the current state by adding new assay outcomes to Mt and
+updating the observed values {y⋆,j }, and 1[·] is the indicator function. This sampling-based approach approximates
+the true transition dynamics when the historical dataset D is sufficiently representative of the underlying system. The
+quality of the approximation depends on the coverage of D, the appropriateness of the similarity metric, and the dataset
+size N = |D|.
+Bayesian Weight Update After transitioning to the new state st+1 , the similarity weights are re-evaluated to incorporate the new evidence. This recalculation is a direct and principled implementation of a Bayesian belief update.
+As we formally derive in Appendix A, our framework is equivalent to a POMDP where the hidden state is a latent
+index over the historical cases in D. The similarity weights wi (st ) represent the posterior belief over these latent
+”prototypes,” and the recalculation after observing new assay outcomes is equivalent to applying Bayes’ rule. The new
+weights {wi (st+1 )}N
+i=1 are computed using the same distance function as before, but now applied to the augmented
+state st+1 :
+wi (st+1 ) = exp (−λw · d(st+1 , Di )) .
+(7)
+This update mechanism shifts the model’s belief toward historical cases that are most consistent with the expanded set
+of evidence for the candidate x⋆ , allowing the planner to refine its predictions and subsequent decisions as more data
+is gathered.
+
+4
+
+Implicit Bayesian Markov Decision Process (IBMDP)
+
+The Implicit Bayesian Markov Decision Process (IBMDP) is a planning framework designed to solve the constrained
+optimization problem defined in Equation equation 3. It integrates the implicit, case-based transition model with a
+powerful planning algorithm to find reward-maximizing sequences of assays. The core of the framework is a Monte
+Carlo Tree Search (MCTS) planner that navigates the decision space by simulating potential experimental paths using
+the generative model derived from historical data. To ensure the robustness of its recommendations, IBMDP employs
+an ensemble method, aggregating the results of multiple independent planning runs.
+The overall workflow proceeds as follows: Historical Data D informs a Similarity Module, which computes
+weights wi (st ) for the current state st . These weights drive the implicit transition model used by an MCTS-DPW
+planner. The planner generates a policy, and this process is repeated across an ensemble of runs. Finally, the policies
+are aggregated to construct a Maximum-Likelihood Action-Sets Path (MLASP), which constitutes the final recommended experimental plan. The detailed procedure is outlined in Algorithm 1.
+IBMDP begins with the initial state s0 , which contains the candidate compound x⋆ and any pre-existing QSAR
+predictions, with an empty set of measured assays (M0 = ∅). The planner, MCTS with Double Progressive Widening
+(MCTS-DPW), is particularly well-suited for this problem due to its ability to handle large, combinatorial action
+spaces—in this case, the power set of unmeasured assays, P≤m (Ut ).
+During each simulation step within the MCTS algorithm, the planner must evaluate the consequence of taking an
+action At . It does this by invoking the implicit transition model from the previous section. A historical case DI is
+sampled based on the current similarity weights wi (st ), and the outcomes for the assays in At are drawn from this
+case. This yields a simulated next state, st+1 . The planner then recalculates the similarity weights for this new state,
+wi (st+1 ), and evaluates the state-uncertainty H(st+1 ) and goal-likelihood L(st+1 ). A state is considered terminal if
+the uncertainty H(s) falls below the threshold ϵ, and the planner receives a negative reward if the feasibility constraint
+L(s) < τ is violated at any step. The immediate step reward, R(st , At ), is also recorded. This process allows the
+MCTS to build a search tree that accurately reflects the trade-off between reward (resource efficiency) and the expected
+information gain towards desired states, all guided by the historical data.
+To mitigate stochasticity, we run the planning process multiple times to form an ensemble. The final recommendation (MLASP) is constructed by majority vote over the actions recommended by the ensemble policies at each stage.
+
+5
+
+Algorithm 1 Ensemble IBMDP Algorithm
+Require: Initial state s0 = (x⋆ , M0 = ∅), historical data D, reward function R(s, A), functionals H(s), L(s), thresholds ϵ, τ , horizon T ,
+iterations nitr , ensemble size Ne .
+Ensure: A Maximum-Likelihood Action-Sets Path (MLASP).
+1: Initialize policy set Π ← ∅.
+2: for j = 1 to Ne do
+▷ Ensemble loop
+3:
+Initialize MCTS tree T with root node s0 .
+4:
+for i = 1 to nitr do
+▷ MCTS iterations
+5:
+Selection: Traverse T from s0 using a tree policy (e.g., UCB1) to select a leaf node sleaf .
+6:
+Expansion: If sleaf is not a terminal state (H(sleaf ) > ϵ), choose an untried action A ∈ At (sleaf ) and create a new child node
+snew .
+7:
+Simulation (Rollout): From snew , simulate a trajectory of states and actions using a reward-aware heuristic policy until a terminal
+state or horizon T is reached.
+8:
+During rollout, for a transition (s, A) → s′ , the next state s′ is generated by the implicit model: sample I ∼ Cat({wk (s)/Z}N
+k=1 )
+P
+′ = s ⊕ {(a , y
+where Z = N
+w
+(s)
+and
+set
+s
+)}
+.
+k I,k k∈A
+k=1 k
+9:
+The total return Q is the cumulative reward, with a large negative reward (e.g., −106 ) if L(s) < τ for any state in the trajectory.
+10:
+Backpropagation: Update the visit counts and value estimates for all nodes on the path from snew back to the root using the return Q.
+11:
+end for
+12:
+Extract the optimal policy πj∗ from the final tree T by selecting the action with the highest value at each node.
+13:
+Π ← Π ∪ {πj∗ }.
+14: end for
+15: Construct MLASP by aggregating policies in Π via majority voting at each decision step.
+16: return MLASP
+
+This ensures the plan is robust and not an artifact of a single simulation run.
+
+5
+
+Experiments
+
+We validate the performance of IBMDP through a two-part evaluation. First, we apply it to a real-world sequential
+assay planning task in central nervous system (CNS) drug discovery to demonstrate its practical utility and potential
+for resource savings. For reproducibility, we performed the same experiment on a public dataset on selecting in vivo
+pharmacokinetics assays between rat and dog to determine in vivo clearance in human (Appendix E). Second, we
+set up a synthetic environment with a known optimal policy to rigorously assess the quality of its decision-making
+process.
+
+5.1
+
+Brain Penetration Assays: A Real-World Case Study
+
+Problem Setting and Data. We evaluate IBMDP on a sequential assay-planning task for central nervous system
+(CNS) drug discovery, where the objective is to efficiently determine a compound’s brain penetration potential. This
+property is critically dependent on the compound’s ability to cross the blood-brain barrier (BBB). The decision involves selecting from cheap, fast, but less informative in vitro transporter assays (P-glycoprotein, PgP; Breast Cancer
+Resistance Protein, BCRP) and a definitive but slow and expensive in vivo assay that measures the unbound brain-toplasma partition coefficient (kpuu ).
+Our historical dataset, D, comprises N = 220 compounds with complete measurements for all relevant assays
+(100 nM PgP, 1 µM PgP, 100 nM BCRP) and the target property, kpuu . All compounds also have associated QSAR
+predictions, which provide initial estimates for the assay outcomes (e.g., for PgP and BCRP activity) and other relevant
+properties such as Mean Residence Time (MRT). The operational costs are defined as $400 and a 7-day turnaround
+for each in vitro assay, and $4,000 and a 21-day turnaround for the in vivo kpuu assay. Actions are constrained to a
+maximum of 3 parallel assays per step. A compound is considered to have high potential if its kpuu > 0.5.
+Experimental Setup. The planning objective is to balance the reduction of state uncertainty H(s) on the target kpuu ,
+the increase in goal likelihood L(s) that kpuu is in the desirable range, and the maximization of reward (efficient use of
+resources). An experimental sequence terminates when the planner reaches a state of sufficient confidence, defined by
+the joint criteria H(sT ) ≤ ϵ and L(st ) ≥ τ for all intermediate steps. Outcomes are compared against a conventional,
+rule-based decision strategy.
+Rule-Based Baseline. In practice, decisions often follow simple heuristics based on QSAR predictions. For this
+task, the baseline heuristic is:
+
+6
+
+• A compound is deemed promising (likely 0.5 ≤ kpuu ≤ 1) if QSAR1uM PgP < 2 AND QSAR100nM BCRP < 2.
+• A compound is deemed non-promising (likely kpuu ≤ 0.5) if QSAR1uM PgP > 4 OR QSAR100nM BCRP > 4.
+We evaluated IBMDP across four representative scenarios from three categories designed to test its performance
+against this heuristic: (i) Baseline confirmation (clear QSAR signals, Scenario 3), (ii) Heuristic challenge (conflicting or borderline QSAR signals, Scenarios 2 and 4), and (iii) Opportunity discovery (QSARs suggest a nonpromising compound that is, in fact, good, Scenario 1).
+
+Figure 2: Monetary-prioritized results from IBMDP for four representative compounds. Each plot shows the Pareto
+front of achievable resource consumption versus terminal state uncertainty, with the Maximum-Likelihood ActionSets Path (MLASP) highlighted. This illustrates how IBMDP provides a trade-off curve, allowing decision-makers to
+select a plan based on their risk and budget tolerance.
+Results. As shown in Table 1, IBMDP consistently identifies more resource-efficient experimental plans than the
+traditional approach, which often defaults to running a full panel of assays consuming $5,200. The table rows are ordered to correspond directly to the scenarios shown in Figure 2. In the opportunity discovery scenario (row 1/Scenario
+1), the heuristic would have incorrectly discarded a valuable compound, whereas IBMDP recommends an efficient
+$800 plan to reveal its true potential. For the next compound (row 2/Scenario 2), IBMDP finds a minimal $400 plan to
+resolve uncertainty. In the baseline confirmation scenario (row 3/Scenario 3), IBMDP recommends just $400-$800 to
+confirm the promising profile. Finally, for the challenging case with conflicting QSARs (row 4/Scenario 4), IBMDP
+efficiently resolves uncertainty for $400-$800. Across these representative cases, IBMDP achieves the same or higher
+level of decision confidence with up to 92% reduction in resource consumption.
+7
+
+Table 1: Resource expense comparison between the traditional heuristic approach and IBMDP for representative
+compounds. Rows are ordered to match scenarios 1-4 in Figure 2. The traditional approach expense of $5200 reflects
+running the full assay panel ($4000 for kpuu plus 3 × $400 for in vitro assays), which IBMDP consistently avoids.
+QSAR Predictor
+
+5.2
+
+Assays
+
+Expense (×$100)
+
+1uM
+PgP
+
+100nM
+BCRP
+
+kpuu
+
+100nM
+PgP
+
+1uM
+PgP
+
+100nM
+BCRP
+
+Trad.
+
+IBMDP
+
+5.0
+0.9
+1.7
+21.4
+
+9.6
+8.5
+1.3
+0.7
+
+0.53
+0.53
+0.54
+0.64
+
+15.9
+2.2
+1.1
+17.4
+
+12.9
+1.1
+0.8
+19.7
+
+8.2
+14.2
+1.3
+0.8
+
+52
+52
+52
+52
+
+8
+4
+4-8
+4-8
+
+Simulation with Synthetic Data
+
+Benchmark Setup. To rigorously assess the policy quality of IBMDP in a controlled setting, we benchmarked it using a synthetic dataset where a theoretically optimal policy is computable (full details in Appendix D). We established
+this optimal policy using Value Iteration with the true, analytic uncertainty dynamics (VI-Theo). We then compared
+IBMDP against both this VI-Theo baseline and a deterministic variant using the same similarity-based estimation as
+IBMDP, but planned with Value Iteration (VI-Sim).
+Results. The results, summarized in Table 2, demonstrate the effectiveness of IBMDP’s stochastic, ensemble-based
+planning. Over 100 independent trials, IBMDP’s primary recommendation (Top 1) aligned with the optimal VI-Theo
+policy in 47% of cases. In contrast, the deterministic VI-Sim approach achieved only 36% alignment. The advantage
+of the ensemble approach is further highlighted by the fact that the optimal action was contained within IBMDP’s top
+two recommendations 66% of the time, providing robust and effective coverage of the high-value policy space.
+Table 2: Policy Alignment with Theoretical Baseline
+Method
+IBMDP Top 1
+IBMDP Top 2
+VI Similarity
+
+Matches
+
+Match Rate (%)
+
+47
+66
+36
+
+47.0
+66.0
+36.0
+
+This superior performance stems from a fundamental difference in policy generation. While VI-based methods
+converge to a single, deterministic policy, IBMDP’s ensemble of MCTS agents explores the policy space more broadly.
+This allows it to identify multiple, often near-equivalent, high-value actions, which is particularly advantageous in
+assay selection where different feature combinations can yield similar information gains. The results confirm that
+our ensemble-based planner provides more robust and reliable recommendations than a deterministic alternative by
+effectively navigating the uncertainty inherent in the policy space itself.
+
+6
+
+Conclusions
+
+To achieve case-guided planning, we presented IBMDP, a reinforcement learning framework that turns historical cases
+into a generative model for sequential assay selection. By weighting historical cases based on similarity, the algorithm
+enables robust, multi-step planning with Monte Carlo Tree Search without requiring an explicit transition function.
+The application to a real-world drug discovery problem demonstrated it uncovers ground truth of a compound with
+fewer, cheaper assays. This work establishes a powerful methodology for leveraging past experience to guide future
+experiments, with broad applicability in fields beyond drug discovery where historical data is abundant but mechanistic
+models are scarce.
+
+7
+
+Related Work
+
+MDPs and Model-Based RL. MDPs formalize sequential decision-making [Puterman, 2014] [Puterman, 1994, Alagoz
+et al., 2010]; model-based RL learns dynamics for planning [Sutton and Barto, 2018, Kaiser et al., 2019, Moerland
+
+8
+
+et al., 2023]. Kernel-based RL leverages similarity primarily for value approximation or smoothing learned transitions
+[Ormoneit and Sen, 2002, Kveton and Theocharous, 2012, Xu et al., 2007]. IBMDP uses similarity to build a generative, nonparametric transition without (s, a, s′ ) tuples—sampling assay outcomes from historical records rather than
+learning explicit kernels over next-states.
+Bayesian RL and Bayesian Optimization. BRL maintains posteriors over model parameters or values and samples explicit MDPs (e.g., PSRL) [Ghavamzadeh et al., 2015, Osband et al., 2013, Agrawal and Jia, 2017]. BO targets
+one-shot improvement of objective functions [Griffiths and Hernández-Lobato, 2020, Gómez-Bombarelli et al., 2018]
+[Shahriari et al., 2015]. IBMDP avoids explicit parameter posteriors and performs Bayesian case-based generation
+via similarity-weighted reweighting of records, enabling multi-step planning with reward optimization and feasibility
+constraints.
+Bayesian Experimental Design and Implicit Models. Canonical single-step BO/BED methods are myopic and
+assume an explicit likelihood or simulator[Chaloner and Verdinelli, 1995, Rainforth et al., 2024]; implicit-BED handles intractable likelihoods with info-theoretic surrogates or policy learning [Kleinegesse and Gutmann, 2020, Kleinegesse et al., 2021, Ivanova et al., 2021] [Blau et al., 2022]. IBMDP embeds an implicit model inside an RL planner
+(MCTS-DPW), balancing reward, time, and feasibility—not solely information gain.
+Constrained MDPs and POMDPs. CMDPs typically constrain cumulative costs [Achiam et al., 2017]; our constraints target state properties (terminal uncertainty, per-step likelihood) enforced during planning. The setting is akin
+to POMDPs [Kaelbling et al., 1998]; our similarity-weighted posterior over records acts as an implicit belief. While
+multi-step RL/POMDP solvers require simulators or (s, a, s′ ) tuples, IBMDP uses a similarity-weighted, implicit generative model built directly from historical assay profiles, preserving cross-assay dependence without learning explicit
+dynamics. A direct benchmark is therefore not strictly comparable without substantial adaptation: (i) redefining utilities over assays rather than inputs, (ii) adding resource-aware batching and a principled stopping rule aligned with
+our constraints on H(s) and L(s), and (iii) supplying a posterior predictive consistent with the no-simulator setting
+(Appendix A).
+Ensembles in RL. Ensembles improve robustness and uncertainty estimates [Dietterich, 2000, Zhou, 2012, Wiering and Van Hasselt, 2008, Osband et al., 2016, Lakshminarayanan et al., 2017]. IBMDP use ensembling pragmatically
+to stabilize stochastic planning.
+Application Context. Prior RL in biomedicine focuses on trials or molecule generation/synthesis [Bennett and
+Hauser, 2013, Eghbali-Zarch et al., 2019, Abbas et al., 2007, Fard et al., 2018, Wang et al., 2021, Bengio et al., 2021,
+You et al., 2018, Zhou et al., 2019, Segler et al., 2018, Coronato et al., 2020, Escandell-Montero et al., 2014, Schneider
+et al., 2020]. Assay selection in early discovery remains underexplored. IBMDP supplies a practical planner that
+converts historical assay records into a coherent, generative transition model with operational constraints, addressing
+the ”no (s, a, s′ )” regime typical of discovery.
+On Fair Comparison with Related Methods. While the above methods appear relevant, direct benchmarking
+would be fundamentally unfair—each operates under different mathematical assumptions and problem formulations.
+Model-based RL requires (s, a, s′ ) data or simulators; Bayesian RL samples from parameter posteriors; BO performs
+single-step optimization; POMDPs need explicit transition models. IBMDP uniquely addresses the setting where only
+static historical outcomes exist, making these comparisons ”apples to oranges.” See Appendix C for detailed analysis.
+
+8
+
+Limitations
+
+Historical data coverage. Effectiveness hinges on the quality/representativeness of D; gaps or bias can yield suboptimal choices. Unlike model-free RL with exploration, similarity-based sampling cannot discover strategies absent
+from D—though in discovery, stable physico-chemical regularities partly mitigate this risk.
+Similarity metric assumptions. The exponential kernel over (normalized) Euclidean distances assumes these distances reflect assay behavior. Nonlinear/threshold biology may violate this; domain-tailored metrics may be required
+to capture structure–activity relations.
+Scalability. The worst-case total complexity is O(Ne · nitr · min(bH , nitr ) · |D| · d), where b is the effective
+branching factor and H is the maximum tree depth. The per-iteration cost is dominated by the similarity weight
+calculation (O(|D| · d)). Large datasets |D| or high feature dimensions d can strain memory and compute, potentially
+requiring distributed infrastructure or data subsampling for enterprise-scale use.
+Hyperparameter sensitivity. Performance depends on tuning {λw , λk , Ne , c, ϵ, τ }; robustness across programs
+may require expert priors or nontrivial validation budgets.
+
+9
+
+References
+Ismail Abbas, Joan Rovira, and Josep Casanovas. Clinical trial optimization: Monte Carlo simulation Markov model
+for planning clinical trials recruitment. In Contemporary Clinical Trials, volume 28, pages 220–231. Elsevier, 2007.
+Joshua Achiam, David Held, Aviv Tamar, and Pieter Abbeel. Constrained policy optimization. In International
+Conference on Machine Learning, pages 22–31. PMLR, 2017.
+Shipra Agrawal and Randy Jia. Posterior sampling for reinforcement learning: Worst-case regret bounds. Advances
+in Neural Information Processing Systems, 30, 2017.
+Oguzhan Alagoz, Heather Hsu, Andrew J Schaefer, and Mark S Roberts. Markov decision processes: A tool for
+sequential decision making under uncertainty. Medical Decision Making, 30(4):474–483, 2010.
+Aurélien Bellet, Amaury Habrard, and Marc Sebban. A survey on metric learning for feature vectors and structured
+data. arXiv preprint arXiv:1306.6709, 2013.
+Emmanuel Bengio, Moksh Jain, Maksym Korablyov, Doina Precup, and Yoshua Bengio. Flow network based generative models for non-iterative diverse candidate generation. Advances in Neural Information Processing Systems,
+34:27381–27394, 2021.
+Casey C Bennett and Kris Hauser. Artificial intelligence framework for simulating clinical decision-making: A Markov
+decision process approach. Artificial Intelligence in Medicine, 57(1):9–19, 2013.
+Tom Blau, Edwin V Bonilla, Iadine Chades, and Amir Dezfouli. Optimizing sequential experimental design with deep
+reinforcement learning. In International Conference on Machine Learning, pages 2107–2128. PMLR, 2022.
+Cameron B Browne, Edward Powley, Daniel Whitehouse, Simon M Lucas, Peter I Cowling, Philipp Rohlfshagen,
+Stephen Tavener, Diego Perez, Spyridon Samothrakis, and Simon Colton. A survey of Monte Carlo tree search
+methods. IEEE Transactions on Computational Intelligence and AI in Games, 4(1):1–43, 2012.
+Kathryn Chaloner and Isabella Verdinelli. Bayesian experimental design: A review. Statistical Science, pages 273–
+304, 1995.
+Jacky Chen, Yunsie Chung, Jonathan Tynan, Chen Cheng, Song Yang, and Alan Cheng. Performance insights for
+small molecule drug discovery models: Data scaling, multitasking, and generalization. 2024.
+Antonio Coronato, Muddasar Naeem, Giuseppe De Pietro, and Giovanni Paragliola. Reinforcement learning for
+intelligent healthcare applications: A survey. Artificial Intelligence in Medicine, 109:101964, 2020.
+Adrien Couëtoux, Jean-Baptiste Hoock, Nataliya Sokolovska, Olivier Teytaud, and Nicolas Bonnard. Continuous
+upper confidence trees. In Learning and Intelligent Optimization: 5th International Conference, LION 5, Rome,
+Italy, January 17-21, 2011. Selected Papers 5, pages 433–445. Springer, 2011.
+Thomas G Dietterich. Ensemble methods in machine learning. In International Workshop on Multiple Classifier
+Systems, pages 1–15. Springer, 2000.
+Maryam Eghbali-Zarch, Reza Tavakkoli-Moghaddam, Fatemeh Esfahanian, Amir Azaron, and Mohammad Mehdi
+Sepehri. A Markov decision process for modeling adverse drug reactions in medication treatment of type 2 diabetes.
+Proceedings of the Institution of Mechanical Engineers, Part H: Journal of Engineering in Medicine, 233(8):793–
+811, 2019.
+Pablo Escandell-Montero, Milena Chermisi, Jose M Martinez-Martinez, Juan Gomez-Sanchis, Carlo Barbieri, Emilio
+Soria-Olivas, Flavio Mari, Joan Vila-Francés, Andrea Stopper, Emanuele Gatti, et al. Optimization of anemia
+treatment in hemodialysis patients via reinforcement learning. Artificial Intelligence in Medicine, 62(1):47–60,
+2014.
+Mahdi M Fard, Sandor Szalma, Shashikant Vattikuti, and Gyan Bhanot. A Bayesian Markov decision process framework for optimal decision making in clinical trials. IEEE Journal of Biomedical and Health Informatics, 22(6):
+2061–2068, 2018.
+
+10
+
+Mohammad Ghavamzadeh, Shie Mannor, Joelle Pineau, and Aviv Tamar. Bayesian reinforcement learning: A survey.
+Foundations and Trends in Machine Learning, 8(5-6):359–483, 2015.
+Rafael Gómez-Bombarelli, Jennifer N Wei, David Duvenaud, José Miguel Hernández-Lobato, Benjamı́n SánchezLengeling, Dennis Sheberla, Jorge Aguilera-Iparraguirre, Timothy D Hirzel, Ryan P Adams, and Alán AspuruGuzik. Automatic chemical design using a data-driven continuous representation of molecules. ACS Central Science, 4(2):268–276, 2018.
+Ryan-Rhys Griffiths and José Miguel Hernández-Lobato. Constrained Bayesian optimization for automatic chemical
+design using variational autoencoders. Chemical Science, 11(2):577–586, 2020.
+John P Hughes, Simon Rees, Sonya B Kalindjian, and Roger K Philpott. Principles of early drug discovery. British
+Journal of Pharmacology, 162(6):1239–1249, 2011.
+Desislava R Ivanova, Adam Foster, Simon Kleinegesse, Michael U Gutmann, and Tom Rainforth. Implicit deep adaptive design: Policy-based experimental design without likelihoods. In Advances in Neural Information Processing
+Systems, volume 34, pages 25785–25798, 2021.
+Leslie Pack Kaelbling, Michael L Littman, and Anthony R Cassandra. Planning and acting in partially observable
+stochastic domains. Artificial Intelligence, 101(1-2):99–134, 1998.
+Lukasz Kaiser, Mohammad Babaeizadeh, Piotr Milos, Blazej Osinski, Roy H Campbell, Konrad Czechowski, Dumitru Erhan, Chelsea Finn, Piotr Kozakowski, Sergey Levine, et al. Model-based reinforcement learning for Atari.
+International Conference on Learning Representations, 2019.
+Steven Kleinegesse and Michael U Gutmann. Bayesian experimental design for implicit models by mutual information
+neural estimation. In International Conference on Machine Learning, pages 5316–5326. PMLR, 2020.
+Steven Kleinegesse, Christopher Drovandi, and Michael U Gutmann. Gradient-based Bayesian experimental design
+for implicit models using mutual information lower bounds. arXiv preprint arXiv:2105.04379, 2021.
+Branislav Kveton and Georgios Theocharous. Kernel-based reinforcement learning on representative states. AAAI
+Conference on Artificial Intelligence, 26(1):977–983, 2012.
+Balaji Lakshminarayanan, Alexander Pritzel, and Charles Blundell. Simple and scalable predictive uncertainty estimation using deep ensembles. Advances in Neural Information Processing Systems, 30, 2017.
+Thomas M Moerland, Joost Broekens, Aske Plaat, and Catholijn M Jonker. Model-based reinforcement learning: A
+survey. Foundations and Trends in Machine Learning, 16(1):1–118, 2023.
+Dirk Ormoneit and Śaunak Sen. Kernel-based reinforcement learning. Machine Learning, 49:161–178, 2002.
+Ian Osband, Daniel Russo, and Benjamin Van Roy. More effective reinforcement learning via posterior sampling. In
+Advances in Neural Information Processing Systems, volume 26, 2013.
+Ian Osband, Charles Blundell, Alexander Pritzel, and Benjamin Van Roy. Deep exploration via bootstrapped DQN.
+Advances in Neural Information Processing Systems, 29, 2016.
+Steven M Paul, Daryl S Mytelka, Christopher T Dunwiddie, Christian C Persinger, Bernard H Munos, Stacy R Lindborg, and Aaron L Schacht. How to improve R&D productivity: The pharmaceutical industry’s grand challenge.
+Nature Reviews Drug Discovery, 9(3):203–214, 2010.
+Martin L Puterman. Markov Decision Processes: Discrete Stochastic Dynamic Programming. John Wiley & Sons,
+1994.
+Martin L Puterman. Markov Decision Processes: Discrete Stochastic Dynamic Programming. John Wiley & Sons,
+2014.
+Tom Rainforth, Adam Foster, Desi R Ivanova, and Freddie Bickford Smith. Modern Bayesian experimental design.
+Statistical Science, 39(1):100–114, 2024.
+
+11
+
+Petra Schneider, W Patrick Walters, Alleyn T Plowright, Norman Sieroka, Jennifer Listgarten, Robert A Goodnow Jr,
+Jasmin Fisher, Johanna M Jansen, José S Duca, Thomas S Rush, et al. Rethinking drug design in the artificial
+intelligence era. Nature Reviews Drug Discovery, 19(5):353–364, 2020.
+Matthew D Segall. Multi-parameter optimization: Identifying high quality compounds with a balance of properties.
+Current Pharmaceutical Design, 18(9):1292–1310, 2012.
+Marwin HS Segler, Mike Preuss, and Mark P Waller. Planning chemical syntheses with deep neural networks and
+symbolic AI. Nature, 555(7698):604–610, 2018.
+Bobak Shahriari, Kevin Swersky, Ziyu Wang, Ryan P Adams, and Nando De Freitas. Taking the human out of the
+loop: A review of Bayesian optimization. Proceedings of the IEEE, 104(1):148–175, 2015.
+Richard S Sutton and Andrew G Barto. Reinforcement Learning: An Introduction. MIT Press, 2018.
+Jike Wang, Chang-Yu Hsieh, Mingyang Wang, Xiaorui Wang, Zhenxing Wu, Dejun Jiang, Benben Liao, Xujun Zhang,
+Bo Yang, Qiaojun He, et al. Multi-constraint molecular generation based on conditional transformer, knowledge
+distillation and reinforcement learning. Nature Machine Intelligence, 3(10):914–922, 2021.
+Marco A Wiering and Hado Van Hasselt. Ensemble algorithms in reinforcement learning. IEEE Transactions on
+Systems, Man, and Cybernetics, Part B (Cybernetics), 38(4):930–936, 2008.
+Xin Xu, Dewen Hu, and Xicheng Lu. Kernel-based least squares policy iteration for reinforcement learning. IEEE
+Transactions on Neural Networks, 18(4):973–992, 2007.
+Bingjia Yang, Yunsie Chung, Archer Y Yang, Bo Yuan, Tianchi Chen, and Xiang Yu. QComp: A QSAR-based
+imputation framework for drug discovery. Journal of Chemical Information and Modeling, 65(15):7862–7873,
+2025.
+Jiaxuan You, Bowen Liu, Zhitao Ying, Vijay Pande, and Jure Leskovec. Graph convolutional policy network for
+goal-directed molecular graph generation. Advances in Neural Information Processing Systems, 31, 2018.
+Zhenpeng Zhou, Steven Kearnes, Li Li, Richard N Zare, and Patrick Riley. Optimization of molecules via deep
+reinforcement learning. Scientific Reports, 9(1):10752, 2019.
+Zhi-Hua Zhou. Ensemble Methods: Foundations and Algorithms. CRC Press, 2012.
+
+12
+
+Appendix
+A
+
+Theoretical Framework: IB-MDP as a POMDP
+
+This appendix provides a formal conceptual grounding for the IB-MDP framework. We demonstrate that our similarityweighted, case-based approach is not an ad-hoc heuristic, but rather a computationally tractable implementation of
+Bayesian belief updating within a Partially Observable Markov Decision Process (POMDP) tailored for informationgathering problems.
+
+A.1
+
+POMDP Preliminaries
+
+A POMDP is formally defined by the tuple (S, A, Ω, P, O, R, γ), where S is a set of hidden states, A is the set of
+actions, and Ω is the set of observations. Since the agent cannot observe the true state s ∈ S, it maintains a belief
+state, bt (s), which is a probability distribution over S. After taking action At and receiving observation ωt , the belief
+is updated via the Bayes filter:
+X
+bt+1 (s′ ) ∝ O(ωt | s′ , At )
+P (s′ | s, At ) bt (s).
+(8)
+s∈S
+
+The Information-Gathering Case. The sequential assay planning task is an instance of an information-gathering
+problem. The underlying intrinsic properties of the candidate compound x⋆ are fixed; performing an assay reveals
+information about these properties but does not change them. This corresponds to a static latent state, where the
+transition probability is an identity function: P (s′ | s, At ) = 1[s′ = s]. In this common special case, the belief update
+from Equation equation 8 simplifies to the multiplicative Bayes’ rule:
+bt+1 (s) ∝ O(ωt | s, At ) bt (s).
+
+A.2
+
+(9)
+
+The IB-MDP Latent Index Model and its POMDP Correspondence
+
+To map our framework to a POMDP, we introduce a discrete latent variable Z ∈ {1, . . . , N }, where each value i
+corresponds to one of the historical records Di ∈ D. We treat Z as the hidden state, representing the ”true prototype” of
+our candidate compound x⋆ from among the known historical cases. The core idea is that by maintaining a belief over
+Z, we are implicitly maintaining a belief about the complete, unobserved profile of x⋆ . The explicit correspondence
+is detailed in Table 3.
+
+A.3
+
+Equivalence of the Similarity Update and Bayesian Filtering
+
+With the mapping established, we now demonstrate that the similarity weight update mechanism in IB-MDP is a direct
+implementation of the Bayesian belief update from Equation equation 9.
+Let the prior belief over the latent index before step t be the weights wi (st ) ≡ P (Z = i | st ). Executing the assay
+batch At yields the observation ωt ≡ {y⋆,j }j∈At . By substituting the IB-MDP analogs into Equation equation 9, we
+derive the IB-MDP belief update rule for the weights:
+p(ωt | Z = i, At ) wi (st )
+wi (st+1 ) = PN
+.
+ℓ=1 p(ωt | Z = ℓ, At ) wℓ (st )
+
+(10)
+
+This confirms that the evolution of weights in IB-MDP is a principled Bayesian recursion.
+Connecting the Likelihood to the Similarity Kernel. The final step is to show that our specific implementation of
+similarity weights corresponds to a valid probabilistic likelihood model. If we model the likelihood of observing an
+assay outcome ya for the candidate with a Gaussian kernel centered on the historical value yi,a :
+
+
+λa (ya − yi,a )2
+,
+p(ya | Z = i, a) ∝ exp −
+2
+σa2
+
+13
+
+and assume conditional independence of assays in a batch given the prototype Z (a modeling assumption that enables
+tractable inference; while biochemical assays may exhibit correlations even given compound properties, our empirical
+results demonstrate robustness to violations of this assumption through the ensemble averaging mechanism), the joint
+likelihood for the observation ωt is the product of individual likelihoods. Applying the Bayesian update recursively
+from a uniform prior over all observed assays {ya }a∈Mt yields a posterior over Z that has the exact form of our
+similarity weights:
+!
+Y
+
+1 X
+(ya − yi,a )2
+p(ya | Z = i, a) = exp −
+wi (st ) ∝
+λa
+≡ exp − λw d(st , Di ) ,
+2
+2
+σa
+a∈Mt
+
+a∈Mt
+
+where we can identify the global temperature parameter λw = β/2 where β is the inverse temperature of the tempered
+posterior. With β = 1 (standard posterior), we have λw = 1/2. Therefore, our similarity function is not an arbitrary
+heuristic but corresponds to a tempered Bayesian posterior over the latent historical prototypes.
+
+A.4
+
+The Posterior Predictive Transition Model
+
+The belief state (the weight vector w(st )) is used for planning. The transition model used to simulate future trajectories
+within the MCTS planner is derived by marginalizing over the uncertainty in the latent variable Z. The probability
+of transitioning to a next state st+1 is the posterior predictive distribution over outcomes, conditioned on the current
+belief:
+P (st+1 | st , At ) =
+
+N
+X
+
+P (st+1 | Z = i, st , At )P (Z = i | st )
+
+(11)
+
+wi (st ) δ st ⊕{(aj ,yi,j )}j∈At (st+1 ),
+
+(12)
+
+i=1
+
+=
+
+N
+X
+i=1
+
+where δx (y) denotes the Dirac delta measure that equals 1 if y = x and 0 otherwise. This confirms that our sampling
+mechanism—drawing a historical case Di according to the weights wi (st ) and using its outcomes—is a principled
+way to sample from the posterior predictive distribution, allowing the planner to explore plausible future scenarios
+consistent with all evidence gathered so far.
+
+A.5
+
+Implications and Summary
+
+Framing IB-MDP within the POMDP context provides strong conceptual grounding and yields several key insights,
+summarized in Table 3.
+• Justification for Dynamics: The changing similarity weights observed within an MCTS simulation are not
+arbitrary non-stationarity. They represent the agent’s evolving belief state. As information is gathered (the state
+st is augmented), the model used for subsequent predictions naturally and correctly changes, reflecting a refined
+belief.
+• Suitability of MCTS: MCTS is well-suited for this task because it is a simulation-based planner designed to
+handle complex state spaces. It effectively explores the consequences of actions on the future belief state and its
+associated rewards without needing an explicit representation of the belief space itself.
+• Principled Approximation: IB-MDP provides a practical, data-driven approximation to solving a formal
+POMDP. Its effectiveness relies on two key assumptions: the quality and coverage of the historical data D,
+and the appropriateness of the chosen kernel (e.g., Gaussian) for the observation likelihood model. While the
+Gaussian kernel provides computational tractability and aligns with common assumptions about measurement
+noise in biochemical assays, we acknowledge that alternative kernels (e.g., Laplacian, Student-t) may better capture heavy-tailed distributions or outliers. The robustness of our approach to kernel choice remains an important
+area for future empirical validation.
+• Computational Efficiency: By representing the belief state implicitly through weights over the case-base D,
+IB-MDP avoids the intractable calculations of maintaining and updating an explicit probability distribution over
+a potentially vast hidden state space.
+14
+
+In conclusion, interpreting IB-MDP as an approximate POMDP framework clarifies that the recalculation of similarity weights is a direct implementation of Bayesian belief updating. This justifies our methodology and the use of
+MCTS for principled planning under uncertainty when only historical data is available.
+Table 3: Summary of the Conceptual Mapping between POMDP and IB-MDP.
+
+A.6
+
+POMDP Component
+
+IB-MDP Conceptual Equivalent
+
+Notes
+
+Hidden State (s ∈ S)
+
+Latent Index Z = i over historical cases Di ∈ D
+
+Belief State (bt (s))
+
+Similarity weights wi (st ) ≡ P (Z = i | st )
+
+Action (At ∈ At )
+Observation (ωt )
+Observation Model (O(ωt |s′ , At ))
+
+Batch of assays to perform, At ⊆ Ut
+Set of assay outcomes {y⋆,j }j∈At
+Likelihood p(ωt | Z = i, At )
+
+Belief Update
+
+Recalculation of weights wi (st+1 )
+
+The ”true” but unknown profile of
+the candidate.
+A probability distribution over possible prototypes.
+Direct equivalence.
+The new evidence gathered.
+Implemented via a similarity kernel.
+A direct, principled Bayesian update.
+
+Convergence Guarantees and Theoretical Considerations
+
+The convergence properties of IBMDP differ fundamentally from traditional Bayesian reinforcement learning due to
+its unique reliance on historical data rather than environment interaction. This subsection examines what convergence
+guarantees can and cannot be provided.
+A.6.1
+
+Traditional Bayesian RL Guarantees
+
+√
+Methods such as Posterior Sampling for Reinforcement Learning (PSRL) provide formal regret bounds of Õ( SAT )
+for finite MDPs, where S denotes states, A denotes actions, and T denotes the horizon. These approaches guarantee
+PAC-style convergence to ϵ-optimal policies with high probability, leveraging the principle that posteriors concentrate
+on the true MDP as data accumulates.
+A.6.2
+
+IBMDP Convergence Properties
+
+IBMDP’s convergence behavior is more nuanced due to its implicit model construction:
+Achievable Guarantees. Standard MCTS with UCB1 provides asymptotic convergence to optimal policies as iterations approach infinity, assuming a fixed MDP model. For IBMDP specifically:
+• MCTS-DPW convergence: The Double Progressive Widening variant used in IBMDP maintains convergence
+properties for large combinatorial action spaces
+• Linear case consistency: For synthetic data with linear relationships and independent features, we prove (Section D) that the similarity-based variance estimator converges in probability to the true conditional variance as
+N →∞
+• Empirical robustness: The ensemble approach with majority voting provides stable recommendations, achieving
+47% optimal policy alignment compared to 36% for deterministic methods
+Fundamental Limitations.
+
+Unlike traditional Bayesian RL, IBMDP cannot provide:
+
+• Formal regret bounds: The implicit model introduces approximation error bounded by historical data coverage
+rather than converging to true dynamics
+• PAC guarantees: Cannot ensure ϵ-optimality with high probability due to dependence on data representativeness
+• True dynamics recovery: The similarity-based model approximates but does not learn the true transition function
+P (s′ |s, a)
+The approximation quality depends on three key factors: (i) the coverage and representativeness of historical data
+D, (ii) the appropriateness of the similarity metric for the domain, and (iii) the size of the historical dataset |D|. While
+formal convergence rates cannot be established without access to the true dynamics, empirical validation demonstrates
+robust performance when these factors are satisfied.
+15
+
+Convergence Trade-offs. IBMDP trades formal convergence guarantees for practical applicability. Under assumptions of sufficient data coverage, appropriate similarity metrics, and regularity conditions, as MCTS iterations nitr →
+∞ and ensemble size Ne → ∞:
+P
+∗
+||πIBMDP − πempirical
+||∞ −
+→0
+(13)
+∗
+where πempirical
+is the optimal policy for the empirical MDP induced by D. However, the gap between this empirical
+optimal and the true optimal policy depends on data quality and coverage—a fundamental limitation when operating
+without simulators.
+This trade-off is not a weakness but a necessary adaptation: IBMDP provides a principled solution where traditional methods with stronger guarantees cannot operate at all due to the absence of environment interaction capabilities.
+
+B
+
+Implementation and Algorithmic Details
+
+B.1
+
+Hyperparameter Selection Methodology
+
+The performance of the IB-MDP framework depends on a set of key hyperparameters that govern the similarity model,
+the MCTS planner, and the problem’s objective constraints. The values used in our experiments were determined
+through a combination of established literature guidelines, empirical testing on our specific dataset, and domainspecific considerations to balance decision quality with computational feasibility.
+Similarity Model Parameters.
+
+These parameters define the core of the implicit, generative transition model.
+
+• Similarity Bandwidth (λw ): This parameter controls the ”smoothness” of the similarity function. From the
+theoretical derivation in Section A, λw = β/2 where β is the inverse temperature. For the standard posterior
+(β = 1), we have λw = 0.5. However, in practice, we tested values in the range [0.5, 2.0] and found that
+λw = 1.0 provided better empirical performance for our dataset (|D| = 220, d = 6). This corresponds to
+a tempered posterior with β = 2.0, which was large enough to ensure locality (giving higher weight to truly
+similar compounds) but small enough to draw support from a sufficient number of historical examples to make
+robust predictions.
+• Feature Weights (λk = 1.0 for all k): These weights allow for emphasizing more or less informative features
+in the distance calculation. As we lacked detailed prior information on the relative reliability of the QSAR
+predictions and assay measurements, we set all weights to be equal to avoid introducing subjective bias. This
+treats all known features as equally important for determining similarity.
+Ensemble and Planner Parameters.
+its final policy.
+
+These parameters control the MCTS search algorithm and the robustness of
+
+• Ensemble Size (Ne = 50): To mitigate variance from the stochastic nature of both the transition model and the
+MCTS planner, we use an ensemble of independent runs. We tested sizes from 20 to 100 and found that Ne = 50
+provided a stable policy recommendation (i.e., a consistent MLASP) without incurring excessive computational
+cost. Figure 3 illustrates how the ensemble’s majority vote leads to a robust action choice.
+• MCTS Iterations (nitr = 20, 000): This determines the search budget for each MCTS run. Our analysis showed
+that policy recommendations stabilized around 20,000 iterations for our problem’s complexity, with diminishing
+returns for higher values.
+• Exploration Constant (c = 5.0): Following standard practice for MCTS, this value balances exploration of
+new actions with exploitation of known high-value actions within the search tree. A value of 5.0 provided
+effective exploration in our experiments.
+Problem Constraint Parameters.
+the planning problem itself.
+
+These parameters define the termination conditions and feasibility constraints of
+
+• Terminal Uncertainty Threshold (ϵ = 0.10): We stop when H(sT ) drops below 0.10. In our runs the initial
+uncertainty is between 0.2 and 0.6, so this threshold guarantees at least a two- to six-fold reduction before
+declaring the policy sufficiently confident.
+16
+
+Figure 3: Example histogram of actions proposed across an ensemble of Ne = 50 runs. For a given state with
+uncertainty H(s) = 0.2 and a likelihood constraint of τ = 0.9, the action with the highest frequency is selected for
+the MLASP. This demonstrates how the ensemble method produces robust and stable recommendations via majority
+voting.
+• Goal-Likelihood Threshold (τ ∈ {0.6, 0.9}): The threshold on the goal likelihood, L(st ), enforces that the
+planner only pursues trajectories that remain sufficiently likely to succeed. We tested two values to explore
+the trade-off between cost and confidence. A lower value (τ = 0.6) permits more exploratory, potentially
+cheaper plans, while a higher value (τ = 0.9) enforces a more conservative and confident, but potentially more
+expensive, policy. Figure 4 explicitly illustrates how a higher τ leads to a different and more costly MLASP to
+satisfy the stricter confidence requirement.
+
+B.2
+
+Computational Complexity Analysis
+
+The computational complexity of the IB-MDP algorithm is a critical factor for its practical application. The worst-case
+total complexity is given by:
+O(Ne · nitr · min(bH , nitr ) · |D| · d),
+where Ne is the ensemble size, nitr is the number of MCTS iterations, b is the effective branching factor (average
+number of actions explored per node), H is the maximum tree depth (bounded by the horizon T ), |D| is the number
+of historical cases, and d is the dimensionality of the feature space. The term min(bH , nitr ) represents the maximum
+number of nodes that can be expanded, bounded either by the tree structure or the iteration budget. In practice, with
+progressive widening and UCT selection, the effective number of expansions is often much smaller than this worst-case
+bound.
+The dominant factor within a single MCTS simulation step is the calculation of the similarity weights, which
+requires computing the distance from the current state to every historical case in D. This operation has a complexity
+of O(|D| · d) and is performed at each node expansion in the search tree.
+Comparison to Alternatives. This complexity, while significant, compares favorably to alternative approaches for
+principled planning under uncertainty. Exact POMDP solvers are computationally intractable for problems of this
+scale, as their complexity is exponential in the size of the belief space. Traditional value iteration would require
+discretizing the state space, which becomes infeasible with a growing number of continuous-valued assays. IB-MDP’s
+sampling-based approach effectively navigates this high-dimensional space without requiring explicit enumeration.
+
+17
+
+Figure 4: Comparison of MLASP paths for the same compound under two different goal-likelihood thresholds: τ =
+0.6 (blue) and τ = 0.9 (red). The stricter constraint (τ = 0.9) forces the planner to recommend a more expensive
+sequence of assays to achieve higher confidence, illustrating the direct trade-off between cost and decision confidence
+controlled by this parameter.
+Practical Performance and Scalability. In our experimental setup (Ne = 50, nitr = 20, 000, |D| = 220, d = 6),
+the total time to generate a policy for a single compound was approximately one hour on an Apple M1 Pro chip with
+16GB of memory. The algorithm’s complexity scales linearly with the size of the historical dataset (|D|), the feature
+dimension (d), and the number of ensemble runs (Ne ). This predictable scaling suggests that the method remains
+computationally feasible for the larger datasets and higher-dimensional problems typically encountered in real-world
+drug discovery campaigns, especially with access to parallel computing resources.
+
+C
+
+Framework Differentiation and the Unfairness of Direct Comparison
+
+C.1
+
+Key Differentiating Features
+
+Table 4 summarizes the fundamental distinctions between IBMDP and traditional reinforcement learning frameworks.
+These differences stem from IBMDP’s unique design for sequential experimental planning in simulator-free, data-rich
+environments—a problem class that existing methods cannot address without fundamental restructuring.
+
+18
+
+Table 4: Fundamental distinctions between IBMDP and traditional RL frameworks
+Aspect
+Data Requirements
+Transition Model
+Belief Representation
+Planning Method
+Constraints
+Action Space
+Action Effect
+Correlation Handling
+Objective
+
+Traditional Frameworks
+′
+
+(s, a, s ) tuples or simulator
+Learned explicit P (s′ |s, a)
+Explicit probability distributions
+Single policyP
+or parametric
+Cumulative: t ct ≤ C
+Parameter optimization
+Changes underlying state
+Requires explicit modeling
+Single reward maximization
+
+19
+
+IBMDP
+Static historical outcomes only
+Implicit via similarity sampling
+Similarity weights wi (st )
+Ensemble MCTS with majority voting
+State-based: H(sT ) ≤ ϵ, L(st ) ≥ τ
+Combinatorial assay selection
+Reveals fixed properties
+Preserves empirically via sampling
+Multi-objective optimization
+
+C.2
+
+The Fundamental Innovation
+
+IBMDP operates in an entirely different problem setting from traditional reinforcement learning. While conventional
+frameworks assume access to either environment simulators or transition data, IBMDP functions with only a static
+database of historical experimental outcomes. This constraint, common in drug discovery where mechanistic models
+are unavailable and experiments are irreversible, necessitates a fundamentally different approach.
+The core mechanism constructs an implicit generative model through similarity-weighted sampling:
+wi (st ) = exp (−λw · d(st , Di ))
+P (st+1 |st , At ) =
+
+N
+X
+
+wi (st )
+· 1[st+1 = st ⊕ {(aj , yi,j )}j∈At ]
+Z
+i=1
+
+(14)
+(15)
+
+This mechanism generates plausible transitions by sampling from historical cases most similar to the current experimental state, thereby preserving the natural correlations between assays observed in real compounds—correlations
+that would be difficult or impossible to model explicitly given current scientific understanding.
+
+C.3
+
+Comparison with Existing Framework Categories
+
+C.3.1
+
+Distinction from MDPs and Model-Based RL
+
+Model-based reinforcement learning fundamentally relies on learning transition dynamics from (s, a, s′ ) tuples, typically through parametric models that approximate P (s′ |s, a). Even kernel-based RL methods, which employ similarity
+metrics, use them primarily for value function approximation rather than transition generation.
+IBMDP diverges by using similarity not as a smoothing mechanism but as the foundation for a complete generative
+process. Without access to any transition data, it samples entire assay outcome profiles from historical compounds,
+weighted by their relevance to the current state. This nonparametric approach sidesteps the need for explicit dynamics
+modeling while naturally preserving cross-assay dependencies present in the historical data.
+C.3.2
+
+Distinction from Bayesian Methods
+
+Bayesian reinforcement learning and Bayesian optimization maintain explicit posterior distributions—over model
+parameters in BRL (exemplified by PSRL) or over objective functions in BO. These methods either sample complete
+MDPs from parameter posteriors or perform myopic single-step optimization.
+IBMDP performs what we term Bayesian case-based generation: the similarity weights serve as an implicit posterior over historical compound prototypes, updated through reweighting as evidence accumulates. Unlike BO’s singlestep focus, IBMDP enables multi-horizon planning that simultaneously considers experimental costs, time constraints,
+and the probability of achieving desired outcomes—a multi-objective optimization fundamentally different from traditional Bayesian approaches.
+C.3.3
+
+Distinction from Experimental Design
+
+Classical Bayesian experimental design assumes availability of a likelihood function or simulator, optimizing for
+immediate information gain. Even implicit-BED methods for intractable likelihoods rely on information-theoretic
+surrogates that assume some form of generative model.
+IBMDP embeds its implicit model directly within a reinforcement learning planner (MCTS-DPW), optimizing entire experimental sequences rather than individual experiments. The framework’s state-uncertainty functional H(st )
+and goal-likelihood functional L(st ) provide interpretable, domain-specific measures that directly relate to experimental objectives, unlike abstract information-theoretic quantities.
+C.3.4
+
+Distinction from POMDPs
+
+Standard POMDP formulations maintain explicit belief distributions over hidden states, requiring specification of both
+transition models P (s′ |s, a) and observation models O(o|s, a). The belief update follows the Bayes filter, necessitating
+these explicit models.
+IBMDP’s similarity-weighted posterior serves as an implicit belief representation, eliminating the need for highdimensional belief state maintenance. The framework’s constraints—terminal uncertainty H(sT ) ≤ ϵ and per-step
+
+20
+
+feasibility L(st ) ≥ τ —target state properties rather than cumulative quantities, directly encoding experimental requirements for decision confidence and trajectory viability.
+
+C.4
+
+Why Direct Benchmarking Against Standard RL is Inapplicable
+
+The fundamental incompatibility between IBMDP and traditional frameworks makes direct benchmarking inapplicable—these methods require input data formats that do not exist in the static historical database setting IBMDP
+addresses.
+C.4.1
+
+Incompatible Prerequisites
+
+Traditional RL methods universally require either an environment simulator for generating transitions on demand
+or a collection of (s, a, s′ ) tuples for learning dynamics. IBMDP operates precisely where these prerequisites are
+absent: only static historical compound profiles exist, with no mechanism to query counterfactual outcomes. Creating
+a simulator would require mechanistic understanding of biochemical interactions that current science lacks, while
+collecting transition data through exhaustive experimentation defeats the very purpose of efficient planning.
+Notably, offline (batch) reinforcement learning methods such as Conservative Q-Learning or Decision Transformer
+also cannot be applied: these methods require trajectory data (st , at , rt , st+1 ) recording sequential decisions under
+some behavioral policy. Historical assay databases contain only static endpoint profiles {(xi , yi )}—the sequence in
+which assays were conducted, the intermediate decision states, and any evaluative signals are not recorded.
+C.4.2
+
+Fundamental Structural Differences
+
+The action spaces are categorically different. Traditional methods optimize over continuous or discrete parameter
+spaces where actions affect state transitions. IBMDP selects from combinatorial sets of experimental assays—P≤m (Ut )∪
+{eox}—where actions reveal information about unchanging molecular properties. This distinction between control
+and information gathering necessitates entirely different planning paradigms.
+Furthermore, the constraint structures are incompatible. Traditional constrained MDPs limit cumulative costs
+across trajectories, while IBMDP enforces instantaneous feasibility constraints and terminal uncertainty bounds that
+directly encode experimental requirements.
+C.4.3
+
+Required Transformations
+
+Adapting traditional methods to this setting would require:
+1. Completely redefining the action space from parameter optimization to combinatorial assay selection with batching constraints
+2. Implementing reward-aware stopping rules aligned with uncertainty and feasibility functionals rather than simple cumulative objectives
+3. Creating posterior predictive distributions without access to simulators or transition data
+4. Restructuring from single-objective to multi-objective optimization with state-based constraints
+Such extensive modifications would fundamentally alter the nature of these methods, creating essentially new
+algorithms rather than variants of existing ones. Any resulting comparison would be between IBMDP and these newly
+created methods, not the original frameworks.
+
+C.5
+
+Theoretical Foundation
+
+Despite operating in this unique setting, IBMDP maintains rigorous theoretical grounding. Section A establishes
+that the framework is mathematically equivalent to a POMDP where the hidden state represents a latent index over
+historical cases. The similarity weights constitute a valid Bayesian posterior, with weight updates implementing exact
+Bayesian belief updates. This equivalence:
+p(ωt |Z = i, At ) · wi (st )
+wi (st+1 ) = PN
+ℓ=1 p(ωt |Z = ℓ, At ) · wℓ (st )
+21
+
+(16)
+
+provides principled justification for the empirical success observed in our experiments, where IBMDP achieved up to
+92% reduction in resource consumption while maintaining decision quality.
+
+C.6
+
+Implications
+
+IBMDP addresses a problem class—sequential experimental planning without simulators—that existing reinforcement learning frameworks were not designed to handle. The inapplicability of direct benchmarking reflects the data
+format gap between IBMDP’s setting (static outcome vectors) and standard RL’s requirements (trajectory data or
+simulators)—a gap that motivates the synthetic benchmark in Appendix D where ground-truth optimal policies are
+computable. By leveraging historical data through similarity-weighted sampling and ensemble planning, IBMDP provides the first practical solution for case-guided sequential decision-making in drug discovery and similar experimental
+sciences where traditional RL assumptions fail to hold.
+
+D
+
+Benchmark with Synthetic Data
+
+Overview and Motivation. This appendix presents a rigorous benchmark study comparing IBMDP against theoretically optimal and deterministic baselines using synthetic data. The synthetic environment provides a unique advantage:
+we can compute the true optimal policy exactly, enabling principled validation of our similarity-based planning approach. This controlled setting allows us to isolate and evaluate the effectiveness of IBMDP’s core innovations—the
+similarity-weighted belief mechanism and ensemble planning—against ground truth.
+Aim. We provide a controlled benchmark to compare three planners for sequential assay selection: (i) a theoretical Value Iteration baseline with exact uncertainty dynamics (VI-Theo); (ii) a deterministic Value Iteration with
+similarity-based uncertainty (VI-Sim); and (iii) the stochastic IBMDP planner using similarity-weighted posterior
+predictive transitions inside an ensemble of MCTS-DPW trees (IBMDP). A synthetic data generator with known
+structure enables exact computation of the VI-Theo policy and a principled testbed for the two similarity-based planners.
+Notation consistency with the main text. We maintain consistency with the notation from the main exposition
+(state/action tuples, similarity weights, H(s), L(s), etc.; see Equations equation 1–equation 3 and Table 8). Throughout this appendix, for notational convenience when the focus is on the set structure rather than individual measurements, we may write the state as s = (x⋆ , M) where x⋆ is the fixed candidate compound and M ⊆ {1, . . . , M }
+represents the set of measured assays. This is equivalent to the main text notation st = (x⋆ , {y⋆,j }j∈Mt ) where
+M = Mt indexes the measured assays and their values. When the candidate is fixed and clear from context, we may
+write the state simply as M.
+
+D.1
+
+Synthetic Data: General Model and Instantiation
+
+Purpose. We construct a synthetic data environment where the true conditional variance can be computed analytically, providing ground truth for evaluating our similarity-based estimators. The linear structure with independent
+features represents a simplified but informative test case where theoretical optimality is tractable.
+D.1.1 General data-generating process (generic formulation).
+Fix integers N (number of historical cases) and M (number of assays/features). For each historical case i ∈ {1, . . . , N }
+we draw a feature vector
+yi = (yi,1 , . . . , yi,M )⊤ ∈ RM .
+For each assay a ∈ {1, . . . , M } specify distributional parameters (µa , σa , aa , ba ) and draw independently
+yi,a ∼ T N (µa , σa ; aa , ba ),
+
+22
+
+the (univariate) truncated normal on [aa , ba ] with location µa and scale σa .1 Let β = (β1 , . . . , βM )⊤ ∈ RM and draw
+independent measurement noise
+ϵi ∼ T N (µϵ , σϵ ; aϵ , bϵ ).
+The scalar target is
+gi =
+
+M
+X
+
+βa yi,a + ϵi = β ⊤ yi + ϵi .
+
+a=1
+
+The historical dataset is D = {(xi , yi )}; targets G = {gi } are stored separately (and never used in any distance/weight
+computation).
+2
+Closed-form variance under independence. Let Σ = diag(σ12 , . . . , σM
+) denote the per-assay variance parameters
+(treated as the empirical variances of the generated yi,a ’s). Then
+
+Var(g) = β ⊤ Σβ + σϵ2 .
+To derive the conditional variance, we partition assays into measured M and unmeasured U and write β = (βM , βU ),
+Σ = diag(ΣM , ΣU ). Under independence, we have the following derivation:
+
+⊤
+Var(g | yM ) = Var βM
+yM + βU⊤ yU + ϵ | yM
+(17)
+
+⊤
+⊤
+= Var βU yU + ϵ | yM
+(since βM yM is fixed given yM )
+(18)
+
+= Var βU⊤ yU + Var(ϵ) (by independence of yU , ϵ from yM )
+(19)
+= βU⊤ Var(yU )βU + σϵ2
+
+(20)
+
+= βU⊤ ΣU βU + σϵ2 .
+
+(21)
+
+This identity is central to the VI-Theo derivation below.
+D.1.2 Instantiation used in the benchmark.
+We set M = 6 and N = 200. For a = 1, . . . , 6,
+a
+µa = 50 · ,
+6
+
+σa = 0.3 µa ,
+
+(aa , ba ) = (0, 2µa ),
+
+β = (0.3, 0.25, 0.2, 0.15, 0.07, 0.03),
+
+ϵ ∼ T N (0, 5; −10, 10).
+
+All feature draws are independent across a and i; noise is independent of features.
+Sampling recipe (for reproducibility). For each trial: (1) fix M, N, {µa , σa , aa , ba } and β; (2) draw {yi }N
+i=1
+⊤
+componentwise; (3) draw {ϵi }N
+i=1 ; (4) set gi = β yi + ϵi ; (5) store D = {(xi , yi )} and G = {gi } with availability
+set Ig = {i : gi used in evaluation}.
+
+D.2
+
+Theoretical Baseline (VI-Theo): Full Derivation
+
+Overview. VI-Theo represents the theoretically optimal policy under perfect information about the data-generating
+process. It uses the exact conditional variance formula derived above to compute optimal uncertainty reduction at each
+step. This baseline is only computable in synthetic settings where the true model parameters are known.
+State, action, and dynamics. The state is the set M ⊆ {1, . . . , 6} of measured assays (consistent with our notation
+convention). The action space is the power set of unmeasured assays:
+
+A(M) = P {1, . . . , 6} \ M .
+Transitions are deterministic: executing a ∈ A(M) yields M ← M ∪ a.
+1 In our experiments we treat (µ , σ ) as the empirical mean/scale of the generated samples; the truncation mildly perturbs the theoretical
+a
+a
+moments.
+
+23
+
+⊤
+Exact conditional variance and reduction. Write g = βM
+yM + βU⊤ yU + ϵ. Conditioning on the realized measurements yM ,
+
+Var(g | yM ) = Var βU⊤ yU + ϵ = βU⊤ ΣU βU + σϵ2 ,
+
+since yU is independent of yM and ϵ. Hence, the exact uncertainty reduction achieved by measuring a batch a ⊆ U is
+computed as follows:
+∆σa2 = Var(g | yM ) − Var(g | yM∪a )
+
+ 
+= βU⊤ ΣU βU + σϵ2 − βU⊤\a ΣU \a βU \a + σϵ2
+= βU⊤ ΣU βU − βU⊤\a ΣU \a βU \a
+X
+=
+βk2 σk2 .
+
+(22)
+(23)
+(24)
+(25)
+
+k∈a
+
+The last equality follows because Σ is diagonal and the contribution of each measured assay k is exactly βk2 σk2 .
+Costs and reward.
+
+Let per-assay costs be
+c1 = 1.0,
+
+c2 = 1.2,
+
+c3 = 1.5,
+
+c4 = 1.8,
+
+c6 = 2.2,
+P
+and (optionally) a terminal target-measurement cost ctarget = 10.0. The batch cost is ca = k∈a ck and the immediate
+reward is uncertainty reduction per unit cost:
+R(M, a) =
+Bellman recursion.
+
+c5 = 2.0,
+
+∆σa2
+.
+ca
+
+With discount γ = 0.95,
+V (M) =
+
+max
+
+n
+
+o
+R(M, a) + γ V (M ∪ a) ,
+
+a∈A(M)
+
+initialized at V ({1, . . . , 6}) = 0 (no uncertainty left, no action left). We iterate to a tolerance of 10−6 or 1000 iterations
+to obtain the optimal policy πTheo (M).
+Remarks on optimality. Because transitions are deterministic and rewards are additive with discount, the recursion
+gives the exact optimal policy under the synthetic uncertainty model. This policy serves as the ground-truth baseline
+against which we compare similarity-based planners.
+
+D.3
+
+Deterministic Similarity-Based VI (VI-Sim): Full Derivation
+
+Overview. VI-Sim represents a deterministic planner that uses the same similarity-based variance estimation as
+IBMDP but applies Value Iteration instead of stochastic tree search. This baseline isolates the contribution of IBMDP’s
+ensemble planning approach by using the same implicit model but with deterministic optimization.
+Similarity weights and distance. At state s = (x⋆ , M) (maintaining our consistent notation; here we use s to
+denote a generic state rather than st for a specific time step), define:
+exp{−λw d(s, Di )}
+wi (s) = PN
+,
+j=1 exp{−λw d(s, Dj )}
+2
+X
+ϕk (s) − ϕk (Di )
+d(s, Di ) =
+λk
+.
+σk2
+
+(26)
+
+(27)
+
+k∈K(s)
+
+Here K(s) are the known features (initial QSARs and any measured assays); ϕk (·) extracts feature k; λk are feature
+weights (default = 1), λw > 0 is the bandwidth, and σk2 are the empirical variances over D. The targets {gi } are never
+used in d(·, ·).
+24
+
+Weighted g-mean and variance (renormalized over Ig ).
+
+Define the renormalized weights and weighted mean:
+
+wi (s)
+ℓ∈Ig wℓ (s)
+X
+ḡ(s) =
+w̃i (s) gi .
+
+w̃i (s) = P
+
+for i ∈ Ig ,
+
+(28)
+(29)
+
+i∈Ig
+
+The estimated conditional variance at state s is:
+2
+σ
+bcond
+(M) =
+
+X
+
+2
+w̃i (s) gi − ḡ(s) .
+
+(30)
+
+i∈Ig
+
+After executing batch a, we update the observed state to s′ = (x⋆ , M ∪ a), recompute weights based on the expanded
+2
+feature set, and obtain σ
+bcond
+(M ∪ a).
+Estimated reduction and reward.
+tion and reward:
+
+Using the similarity-weighted variance estimate, we define the variance reduc2
+2
+∆b
+σa2 = σ
+bcond
+(M) − σ
+bcond
+(M ∪ a),
+
+∆b
+σa2
+R(M, a) =
+.
+ca
+
+(31)
+(32)
+
+We then apply this R to the same deterministic VI recursion as in Section D.2 to obtain the policy πSim .
+
+D.4
+
+IBMDP: Implicit Posterior-Predictive Model and Planning Details
+
+Overview. IBMDP extends the similarity-based approach with two key innovations: (1) a stochastic posteriorpredictive model that samples from historical cases weighted by similarity, and (2) ensemble MCTS planning that
+explores multiple policy trajectories. This combination enables robust planning despite the implicit model’s inherent
+uncertainty.
+Latent-index view and likelihood. Introduce a discrete latent index Z ∈ {1, . . . , N } over historical cases Di .
+Given Z = i and selecting assay a, a Gaussian discrepancy model leads to:
+
+
+λa (ya − yi,a )2
+p(ya | Z = i, a) ∝ exp −
+,
+(33)
+2σa2
+with per-assay weight λa > 0. For a batch At and assuming conditional independence across assays given Z (see
+discussion in Section A regarding this assumption):
+
+
+Y
+λa (ya − yi,a )2
+p(yAt | Z = i, At ) ∝
+.
+(34)
+exp −
+2σa2
+a∈At
+
+Weights as (tempered) posteriors and incremental recursion. Let Ot denote the set of observed assays up to time
+t. Define the variance-normalized distance
+X λa
+d(st , Di ) =
+(ya − yi,a )2 .
+σa2
+(a,ya )∈Ot
+
+With a uniform prior over Z and temperature λw , the similarity weight equals a tempered posterior
+exp{−λw d(st , Di )}
+.
+wi (st ) = PN
+j=1 exp{−λw d(st , Dj )}
+
+25
+
+If we then measure assay at and observe yat , the distance updates additively:
+d(st+1 , Di ) = d(st , Di ) +
+
+λat
+(yat − yi,at )2 .
+σa2t
+
+(35)
+
+This yields the multiplicative weight update:
+
+
+λa
+wi (st+1 ) ∝ wi (st ) · exp −λw 2t (yat − yi,at )2
+σat
+
+2λw
+, where λw = β/2,
+∝ wi (st ) · p(yat | Z = i, at )
+
+(36)
+(37)
+
+followed by normalization. Thus the reweighting is a (tempered) Bayesian belief update.
+Marginalizing over Z gives the posterior predictive over next information
+
+Posterior predictive (implicit transition).
+states:
+P (st+1 | st , At ) =
+
+N
+X
+
+
+
+wi (st ) · δ st+1 = st ⊕ {(a, yi,a )}a∈At ,
+
+(38)
+
+i=1
+
+which is implemented operationally by sampling a single historical case i ∼ Cat({wk (st )}) and copying the batch
+outcomes {yi,a }a∈At into the candidate—thereby preserving cross-assay correlation within the sampled historical
+profile.
+Planning with MCTS-DPW and ensembling. Within each MCTS rollout, we generate stochastic next states by the
+posterior predictive above, accrue step cost R(st , At ), and apply penalties when feasibility is violated (e.g., L(s) < τ
+at any step) until a terminal state (e.g., H(s) ≤ ϵ) or horizon T . To reduce variance from stochastic sampling and
+tree search, we run Ne independent trees and aggregate recommendations by majority vote, reporting both the Top-1
+action and the Top-2 action set at each decision step, forming an MLASP.
+
+D.5
+
+Illustrative Example: Evolution of Similarity Weights
+
+Purpose. This toy example demonstrates how similarity weights evolve as evidence accumulates, providing intuition
+for the adaptive nature of IBMDP’s implicit dynamics.
+Setup. Three historical records with one feature each at values {0, 1, 2}; let σ 2 = 1, λw = λ1 = 1. The initial
+candidate state is s(0) with value 1.1.
+Step 0 (initial).
+
+Raw weights:
+2
+
+w1 = e−(1.1−0) = e−1.21 = 0.297,
+−(1.1−1)2
+
+w2 = e
+
+−0.01
+
+=e
+
+(39)
+
+= 0.990,
+
+(40)
+
+w3 = e−(1.1−2) = e−0.81 = 0.445.
+
+(41)
+
+2
+
+After normalization Z = 0.297 + 0.990 + 0.445 = 1.732, we obtain:
+w̃ = (0.171, 0.571, 0.257).
+Step 1 (after action moves state to 1.6).
+
+(42)
+
+Raw weights:
+2
+
+w1 = e−(1.6−0) = e−2.56 = 0.077,
+2
+
+w2 = e−(1.6−1) = e−0.36 = 0.697,
+−(1.6−2)2
+
+w3 = e
+
+−0.16
+
+=e
+
+26
+
+= 0.852.
+
+(43)
+(44)
+(45)
+
+Normalizing with Z ′ = 1.626 gives:
+w̃ = (0.047, 0.429, 0.524).
+
+(46)
+
+The posterior shifts toward the historical record at 2 as evidence moves rightward.
+
+D.6
+
+Theoretical Analysis: Consistency of VI-Sim
+
+Theorem (Consistency of Similarity-Based Estimation). Under the synthetic linear model with independent fea2
+tures, the similarity-based variance estimator σ
+bcond
+(M) used by VI-Sim converges in probability to the exact condiP
+
+2
+2
+2
+tional variance σcond
+(M) used by VI-Theo, i.e., σ
+bcond
+(M) −
+→ σcond
+(M) as N → ∞.
+Proof.
+
+Assumptions. (A1) Features {yi,a } are independent across a and i.i.d. across i, each with finite variance σa2 ; (A2)
+noise ϵi is independent of features with finite variance σϵ2 ; (A3) the weight function wi (s) depends only on measured
+assays M of each record and on the candidate’s observed values at those assays; (A4) the renormalized weights w̃i (s)
+over Ig form a probability vector; (A5) Ig grows with N so that |Ig | → ∞.
+Step 1: Setup and notation. Fix a state s = (x⋆ , M) with measured set M and unmeasured set U = {1, . . . , M } \
+M. Define the target for record i:
+⊤
+gi = βM
+yi,M + βU⊤ yi,U + ϵi .
+The exact conditional variance (under the model) is:
+2
+σcond
+(M) = βU⊤ ΣU βU + σϵ2 .
+
+The estimator used by VI-Sim at s is:
+2
+σ
+bcond
+(M) =
+
+Step 2: Decomposition via independence.
+
+X
+
+
+2
+X
+w̃i (s) gi −
+w̃j (s) gj .
+
+i∈Ig
+
+j∈Ig
+
+⊤
+We decompose each target as gi = βM
+yi,M +
+| {z }
+measured term
+
+zi
+|{z}
+
+, where
+
+unmeasured term
+
+zi := βU⊤ yi,U + ϵi .
+By assumptions (A1)–(A2) on independence, zi is independent of yi,M and thus independent of any measurable
+function of yi,M , including wi (s) and w̃i (s). This yields:
+E(zi | yi,M ) = E(zi ) = E(βU⊤ yi,U ) + E(ϵi ) = 0,
+
+(47)
+
+Var(zi | yi,M ) = Var(zi ) = Var(βU⊤ yi,U ) + Var(ϵi )
+= βU⊤ ΣU βU + σϵ2 .
+
+(48)
+
+Step 3: Analysis of the weighted variance estimator. Define the weighted means: ḡw :=
+P
+P
+⊤
+i∈Ig w̃i (s) βM yi,M , and z̄w :=
+i∈Ig w̃i (s)zi . Then the variance estimator becomes:
+2
+σ
+bcond
+(M) =
+
+X
+
+(49)
+P
+
+i∈Ig w̃i (s)gi , ȳM,w :=
+
+
+2
+w̃i (s) gi − ḡw
+
+(50)
+
+
+2
+⊤
+w̃i (s) (βM
+yi,M + zi ) − (ȳM,w + z̄w )
+
+(51)
+
+
+2
+⊤
+w̃i (s) βM
+yi,M − ȳM,w + zi − z̄w .
+
+(52)
+
+i∈Ig
+
+=
+
+X
+i∈Ig
+
+=
+
+X
+i∈Ig
+
+27
+
+Taking expectation conditional on the entire measured panel {yi,M }i∈Ig (which determines {w̃i (s)}i∈Ig ), and using
+E(zi |yi,M ) = 0 with independence across i:
+
+2 X
+
+
+ 2
+ X
+⊤
+w̃i (s) βM
+yi,M − ȳM,w +
+w̃i (s) E (zi − z̄w )2 {yi,M } .
+E σ
+bcond (M) {yi,M } =
+i∈Ig
+
+i∈Ig
+
+Step 4: Simplification of the second term. The second sum simplifies because {zi } are i.i.d., mean zero and
+independent of the weights:
+
+
+2
+E (zi − z̄w )2 {yi,M } = E[zi2 ] + E[z̄w
+] − 2E[zi z̄w ] (expanding the square)
+(53)
+= Var(zi ) + Var(z̄w ) − 2 Cov(zi , z̄w )
+X
+w̃j (s)2 − 2w̃i (s)Var(zi )
+= Var(zi ) + Var(zi )
+
+(54)
+(55)
+
+j∈Ig
+
+= Var(zi ) (1 +
+
+X
+
+w̃j (s)2 − 2w̃i (s)),
+
+(56)
+
+j∈Ig
+
+where we used Var(z̄w ) = Var(zi )
+X
+
+2
+j∈Ig w̃j (s) (by independence) and Cov(zi , z̄w ) = w̃i (s) Var(zi ). Therefore
+
+P
+
+X
+X
+
+
+w̃i (s) E (zi − z̄w )2 {yi,M } = Var(zi )
+w̃i (s) (1 +
+w̃j (s)2 − 2w̃i (s))
+
+i∈Ig
+
+i∈Ig
+
+= Var(zi )
+
+(57)
+
+j∈Ig
+
+X
+
+w̃i (s) +
+
+i∈Ig
+
+X
+
+w̃i (s)
+
+i∈Ig
+
+X
+
+w̃j (s)2 − 2
+
+j∈Ig
+
+X
+
+w̃i (s)2
+
+(58)
+
+i∈Ig
+
+
+
+X
+X
+= Var(zi ) 1 +
+w̃j (s)2 − 2
+w̃i (s)2
+j∈Ig
+
+
+
+(59)
+
+i∈Ig
+
+
+
+X
+= Var(zi ) 1 −
+w̃i (s)2 .
+
+(60)
+
+i∈Ig
+
+Note: In the third line, we used
+sum to 1. Thus
+
+P
+
+i∈Ig w̃i (s) = 1 and
+
+P
+
+i∈Ig w̃i (s)
+
+2
+j∈Ig w̃j (s) =
+
+P
+
+2
+j∈Ig w̃j (s) since the weights
+
+P
+
+
+
+
+2
+X
+ 2
+ X
+⊤
+w̃i (s)2 .
+E σ
+bcond (M) {yi,M } =
+w̃i (s) βM
+yi,M − ȳM,w +Var(zi ) 1 −
+i∈Ig
+
+i∈Ig
+
+|
+
+{z
+
+weighted variance of measured part
+
+}
+
+P
+AsymptoticsP
+and conclusion. By (A5) and boundedness of the weights (since i w̃i (s) = 1 and 0 ≤ w̃i (s) ≤
+1), we have i∈Ig w̃i (s)2 → 0 in probability when |Ig | → ∞ and the weights are not degenerate.2 Also, by a
+(weighted) law of large numbers for triangular arrays with random but measured-part-measurable weights and finite
+second moments, the first term converges in probability to the true conditional variance of the measured contribution
+given the measured panel. However, the exact VI-Theo conditional variance does not depend on the measured panel
+(independence across assays), hence
+X
+
+
+2 p
+⊤
+w̃i (s) βM
+yi,M − ȳM,w
+−
+→ 0.
+
+i∈Ig
+
+Combining, we get
+P
+
+2
+2
+σ
+bcond
+(M) −
+→ Var(zi ) (1 − 0) = βU⊤ ΣU βU + σϵ2 = σcond
+(M).
+
+Hence, under the synthetic linear/independent model, VI-Sim’s variance estimator is consistent for the exact VI-Theo
+conditional variance.
+P
+P
+P
+2
+−→ 0, then
+i w̃i (s) ≤ maxi w̃i (s)
+i w̃i (s) → 0. This condition requires that the similarity kernel
+bandwidth is chosen such that as N → ∞, no single historical case dominates the weights.
+2 Specifically, if max
+
+i w̃i (s)
+
+28
+
+2
+Implications. Because σcond
+(M) is constant in yM under independence, any reasonable similarity weighting over
+measured assays yields the same limiting conditional variance. In more general (correlated or non-linear) settings,
+the estimator targets Var(g | yM = candidate) provided the kernel and bandwidth obey standard nonparametric
+conditions; IBMDP’s stochastic ensembling further mitigates finite-sample bias/variance.
+
+D.7
+
+Experimental Protocol and Metrics
+
+Overview. We conduct a systematic comparison of the three planning methods across 100 independent trials, focusing on their alignment with the theoretically optimal policy.
+For each of 100 independent trials:
+(i) Generate a fresh synthetic dataset as in Section D.1.
+(ii) Compute VI-Theo’s optimal first action at the initial state.
+(iii) Compute VI-Sim’s recommended first action.
+(iv) Run IBMDP with an ensemble of MCTS-DPW planners; record (a) the Top-1 action (most frequent across the
+ensemble), and (b) the Top-2 action set (two most frequent).
+We report three alignment metrics per trial:
+• T1 Match: indicator that IBMDP’s Top-1 equals VI-Theo’s action.
+• T2 Match: indicator that the VI-Theo action appears in IBMDP’s Top-2 set.
+• Sim Match: indicator that VI-Sim equals VI-Theo.
+
+D.8
+
+Experimental Results and Analysis
+
+Summary. Table 5 presents the main results. Over 100 trials, IBMDP’s Top-1 matches the VI-Theo optimum in
+47 cases; IBMDP’s Top-2 covers the optimum in 66 cases; VI-Sim matches the optimum in 36 cases. These results
+demonstrate that the stochastic, ensemble planner recovers a larger fraction of near-equivalent high-value actions than
+a deterministic similarity planner, validating the value of IBMDP’s ensemble approach.
+Table 5: Policy alignment with the theoretical baseline over 100 trials.
+Method
+
+Matches
+
+Match Rate (%)
+
+47
+66
+36
+
+47.0
+66.0
+36.0
+
+IBMDP Top 1
+IBMDP Top 2
+VI-Sim
+
+Statistical Consistency Across Independent Trials. To validate the statistical reproducibility of our method, we
+present the complete trial-by-trial alignment results below. This detailed analysis demonstrates that IBMDP’s policy
+recommendations consistently align with the theoretical optimum across diverse problem instances, providing empirical evidence of the method’s robustness and reliability (feature indices refer to assays a ∈ {1, . . . , 6}).
+Table 6: Trial-wise comparison of VI-Theo vs. IBMDP and VI-Sim.
+Iter
+
+VI-Theo
+
+1
+2
+3
+4
+5
+
+5
+5
+3
+5
+3
+
+IBMDP Top-1 Features
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+
+T1 Match
+
+IBMDP Top-2 Features
+{3, 5}
+{3, 5, 6}
+{3, 5}
+{3, 5}
+{3, 5}
+
+0
+0
+1
+0
+1
+
+T2 Match
+1
+1
+1
+1
+1
+
+VI-Sim
+
+Sim Match
+
+3
+3
+5
+3
+3
+
+0
+0
+0
+0
+1
+
+Continued on next page
+
+29
+
+Table 6: (continued)
+Iter
+
+VI-Theo
+
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+62
+
+4
+3
+5
+3
+4
+4
+4
+4
+4
+5
+5
+4
+4
+5
+5
+5
+4
+5
+4
+5
+5
+5
+4
+4
+5
+5
+4
+5
+4
+4
+5
+5
+5
+5
+3
+4
+4
+3
+5
+5
+5
+3
+5
+4
+5
+4
+5
+5
+5
+4
+5
+4
+3
+4
+3
+3
+6
+
+IBMDP Top-1 Features
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4, 5}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+
+T1 Match
+
+IBMDP Top-2 Features
+{3, 5}
+{3, 5}
+{3, 5, 6}
+{3, 5}
+{3, 5, 6}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5, 6}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 6}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5, 6}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 4, 5}
+{3, 5}
+{3, 5, 6}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5, 6}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 4, 5}
+{3, 5}
+{3, 5}
+{3, 4, 5}
+{3, 5, 6}
+{3, 5}
+
+1
+1
+0
+1
+1
+1
+1
+1
+1
+0
+0
+1
+1
+0
+0
+0
+1
+0
+1
+0
+0
+0
+1
+1
+0
+0
+1
+0
+1
+1
+0
+0
+0
+0
+1
+1
+1
+1
+0
+0
+0
+1
+0
+1
+0
+1
+0
+0
+0
+1
+0
+1
+1
+1
+1
+1
+0
+
+T2 Match
+0
+1
+1
+1
+0
+0
+0
+0
+0
+1
+1
+0
+0
+1
+1
+1
+0
+1
+0
+0
+1
+1
+0
+0
+1
+1
+0
+1
+0
+0
+1
+1
+1
+1
+1
+0
+1
+1
+1
+1
+1
+1
+1
+0
+1
+0
+1
+1
+1
+0
+1
+1
+1
+0
+1
+1
+0
+
+VI-Sim
+
+Sim Match
+
+3
+3
+3
+3
+6
+4
+4
+6
+6
+3
+3
+4
+3
+3
+3
+3
+4
+3
+6
+5
+3
+3
+3
+3
+3
+3
+6
+5
+4
+4
+3
+3
+3
+3
+3
+4
+6
+3
+3
+3
+3
+3
+5
+3
+3
+4
+3
+5
+3
+3
+3
+3
+3
+6
+3
+3
+3
+
+0
+1
+0
+1
+0
+1
+1
+0
+0
+0
+0
+1
+0
+0
+0
+0
+1
+0
+0
+1
+0
+0
+0
+0
+0
+0
+0
+1
+1
+1
+0
+0
+0
+0
+1
+1
+0
+1
+0
+0
+0
+1
+1
+0
+0
+1
+0
+1
+0
+0
+0
+0
+1
+0
+1
+1
+0
+
+Continued on next page
+
+30
+
+Table 6: (continued)
+Iter
+
+VI-Theo
+
+63
+64
+65
+66
+67
+68
+69
+70
+71
+72
+73
+74
+75
+76
+77
+78
+79
+80
+81
+82
+83
+84
+85
+86
+87
+88
+89
+90
+91
+92
+93
+94
+95
+96
+97
+98
+99
+100
+
+5
+4
+5
+5
+5
+4
+6
+4
+5
+5
+4
+5
+5
+5
+5
+4
+5
+5
+5
+5
+4
+5
+5
+5
+4
+5
+5
+5
+3
+4
+3
+3
+4
+5
+5
+4
+3
+4
+
+IBMDP Top-1 Features
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+{3, 4}
+
+T1 Match
+
+IBMDP Top-2 Features
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5, 6}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5, 6}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+{3, 5}
+
+0
+1
+0
+0
+0
+1
+0
+1
+0
+0
+1
+0
+0
+0
+0
+1
+0
+0
+0
+0
+1
+0
+0
+0
+1
+0
+0
+0
+1
+1
+1
+1
+1
+0
+0
+1
+1
+1
+
+T2 Match
+1
+0
+1
+1
+1
+0
+0
+0
+1
+1
+0
+1
+1
+1
+1
+0
+1
+1
+1
+1
+0
+1
+1
+1
+0
+1
+1
+1
+1
+0
+1
+1
+0
+1
+1
+0
+1
+0
+
+VI-Sim
+
+Sim Match
+
+5
+3
+3
+3
+3
+6
+6
+4
+3
+3
+6
+3
+5
+5
+3
+4
+3
+5
+3
+3
+4
+3
+3
+3
+3
+3
+3
+3
+3
+4
+3
+3
+3
+5
+3
+4
+3
+6
+
+1
+0
+0
+0
+0
+0
+1
+1
+0
+0
+0
+0
+1
+1
+0
+1
+0
+1
+0
+0
+1
+0
+0
+0
+0
+0
+0
+0
+1
+1
+1
+1
+0
+1
+0
+1
+1
+0
+
+Interpretation. VI-Theo and VI-Sim return a single deterministic action per state. IBMDP explores the posteriorpredictive policy space via stochastic rollouts and, by ensembling, surfaces multiple near-equivalent high-value choices.
+The superior Top-2 coverage (66% vs. VI-Sim’s 36% matching rate) reflects better policy-space exploration and robustness to finite-sample effects.
+
+E
+
+Benchmark with Public Dataset
+
+E.1
+
+High-Cost Differential Clearance Optimization
+
+We reuse a publicly available pharmacokinetics dataset (rat, dog, human clearance plus QSAR predictors) to stresstest IBMDP under large assay cost differentials. The dataset is described in [Yang et al., 2025] and is available to
+download. The planner may propose at most two assays per decision step, and the expensive human clearance assay
+is treated just like the rat and dog assays (i.e., it can be scheduled in any batch). The operational objective is to finish
+with human clearance exceeding 1.0 mL/min/kg while spending as little as possible. Species-specific costs are listed
+in Table 7.
+
+31
+
+Table 7: Assay cost structure for high-cost differential experiment
+Assay
+Rat clearance
+Dog clearance
+Human clearance
+
+Cost ($)
+400
+800
+4,000
+
+Relative Cost
+1.0×
+2.0×
+10.0×
+
+Unlike traditional gated progression (e.g., “rat before dog before human”), every episode starts with the unmeapred
+pred
+sured state s0 = {CLpred
+rat , CLdog , CLhuman } so the solver can pick any eligible batch. The IBMDP ensemble (30 runs,
+c = 5.0, 5,000 iterations per run, τ ∈ {0.6, 0.9}) produces a Maximum-Likelihood Action-Set Path (MLASP) by
+majority vote over recommended assay batches. The voting tally reveals three regimes: (i) high-uncertainty states
+favour rat/dog assays before committing to human tests; (ii) low-uncertainty states jump directly to human clearance;
+and (iii) intermediate states switch behaviour depending on the belief threshold τ . Figure 5 visualizes the resulting
+Pareto front and highlights how the MLASP navigates the trade-off between total spend and terminal uncertainty.
+
+E.2
+
+Interpreting the Pareto Frontier
+
+Figure 5 aggregates planning outcomes for tolerances τ ∈ {0.0, 0.1, . . . , 1.0} under the two-assays-per-step constraint.
+For each tolerance we execute a 30-run ensemble and record the first assay batch proposed by every run. Each
+marker therefore represents the rule ”if H(sT ) ≤ τ is required, begin with batch A0 ”; the horizontal axis reports
+the corresponding assay spend (rat + dog + human) and the vertical axis equals the targeted uncertainty τ . The
+blue locus links the Pareto-efficient points, exposing the spend-versus-uncertainty trade-off that emerges when τ is
+tightened. The starred marker denotes the Maximum-Likelihood Action-Set Path (MLASP)—the batch occurring
+most frequently across ensemble members for the displayed tolerance. Progressing from higher to lower τ shows that
+lenient tolerances favour inexpensive rat/dog assays, whereas stringent requirements such as H(sT ) ≤ 0.10 eventually
+demand the human clearance assay despite its 10× cost in Table 7. After the first batch is executed the IBMDP policy
+updates the belief state and recomputes the next action, so the figure captures the initial decision while the full policy
+remains adaptive.
+
+F
+
+Global Notation Reference
+
+This appendix provides a comprehensive reference for all mathematical notation used throughout the manuscript. The
+table below organizes symbols by category for easy reference.
+
+32
+
+Figure 5: ADME clearance optimization results comparing IBMDP performance under two belief thresholds (τ = 0.6
+and τ = 0.9) for a representative compound from the public CNS clearance benchmark. The plot demonstrates the
+Pareto-optimal trade-offs between total assay spend (horizontal axis) and terminal state uncertainty H(sT ) (vertical
+axis) achieved by the IBMDP ensemble across 30 runs. The two distinct curves for τ = 0.6 (more lenient) and τ = 0.9
+(more stringent) illustrate how tighter belief thresholds drive higher assay expenditure to achieve lower uncertainty.
+Notably, the two tau configurations exhibit strong alignment in their Pareto frontiers, confirming that IBMDP produces
+consistent and robust planning strategies across different confidence requirements. The Maximum-Likelihood ActionSet Paths (MLASPs) for each threshold are marked, showing how the ensemble consensus adapts to balance the high
+cost of human clearance assays ($4,000) against the need to reduce decision uncertainty below the specified threshold.
+
+33
+
+Table 8: Global Notation Reference summarizing the symbols used across the manuscript.
+Symbol
+
+Meaning
+
+Sets & Indices
+N, M
+X = {xi }N
+i=1
+A = {a1 , . . . , aM }
+D = {(xi , yi )}N
+i=1
+i, j, k, t
+
+Number of historical compounds and total available assays, respectively.
+Set of N historical compounds with fixed representations.
+Set of M available assays.
+Historical dataset of compounds and their assay outcome vectors.
+Indices for historical case, assay, feature, and decision step.
+
+Candidate Compound & State
+x⋆
+st = (x⋆ , {y⋆,j }j∈Mt )
+Mt ⊆ A
+Ut = A \ Mt
+
+The candidate compound for which a plan is being made.
+State at step t, comprising the candidate and all outcomes measured so far.
+The set of assays that have been measured for x⋆ up to step t.
+The set of unmeasured assays for x⋆ at step t.
+
+Actions, Costs & Policy
+At = P≤m (Ut ) ∪ {eox}
+m
+At ∈ At
+c(st , At ) ∈ Rq≥0
+ρ ∈ Rq≥0
+R(st , At )
+π, π ⋆
+
+Action set at st : batches of up to m unmeasured assays, plus the stop action.
+Maximum number of assays that can be run in parallel per step.
+The action (a batch of assays) chosen at step t.
+Vector of q resource costs for taking action At .
+User-defined weights for trading off different cost types.
+Scalar step cost: ρT c(st , At ). R(st , eox) = 0.
+A policy mapping states to actions, and the optimal policy.
+
+Similarity Model & Target Functionals
+g
+G = {gi }, Ig
+d(st , Di )
+wi (st )
+w̃i (st )
+H(st )
+L(st )
+1[·]
+
+The primary scalar target property of interest (e.g., an in vivo endpoint).
+Set of historical target values and the index set where they are available.
+Variance-normalized distance between the current state and historical case i.
+Similarity weight of historical case i given the current state st .
+Similarity weight wi (st ) re-normalized over the set Ig .
+State uncertainty: the weighted variance of the target g based on w̃i (st ).
+Goal likelihood: the weighted probability that g is in a desirable range.
+Indicator function: returns 1 when the condition inside the brackets holds, and 0
+otherwise.
+
+Hyperparameters & Constraints
+λw , λk
+ϵ, τ
+γ, T
+Ne , nitr
+
+Hyperparameters: global similarity bandwidth and per-feature weights.
+Thresholds for the constrained objective: max terminal uncertainty and min goal
+likelihood.
+Discount factor and maximum horizon for the MDP.
+Planning parameters: ensemble size and MCTS iterations per run.
+
+Algorithm Components
+MCTS-DPW
+MLASP
+eox
+
+Monte Carlo Tree Search with Double Progressive Widening.
+Maximum-Likelihood Action-Sets Path: final plan from ensemble majority
+voting.
+End of experiment action (stop action).
+
+34
+
+

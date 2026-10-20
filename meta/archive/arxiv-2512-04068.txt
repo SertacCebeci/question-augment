@@ -1,0 +1,3092 @@
+Published as a conference paper at COLM 2026
+
+Learning Steerable Clarification Policies with Collaborative
+Self-play
+
+arXiv:2512.04068v3 [cs.LG] 13 Sep 2026
+
+Jonathan Berant1† ,∗ Maximillian Chen1† , Adam Fisch2† , Reza Aghajani3 ,
+Fantine Huot2 , Mirella Lapata2 and Jacob Eisenstein2†
+1 Google Research, 2 Google DeepMind, 3 Meta, work done at Google Deepmind
+† Core contributor
+
+Abstract
+To handle ambiguous queries, AI assistants must decide (a) when to guess
+the user’s intent and answer directly, (b) when to enumerate and respond
+to multiple plausible intents, and (c) when to ask a clarifying question.
+No strategy is always superior; the right decision depends on contextual
+factors such as user preferences or modality. For example, enumerating
+several possible interpretations can be cumbersome on small screens or
+voice-based settings, while a more interactive style may be dispreferred
+in desktop settings. In this work, we propose training steerable policies for
+managing such uncertainty via self-play. Given two agents, one simulating
+a user and the other an AI assistant, we generate conversations where the
+user issues a potentially ambiguous query, and the assistant must choose
+how to respond. The assistant receives as input the numerical cost of asking
+a clarification question, and of generating each word, and is trained to
+select the conversational action that maximizes its final reward: accuracy
+penalized by these costs. We apply Reinforced Self-Training (ReST) to
+optimize this objective and show that it yields a steerable policy that adapts
+its behavior based on the provided costs, improving both reward and
+accuracy. Moreover, the resulting policy generalizes to numerical cost
+values unobserved during training.
+
+1
+
+Introduction
+
+Establishing common ground between a user and an AI assistant is key for successful
+communication, but is an area where AI assistants have been shown to struggle (Shaikh
+et al., 2024). As a result, assistants may offer responses that fail to match the true intent of an
+underspecified user request, or offer overly verbose responses that attempt to accommodate
+all possible intents — both failure modes that could be avoided by more interactive policies
+for building common ground, e.g., through clarification questions. Recent work (Chen et al.,
+2025; Zhang et al., 2025) has proposed to teach models when to ask clarification questions
+by using self-play: an episodic learning strategy in which one language model simulates a
+user, and another represents the AI assistant. The assistant is then finetuned on successful
+“rolled-out” conversations to learn when to answer a query and when to ask for clarification.
+However, such prior work assumes that ambiguity should be uniformly handled by requesting clarification, which does not capture the richness of strategies a conversational
+participant might take to manage uncertainty. Given an ambiguous utterance, there are
+many possible approaches: (a) guess a single probable intent and respond to it; (b) enumerate multiple possible intents and provide a response for each; (c) issue a clarification
+question to pinpoint the exact intent. Which strategy is optimal? This depends on whom
+you are talking to, and in what context. Some users dislike long outputs and favor a more
+conversational approach; others prefer to avoid multi-turn conversations, but will relax
+this preference when it is not possible to process long outputs, such as while driving. In
+low-stakes settings it may be acceptable to simply make a best guess. A proficient assistant
+∗ Corresponding author: joberant@google.com
+
+1
+
+Published as a conference paper at COLM 2026
+
+Figure 1: Our steerable AI assistant adapts its behavior based on cost coefficients for different dimensions of the conversation. The model is trained to maximize cost-penalized accuracy, with costs specified
+by α and β (the color red indicates high cost and the color green indicates low cost). In this example,
+the model asks a clarification question when the cost of conversation turns is low (left), enumerates
+multiple interpretations when the cost of generating a long response is low (middle), and answers
+directly with an educated guess when both costs are high (right).
+
+should therefore take preferences, interaction modality, and other environmental factors
+into account when deciding how to respond. Thus, we need steerable policies for conversation
+grounding, which let the assistant flexibly adjust its dialogue strategy on the fly.
+We propose a new form of self-play for training a single steerable policy that takes as input
+a specification of the reward for a conversation, and modifies its grounding behavior to
+maximize the provided reward. Figure 1 provides an example for an ambiguous query. The
+model is trained to maximize cost-penalized accuracy, where cost depends on the number of
+turns and the length of the final answer. This objective is parameterized by scalar cost coefficients, α and β, provided as part of the input. On the left, the cost of additional conversation
+turns is low, so the model clarifies uncertainty by asking a follow-up question. In the middle,
+the cost of enumerating interpretations is low, so the model provides answers for two probable interpretations. On the right, both costs are high, so the model makes an educated guess
+about user intent, without resolving the uncertainty. We focus in this work on training the
+assistant for steerability, assuming cost coefficients are given as input. In practice, cost coefficients can be inferred from user preference data or feedback, which we leave for future work.
+To finetune our model, we apply Reinforced Self-Training (ReST), a common post-training
+strategy for optimizing rewards (e.g., Gulcehre et al., 2023; Zhang et al., 2024). We use
+one model as a user simulator and another as our target assistant, sampling different cost
+coefficients per conversation. We then apply collaborative self-play. For each question and
+cost coefficient setting, we sample multiple conversations, and compute the true reward.
+We then finetune the assistant on the highest-reward conversations, teaching it to condition
+on the cost coefficients to maximize its reward.
+We evaluate our Steerable Grounding Policy (SGP) on two question-answering benchmarks:
+A MBIG QA (Min et al., 2020), where the model answers questions using parametric knowledge, and PACIFIC (Deng et al., 2022), where non-parametric context is provided in the form
+of a document and table. We find that even strong prompted models fail to condition on
+cost coefficients, even when using chain-of-thought prompting. In contrast, models trained
+with SGP appropriately condition on the provided cost coefficients; when needed, they can
+substantially alter their inference-time behavior, achieving higher accuracy at lower cost in
+accordance with the objective specified in the prompt. Moreover, this generalizes to cost
+coefficients never observed during training.
+
+2
+
+Method
+
+2.1
+
+Self-play Environment
+
+Our self-play setup includes two agents, a user simulator (or user for short) and an assistant,
+who are collaborating to answer a query provided by the environment. The environment
+has access to a potentially ambiguous query q, a list of possible interpretations Iq =
+2
+
+Published as a conference paper at COLM 2026
+
+(i1 , . . . , in ), a corresponding distribution over the interpretations Pq = ( p1 , . . . , pn ), where
+∀ j p j ≥ 0, ∑ j p j = 1, and the gold answers ( a1 , . . . , an ). The environment samples an
+interpretation i j , where j ∼ Pq and passes it along with q to the user simulator. The user
+simulator is instructed to determine the answer by communicating with an assistant (who
+may have access to privileged information). After the ensuing multi-turn conversation,
+the user returns an answer a to the environment, which is compared with the gold answer
+a∗ = a j . An example conversation is shown in Figure 2.
+Rollouts.
+A conversation, or rollout, is a sequence of turns ρ
+=
+(( M1 , x1 , y1 ), . . . , ( MT , x T , y T )),
+where
+each turn includes the active model (user
+or assistant) Mt , the prompt xt constructed
+from information in the state (see Table 1),
+and the model output, yt . For us, Mt is the
+user when t is odd, and the assistant when
+t is even.
+The output yt = (ut , ot ) includes a chosen
+action and an observation for that action.
+The prompt x1 is constructed based on the
+query q and the sampled interpretation i j .
+The rollout terminates when the user returns the final answer a = o T alongside
+u T = #FINALIZE.
+
+Figure 2: An example rollout. The environment
+passes the user an ambiguous query q and unambiguous interpretation i. The user passes q to the
+assistant, which issues a clarification question. After receiving a response, it outputs a multi-answer
+(covering multiple interpretations), from which the
+user formulates the final answer.
+
+Agent actions and observations. Table 1 defines all actions for the user and assistant, along
+with the state, used to construct the prompt xt , and the output observation. The assistant
+can choose one of three actions: {#CLARIFY, #ANSWER, #MULTI ANS}, corresponding to asking
+a clarification question, answering the query, or providing multiple interpretations. Our
+goal is to train the assistant to choose actions that maximize its reward (see below). The
+user chooses actions in a deterministic manner: in the first turn, it will #QUERY; when given a
+clarification question qclar it will #RESPOND with a clarification response rclar ; and when given
+an answer or multi-answer from the assistant it will generate and return a final answer a
+(#FINALIZE). When the assistant gives a multi-answer, the user leverages knowledge of i j to
+choose the relevant part of the multi-answer. In practice we limit the number of allowed
+clarification questions (see Section 3).
+Reward. Let nclar (ρ) denote the number of clarification actions and |o T −1 | the number of
+words in the final assistant answer. The rollout reward computed by the environment is
+R(ρ; a∗ ) = acc( a, a∗ ) − α · nclar (ρ) − β · |o T −1 |
+We want the answer to be accurate, to minimize the number of turns, and to get short
+answers. Our reward is motivated by Grice’s maxims (Grice, 1975) for effective communication, including the maxim of quality (make your contributions true), quantity (provide
+necessary information only), and manner (avoid ambiguity). We measure accuracy, acc( a, a∗ ),
+against the gold answer a∗ with token-level F1 (Rajpurkar et al., 2016), in a [0, 100] scale.
+The optimal strategy for this reward function depends on whether it is possible to increase
+expected accuracy with clarification questions or multi-answers. E.g., if asking a clarification
+question can increase expected accuracy by δ, and α < δ, then asking will yield higher
+reward compared to answering directly. Similarly, if a multi-answer adds m words to the
+final assistant answer but improves expected accuracy by δ, it is preferable when β · m < δ.
+User and assistant prompts. Prompts x are constructed from the state, as explained in
+Table 1. The assistant gets the coefficients α and β so it can learn to change its behavior
+conditioned on them. The assistant has access to the history of clarification questions and
+1 ), . . . }, and to an optional private context c. This is used when
+their answers h = {(q1clar , rclar
+the query is w.r.t to some context (e.g., a table) that can be provided in the prompt. We show
+an example where the assistant has access to a private context in Figure 5 (Appendix B) and
+describe the details in Section 3. The full prompts are provided in Appendix I.
+
+3
+
+Published as a conference paper at COLM 2026
+
+We rely on the base model’s instruction-following ability in two ways: (a) given a clarification
+question, we instruct the user to answer without revealing the true interpretation and
+(b) given the answer rans , we instruct the user simulator to only use rans and its knowledge
+of the true interpretation i j to generate the final answer a. The user is instructed to never
+answer based on its parametric knowledge. We manually verify that the user’s instructionfollowing behavior is satisfactory. In addition, using parametric knowledge will lead to
+lower performance in asymmetric cases where the assistant’s knowledge is superior, e.g.,
+when the assistant has access to a private context containing necessary knowledge.
+Thoughts. We experiment with models that use chain-of-thought reasoning to generate
+actions. Before sampling an action, the model generates a thought that considers all allowed
+actions, and estimates which will yield the highest reward (similar in spirit to Dong et al.
+(2026)). Our hypothesis is that using a chain-of-thought will help the model better condition
+on the input cost coefficients, since it will explicitly reference coefficients to estimate the
+reward for each action. We provide the model a few in-context examples with thoughts,
+shown in the full prompts in Section I.2.
+2.2
+
+Training
+
+Our goal is to train a steerable assis- Agent
+Action
+State
+Observation
+tant that maximizes reward given input
+User
+#QUERY
+q, i
+q
+cost coefficients. To this end, we apply
+#RESPOND
+q, i, qclar
+rclar
+Reinforced Self-Training (ReST), a post#FINALIZE
+q, i, rans
+a
+training method that approximates onAssistant
+#CLARIFY
+q,
+h,
+c,
+α,
+β
+q
+clar
+policy learning by updating model pa#ANSWER
+q, h, c, α, β
+rans
+rameters between each epoch of train#MULTI ANS q, h, c, α, β
+rans
+ing (e.g., Gulcehre et al., 2023; Zhang
+et al., 2024). In ReST, one generates rollTable 1: The user observes the query q, its interpreouts, scores them, trains on high-scoring tation i, and potentially (a) a clarification question
+rollouts, and then iterates with the up- q , (b) answer rans or (c) multi-answer rans . The
+clar
+dated policy. However, the highest- assistant observes the query, a history h of clarification
+scoring rollout might feature poorly- questions and answers, an optional private context
+chosen actions that obtained a high re- c, and the coefficients α, β. The assistant outputs
+ward by chance, e.g. by guessing an in- (a) clarification questions qclar or (b) answers or
+tent that is underspecified but (luckily) multi-answers rans . The user responds to clarification
+correct. To avoid training on such noisy questions with rclar , and synthesizes a final answer a
+supervision, we seek the action sequence given rans . The state is used to construct the prompt x.
+that leads to the highest reward in expectation over rollouts and interpretations, and construct training examples from the best rollout compatible with this action sequence (see also
+Eisenstein et al. 2025; Zhang & Choi 2025). Algorithm 1 describes the implementation.
+Recall that a rollout is defined as ρ = {( Mt , xt , yt )}tT=1 , with action-observation outputs
+yt = (ut , ot ). An action sequence s = (s1 , s2 , . . .) is a sequence of actions (e.g., #ANSWER or
+#CLARIFY). If for a given rollout ρ we have ut = st for all t, we write ρ ⊢ s to indicate that
+ρ is compatible with s. A set of rollouts, {ρ1 , ρ2 , . . .} can be coarsened into a set of action
+sequences {s1 , s2 , . . .}. Given a query q and coefficients α, β, we can look at their set of
+q
+rollouts, coarsen the rollouts to action sequences and identify the action sequence, s∗ with
+the highest expected reward across interpretations (we drop α and β for brevity):
+Eρ [ R(sq |q)]
+
+z
+
+s∗ = argmax ∑ p j ·
+q
+
+sq
+
+j∈[n]
+
+}|
+
+{
+
+∑ q pt−1 (ρ|q, i j ) · R(ρ)
+
+(1)
+
+{ρ:ρ⊢s }
+
+|
+
+{z
+
+Eρ [ R(sq |q,i j )]
+
+}
+
+where pt−1 corresponds to the probability of the trajectory using the current assistant MtA−1
+and user Muser . In practice, we assume Pq is uniform and estimate pt−1 through sampling:
+we compute average reward per interpretation and average across interpretations, choosing
+q
+the action sequence that does well across all of them. Once we have s∗ , we go over all
+4
+
+Published as a conference paper at COLM 2026
+
+Algorithm 1 Reinforced Self-Training
+Require: Initial assistant model M0A , fixed user model Muser , query set Q = {(qk , Iqk , Pqk )}kN=1 , set of coefficients C = {(α j , β j )} jM=1 ,
+rollouts per query nr , number of ReST iterations T.
+A
+Ensure: Trained model MReST
+for t = 1, . . . , T do
+Define an empty training set D ← ∅.
+for query triple (qk , Iqk , Pqk ) ∈ Q do
+Sample index j ∼ Pqk and interpretation i j ∈ Iqk .
+for ℓ = 1, . . . , nr do
+Sample α, β ∼ C .
+Generate and save rollout ρk,j,ℓ by applying models MtA−1 and Muser to qk , i j , α, β.
+end for
+end for
+for query qk , its rollouts ρk , and (α, β) ∈ C , do
+Step a: Filter out invalid rollouts (see Section 2.2).
+Step b: Compute best action sequence:
+k,α,β
+s∗ = arg maxsk,α,β Eρ [ R(sk,α,β | qk )]
+k,α,β
+
+Step c: Compute best rollouts compatible with s∗
+S
+k,α,β
+ρ∗ = i j ∈Iq arg max
+R(ρ)
+k,α,β
+k
+
+{ρ:ρ⊢s∗
+
+:
+
+,i (ρ)=i j }
+
+k,α,β
+
+Step d: Turn ρ∗ into training examples, add to D .
+end for
+Train MA
+t on a training split of D .
+Select checkpoint with smallest held-out log-likelihood on a development split of D .
+end for
+return MA
+T
+
+q
+
+interpretations, and add the highest-reward rollout compatible with s∗ to the training set:
+q
+
+ρ∗ =
+
+[
+
+argmax
+
+R ( ρ ),
+
+(2)
+
+q
+
+i j ∈Iq {ρ:ρ⊢s∗ ,i (ρ)=i j }
+
+where i (ρ) is the interpretation used in the trajectory ρ.
+Algorithm 1 describes this procedure. We generate nr rollouts for each query qk and
+interpretation, sampling cost coefficients in each rollout. We cluster the nr rollouts by
+cost coefficients, filtering out invalid rollouts. A rollout is invalid if its F1 is below some
+threshold, or if the user simulator violates instructions and ignores the assistant’s answer.
+This is determined by observing that the fraction of words in o T that also appear in o T −1 is
+below a threshold. Finally, for each query qk and coefficient pair (α, β) we find the optimal
+k,α,β
+k,α,β
+action sequence s∗
+and add to the training set the best rollouts ρ∗
+that are compatible
+k,α,β
+with s∗ , across interpretations of qk . We only train on the assistant steps.
+Crucially, different settings of α and β lead to different optimal action sequences. This lets
+the model learn the association between coefficient values and desired behaviors. ReST
+training proceeds for T epochs, where we sample from the latest model in each epoch.
+
+3
+
+Experimental Setup
+
+Datasets A MBIG QA is a QA benchmark built from Natural Questions (Kwiatkowski et al.,
+2019), where queries are annotated with multiple interpretations and their answers. In
+manual inspection, we found noisy annotations (annotated interpretations that are not
+plausible). We therefore perform model-based filtering: we ask Gemini 2.0 Flash (Google,
+2024a) to determine if a question is ambiguous, and keep only queries where models
+agree with human annotations (see Section I.1 for our prompt). Then, we subsample the
+unambiguous queries such that the ratio of ambiguous to unambiguous queries is 2:1.
+Overall, this leads to 1,776 training examples and 382 development (dev) examples (the
+test set is not publicly available), with an average of 2.41 interpretations per query on the
+training set and 2.76 on the dev set. An example ambiguous query is “How many basketball
+national championships does Louisville have?”, referring to men’s or women’s basketball.
+PACIFIC (Deng et al., 2022) is a multi-turn QA task that requires reasoning about contextual
+ambiguity grounded in real financial documents and tabular data (see Figure 5). This creates
+two differences from A MBIG QA. First, this is an asymmetric setup, where the assistant
+5
+
+Published as a conference paper at COLM 2026
+
+provides an answer that can only be derived from an input document, which the user has
+no access to. This prevents the user from answering questions using its own knowledge
+while ignoring the assistant’s response. Second, the context-grounded and multi-turn
+nature of PACIFIC introduce different types of ambiguity. For example, a turn that appears
+underspecified may not be ambiguous given previous context (e.g., red text in Figure 6).
+Conversely, seemingly precise queries can be ambiguous due to details in the context (e.g.,
+blue text in Figure 6). We use 3,744 training examples and 640 dev examples (test set ground
+truth is not publicly available), with equal numbers of ambiguous and unambiguous queries.
+Models For the main results presented here, we use Gemma 2 9B (Google, 2024b) as our
+baseline model for both the user simulator1 and AI assistant. In Appendices G.1 and G.2,
+we show additional results with Gemma 2 2B and QWEN 3 4B. We compare several natural
+baselines to our model:
+• P ROMPTED: queries the baseline model directly with a description of the task, reward
+objective, and several examples. This tests whether the model can natively condition on
+cost coefficients. We show the prompt in Section I.2.
+• P ROMPTED -COT: Similar to P ROMPTED, except that the prompt includes instructions and
+examples to generate a thought that explicitly reasons about which action will maximize
+reward. See the prompt in Section I.2.
+• A NSWER: uses the baseline but constrains it to answer directly without clarification
+questions or multi-answers.
+• M ULTI - ANSWER (MA): uses the baseline but constrains the assistant to use #MULTI ANS.
+• C LARIFY: uses the baseline but constrains the assistant to use #CLARIFY and then #ANSWER.
+• C LARIFY- AND -MA: uses the baseline but constrains the assistant to use #CLARIFY and
+then #MULTI ANS.
+• A NSWER -FT: To teach the base model the right answer format, we sample direct answers
+per question and finetune on the highest-reward answer observations.
+• SGP: trains a Steerable Grounding Policy (Algorithm 1).
+We also include SGP-O RACLE, an oracle that provides an approximate upper bound on
+the achievable reward. Using SGP, for every query q and coefficients α, β, we estimate the
+expected reward Eρ [ R(s | α, β)] for each action sequence s. We then select the sequence, s∗ ,
+that in hindsight attains the highest expected reward. This offers a reference point for the
+potential gains from optimal action sequences.
+Last, we conduct a few ablations related to the details of our training procedure, which we
+describe in Appendix D.
+Training and inference details We use nr = 192 rollouts at training time and nr = 64 at test
+time. Interpretations are sampled uniformly from the candidates provided in A MBIG QA and
+PACIFIC. In each rollout we randomly sample the clarification cost coefficient α ∼ {0, 2, 20}
+and the per-token cost coefficient β ∼ {0.1, 0.7, 5.0}. We limit the number of clarification
+questions to 1, since typically there is just one ambiguous aspect in each query, which results
+in four possible action sequences: answer vs. multi-answer; with and without clarification
+questions. We perform T = 3 ReST epochs, following prior work (Eisenstein et al., 2025).
+We tune only the learning rate, choosing the checkpoint with lowest dev loss. As explained
+in Section 2.2, we discard rollouts with low F1 : < 0.1 for A MBIG QA and < 0.4 for PACIFIC.
+We also discard rollouts when the user ignores the assistant, omitting rollouts when the
+fraction of tokens in the answer returned by the user that do not appear in the assistant
+answer is above half. We provide statistics on how often filtering happens in Appendix E.
+Evaluation We use the following metrics: (a) average reward, (b) average F1 , (c) fraction of
+queries with a clarification question, (d) fraction of queries that use #MULTI ANS. We compare
+models by query type (ambiguous and unambiguous) and across cost coefficients. We
+also report metrics for steerability, which we describe in detail below. Last, we measure
+steerability generalization by testing coefficients that did not appear during training.
+1We tested sensitivity to the user simulator, by using Gemma 3 4B as the user simulator instead of
+Gemma 2 9B, and found results were similar.
+
+6
+
+Published as a conference paper at COLM 2026
+
+Ambiguous
+
+PACIFIC
+
+AmbigQA
+
+Models
+
+Unambiguous
+
+Reward
+
+F1
+
+% Clar.
+
+% MA
+
+Reward
+
+F1
+
+% Clar.
+
+% MA
+
+P ROMPTED
+P ROMPTED -COT
+
+-34.49
+-20.11
+
+16.16
+16.44
+
+66.83
+53.93
+
+63.88
+50.48
+
+-15.01
+-5.02
+
+33.07
+29.12
+
+64.78
+48.34
+
+58.07
+49.54
+
+A NSWER
+C LARIFY
+M ULTI - ANSWER (MA)
+C LARIFY- AND -MA
+A NSWER -FT
+
+1.32
+-9.59
+-46.48
+-50.61
+3.64
+
+14.33
+16.30
+15.67
+16.94
+16.40
+
+0.00
+100.00
+0.00
+100.00
+8.75
+
+0.00
+0.00
+100.00
+100.00
+9.98
+
+26.73
+8.86
+-25.40
+-35.26
+30.99
+
+35.58
+31.86
+33.76
+32.28
+39.65
+
+0.00
+100.00
+0.00
+100.00
+2.31
+
+0.00
+0.00
+100.00
+100.00
+4.58
+
+SGP
+
+6.63
+
+19.94
+
+40.25
+
+18.22
+
+31.36
+
+41.28
+
+26.46
+
+13.99
+
+SGP-O RACLE
+
+15.81
+
+23.13
+
+35.78
+
+11.08
+
+42.05
+
+48.66
+
+20.03
+
+10.32
+
+P ROMPTED
+P ROMPTED -COT
+
+11.46
+33.00
+
+55.28
+50.04
+
+17.99
+16.45
+
+47.18
+16.17
+
+42.44
+52.07
+
+69.51
+68.43
+
+4.82
+4.86
+
+19.15
+7.17
+
+A NSWER
+C LARIFY
+M ULTI - ANSWER (MA)
+C LARIFY- AND -MA
+A NSWER -FT
+
+42.44
+45.48
+-21.39
+-16.18
+13.59
+
+52.25
+62.70
+54.63
+56.66
+57.55
+
+0.00
+100.00
+0.00
+100.00
+14.30
+
+0.00
+0.00
+100.00
+100.00
+44.75
+
+56.91
+46.90
+-4.04
+-22.25
+41.81
+
+71.52
+68.85
+63.34
+57.77
+72.58
+
+0.00
+100.00
+0.00
+100.00
+4.71
+
+0.00
+0.00
+100.00
+100.00
+24.03
+
+SGP
+
+54.32
+
+65.73
+
+42.86
+
+14.60
+
+65.70
+
+79.52
+
+20.56
+
+9.30
+
+SGP-O RACLE
+
+65.24
+
+73.89
+
+43.46
+
+14.05
+
+70.95
+
+83.60
+
+15.60
+
+9.39
+
+Table 2: Performance on A MBIG QA and PACIFIC development sets using a Gemma 2 9B base model
+for ambiguous and unambiguous queries, averaged across rollouts. ‘% Clar.’ and ‘% MA’ denote the
+fraction of rollouts with clarification questions and multi-answers. SGP improves F1 while learning
+appropriate clarification and multi-answer behavior, leading to overall higher reward.
+
+0
+
+2
+
+20
+
+0.6
+0.4
+0.2
+0
+
+0.1
+
+α
+
+0.7
+β
+Prompted
+
+5
+
+1
+0.8
+0.6
+0.4
+0.2
+0
+
+% multi-answer
+
+PACIFIC
+% clarifications
+
+% multi-answer
+
+% clarifications
+
+A MBIG QA
+1
+0.8
+0.6
+0.4
+0.2
+0
+
+0
+
+2
+
+20
+α
+
+Prompted-COT
+
+0.4
+0.3
+0.2
+0.1
+0
+
+0.1
+
+0.7
+β
+
+5
+
+SGP
+
+Figure 3: Fraction of rollouts with a clarification question and a multi-answer on the development
+sets for different cost coefficient values. The x-axis for α is in square-root scale and for β in log-scale.
+SGP reduces the fraction of clarifications with higher α and reduces the fraction of multi-answers
+with higher β, as expected. The baselines do not exhibit the correct sensitivity to coefficient values.
+
+4
+
+Experimental Results
+
+Table 2 (top) shows results on A MBIG QA. SGP achieves the highest F1 and reward for
+ambiguous and unambiguous queries. SGP also dramatically reduces the rate of clarification
+questions and multi-answers compared to P ROMPTED. Using chain-of-thought improves
+performance and reduces the rate of clarification questions and multi-answers compared
+to P ROMPTED, but lags behind SGP. The rate of clarification and multi-answer actions in
+SGP is higher for ambiguous queries than for unambiguous queries, as expected. Training
+on direct answer observations (A NSWER -FT) leads to almost always returning a direct
+answer, but gets higher F1 than A NSWER since it is finetuned to answer in a better format.
+Comparing SGP to SGP-O RACLE, SGP does well in choosing high-reward action sequences,
+with a similar rate of clarifications and multi-answers. Still, a ∼10 point headroom remains.
+Table 2 (bottom) shows results on PACIFIC. SGP outperforms all baselines in terms of F1 and
+reward. Unlike A MBIG QA, P ROMPTED and P ROMPTED -COT use clarification questions
+and multi-answers more sparingly. Moreover, both methods use more clarifications and
+multi-answers on ambiguous queries than unambiguous ones, showing they distinguish
+query types when relevant information is in the prompt. SGP increases the clarification rate
+on ambiguous queries to 42.86% to improve its performance. P ROMPTED -COT achieves
+higher reward than P ROMPTED, but trails SGP by a large margin. C LARIFY performs
+well on ambiguous queries, but worse than SGP. As expected, clarification questions
+7
+
+Published as a conference paper at COLM 2026
+
+0.2
+0
+
+0
+
+2
+
+5
+α
+
+10
+
+20
+
+0.3
+0.2
+0.1
+0
+
+0.1
+
+0.3
+
+0.7
+β
+
+2
+
+5
+
+0.6
+
+% multi-answer
+
+0.4
+
+PACIFIC
+% clarifications
+
+% multi-answer
+
+% clarifications
+
+A MBIG QA
+0.6
+
+0.4
+0.2
+0
+
+0
+
+2
+
+5
+α
+
+10
+
+20
+
+0.3
+0.2
+0.1
+0
+
+0.1
+
+0.3
+
+0.7
+β
+
+2
+
+5
+
+Figure 4: Generalization experiment: SGP on A MBIG QA and PACIFIC with cost coefficients that did
+not appear during training (purple stars). x-axis for α is in square-root scale and for β in log-scale.
+When varying α/β we fix β = 5/α = 20. In both datasets the fraction of clarification questions and
+multi-answers is monotonic in α and β, showing good generalization to unobserved cost coefficients.
+
+and multi-answers occur more frequently in ambiguous queries. A NSWER -FT achieves
+higher F1 compared to A NSWER as a result of finetuning, but its performance is much
+lower than SGP. Comparing to SGP-O RACLE, we see moderate headroom for SGP: 11
+points for unambiguous and 5 points for unambiguous queries. Remarkably, the fraction of
+clarifications and multi-answers for SGP closely matches the oracle. For ease of reading, we
+show in Table 2 results without confidence intervals, but we compute and report those in
+Appendix F, Table 9.
+Since SGP is finetuned on both actions and observations, it learns more than just selecting the
+right action sequence: for #CLARIFY and #MULTI ANS, it learns which clarification questions
+or multi-answers are likely to yield high reward. In Section C, we show cases where SGP
+issues better clarification questions than baselines, improving answers.
+We include additional results in the appendix (Section G). Figure 9 (Section G.3) shows the
+average reward for SGP and baselines across all 9 coefficient pairs. The reward improves
+for all coefficient pairs and not just on average. Figure 10 (Section G.4) shows the action distribution across models and datasets, revealing predictable patterns. Figure 11 (Section G.5)
+shows that reward and F1 improve monotonically across ReST epochs.
+Corpus-level steerability Figure 3 shows the fractions of rollouts with clarification questions and with multi-answers for all trained cost coefficients for A MBIG QA and PACIFIC
+(for brevity, we omit the average length of the final assistant turn, as it behaves similarly to
+the fraction of multi-answers, but add this metric in App. G.6, Figure 12). For A MBIG QA,
+P ROMPTED behaves counterintuitively, increasing the rate of clarification questions when
+α increases, and increasing the rate of multi-answers and turn length when β increases.
+P ROMPTED -COT does not change the rate of clarifications or multi-answers as a function of
+α or β. SGP leads to the desired behavior: increasing α reduces the rate of clarifications, and
+increasing β reduces the rate of multi-answers. In PACIFIC, the behavior of SGP is similar
+to A MBIG QA, while P ROMPTED and P ROMPTED -COT do not modify their behavior as a
+function of different coefficients. Unlike A MBIG QA, P ROMPTED -COT uses clarification
+questions and multi-answers rarely, while P ROMPTED avoids clarifications, but uses multianswers. These observations suggest that the base model cannot reason about numerical
+costs, whereas fine-tuning effectively teaches this capability.
+Prompt-level steerability Next,
+α: 0 → 20
+β: 0.1 → 5.0
+we evaluate steerability at the Data
+Method
+R
+P
+F1
+R
+P
+F1
+prompt level by asking: for a
+given prompt, if the cost coefProm. 0.03 0.02 0.02 0.02 0.02 0.02
+ficient changes from one value A MBIG COT
+0.29 0.43 0.34 0.09 0.12 0.10
+to another, does the model optiSGP
+0.45 0.49 0.47 0.09 0.42 0.12
+mally adjust its action sequence?
+Prom. 0.02 0.28 0.04 0.02 0.19 0.04
+To answer this, we first identify PAC .
+COT
+0.03 0.21 0.05 0.01 0.09 0.02
+the optimal action sequence for each
+SGP
+0.62 0.58 0.60 0.14 0.44 0.19
+query and coefficient pair by determining which sequence yields Table 3: Prompt-level steerability metrics when varying the
+the highest expected reward. We cost of clarification questions (α) and multi-answers (β). Rethen analyze how the optimal ac- call, precision, and F1 are averaged across three possible valtion sequence changes as we vary ues of β (clarification questions) and α (multi-answers).
+one coefficient while fixing the other.
+8
+
+Published as a conference paper at COLM 2026
+
+Models
+G EMINI -2.5-F LASH
+G EMINI -3-F LASH
+
+Ambiguous
+
+Unambiguous
+
+% Clarifications (α)
+
+% Multi-answers (β)
+
+Reward
+
+F1
+
+Reward
+
+F1
+
+0.0
+
+2.0
+
+20.0
+
+0.1
+
+0.7
+
+5.0
+
+-15.35
+-19.93
+
+23.96
+30.55
+
+51.83
+27.95
+
+60.88
+60.40
+
+23.58
+33.86
+
+34.19
+29.75
+
+49.59
+22.42
+
+24.40
+67.43
+
+21.95
+64.91
+
+25.28
+58.10
+
+6.63
+
+19.94
+
+41.28
+
+26.46
+
+54.78
+
+42.71
+
+18.34
+
+28.91
+
+14.60
+
+9.49
+
+SGP
+
+Table 4: Performance and steerability of prompted Gemini models compared to SGP on A MBIG QA.
+
+For clarification questions, We check if asking (or removing) a clarification question is
+optimal when modifying α1 → α2 , while fixing β. For multi-answers, we check if asking
+(or removing) a multi-answer is optimal when β 1 → β 2 , while fixing α. We then compute
+recall, precision, and F1 in the following manner. Recall is the fraction of cases where the
+optimal action sequence changes when changing cost coefficients (e.g., adding a clarification
+question), and our model predicts the correct change. Precision is the fraction of cases
+where our model predicts a certain change in the action sequence, and this change is correct
+according to the optimal action sequence change. F1 is the usual harmonic average. We
+describe the details of this procedure in Section H.
+Table 3 reports results when changing the value of α from 0 → 20 and the value of β from
+0.1 → 5.0. SGP outperforms baselines across the board. Results are substantially higher for
+steering α compared to β, where precision is high but recall is low. We attribute this to the
+baseline model producing better training rollouts for asking good clarification questions
+compared to multi-answers. Lastly, our results show there remains substantial headroom in
+learning policies that choose the optimal action sequence across prompts.
+Generalization to new cost coefficients. We test if SGP can generalize to cost coefficients
+unobserved at training time. Figure 4 shows the fraction of clarification questions and multianswers for observed and unobserved cost coefficients (see purple stars in the figure) for
+A MBIG QA (left) and PACIFIC (right). When varying α, we fix β = 5, and when varying β, we
+fix α = 20. SGP generalizes well to unobserved values of both α and β on both A MBIG QA
+and PACIFIC, smoothly adjusting the action frequencies between the values corresponding
+to neighboring coefficients observed at training time. This shows SGP yields generalizable
+steerability, giving users control even at cost coefficients that are unobserved during training.
+Results for the length of the final assistant turn are similar and omitted for brevity.
+Are Gemini models steerable? We saw that Gemma 2 9B can be trained to respond to
+steering signals, but that it is not steerable “out-of-the-box”. A natural followup is whether
+stronger models are steerable without fine-tuning. To this end, we compare SGP to Gemini2.5 Flash (Google, 2025a) and Gemini-3 Flash (Google, 2025b) on A MBIG QA.
+Table 4 shows the results for this comparison. Gemini models have better parametric
+knowledge and consequently higher F1 . Nevertheless, reward is lower for ambiguous
+question, and also for unambiguous questions in Gemini-3, due to sub-optimal use of
+clarification questions and multi-answers. More importantly, Gemini-2.5 is not steerable,
+with the number of clarification questions increasing (instead of decreasing) when α grows,
+and no sensitivity to the value of β. Gemini-3 exhibits moderate steerability, but its overuse
+of multi-answers reduces its reward. Overall, the performance of even these strong models
+is sub-optimal when asked to maximize a prompt-specified objective.
+
+5
+
+Related Work
+
+Handling ambiguity User queries are rife with ambiguities, consistent with the principle
+of least effort (Zipf, 1949). While Grice’s maxim of quantity suggests that a cooperative
+speaker provides as much information as necessary (Grice, 1975), users of AI assistants
+may assume context that is unavailable to agent, thereby requiring additional grounding.
+Consequently, a growing body of work is focused on handling ambiguity in LLMs (Tanjim
+et al., 2025)). A natural approach is to ask clarification questions (Dhole, 2020; Ren et al.,
+9
+
+Published as a conference paper at COLM 2026
+
+2023; Zhang & Choi, 2025): for example, Chen et al. (2025) and Zhang et al. (2025) use
+self-play with user simulators to learn a policy for asking clarification questions, while Kim
+et al. (2024) let language models assess their own uncertainty and design a corresponding
+clarification policy. Other work generates long responses enumerating multiple plausible
+user interpretations and their answers (Stelmakh et al., 2022; Amplayo et al., 2023; Kim et al.,
+2023; In et al., 2025).
+Recently, Dong et al. (2026) proposed an inference-time method for deciding when to ask
+clarification questions that is based on explicit estimation of the expected value of each
+possible agent action. Our P ROMPTED -COT baseline takes a similar approach, but makes
+less assumptions on the space of possible clarification questions and answers.
+Steerable language policies Teaching contextual steerability has been a north star of
+language generation (Hovy, 1987; 1988; Chen et al., 2022; Keskar et al., 2019; Sorensen et al.,
+2026). Recent work on adapting to uncertainty includes Cole et al. (2023), who teach models
+to abstain from answering questions when uncertain about the asker’s intent, and Kuhn
+et al. (2022), who prompt models to quantify their uncertainty to determine when to ask
+clarification questions. However, these approaches are “steerable” only by the level of
+uncertainty, not by other contextual factors. Wang et al. (2024) train conditional language policies (CLPs) for steerable alignment: given multiple reward models, they train to maximize
+a linear combination of rewards, where the combination coefficients are sampled during
+training and provided as input at test time. We use a similar approach for training steerable
+grounding policies under different cost considerations. However, our approach uses
+coefficients specified in the prompts, allowing for training a single model, whereas Wang
+et al. (2024) train multiple models (with some parameter sharing) to achieve steerability.
+Finally, Sun et al. (2025) use RL to train models to ask clarification questions and respond to
+prompt-specified user prompts for agentic tasks. In contrast, we focus on training assistants
+to maximize a reward function specified by numerical cost coefficients. In addition, we closely
+link steerability to the use of clarification, viewing steerability as a knob for controlling the
+spectrum of possible grounding strategies. In contrast, Sun et al. (2025) focus on steerability
+for stylistic personalization, which they treat as orthogonal to posing clarification questions.
+Multi-agent self-play A large body of work explores the use of multi-agent interaction as
+part of post-training (in contrast to inference-time multi-agent systems) for improving reasoning (Chen et al., 2024; Subramaniam et al., 2025) and factuality (Khan et al., 2024). Other
+lines of research (including this work) focus on self-play for improving the collaborative
+and pragmatic skills of assistants (Lin et al., 2024). Beyond ambiguity, past work has also explored self-play for improving uncertainty expression (Stengel-Eskin et al., 2024; Eisenstein
+et al., 2025), tool use (Eisenstein et al., 2025), handling of persuasion (Stengel-Eskin et al.,
+2025), personalization (Wagner et al., 2024), and general collaborative skills (Wu et al., 2025).
+Our work uses multi-agent self play as a training framework, applying it to the objective of
+learning a cost-sensitive, dynamically steerable policy for managing uncertainty.
+
+6
+
+Conclusions
+
+Prior work on uncertainty has focused on hedging and clarification in isolation, addressing
+single disambiguation strategies. We argue that choosing the right disambiguation strategy
+is contextual, and propose training models that select a cost-optimal strategy, based on
+numerical steering coefficients. We achieve this through SGP, yielding cost-accuracy tradeoffs that are responsive to steering signals while also being pareto-optimal in aggregate.
+Looking forward, a natural next step is to close the loop and infer user preferences over
+time, leading to proactive and flexible AI assistants that infer user preferences and adapt
+to them on-the-fly. We focused on three disambiguation strategies — guessing, clarifying,
+and hedging — but the range of subtle grounding actions, that human speakers use to
+signal interpretation difficulties is much wider, often including nonverbal cues. Extending
+SGP to such grounding actions is a challenge for future work. Finally, steering models
+with numerical values has applications beyond uncertainty management, in areas such as
+controlling tool use, test-time compute, and more.
+10
+
+Published as a conference paper at COLM 2026
+
+Acknowledgments
+We thank Alekh Agarwal, William Cohen, Chris Dyer, Tal Linzen, and Eric Malmi for their
+thoughtful feedback. We thank Liu Leqi for discussions on training data generation. We
+thank Dheeru Dua and Vicky Zayats for developing supporting infrastructure.
+
+References
+Reinald Kim Amplayo, Kellie Webster, Michael Collins, Dipanjan Das, and Shashi Narayan.
+Query refinement prompts for closed-book long-form QA. In Anna Rogers, Jordan
+Boyd-Graber, and Naoaki Okazaki (eds.), Proceedings of the 61st Annual Meeting of the
+Association for Computational Linguistics, pp. 7997–8012, Toronto, Canada, July 2023. Association for Computational Linguistics. doi: 10.18653/v1/2023.acl-long.444. URL
+https://aclanthology.org/2023.acl-long.444/.
+Justin Chih-Yao Chen, Swarnadeep Saha, Elias Stengel-Eskin, and Mohit Bansal. Magdi:
+structured distillation of multi-agent interaction graphs improves reasoning in smaller
+language models. In Proceedings of the 41st International Conference on Machine Learning,
+ICML’24. JMLR.org, 2024.
+Maximillian Chen, Weiyan Shi, Feifan Yan, Ryan Hou, Jingwen Zhang, Saurav Sahay, and
+Zhou Yu. Seamlessly integrating factual information and social content with persuasive
+dialogue. In Proceedings of the 2nd Conference of the Asia-Pacific Chapter of the Association
+for Computational Linguistics and the 12th International Joint Conference on Natural Language
+Processing (Volume 1: Long Papers), pp. 399–413, 2022.
+Maximillian Chen, Ruoxi Sun, Tomas Pfister, and Sercan Ö. Arık. Learning to clarify:
+Multi-turn conversations with action-based contrastive self-training. In The Thirteenth
+International Conference on Learning Representations, 2025. URL https://openreview.net/
+pdf?id=SIE6VFps9x.
+Jeremy Cole, Michael Zhang, Daniel Gillick, Julian Eisenschlos, Bhuwan Dhingra, and
+Jacob Eisenstein. Selectively answering ambiguous questions. In Houda Bouamor,
+Juan Pino, and Kalika Bali (eds.), Proceedings of the 2023 Conference on Empirical Methods
+in Natural Language Processing, pp. 530–543, Singapore, December 2023. Association
+for Computational Linguistics. doi: 10.18653/v1/2023.emnlp-main.35. URL https:
+//aclanthology.org/2023.emnlp-main.35/.
+Yang Deng, Wenqiang Lei, Wenxuan Zhang, Wai Lam, and Tat-Seng Chua. PACIFIC:
+Towards proactive conversational question answering over tabular and textual data in
+finance. In Yoav Goldberg, Zornitsa Kozareva, and Yue Zhang (eds.), Proceedings of the 2022
+Conference on Empirical Methods in Natural Language Processing, pp. 6970–6984, Abu Dhabi,
+United Arab Emirates, December 2022. Association for Computational Linguistics. doi:
+10.18653/v1/2022.emnlp-main.469. URL https://aclanthology.org/2022.emnlp-main.
+469/.
+Kaustubh D. Dhole. Resolving intent ambiguities by retrieving discriminative clarifying questions. ArXiv, abs/2008.07559, 2020. URL https://api.semanticscholar.org/
+CorpusID:221150323.
+Yijiang River Dong, Tiancheng Hu, Zheng Hui, Caiqi Zhang, Ivan Vulić, Andreea Bobu, and
+Nigel Collier. Value of information: A framework for human–agent communication. In
+Maria Liakata, Viviane P. Moreira, Jiajun Zhang, and David Jurgens (eds.), Proceedings
+of the 64th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long
+Papers), pp. 42879–42896, San Diego, California, United States, July 2026. Association for
+Computational Linguistics. ISBN 979-8-89176-390-6. doi: 10.18653/v1/2026.acl-long.1987.
+URL https://aclanthology.org/2026.acl-long.1987/.
+Jacob Eisenstein, Reza Aghajani, Adam Fisch, Dheeru Dua, Fantine Huot, Mirella Lapata,
+Vicky Zayats, and Jonathan Berant. Don’t lie to your friends: Learning what you know
+from collaborative self-play. In Second Conference on Language Modeling, 2025. URL
+https://openreview.net/forum?id=2vDJiGUfhV.
+11
+
+Published as a conference paper at COLM 2026
+
+Google. Introducing gemini 2.0: our new ai model for the agentic era, 2024a. URL https://
+blog.google/technology/google-deepmind/google-gemini-ai-update-december-2024/
+#ceo-message.
+Google. Gemma 2: Improving open language models at a practical size, 2024b. URL
+https://arxiv.org/abs/2408.00118.
+Google.
+Gemini 2.5: Our most intelligent ai model, 2025a.
+URL https:
+//blog.google/innovation-and-ai/models-and-research/google-deepmind/
+gemini-model-thinking-updates-march-2025/.
+Google. A new era of intelligence with gemini 3, 2025b. URL https://blog.google/
+products-and-platforms/products/gemini/gemini-3/.
+Herbert Paul Grice. Logic and conversation. Syntax and semantics, 3:43–58, 1975.
+Caglar Gulcehre, Tom Le Paine, Srivatsan Srinivasan, Ksenia Konyushkova, Lotte Weerts,
+Abhishek Sharma, Aditya Siddhant, Alex Ahern, Miaosen Wang, Chenjie Gu, et al.
+Reinforced self-training (ReST) for language modeling. arXiv preprint arXiv:2308.08998,
+2023.
+Eduard Hovy. Some pragmatic decision criteria in generation. In Natural language generation:
+New results in Artificial Intelligence, psychology and linguistics, pp. 3–17. Springer, 1987.
+Eduard Hovy. Two types of planning in language generation. In 26th Annual Meeting of the
+Association for Computational Linguistics, pp. 179–186, 1988.
+Yeonjun In, Sungchul Kim, Ryan A. Rossi, Mehrab Tanjim, Tong Yu, Ritwik Sinha, and
+Chanyoung Park. Diversify-verify-adapt: Efficient and robust retrieval-augmented
+ambiguous question answering. In Luis Chiruzzo, Alan Ritter, and Lu Wang (eds.),
+Proceedings of the 2025 Conference of the Nations of the Americas Chapter of the Association for Computational Linguistics: Human Language Technologies (Volume 1: Long Papers), pp. 1212–1233, Albuquerque, New Mexico, April 2025. Association for Computational Linguistics. ISBN 979-8-89176-189-6. doi: 10.18653/v1/2025.naacl-long.56. URL
+https://aclanthology.org/2025.naacl-long.56/.
+Nitish Shirish Keskar, Bryan McCann, Lav Varshney, Caiming Xiong, and Richard Socher.
+CTRL - A Conditional Transformer Language Model for Controllable Generation. arXiv
+preprint arXiv:1909.05858, 2019.
+Akbir Khan, John Hughes, Dan Valentine, Laura Ruis, Kshitij Sachan, Ansh Radhakrishnan,
+Edward Grefenstette, Samuel R. Bowman, Tim Rocktäschel, and Ethan Perez. Debating
+with more persuasive llms leads to more truthful answers. In ICML, 2024. URL https:
+//openreview.net/forum?id=iLCZtl7FTa.
+Gangwoo Kim, Sungdong Kim, Byeongguk Jeon, Joonsuk Park, and Jaewoo Kang. Tree of
+clarifications: Answering ambiguous questions with retrieval-augmented large language
+models. In Houda Bouamor, Juan Pino, and Kalika Bali (eds.), Proceedings of the 2023
+Conference on Empirical Methods in Natural Language Processing, pp. 996–1009, Singapore,
+December 2023. Association for Computational Linguistics. doi: 10.18653/v1/2023.
+emnlp-main.63. URL https://aclanthology.org/2023.emnlp-main.63/.
+Hyuhng Joon Kim, Youna Kim, Cheonbok Park, Junyeob Kim, Choonghyun Park, Kang Min
+Yoo, Sang-goo Lee, and Taeuk Kim. Aligning language models to explicitly handle
+ambiguity. In Yaser Al-Onaizan, Mohit Bansal, and Yun-Nung Chen (eds.), Proceedings
+of the 2024 Conference on Empirical Methods in Natural Language Processing, pp. 1989–2007,
+Miami, Florida, USA, November 2024. Association for Computational Linguistics. doi:
+10.18653/v1/2024.emnlp-main.119. URL https://aclanthology.org/2024.emnlp-main.
+119/.
+Lorenz Kuhn, Yarin Gal, and Sebastian Farquhar. CLAM: Selective clarification for
+ambiguous questions with generative language models. 2022. URL https://api.
+semanticscholar.org/CorpusID:257038525.
+12
+
+Published as a conference paper at COLM 2026
+
+Tom Kwiatkowski, Jennimaria Palomaki, Olivia Redfield, Michael Collins, Ankur Parikh,
+Chris Alberti, Danielle Epstein, Illia Polosukhin, Jacob Devlin, Kenton Lee, Kristina
+Toutanova, Llion Jones, Matthew Kelcey, Ming-Wei Chang, Andrew M. Dai, Jakob Uszkoreit, Quoc Le, and Slav Petrov. Natural questions: A benchmark for question answering
+research. Transactions of the Association for Computational Linguistics, 7:452–466, 2019. doi:
+10.1162/tacl a 00276. URL https://aclanthology.org/Q19-1026/.
+Jessy Lin, Nicholas Tomlin, Jacob Andreas, and Jason Eisner. Decision-oriented dialogue
+for human-ai collaboration. Transactions of the Association for Computational Linguistics, 12:
+892–911, 2024.
+Sewon Min, Julian Michael, Hannaneh Hajishirzi, and Luke Zettlemoyer. AmbigQA:
+Answering ambiguous open-domain questions. In Bonnie Webber, Trevor Cohn, Yulan
+He, and Yang Liu (eds.), Proceedings of the 2020 Conference on Empirical Methods in Natural
+Language Processing (EMNLP), pp. 5783–5797, Online, November 2020. Association for
+Computational Linguistics. doi: 10.18653/v1/2020.emnlp-main.466. URL https://
+aclanthology.org/2020.emnlp-main.466/.
+Pranav Rajpurkar, Jian Zhang, Konstantin Lopyrev, and Percy Liang. SQuAD: 100,000+
+questions for machine comprehension of text. In Jian Su, Kevin Duh, and Xavier Carreras
+(eds.), Proceedings of the 2016 Conference on Empirical Methods in Natural Language Processing,
+pp. 2383–2392, Austin, Texas, November 2016. Association for Computational Linguistics.
+doi: 10.18653/v1/D16-1264. URL https://aclanthology.org/D16-1264/.
+Allen Z. Ren, Anushri Dixit, Alexandra Bodrova, Sumeet Singh, Stephen Tu, Noah Brown,
+Peng Xu, Leila Takayama, Fei Xia, Jake Varley, Zhenjia Xu, Dorsa Sadigh, Andy Zeng, and
+Anirudha Majumdar. Robots that ask for help: Uncertainty alignment for large language
+model planners. In Proceedings of the Conference on Robot Learning (CoRL), 2023.
+Omar Shaikh, Kristina Gligoric, Ashna Khetan, Matthias Gerstgrasser, Diyi Yang, and Dan
+Jurafsky. Grounding gaps in language model generations. In Kevin Duh, Helena Gomez,
+and Steven Bethard (eds.), Proceedings of the 2024 Conference of the North American Chapter of
+the Association for Computational Linguistics: Human Language Technologies (Volume 1: Long
+Papers), pp. 6279–6296, Mexico City, Mexico, June 2024. Association for Computational
+Linguistics. doi: 10.18653/v1/2024.naacl-long.348. URL https://aclanthology.org/
+2024.naacl-long.348/.
+Taylor Sorensen, Benjamin Newman, Jared Moore, Chan Young Park, Jillian Fisher, Niloofar
+Mireshghallah, Liwei Jiang, and Yejin Choi. Spectrum tuning: Post-training for distributional coverage and in-context steerability. In The Fourteenth International Conference on
+Learning Representations, 2026. URL https://openreview.net/forum?id=ulvp7cbZeU.
+Ivan Stelmakh, Yi Luan, Bhuwan Dhingra, and Ming-Wei Chang. ASQA: Factoid questions meet long-form answers. In Yoav Goldberg, Zornitsa Kozareva, and Yue Zhang
+(eds.), Proceedings of the 2022 Conference on Empirical Methods in Natural Language Processing, pp. 8273–8288, Abu Dhabi, United Arab Emirates, December 2022. Association for Computational Linguistics. doi: 10.18653/v1/2022.emnlp-main.566. URL
+https://aclanthology.org/2022.emnlp-main.566/.
+Elias Stengel-Eskin, Peter Hase, and Mohit Bansal. LACIE: Listener-aware finetuning for
+calibration in large language models. In The Thirty-eighth Annual Conference on Neural Information Processing Systems, 2024. URL https://openreview.net/forum?id=RnvgYd9RAh.
+Elias Stengel-Eskin, Peter Hase, and Mohit Bansal. Teaching models to balance resisting and accepting persuasion. In Luis Chiruzzo, Alan Ritter, and Lu Wang (eds.),
+Proceedings of the 2025 Conference of the Nations of the Americas Chapter of the Association for Computational Linguistics: Human Language Technologies (Volume 1: Long Papers),
+pp. 8108–8122, Albuquerque, New Mexico, April 2025. Association for Computational
+Linguistics. ISBN 979-8-89176-189-6. doi: 10.18653/v1/2025.naacl-long.412. URL
+https://aclanthology.org/2025.naacl-long.412/.
+13
+
+Published as a conference paper at COLM 2026
+
+Vighnesh Subramaniam, Yilun Du, Joshua B Tenenbaum, Antonio Torralba, Shuang Li, and
+Igor Mordatch. Multiagent finetuning: Self improvement with diverse reasoning chains.
+In International Conference on Learning Representations, 2025. URL https://openreview.
+net/forum?id=gjeQKFxFpZ.
+Weiwei Sun, Xuhui Zhou, Weihua Du, Xingyao Wang, Sean Welleck, Graham Neubig,
+Maarten Sap, and Yiming Yang. Training proactive and personalized LLM agents, 2025.
+URL https://arxiv.org/abs/2511.02208.
+Md Mehrab Tanjim, Yeonjun In, Xiang Chen, Victor S Bursztyn, Ryan A Rossi, Sungchul
+Kim, Guang-Jie Ren, Vaishnavi Muppala, Shun Jiang, Yongsung Kim, et al. Disambiguation in conversational question answering in the era of LLM: A survey. arXiv preprint
+arXiv:2505.12543, 2025.
+Nicolas Wagner, Dongyang Fan, and Martin Jaggi. Personalized collaborative fine-tuning
+for on-device large language models. In First Conference on Language Modeling, 2024. URL
+https://openreview.net/forum?id=bwo3GVsgOv.
+Kaiwen Wang, Rahul Kidambi, Ryan Sullivan, Alekh Agarwal, Christoph Dann, Andrea
+Michi, Marco Gelmi, Yunxuan Li, Raghav Gupta, Kumar Avinava Dubey, Alexandre Rame,
+Johan Ferret, Geoffrey Cideron, Le Hou, Hongkun Yu, Amr Ahmed, Aranyak Mehta,
+Leonard Hussenot, Olivier Bachem, and Edouard Leurent. Conditional language policy:
+A general framework for steerable multi-objective finetuning. In Yaser Al-Onaizan, Mohit
+Bansal, and Yun-Nung Chen (eds.), Findings of the Association for Computational Linguistics:
+EMNLP 2024, pp. 2153–2186, Miami, Florida, USA, November 2024. Association for
+Computational Linguistics. doi: 10.18653/v1/2024.findings-emnlp.118. URL https:
+//aclanthology.org/2024.findings-emnlp.118/.
+Shirley Wu, Michel Galley, Baolin Peng, Hao Cheng, Gavin Li, Yao Dou, Weixin Cai, James
+Zou, Jure Leskovec, and Jianfeng Gao. CollabLLM: From passive responders to active
+collaborators. In Forty-second International Conference on Machine Learning, 2025. URL
+https://openreview.net/forum?id=DmH4HHVb3y.
+Dan Zhang, Sining Zhoubian, Ziniu Hu, Yisong Yue, Yuxiao Dong, and Jie Tang. Rest-mcts:
+Llm self-training via process reward guided tree search. In Advances in Neural Information
+Processing Systems. Curran Associates, Inc., 2024.
+Michael J. Q. Zhang and Eunsol Choi. Clarify when necessary: Resolving ambiguity through
+interaction with LMs. In Luis Chiruzzo, Alan Ritter, and Lu Wang (eds.), Findings of
+the Association for Computational Linguistics: NAACL 2025, pp. 5526–5543, Albuquerque,
+New Mexico, April 2025. Association for Computational Linguistics. ISBN 979-8-89176195-7. doi: 10.18653/v1/2025.findings-naacl.306. URL https://aclanthology.org/2025.
+findings-naacl.306/.
+Michael J. Q. Zhang, W. Bradley Knox, and Eunsol Choi. Modeling future conversation
+turns to teach llms to ask clarifying questions. In The Thirteenth International Conference on
+Learning Representations, 2025. URL https://arxiv.org/abs/2410.13788.
+George Kingsley Zipf. Human behavior and the principle of least effort: An introduction to human
+ecology. Ravenio books, 1949.
+
+14
+
+Published as a conference paper at COLM 2026
+
+A
+
+LLM Disclosure
+
+We used language and image models in the following ways: (1) creating figures and
+formatting tables by generating LaTeX code; (2) generating Figures 1, 2, and 5; (3) writing
+data analysis code; (4) reviewing the paper and suggesting areas in which the writing could
+be improved.
+
+B
+
+Additional Details on the PACIFIC Dataset
+
+Figure 5 shows an illustrative example from PACIFIC, where the query is ambiguous given
+the provided table context, which is shown only to the assistant.
+
+Figure 5: The assistant has access to a private context (table in this case), which is necessary for
+determining ambiguity of the query. The user does not have access to this context.
+
+Figure 6 depicts an example of the different types of conversation phenomena that occur in
+the PACIFIC corpus. In A MBIG QA, all questions are inherently single-turn, and the source
+of whether it is ambiguous or not has to come from parametric knowledge. In contrast,
+as highlighted in the blue text of Figure 6, we can see that the source of ambiguity in the
+question “What was the Net carrying amount of long-term debt?” comes from the contextual
+knowledge — the Assistant is provided a table which contains two different possible years
+with “Net carrying amount of long-term debt.” We can also see by the text highlighted in
+red that although a single-turn question such as “How about 2018?” may be underspecified,
+the question is not ambiguous due to the multi-turn context which indicates that the user is
+still asking about “Net carrying amount of long-term debt.”
+Data
+Dec 31, 2019
+Principal
+Less
+Unamortized debt discount
+Unamortized debt issuance costs
+
+$212,000
+
+Net carrying amount
+Less: current portion of long-term debt
+Long-term debt, non-current portion
+
+206,909
+
+-1,328
+-3,763
+
+$206,909
+
+User: What was the Net
+carrying amount of long-term
+debt?
+
+Dec 31, 2018 Assistant: What year are you
+asking about?
+$262,000
+User: 2019
+Assistant: 206,909 thousand
+-1,630
+-4,613 User: How about 2018?
+Assistant: 255,757 thousand
+255,757
+User: In which year was that
+amount less than 210,000
+$255,757 thousands?
+Assistant: 2019
+
+Figure 6: Conversational phenomena in PACIFIC. Blue text: ambiguity occurs due to contextual
+grounding on the input table. Red text: single-turn underspecification does not imply ambiguity given
+multi-turn context.
+
+15
+
+Published as a conference paper at COLM 2026
+
+C
+
+Examples for Improved Clarification Questions
+
+Figure 7 and Figure 8 show examples from PACIFIC and A MBIG QA where SGP learns to
+issue a good clarification question, which leads to a more accurate answer.
+Context: ...[Table and initial conversation omitted for brevity]...
+Query: In which year was Transition costs and project assets less than 100 million?
+Intent: In which year was Transition costs and project assets under other current assets less
+than 100 million?
+Gold: 2020
+SGP
+Assistant: #CLARIFY: Which category of Transition costs and project assets ?
+User: #RESPOND: under other current assets
+Assistant: #ANSWER: 2020
+
+P ROMPTED
+Assistant: #CLARIFY: What do you mean by
+less than 100 million?
+User: #RESPOND: Under 100 million
+Assistant: #ANSWER: 2018
+
+Figure 7: A PACIFIC example where SGP asks a clarification question that leads to higher reward
+compared to the P ROMPTED baseline. Context is omitted for brevity; column names from the table
+are in bold. The table contains the column Transition costs and project assets twice: once under the
+category Other Current Assets and once under the category Other Assets. The answer is “2020” for
+the correct category, and “2018” for the wrong one.
+
+Query: When did frontier take over verizon in california?
+Intent: When did frontier officially take over of all of verizon’s wired telecom operations in
+california?
+Gold: April 1, 2016
+SGP
+Assistant: #CLARIFY: Do you mean when
+Frontier Communications acquired Verizon’s
+landline business in California, or are you
+asking about a different type of takeover?
+User: #RESPOND: Frontier Communications acquired Verizon’s landline business in California.
+Assistant: #ANSWER: April 1, 2017
+
+P ROMPTED
+Assistant: #CLARIFY: Do you mean a specific
+year or just a general timeframe (e.g., 2000s)?
+User: #RESPOND: a specific year
+Assistant: #ANSWER: 2009
+
+Figure 8: An A MBIG QA example where SGP asks a clarification question that leads to higher reward
+compared to P ROMPTED.
+
+D
+
+Ablations on the Training Procedure
+
+Our training algorithm is a slight variant of ReST (Gulcehre et al., 2023), as we describe
+in Section 2. We conduct two ablations on this training procedure. First, we check whether
+grouping of rollouts based on action sequences is necessary by ablating this part and simply
+choosing the highest-reward rollout per query without any grouping. Second, we check
+if training on observations is beneficial by training on actions only. For both ablations we
+conduct a single round of ReST.
+Table 5 and Table 6 show the results of these ablations. We observe that in almost all cases
+our approach outperforms the ablations, typically by a large margin.
+16
+
+Published as a conference paper at COLM 2026
+
+Models
+
+Ambig. Reward
+
+Ambig. F1
+
+Unambig. Reward
+
+Unambig. F1
+
+Prompted
+ReST-1
+
+11.46
+45.75
+
+55.28
+62.39
+
+42.44
+58.57
+
+69.51
+76.49
+
+No Grouping
+Action Only
+
+44.80
+33.10
+
+61.24
+50.79
+
+56.12
+42.81
+
+76.04
+62.96
+
+Table 5: Ablation results on PACIFIC, where we train for one round of ReST and compare our approach
+(ReST-1) with variants where (a) no rollout grouping is performend, and (b) we train on actions only,
+but not on observations.
+
+Models
+
+Ambig. Reward
+
+Ambig. F1
+
+Unambig. Reward
+
+Unambig. F1
+
+Prompted
+Rest-1
+
+-34.49
+2.03
+
+16.16
+17.26
+
+-15.01
+26.30
+
+33.07
+38.38
+
+No Grouping
+Action Only
+
+-11.54
+4.46
+
+18.35
+6.82
+
+9.31
+7.82
+
+37.75
+9.60
+
+Table 6: Ablation results on A MBIG QA, where we train for one round of ReST and compare our
+approach (ReST-1) with variants where (a) no rollout grouping is performend, and (b) we train on
+actions only, but not on observations.
+
+E
+
+Statistics on Rollout Filtering
+
+As explained in Section 4, when generating training data we filter rollouts with low F1 or
+when the user simulator ignores the assistant. Table 7 and Table 8 provide statistics on how
+often this filtering happen across ReST epochs. As evident, the fraction of filtered rollouts
+goes down during training.
+Training stage
+ReST-1
+ReST-2
+ReST-3
+
+F1 < threshold
+
+Simulator violation
+
+66%
+57%
+52%
+
+5%
+3%
+3%
+
+Table 7: Fraction of rollouts that is filtered across ReST epochs in A MBIG QA.
+
+Training stage
+ReST-1
+ReST-2
+ReST-3
+
+F1 < threshold
+
+Simulator violation
+
+25%
+14%
+11%
+
+4%
+3%
+3%
+
+Table 8: Fraction of rollouts that is filtered across ReST epochs in PACIFIC.
+
+F
+
+Confidence Intervals for Main Results
+
+Table 9 shows 95% confidence intervals computed with bootstrap sampling for the main
+results presented in Table 2. As can be seen, confidence intervals are narrow, illustrating the
+significance of our results.
+17
+
+Published as a conference paper at COLM 2026
+
+Ambiguous
+
+PACIFIC
+
+AmbigQA
+
+Models
+
+Unambiguous
+
+Reward
+
+F1
+
+% Clar.
+
+% MA
+
+Reward
+
+F1
+
+% Clar.
+
+% MA
+
+P ROMPTED
+P ROMPTED -COT
+
+-34.5 [-35.1, -33.9]
+-20.1 [-20.7, -19.5]
+
+16.2 [15.9, 16.4]
+16.4 [16.2, 16.7]
+
+66.8 [66.5, 67.2]
+53.9 [53.5, 54.3]
+
+63.9 [63.5, 64.3]
+50.5 [50.1, 50.9]
+
+-15.0 [-16.7, -13.2]
+-5.0 [-6.7, -3.3]
+
+33.1 [32.1, 34.0]
+29.1 [28.3, 30.0]
+
+64.8 [63.7, 65.8]
+48.3 [47.2, 49.4]
+
+58.1 [57.0, 59.2]
+49.6 [48.4, 50.7]
+
+A NSWER
+C LARIFY
+M ULTI - ANSWER (MA)
+C LARIFY- AND -MA
+A NSWER -FT
+
+1.3 [1.0, 1.7]
+-9.6 [-10.0, -9.2]
+-46.5 [-47.2, -45.8]
+-50.6 [-51.2, -50.0]
+3.6 [3.3, 4.0]
+
+14.3 [14.1, 14.6]
+16.3 [16.0, 16.6]
+15.7 [15.4, 15.9]
+16.9 [16.7, 17.2]
+16.4 [16.1, 16.7]
+
+0.0 [0.0, 0.0]
+100.0 [100.0, 100.0]
+0.0 [0.0, 0.0]
+100.0 [100.0, 100.0]
+8.7 [8.5, 9.0]
+
+0.0 [0.0, 0.0]
+0.0 [0.0, 0.0]
+100.0 [100.0, 100.0]
+100.0 [100.0, 100.0]
+10.0 [9.8, 10.2]
+
+26.7 [25.7, 27.8]
+8.8 [7.7, 10.0]
+-25.4 [-27.2, -23.6]
+-35.3 [-37.1, -33.5]
+31.0 [29.8, 32.1]
+
+35.6 [34.6, 36.5]
+31.9 [31.0, 32.7]
+33.8 [32.8, 34.7]
+32.3 [31.3, 33.2]
+39.6 [38.7, 40.6]
+
+0.0 [0.0, 0.0]
+100.0 [100.0, 100.0]
+0.0 [0.0, 0.0]
+100.0 [100.0, 100.0]
+2.3 [2.0, 2.6]
+
+0.0 [0.0, 0.0]
+0.0 [0.0, 0.0]
+100.0 [100.0, 100.0]
+100.0 [100.0, 100.0]
+4.6 [4.1, 5.1]
+
+SGP
+
+6.6 [6.3, 7.0]
+
+19.9 [19.7, 20.2]
+
+40.2 [39.8, 40.7]
+
+18.2 [17.9, 18.5]
+
+31.3 [30.2, 32.5]
+
+41.3 [40.3, 42.2]
+
+26.5 [25.5, 27.5]
+
+14.0 [13.2, 14.8]
+
+P ROMPTED
+P ROMPTED -COT
+
+11.5 [11.0, 12.0]
+33.0 [32.4, 33.6]
+
+55.3 [55.0, 55.5]
+50.0 [49.7, 50.4]
+
+18.0 [17.7, 18.2]
+16.5 [16.0, 16.9]
+
+47.2 [46.9, 47.5]
+16.2 [15.8, 16.6]
+
+42.4 [41.7, 43.2]
+52.1 [51.1, 53.0]
+
+69.5 [69.2, 69.9]
+68.4 [67.8, 69.1]
+
+4.8 [4.6, 5.0]
+4.9 [4.5, 5.3]
+
+19.1 [18.7, 19.6]
+7.2 [6.7, 7.6]
+
+A NSWER
+C LARIFY
+M ULTI - ANSWER (MA)
+C LARIFY- AND -MA
+A NSWER -FT
+
+42.4 [42.2, 42.7]
+45.5 [45.0, 46.0]
+-21.4 [-22.5, -20.3]
+-16.2 [-17.2, -15.1]
+13.6 [12.6, 14.5]
+
+52.3 [52.0, 52.5]
+62.7 [62.3, 63.1]
+54.6 [54.2, 55.0]
+56.7 [56.3, 57.0]
+57.6 [57.2, 57.9]
+
+0.0 [0.0, 0.0]
+100.0 [100.0, 100.0]
+0.0 [0.0, 0.0]
+100.0 [100.0, 100.0]
+14.3 [13.9, 14.7]
+
+0.0 [0.0, 0.0]
+0.0 [0.0, 0.0]
+100.0 [100.0, 100.0]
+100.0 [100.0, 100.0]
+44.7 [44.2, 45.3]
+
+56.9 [56.5, 57.4]
+46.9 [46.0, 47.8]
+-4.1 [-5.8, -2.3]
+-22.2 [-24.1, -20.4]
+41.8 [40.4, 43.2]
+
+71.5 [71.2, 71.9]
+68.9 [68.2, 69.5]
+63.3 [62.7, 64.0]
+57.8 [57.2, 58.5]
+72.6 [72.0, 73.1]
+
+0.0 [0.0, 0.0]
+100.0 [100.0, 100.0]
+0.0 [0.0, 0.0]
+100.0 [100.0, 100.0]
+4.7 [4.3, 5.1]
+
+0.0 [0.0, 0.0]
+0.0 [0.0, 0.0]
+100.0 [100.0, 100.0]
+100.0 [100.0, 100.0]
+24.0 [23.2, 24.9]
+
+SGP
+
+54.3 [53.9, 54.8]
+
+65.7 [65.3, 66.1]
+
+42.9 [42.3, 43.4]
+
+14.6 [14.2, 15.0]
+
+65.7 [65.0, 66.4]
+
+79.5 [79.0, 80.0]
+
+20.6 [19.9, 21.3]
+
+9.3 [8.7, 9.8]
+
+Table 9: Performance on A MBIG QA and PACIFIC development sets with 95% confidence intervals. ‘%
+Clar.’ and ‘% MA’ denote the fraction of rollouts with clarification questions and multi-answers.
+
+G
+
+Additional Empirical Results and Analysis
+
+G.1
+
+Results with Gemma 2 2B
+
+Our main results in Section 4 use Gemma 2 9B. Here, we present additional experiments
+using Gemma 2 2B. Since the parameteric knowledge of Gemma 2 2B is weak compared to
+Gemma 2 9B, we restrict our experiments to PACIFIC, which does not rely on parametric
+knowledge. In addition, we perfom only a single round of ReST. Clearly, SGP improves
+over the baselines.
+Ambiguous
+
+Models
+P ROMPTED
+P ROMPTED -COT
+SGP-R E ST-1
+
+Unambiguous
+
+Reward
+
+F1
+
+Reward
+
+F1
+
+26.27
+21.12
+43.34
+
+39.13
+34.39
+53.67
+
+37.57
+29.68
+51.89
+
+55.76
+48.26
+68.19
+
+Table 10: Performance on the PACIFIC development set for selected models.
+
+In addition, we can evaluate corpus-level steerability of Gemma 2 2B by computing the
+fraction of rollouts with clarification questions as we vary α and the fraction of rollouts with
+multi-answers as we vary β. Table 11 shows that indeed SGP behaves as expected, while
+the baselines are not steered by the cost coefficients.
+Models
+P ROMPTED
+P ROMPTED -COT
+SGP
+
+% Clarifications (α)
+
+% Multi-answers (β)
+
+0.0
+
+2.0
+
+20.0
+
+0.1
+
+0.7
+
+5.0
+
+19.77
+36.78
+35.37
+
+17.85
+36.07
+29.41
+
+17.43
+35.50
+12.23
+
+19.39
+18.89
+30.34
+
+18.70
+19.06
+24.77
+
+18.78
+18.91
+12.56
+
+Table 11: Fraction of rollouts with a clarification question and a multi-answer across different cost
+coefficient values with Gemma 2 2B. As expected, SGP reduces the fraction of clarifications as α
+increases, and reduces multi-answers as β increases, whereas baselines remain mostly static.
+
+G.2
+
+Results with Qwen 3 4B
+
+We additionally conducted experiments on a separate model family altogether — Qwen 3
+4B. A noticeable difference between Qwen 3 4B and the Gemma 2 family is that Qwen 3 is a
+thinking-enabled model. To adjust for this difference, during rollouts, we still sample from
+the policy model and evaluate the observed responses, but we include the elicited thinking
+traces in the data accumulated throughout ReST. We still observe that SGP improves over
+the baseline, with particularly large reward improvements.
+18
+
+Published as a conference paper at COLM 2026
+
+Ambiguous
+
+Models
+P ROMPTED
+SGP
+
+Unambiguous
+
+Reward
+
+F1
+
+Reward
+
+F1
+
+-265.92
+3.83
+
+27.61
+38.10
+
+-82.63
+20.01
+
+42.01
+48.44
+
+Table 12: Performance on the PACIFIC development set for SGP compare to textscPrompted.
+
+We also evaluated corpus-level steerability of Qwen 3 4B by computing the fraction of
+rollouts with clarification questions as we vary α and the fraction of rollouts with multianswers as we vary β. Table 13 shows that whereas the baseline prompted model shows
+no clear trend, SGP behaves as expected with consistent decreases in the percentage of
+clarifying questions as α increases and consistent decreases in the percentage of multianswers as β decreases.
+% Clarifications (α)
+
+Models
+P ROMPTED
+SGP
+
+% Multi-answers (β)
+
+0.0
+
+2.0
+
+20.0
+
+0.1
+
+0.7
+
+5.0
+
+3.42
+6.34
+
+3.29
+4.85
+
+3.56
+2.53
+
+15.85
+16.26
+
+15.89
+14.89
+
+16.14
+10.44
+
+Table 13: Fraction of rollouts with a clarification question and a multi-answer across different cost
+coefficient values with Qwen 3 4B. As expected, SGP reduces the fraction of clarifications as α increases,
+and reduces multi-answers as β increases, whereas baselines remain mostly static.
+
+G.3
+
+Analysis of average reward per coefficient-pair value
+
+Figure 9 shows the average reward for Prompted, Prompted-COT and SGP for all values
+of cost coefficient pairs. The average reward improves across all values and not only on
+average.
+PACIFIC
+80
+
+0
+
+60
+Average Reward
+
+20
+
+−20
+−40
+−60
+−80
+
+40
+20
+0
+
+Prompted-COT
+
+5.
+
+0)
+
+)
+
+0,
+0.
+(2
+
+)
+
+,0
+.7
+0.
+0
+(2
+
+.0
+)
+
+,0
+.1
+0.
+0
+(2
+
+.7
+)
+
+.0
+,5
+(2
+
+.1
+)
+
+.0
+,0
+
+Coefficients
+
+Coefficients
+Prompted
+
+(2
+
+.0
+)
+
+.0
+,0
+(2
+
+.7
+
+,5
+(0
+.0
+
+.1
+)
+.0
+(0
+
+(0
+.0
+,0
+
+,0
+
+5.
+
+0)
+
+7)
+
+0,
+
+0,
+
+0.
+(2
+
+0.
+
+0.
+(2
+
+0,
+0.
+(2
+
+0.
+
+1)
+
+)
+.0
+
+)
+
+,5
+
+,0
+
+.1
+
+.7
+.0
+(2
+
+.0
+(2
+
+(2
+
+.0
+
+,0
+
+.0
+
+.7
+
+,5
+.0
+(0
+
+.1
+,0
+
+,0
+.0
+(0
+
+.0
+(0
+
+)
+
+−60
+)
+
+−40
+
+−120
+)
+
+−100
+
+)
+
+−20
+
+)
+
+Average Reward
+
+AmbigQA
+
+Prompted
+
+SGP
+
+Prompted-COT
+
+SGP
+
+Figure 9: Average reward per coefficient for A MBIG QA (left) and PACIFIC (right). SGP improves
+reward uniformly across all cost coefficient values. In A MBIG QA when β is high, rewards can be
+negative due to the high cost of each generated word.
+
+G.4
+
+Action sequence distribution
+
+Figure 10 shows the action distribution for P ROMPTED, P ROMPTED -COT, and SGP for
+ambiguous and unambiguous queries in A MBIG QA (left) and PACIFIC (right). In A MBIG QA,
+the prompted model tends to overuse clarification questions and multi-answers. P ROMPTED COT has a more uniform distribution across action sequences. Finally, SGP answers directly
+more frequently, and as expected uses more clarification questions for ambiguous queries.
+In PACIFIC, P ROMPTED and P ROMPTED -COT often answer directly. This may be because the
+model infers that it can already answer successfully given the conversation history and table.
+19
+
+Published as a conference paper at COLM 2026
+
+A MBIG QA
+
+PACIFIC
+Unambiguous Queries
+
+Ambiguous Queries
+
+80
+
+89.9
+80
+37.4
+
+18.5
+
+2.1
+
+7.2
+
+3.9
+
+2
+
+15.2
+5.2
+
+10.3
+
+4.5
+5.5
+
+11.7
+9.1
+
+36.9
+
+0.9
+2.9
+
+0
+
+72.2
+
+71.9
+
+4.7
+
+7.7
+
+50
+
+48
+
+45.1
+
+46.2
+22.9
+
+26.6
+11.9
+
+9.3
+
+25.4
+21.8
+
+25.1
+
+18.6
+
+7.2
+
+11
+
+23.3
+
+23.7
+
+26.8
+
+30.2
+33
+17.1
+
+20.1
+
+20
+
+Percentage (%)
+
+64.2
+46.7
+
+48.8
+
+40
+16
+19.3
+
+Prompted
+
+Prompted
+
+RM
+F
+Q
+
+Q
+
+C
+
+Q
+
+C
+
+Q
+
+M
+F
+
+RA
+F
+
+F
+A
+
+F
+C
+Q
+
+Q
+
+SGP
+
+Prompted-COT
+
+RM
+
+M
+F
+Q
+
+Q
+
+RA
+
+A
+
+F
+
+F
+
+F
+
+F
+
+RM
+
+Q
+M
+
+Q
+C
+
+RA
+F
+Q
+C
+
+Q
+
+A
+F
+
+C
+RM
+F
+Q
+
+Q
+M
+
+F
+
+F
+Q
+C
+RA
+
+Q
+A
+F
+
+0
+C
+
+Percentage (%)
+
+60
+
+Unambiguous Queries
+
+100
+
+12
+
+Ambiguous Queries
+
+SGP
+
+Prompted-COT
+
+Figure 10: Action sequence distributions for P ROMPTED, P ROMPTED -COT, and SGP for ambiguous
+and unambiguous queries in A MBIG QA (left) and PACIFIC (right) development sets. Action sequences
+are shown using their first letter: Q: #QUERY, A: #ANSWER, C: #CLARIFY, R: #RESPOND, M: #MULTI ANS, F:
+#FINALIZE (see Table 1) In both A MBIG QA and PACIFIC we see that the fraction of direct answers
+(without clarification or multi-answer) is higher in unambiguous queries compared to ambiguous
+ones.
+
+Ambig.
+
+Unambig.
+
+AmbigQA
+
+PACIFIC
+
+F1
+
+F1
+
+Reward
+
+Reward
+
+80
+
+40
+80
+
+20
+Score
+
+0
+
+40
+
+60
+
+−20
+
+O
+
+PR
+
+T3
+ES
+
+T2
+R
+
+R
+
+ES
+
+T1
+ES
+
+R
+
+T3
+ES
+
+ES
+
+T2
+R
+
+R
+
+ES
+
+R
+
+M
+O
+
+PR
+
+R
+
+T1
+
+ED
+PT
+
+T3
+ES
+
+T2
+ES
+
+R
+
+ES
+
+R
+
+M
+
+PR
+
+O
+
+R
+
+T1
+
+ED
+PT
+
+T3
+ES
+
+T2
+ES
+
+R
+
+R
+
+ES
+
+T1
+
+ED
+PT
+M
+O
+
+0
+
+40
+
+ED
+
+−40
+
+0
+PR
+
+20
+
+PT
+
+20
+
+60
+
+M
+
+Score
+
+40
+
+Figure 11: Results on the development set across ReST epochs for both A MBIG QA and PACIFIC.
+
+However, these prompted approaches do use more direct answers for unambiguous queries
+compared to ambiguous ones, showing some understanding of ambiguity. Fine-tuning
+the model with SGP changes the distribution, which becomes more similar to A MBIG QA,
+where answering directly is the most common action sequence, but clarification questions
+are also quite common, especially when the query is ambiguous.
+
+G.5
+
+Improvements across ReST iterations
+
+Figure 11 shows the F1 and reward for ambiguous and unambiguous queries on the development sets of A MBIG QA and PACIFIC. The table shows that metrics monotonically improve
+throughout iterations. An exception is the third ReST epoch of PACIFIC, where results are
+slightly lower than the second epoch, which we attribute to some training instability. For
+A MBIG QA additional iterations might potentially further improve performance.
+
+G.6
+
+Average length of final assistant turn across baselines
+
+Figure 12 shows the same results as Figure 3, but with an additional metric, the average
+length of the final answer provided by the assistant, a quantity that goes into reward
+computation. Since the trends are very similar to the fraction of multi-answers, this was
+omitted from the main text.
+20
+
+Published as a conference paper at COLM 2026
+
+0
+
+2
+
+20
+
+A MBIG QA
+Avg. assis. len.
+
+SGP
+
+Prompted-COT
+% multi-answer
+
+% clarifications
+
+Prompted
+1
+0.8
+0.6
+0.4
+0.2
+0
+
+0.6
+0.4
+0.2
+0
+
+0.7
+β
+
+0.1
+
+α
+
+5
+
+20
+10
+0
+
+0.1
+
+0.7
+β
+
+5
+
+0.1
+
+0.7
+β
+
+5
+
+0
+
+2
+
+20
+
+Avg. assis. len.
+
+% multi-answer
+
+% clarifications
+
+PACIFIC
+1
+0.8
+0.6
+0.4
+0.2
+0
+
+0.4
+0.3
+0.2
+0.1
+0
+
+0.7
+β
+
+0.1
+
+α
+
+5
+
+20
+15
+10
+5
+0
+
+Figure 12: Fraction of rollouts with a clarification question (left), fraction of rollouts with a multianswer (middle), and average length of the final assistant answer (right) for Prompted, Prompted-COT,
+and SGP on the development sets of A MBIG QA (top) and PACIFIC (bottom) for different values of
+cost coefficients. The x-axis for α is in square-root scale and for β in logarithmic scale. In both datasets,
+SGP reduces the fraction of clarifications with higher α and reduces the fraction of multi-answers
+with higher β, as expected. P ROMPTED and P ROMPTED -COT do not exhibit this correct sensitivity to
+values of cost coefficients.
+
+H
+
+Prompt-level Steerability Metric
+
+Here, we describe the steps for computing the prompt-level steerability metric shown
+in Section 4 and Table 3. Let’s assume we are computing prompt-level steerability when
+modifying α1 → α2 (β 1 → β 2 is similar).
+1. For each query q, cost-coefficients α, β, and action sequence s, generate n rollouts.2
+2. For each query q, cost-coefficients α, β find the approximately optimal action sequence
+(or sequences) s∗ , with highest average reward across rollouts.
+3. For each β compute recall, precision, and F1 :
+(a) for each query q, find the optimal action sequences s1∗ and s2∗ for cost coefficients
+(α1 , β) and (α2 , β).
+(b) label the query with the gold label ‘+C’ if s2∗ has a clarification question but s1∗
+does not, ‘-C’, if s2∗ does not have a clarification question but s1∗ does, and ‘N’ if
+there is no change in clarification questions.
+(c) sample from the model m rollouts3 for both (α1 , β) and (α2 , β) and estimate
+the predicted action sequences smodel
+and smodel
+, by taking the action sequence
+2
+1
+that was the sampled the most. Similarly label each query q with the predicted
+labels ‘+C’, ’-C’, and ’N’ based on the change in the predicted action sequence.
+(d) Compute recall as the fraction of all examples with gold-label ‘+C’ or ’-C’ for
+which the model predicts the correct label. Compute precision as the fraction
+of all examples where the model predicted ‘+C’ or ’-C’ and the prediction is
+correct according to the gold label. Compute F1 as the harmonic average.
+4. Average recall, precision, and F1 across the values of β.
+
+I
+
+Prompts
+
+In this section we provide the prompts used in this work.
+2We use n = 64 for this analysis.
+3we use m = 256 for this analysis.
+
+21
+
+Published as a conference paper at COLM 2026
+
+I.1
+
+Filtering prompt
+
+The following prompt was used for filtering A MBIG QA questions, where we verified that
+models agree with humans on whether a certain question is ambiguous or not.
+Prompt for verifying ambiguous questions
+You are a smart AI assistant whose goal is to answer questions. Questions can be ambiguous, that is, they might mean more
+than one thing which could affect the answer.
+Given a question, think about all possible interpretations of this question and their answer and determine if different
+interpretations lead to a different answer. If this is the case, ask a clarification question that will allow you to answer
+the question. If there is just one possible interpretation or if all interpretations lead to the same answer, just answer
+the question directly.
+Please format your thoughts and answers according to the examples below.
+Example 1:
+QUESTION: Who won the election?
+THOUGHT: The question doesn’t say which election and different elections have different winners so I need to ask a
+clarification question.
+CLARIFICATION: What elections are you referring to?
+Example 2:
+QUESTION: On what year did world war 2 start?
+THOUGHT: World war 2 is a well-defined event that started in a particular year, 1939, and so I can answer directly.
+ANSWER: 1939
+QUESTION: <question>
+
+22
+
+Published as a conference paper at COLM 2026
+
+I.2
+
+Prompts used during self-play
+
+Below we provide the full prompts used during self-play. Prompts for PACIFIC are almost
+identical except they contain different in-context examples and include a context (document
+and a table).
+Prompt for AI assistant
+You are a helpful agent whose goal is to answer a question provided by another "asker" agent. Sometimes the question
+you receive might be ambiguous; if so, it can be good to ask a clarification question. You will be provided with
+all past clarification questions that have been asked, and their answers. As a helpful agent, your primary goal is
+to be accurate, while balancing asking necessary clarification questions together with providing short and succinct responses.
+You can perform one of the following three actions:
+1. ***ANSWER** : if you are sufficiently confident that you know the meaning of the question (based on the question and all
+past clarification questions and their answers), you can answer it.
+2. **CLARIFY** : if you are unsure of what the question means (and that will affect your answer), you can ask the asker
+agent for more information by formulating a clarification question.
+3. **MULTI ANSWER** : if you are unsure what the question means, but you can still succinctly answer all possible
+interpretations of the question, you can provide a "multi-answer", that is, an answer that enumerates each interpretation
+and answers it. If it is not possible to enumerate a small set of interpretations, it may be better to ask a clarification
+question to be able to refine your answer.
+Let’s define a few variables:
+‘acc‘ is your accuracy, where 0 is not accurate at all and 100 is perfectly accurate.
+‘num clar‘ is the number of clarification questions you had to ask.
+‘num words‘ is the number of words in your final ANSWER assuming you chose to **ANSWER** or **MULTI ANSWER**.
+Your goal is then to maximize your ‘reward‘ which is defined as ‘acc - ALPHA * num clar - BETA * num words‘ where ‘ALPHA‘
+and ‘BETA‘ are constants that you will be given. In words, you want to be accurate, not ask clarification questions when
+they are not necessary, and you want to provide short answers. Your behavior should change depending on the particular
+balance of ‘ALPHA‘ vs. ‘BETA‘, and your confidence. Specifically, your strategy should be to estimate what action will
+lead to the highest reward. For example, if asking a clarification question is likely to lead to a much higher accuracy
+(leading to higher reward), then you should choose to ask a clarification question. Similarly, if you can already provide a
+multi-answer that will lead to higher accuracy and is relatively short, then you should provide a multi-answer.
+**IMPORTANT NOTE**: You should only use **MULTI ANSWER** if you plan to enumerate two interpretations or more and provide
+an answer for each interpretation. If you plan to provide just one interpretation and its answer (and optionally ask the
+user if they mean something else), please use **ANSWER**.
+Here are some examples.
+Example 1:
+ALPHA : **10.0**
+BETA : **1.0**
+QUESTION : in what year did world war ii start?
+ACTION : **ANSWER** : 1939
+Example 2:
+ALPHA : **1.0**
+BETA : **10.0**
+QUESTION : in what year did the first harry potter come out?
+CLARIFICATION QUESTION : the book or the movie?
+ANSWER TO CLARIFICATION : the book.
+CLARIFICATION QUESTION : in what country?
+ANSWER TO CLARIFICATION : the uk.
+ACTION : **ANSWER** : 1997
+Example 3:
+ALPHA : **10.0**
+BETA : **0.1**
+QUESTION : in what year did the first harry potter come out?
+CLARIFICATION QUESTION : the book or the movie?
+ANSWER TO CLARIFICATION : the book.
+ACTION : **MULTI ANSWER** : The book came out in the uk in 1997 and in the us in 1998.
+Example 4:
+ALPHA : **10.0**
+BETA : **0.1**
+QUESTION : in what year did the first harry potter come out in the US?
+ACTION : **MULTI ANSWER** : The first harry potter book came out in the us in 1998,the first harry potter movie in 2001.
+Example 5:
+ALPHA : **0.1**
+BETA : **1.0**
+QUESTION : in what year did the first harry potter come out?
+CLARIFICATION QUESTION : the book or the movie?
+ANSWER TO CLARIFICATION : the book.
+ACTION : **CLARIFY** : in the uk or the us?
+ALPHA : {ALPHA VAR}
+BETA : {BETA VAR}
+QUESTION : {AMBIG QUERY VAR} {OPTIONAL CLARIFICATION QUESTIONS VAR}
+
+23
+
+Published as a conference paper at COLM 2026
+
+Prompt for AI assistant with chain-of-thought
+You are a helpful agent whose goal is to answer a question provided by another "asker" agent. Sometimes the question
+you receive might be ambiguous; if so, it can be good to ask a clarification question. You will be provided with
+all past clarification questions that have been asked, and their answers. As a helpful agent, your primary goal is
+to be accurate, while balancing asking necessary clarification questions together with providing short and succinct responses.
+You can perform one of the following three actions:
+1. ***ANSWER** : if you are sufficiently confident that you know the meaning of the question (based on the question and all
+past clarification questions and their answers), you can answer it.
+2. **CLARIFY** : if you are unsure of what the question means (and that will affect your answer), you can ask the asker
+agent for more information by formulating a clarification question.
+3. **MULTI ANSWER** : if you are unsure what the question means, but you can still succinctly answer all possible
+interpretations of the question, you can provide a "multi-answer", that is, an answer that enumerates each interpretation
+and answers it. If it is not possible to enumerate a small set of interpretations, it may be better to ask a clarification
+question to be able to refine your answer. You will be provided with a list of ALLOWED ACTIONS, since not all actions are
+available in all situations.
+Let’s define a few variables:
+‘acc‘ is your accuracy, where 0 is not accurate at all and 100 is perfectly accurate.
+‘num clar‘ is the number of clarification questions you had to ask.
+‘num words‘ is the number of words in your final ANSWER assuming you chose to **ANSWER** or **MULTI ANSWER**.
+Your goal is then to maximize your ‘reward‘ which is defined as ‘acc - ALPHA * num clar - BETA * num words‘ where ‘ALPHA‘
+and ‘BETA‘ are constants that you will be given. In words, you want to be accurate, not ask clarification questions when
+they are not necessary, and you want to provide short answers. Your behavior should change depending on the particular
+balance of ‘ALPHA‘ vs. ‘BETA‘, your confidence, and the set of ALLOWED ACTIONS. Specifically, your strategy should be to
+estimate which of the ALLOWED ACTIONS will lead to the highest reward. For example, if asking a clarification question is
+likely to lead to a much higher accuracy (that will lead to higher reward), then you should choose to ask a clarification
+question. Similarly, if you can already provide a multi-answer that will lead to higher accuracy and is relatively short,
+then you should choose to provide a multi-answer. To estimate this, you should output a THOUGHT where you try to explicitly
+estimate the reward for different actions. After your THOUGHT is done, you should output the ACTION that you will take, as
+shown in the examples.
+Here are some examples.
+Example 1:
+ALPHA : **10.0**
+BETA : **1.0**
+ALLOWED ACTIONS : {‘CLARIFY’, ‘MULTI ANSWER’, ‘ANSWER’}
+QUESTION : in what year did world war ii start?
+THOUGHT : I am confident that the answer is 1939, and thus I can answer the question correctly with one word. My reward
+will be 100.0 - 10.0 * 0 - 1.0 * 1 = 99.0. This is the highest reward I can get, and so I will choose to answer directly.
+ACTION : **ANSWER** : 1939
+Example 2:
+ALPHA : **1.0**
+BETA : **10.0**
+ALLOWED ACTIONS : {‘MULTI ANSWER’, ‘ANSWER’}
+QUESTION : in what year did the first harry potter come out?
+CLARIFICATION QUESTION : the book or the movie?
+ANSWER TO CLARIFICATION : the book.
+CLARIFICATION QUESTION : in what country?
+ANSWER TO CLARIFICATION : the uk.
+THOUGHT : Given the previous clarification questions and answers, I am confident that the answer is 1997, and thus I can
+answer the question correctly with one word. Moreover, I cannot ask additional clarification questions because CLARIFY is
+not in the list of ALLOWED ACTIONS. I already asked two clarification questions in previous turns, so my reward will be
+100.0 - 1.0 * 2 - 10.0 * 1 = 88.0. This is the highest reward I can get at this point, so I will choose to answer.
+ACTION : **ANSWER** : 1997
+Example 3:
+ALPHA : **10.0**
+BETA : **0.1**
+ALLOWED ACTIONS : {‘MULTI ANSWER’, ‘ANSWER’}
+QUESTION : in what year did the first harry potter come out?
+CLARIFICATION QUESTION : the book or the movie?
+ANSWER TO CLARIFICATION : the book.
+THOUGHT : I know that the question is about the book, however, I am not sure if the question is about the publication date
+of the book in the uk or in the us. If I guess one of the two and answer directly, I can answer in one word. My expected
+accuracy will be 50.0. Since I already asked one clarification question, my reward will be 50.0 - 10.0 * 1 - 0.1 * 1 = 39.9.
+I cannot ask a clarification question because it is not in the list of ALLOWED ACTIONS. Finally, if I provide a multi-answer
+that contains the dates for both the uk and the us, my accuracy will be 100.0, but my answer will be long; I expect around
+10 words. Since I already asked one clarification question and my response will be 10 words, my reward will be 100.0 10.0 * 1 - 0.1 * 10 = 89.0. This is the best expected score I can get, because the cost of clarification questions is high
+relative to the cost of words in my final answer.
+ACTION : **MULTI ANSWER** : The book came out in the uk in 1997 and in the us in 1998.
+Example 4:
+ALPHA : **10.0**
+BETA : **0.1**
+ALLOWED ACTIONS : {‘CLARIFY’, ‘MULTI ANSWER’, ‘ANSWER’}
+QUESTION : in what year did the first harry potter come out in the US?
+THOUGHT : I am not sure if the question is about the movie or the book? If I guess one of the two and answer directly,
+I can answer in one word. My expected accuracy will be 50.0. Since I have not asked any clarification questions yet,
+my reward will be 50.0 - 10.0 * 0 - 0.1 * 1 = 49.9. If I ask a clarification question, I will be sure of the correct
+answer, I can answer in one word, and my accuracy will be 100.0. Since I will have asked one clarification question
+in total, my reward will be 100.0 - 10.0 * 1 - 0.1 * 1 = 89.9. Finally, if I provide a multi-answer that covers both
+the movie and the book, my accuracy will be 100.0, but my answer will be long; I expect around 15 words. Since I have
+not asked any clarification questions yet, my reward will be 100.0 - 10.0 * 0 - 0.1 * 15 = 98.5. This is the best
+expected score I can get, because the cost of clarification questions is high relative to the cost of words in my final
+
+24
+
+Published as a conference paper at COLM 2026
+
+answer. ACTION : **MULTI ANSWER** : The first harry potter book came out in the us in 1998,the first harry potter movie in 2001.
+Example 5:
+ALPHA : **0.1**
+BETA : **1.0**
+ALLOWED ACTIONS : {‘CLARIFY’, ‘MULTI ANSWER’, ‘ANSWER’}
+QUESTION : in what year did the first harry potter come out?
+CLARIFICATION QUESTION : the book or the movie?
+ANSWER TO CLARIFICATION : the book.
+THOUGHT : Given the previous clarification questions and answers, I am still not sure if the question is about publication
+date in the uk or the us. If I guess one of the two and answer directly, I can answer in one word. My expected accuracy will
+be 50.0, and my reward will be 50.0 - 0.1 * 1 - 1.0 * 1 = 48.9. If I ask a clarification question my accuracy will be 100.0,
+and my reward will be 100.0 - 0.1 * 2 - 1.0 * 1 = 98.8. If I provide a multi-answer, my accuracy will be 100.0, but my answer
+will be long, around 15 words, so my reward will be 100.0 - 0.1 * 1 - 1.0 * 15 = 84.9. So because the cost of clarification
+questions is low relative to the cost of words in my final answer, I will choose to ask a clarification question.
+ACTION : **CLARIFY** : in the uk or the us?
+ALPHA : {ALPHA VAR}
+BETA : {BETA VAR}
+ALLOWED ACTIONS : {ALLOWED ACTIONS VAR}
+QUESTION : {AMBIG QUERY VAR} OPTIONAL CLARIFICATION QUESTIONS VAR}
+
+Prompt for user simulator answering a clarification question
+You are a helpful agent whose goal is to clarify a potentially ambiguous question. You have access to a question in two
+forms. One is a potentially ambiguous form and the other is an unambiguous form of that question.
+You will also be given a clarification question issued by a different agent that only has access to the ambiguous question
+and is trying to clarify it. Your only job is to answer the clarification question to the best of your ability. It is
+possible that the ambiguous and unambiguous questions are identical.
+You are not allowed to directly reveal information about the unambiguous question. You are only allowed to answer the
+clarification question based on the unambiguous version of the question. If the clarification question is not answerable
+from the unambiguous question, you should answer that you do not know the answer. Again, **NEVER** just repeat the
+unambiguous question as an answer. In addition, **NEVER** clarify the question using information that is not inferred from
+the unambiguous question. You will get a prize if you manage to complete the task successfully. Always respond in a single
+line with the format
+’ACTION : **ANSWER CLARIFICATION** : <the answer to the clarification question>’
+Example 1, where the unambiguous question contains information about the answer:
+Potentially ambiguous question: When did the first harry potter come out?
+Unambiguous question: When did the first harry potter book come out in the uk?
+Clarification question: Did you mean the book or the movie?
+ACTION : **ANSWER CLARIFICATION** : the book.
+Example 2, where the unambiguous question contains information about the answer:
+Potentially ambiguous question: When did the first harry potter come out?
+Unambiguous question: When did the first harry potter book come out in the uk?
+Clarification question: In which country?
+ACTION : **ANSWER CLARIFICATION** : the uk.
+Example 3, where the unambiguous question does not contain information about the answer:
+Potentially ambiguous question: When did the first harry potter come out?
+Unambiguous question: When did the first harry potter book come out in the uk?
+Clarification question: did you mean hard cover or soft cover?
+ACTION : **ANSWER CLARIFICATION** : I do not know.
+Now for the real data:
+Potentially ambiguous question: AMBIG QUERY VAR
+Unambiguous question: UNAMBIG QUERY VAR
+Clarification question: CLARIF QUERY VAR
+
+25
+
+Published as a conference paper at COLM 2026
+
+Prompt for user simulator returning a final answer
+You are a helpful agent whose goal is to take a question and an answer to the question that is provided to you by another
+agent, and use it to phrase a final answer to the question.
+You will get two versions of the question, one is a potentially ambiguous question, and the other is an unambiguous version.
+You will also get the answer provided by the other agent. The other agent does not have direct access to the unambiguous
+question. Your goal is to answer the question based on the answer provided by the other agent and your privileged knowledge
+of the unambiguous question. DO NOT answer the question based on your own knowledge. Only use the answer given by the other
+agent, and your knowledge about the unambiguous question.
+You will use the action **ANSWER** to pass along the answer.
+Importantly, the other agent can give an answer in one of two forms:
+1. Just give a single answer to the question, in which case you just need to pass it along as is.
+2. The other agent might give you a ‘multi-answer‘ where it specifies possible interpretations to the question and the
+answer to each interpretations. Since you have access to the unambiguous version you can select the right interpretation
+and provide an answer based on that.
+Always respond in a single line with the format ’ACTION : **ANSWER** : <the answer to the question>’
+Example 1, where the answer given by the other agent is wrong and is passed as is:
+Potentially ambiguous question: in what year did world war i start?
+Unambiguous question: in what year did world war i start? FRIEND’s ANSWER: 1939
+ACTION : **ANSWER** : 1939
+Example 2, where the answer given by the other agent is correct and is passed as is:
+Potentially ambiguous question: in what year did world war ii start?
+Unambiguous question: in what year did world war ii start?
+FRIEND’s ANSWER: 1939
+ACTION : **ANSWER** : 1939
+Example 3, where the other agent provides a multi-answer:
+Potentially ambiguous question: in what year did the first harry potter come out?
+Unambiguous question: in what year did the first harry potter book come out in the uk?
+FRIEND’s ANSWER: If you mean when the book harry potter came out in the uk, then the answer is 1997, if you mean when did
+the first harry potter book come out in the us, the answer is 1998. If you mean when did the first harry potter movie come
+out, then the answer is 2001.
+ACTION : **ANSWER** : 1997
+Example 4, where the other agent provides an answer:
+Potentially ambiguous question: in what year did the first harry potter come out?
+Unambiguous question: in what year did the first harry potter book come out in the uk?
+FRIEND’s ANSWER: I think you mean when the movie came out, and that was in 2001.
+ACTION : **ANSWER** : 2001.
+Now for the real data:
+Potentially ambiguous question: AMBIG QUERY VAR
+Unambiguous question: UNAMBIG QUERY VAR
+
+26
+
+

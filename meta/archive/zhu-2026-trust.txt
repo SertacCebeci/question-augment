@@ -1,0 +1,4767 @@
+Trust or Abstain? A Self-Aware RAG Approach
+
+Xi Zhu 1
+
+arXiv:2605.18792v1 [cs.IR] 11 May 2026
+
+1
+
+Ziqi Wang 1 Kai Mei 1 Wujiang Xu 1 Minghao Guo 1
+Bangji Yang 2 Jiajun Fan 2 Dimitris N. Metaxas 1
+
+Rutgers University
+
+2
+
+University of Illinois Urbana-Champaign
+
+Abstract
+Retrieval-augmented generation (RAG) improves large language models (LLMs)
+by incorporating external evidence, but it also introduces knowledge conflicts when
+retrieved contextual knowledge (CK) and parametric knowledge (PK) disagree
+or are both unreliable. Existing approaches mainly coordinate which source to
+use, without explicitly asking whether each answer path is correct. We argue that
+faithful RAG requires LLM self-awareness, namely the ability to recognize the
+limits of its own knowledge and reasoning. To ground this problem, we construct a
+model-specific, ground-truth-aligned knowledge-conflict benchmark by evaluating
+LLM backbones on PK-only and CK-conditioned answer paths over approximately
+69K query-context instances per backbone, drawn from five conflict-QA datasets.
+We then introduce SABER, a Self-Aware Belief Estimator for RAG that requires
+no LLM fine-tuning. SABER combines a self-prior with PK-side and CK-side
+conditional reasoning representations from multi-trace inference, then estimates
+reliability beliefs with two lightweight predictors to drive a 4-cell decision over
+trust PK, trust CK, trust either, or abstain. Across four LLM backbones, SABER
+improves end-to-end accuracy and conflict-specific faithfulness over ten inferencetime and fine-tuning baselines, with the largest gains on conflict-heavy datasets.
+Under abstention, SABER’s risk-coverage curve Pareto-dominates every promptbased abstainer, providing a tunable balance between coverage and answer risk.
+Our code is available at https://github.com/xizhu1022/SABER.
+
+1
+
+Introduction
+
+Retrieval-augmented generation (RAG) [16, 27] is a widely-used inference-time strategy that supplies
+a large language model (LLM) with external evidence, complementing its parametric knowledge (PK)
+with retrieved contextual knowledge (CK). However, PK and CK are not always consistent, as they
+may agree, disagree, or both fail. This gives rise to a knowledge-conflict problem in which the LLM
+must decide how to use PK and retrieved CK when generating a faithful answer [18, 30, 29, 19, 31].
+Existing approaches follow three broad trajectories on how to choose between or fuse PK and
+CK. Source-arbitration methods decide which source should be trusted [29, 22, 12]. In parallel,
+context-quality methods determine whether the CK should be filtered or repaired [34, 36, 7, 14].
+Retrieval-regulation methods consider whether and how CK should be invoked [1, 13, 23, 32, 10].
+Despite these efforts, they do not explicitly and independently ask whether the PK-based answer path
+and the CK-based answer path would each produce a correct answer with respect to the ground truth.
+This omission creates a conceptual blind spot that excludes the both-unreliable outcome from the
+decision space, pushing the model toward a confidently incorrect and unsupported response rather
+than an honest abstention, i.e., I don’t know, when neither answer path is reliable.
+An open-book exam analogy in Figure 1 illustrates how humans make such decisions. Before the
+exam, a student has a rough sense of their own knowledge, including what they know and how certain
+Email: xi.zhu@rutgers.edu
+Preprint.
+
+(1) Before the exam
+
+Selective-Prediction Exam Rule
+General
+concept
+s
+
+Specific
+physical
+constant
+
++1 correct
+
+-1 wrong
+
+(4) Belief Decision + Selective Answer
+
+(3) Self-Reason and Self-Evaluate
+
+(2) During the Exam
+
+PK path (from memory)
+PK reasoning:
+knowledge gap
+
+0 abstain
+I don't recall the
+exact value...
+
+Answer
+(unknown)
+
+Low reliability
+Exam Question
+
+Reference Book
+
+What is the
+boiling point of
+mercury (Hg)?
+
+Boiling point of
+mercury: 10 °C.
+
+CK path (from reference book)
+
+Mercury is liquid at room
+temperature (-20°C);
+a boiling point of 10°C is
+impossible.
+
+10 °C
+
+Both
+
+Neither
+
+CK Only
+
+I don't know
+(abstain)
+
+Final answer
+
+be
+ay g
+M ron
+w
+
+I'm comfortable with concepts.
+But I rarely remember
+specific physical constants.
+
+PK Only
+
+10 °C
+
+CK reasoning:
+contradicts
+physics
+
+Under +1/-1/0 scoring, abstaining (0)
+is strictly better than a wrong guess (-1)
+when both paths fail the check.
+
+Low reliability
+
+Figure 1: A student facing a +1 / −1 / 0 exam rule, where a correct answer earns +1, a wrong one
+−1, and abstention earns 0. The student’s memory corresponds to PK, while the potentially flawed
+reference book corresponds to retrieved CK. The example highlights two forms of self-awareness,
+namely knowledge-boundary awareness, which reveals when internal knowledge is insufficient, and
+reasoning-reliability awareness, which detects when retrieved context leads to an implausible answer.
+When both paths are unreliable, abstention is preferable to an unsupported prediction.
+they are. This corresponds to knowledge-boundary awareness. During the exam, the student may
+answer from memory or consult a reference book to form an answer. Since the reference book may
+be flawed, the student must judge which answer path, if any, is likely to lead to a correct answer. This
+corresponds to reasoning-reliability awareness. If only one path seems reliable, the student should
+follow that path. If both seem reliable, either can work. If neither does, the honest response is to
+admit uncertainty or ignorance rather than make an unsupported guess.
+In the RAG setting, the LLM acts as the student, PK as memory, and CK as the reference book.
+Without such self-assessment, two failures recur. Confident hallucination, a knowledge-boundary
+failure, arises when the model overestimates PK, dismisses corrective evidence, and hallucinates
+from memory [19, 29, 5]. Context over-reliance, a reasoning-reliability failure, arises when the
+model over-relies on CK and adopts misleading retrieved context even when its own knowledge and
+reasoning could expose the error [30, 12]. We trace both vulnerabilities to a self-awareness gap,
+where the model lacks a knowledge-boundary self-prior that reflects what it actually knows [33] and a
+reasoning-reliability self-evaluation that assesses whether its reasoning under a given source is sound.
+Faithful RAG therefore requires more than source coordination. It requires the model to recognize the
+boundaries and reliability of its own knowledge and reasoning before committing to a final answer.
+To close this gap, we first construct a ground-truth-aligned knowledge-conflict benchmark by running
+four LLM backbones under PK-only and CK-conditioned answer paths, recording the observed
+correctness against the ground truth for approximately 69K query-context instances per backbone,
+drawn from five conflict-QA datasets. Then, we introduce Self-Aware Belief Estimator for RAG
+(SABER). Mirroring the open-book exam mechanism above, SABER decomposes self-awareness
+into a knowledge-boundary self-prior and a reasoning-reliability self-evaluation. It first extracts the
+self-prior representation from the query-only hidden state to capture the model’s inherent knowledge
+boundary. SABER then generates and self-evaluates multiple reasoning traces under PK and CK,
+aggregating them through multi-trace test-time inference into robust PK- and CK-conditional states.
+Two lightweight predictors combine the self-prior with the PK-side and CK-side states to estimate
+their reliability beliefs, which drive a 4-cell decision over PK, CK, both, or neither. SABER then
+commits to the more reliable PK or CK answer, or honestly abstains when neither path is reliable.
+Our contributions are summarized as follows.
+• Problem Formulation. We formulate knowledge conflict as a ground-truth-aligned decision
+problem. Instead of choosing between PK and CK, we independently evaluate the correctness of the
+PK-only and CK-conditioned paths, yielding a 4-cell decision space over PK, CK, both, and neither.
+• Benchmark Construction. We construct a benchmark with approximately 69K query–context
+instances per backbone across four LLM backbones and five conflict-QA datasets. Each instance
+records observed PK-path and CK-path correctness against the ground truth. We further introduce
+three conflict-specific faithfulness metrics to support controlled evaluation of path-level reliability
+and reveal failure modes hidden by overall accuracy.
+• Method. We introduce SABER, a lightweight self-aware belief reasoning framework requiring
+no LLM fine-tuning. SABER combines a self-prior with PK- and CK-side conditional reasoning
+representations from multi-trace inference, then estimates reliability beliefs to drive a 4-cell decision
+over trust PK, trust CK, trust both, or abstain.
+2
+
+• Empirical Findings. SABER improves end-to-end accuracy and conflict-specific faithfulness over
+ten inference-time and trained baselines, with the largest gains on conflict-heavy datasets. Under
+abstention, SABER’s risk-coverage curve Pareto-dominates every prompt-based abstainer, providing
+a tunable threshold that lets practitioners trade coverage against answer risk without retraining.
+
+2
+
+A Knowledge-Conflict Benchmark for LLM Self-Awareness
+
+LLM self-awareness cannot be studied without observing actual model behavior. Therefore, we construct a model-specific benchmark in which each instance is labeled by observed answer correctness.
+For every backbone, we record answers produced under a closed-book PK path and an open-book
+CK path, then label each path by whether it matches the ground truth.
+Datasets and LLM Backbones. We construct the query-context pool from five conflict-QA datasets,
+including ConFiQA [3] with three sub-tasks (QA, MR, MC), ConflictQA-PopQA [30] (abbr. ConflictQA), ConflictBank [24], and the TriviaQA and Natural Questions (NQ) subsets prepared by
+Huang et al. [12]. We evaluate four LLM backbones on this pool, namely Qwen-2.5-3B-Instruct,
+Qwen-2.5-7B-Instruct, Llama-3.1-8B-Instruct, and Llama-3.2-3B-Instruct, yielding approximately
+69K ground-truth-aligned PK/CK instances per backbone. Processing details, per-dataset split sizes,
+the 4-cell distribution, and the labeling prompts are in Appendices B and D.1.
+Grounding PK and CK in Answer Correctness. For each LLM backbone M and instance (q, c, a⋆ ),
+consisting of a query, a retrieved context, and a ground-truth answer or alias set, we generate two
+candidate answers. The PK-only answer is produced from the query alone, while the CK-conditioned
+answer is produced from both the query and the retrieved context.
+aPK = M(promptPK (q)),
+aCK = M(promptCK (q, c)).
+(1)
+We then evaluate both answers against the ground truth using an alias-aware matching function.
+yPK = match(aPK , a⋆ ),
+yCK = match(aCK , a⋆ ).
+(2)
+The pair (yPK , yCK ) partitions the benchmark into four reliability cells Cab , where a, b ∈ {0, 1}
+indicate the correctness of the PK and CK paths. These cells correspond to both paths correct (C11 ),
+only PK correct (C10 ), only CK correct (C01 ), and neither path correct (C00 ). These cells provide a
+ground-truth basis for studying whether the model can form accurate beliefs about its self-awareness.
+Evaluation Metrics. Beyond end-to-end answer accuracy, we use three conflict-specific faithfulness metrics. CF (Context Faithfulness) measures accuracy on instances where only the CKconditioned answer is correct, testing whether a method follows reliable CK when PK is misleading.
+KF (Knowledge Faithfulness) measures accuracy on instances where only the PK-only answer
+is correct, testing whether a method preserves correct PK when CK is misleading. MFS (Macro
+Faithfulness Score) averages CF and KF, rewarding methods that handle both conflict directions. The
+selective-prediction setting in §4.2 additionally evaluates calibrated refusals using Score, Coverage,
+Risk on answered (RC ), and abstention F1 (F1 ). Formal definitions appear in Appendix A.3.
+
+3
+
+Method: SABER
+
+SABER is a lightweight two-stage belief estimator that operates at test time without fine-tuning the
+backbone LLM. Building on the benchmark, it extracts a self-prior representation from the frozen
+LLM (§3.1) and per-side conditional reasoning representations (§3.2), then feeds them into two
+lightweight predictors that estimate reliability beliefs over PK-side and CK-side correctness. These
+beliefs drive an internal 4-cell decision that produces SABER’s final response, including explicit
+abstention when neither side is reliable (§3.3). The full pipeline is illustrated in Figure 2.
+3.1
+
+Self-Prior Representation
+
+The self-prior representation captures the LLM backbone’s internal confidence before any retrieved
+context or reasoning trace is introduced. It reflects the model’s self-assessed competence on the current
+query, signaling whether later reasoning should rely on PK or seek support from CK. Following prior
+work that reads implicit beliefs from frozen-LLM hidden states [15, 4, 2], we extract this signal by
+feeding the query alone into the frozen LLM M and reading the hidden state at a fixed prior layer ℓp ,
+
+(ℓ )
+hq = ϕMp promptprior (q) .
+(3)
+3
+
+Conditional Reasoning Representation
+
+Self-Prior
+Query
+
+Query
+Layer 𝑙"
+
+PK
+Reasoning
+Prompt
+
+…
+
+%&,)
+ℎ!"#$
+
+'(
+ℎ#$%&
+
+%&,&
+ℎ!"#$
+
+Mean-Pool
+
+…
+
+Self-eval
+Prompt
+
+Trace K
+
+LLM
+Layer 𝑙"
+
+Layer 𝑙!
+
+CK
+Reasoning
+Prompt
+
+*&,(
+ℎ!"#$
+
+Trace 2
+
+LLM
+
+…
+
+CK-Conditioned
+
+𝑧 )(
+
+𝑧 '(
+
+CK-side
+Predictor
+
+PK-side
+Predictor
+
+𝑃#$
+
+0.5
+
+Trace K
+
+LLM
+
+4-Cell
+Decision
+
+*&,)
+ℎ!"#$
+
+)(
+ℎ#$%&
+
+*&,&
+ℎ!"#$
+
+Mean-Pool
+
+…
+
+Self-eval
+Prompt
+
+≥𝜏
+𝑃%$
+<𝜏
+
+0.5
+
+𝑃%$
+1
+
+0
+
+Trace 1
+
+'(
+ℎ#$%&
+
+PK-Conditioned
+ℎ%&,(
+!"#$
+
+Trace 2
+
+LLM
+
+ℎ"
+
+)(
+ℎ#$%&
+
+Trace 1
+
+Self-Prior
+Prompt
+
+LLM
+
+Belief Estimation
+
+1
+
+0
+
+𝑃#$
+
+<𝜏
+
+≥𝜏
+
+Trust PK
+
+Trust Both
+
+Abstain
+
+Trust CK
+
+ℎ"
+Self-prior
+
+Query
+
+Answer
+
+Retrieved context
+
+Figure 2: SABER pipeline. The frozen LLM produces a query-only self-prior and per-side conditional
+reasoning representations via multi-trace generation and self-evaluation. Two lightweight predictors
+output CK- and PK-beliefs that drive the 4-cell decision with optional abstention.
+The self-prior prompt is in Appendix D.2). This mirrors a student’s pre-exam sense of whether
+memory can answer the question or a potentially flawed reference book is needed, shaping whether
+the book is treated as auxiliary evidence or relied on more heavily. The self-prior therefore conditions
+both PK and CK predictions without determining either one.
+3.2
+
+Conditional Reasoning Representation
+
+The conditional reasoning representation captures how the model reasons under each source assumption and how it self-evaluates that reasoning after generation. Unlike the self-prior, which reflects
+pre-reasoning confidence, this representation provides a post-reasoning self-awareness signal. We
+obtain this signal through a generate-then-evaluate procedure, where the model first generates a
+source-conditioned reasoning trace and then runs a self-evaluation forward pass over that trace.
+Source-conditional Reasoning Trace. For each source, we let the same LLM sample chain-ofthought reasoning traces and answers under the corresponding knowledge condition. On the PK side,
+the model answers in a closed-book setting from its own knowledge. On the CK side, the model
+anchors its reasoning only on the retrieved context. We denote the k-th sampled trace under source
+s ∈ {PK, CK} by ts,k ; the resulting trace provides a side-specific view of how the model walks
+toward an answer, revealing which knowledge it draws on and how it integrates or resists the available
+evidence. The exact reasoning prompts are given in Appendix D.3 and Appendix D.4.
+Self-evaluation Forward Pass. To estimate confidence in the generated reasoning trace, we ask the
+LLM to self-evaluate it in a second forward pass, indicating whether the trace is likely to support a
+correct answer under the assumed source [15, 20]. Specifically, we read per-token hidden states at a
+fixed conditional layer ℓc over the reasoning span [21] and mean-pool them into a per-trace vector,
+
+(s,k)
+(ℓ )
+hcond = ϕ̄Mc promptself-eval (q, c, ts,k ) ,
+
+(4)
+
+(ℓ )
+
+where ts,k denotes the k-th reasoning trace under source s, and ϕ̄Mc (·) averages hidden states at
+layer ℓc over the reasoning span. This self-evaluation may reflect the trace’s coherence, internal
+consistency, and use of available knowledge, which together shape the LLM’s confidence in the trace.
+It mirrors how students, when uncertain about memory or a flawed reference book, reason through a
+problem and judge whether the answer is plausible. The self-evaluation prompt is in Appendix D.5.
+Multi-trace Test-time Inference. A single trace is one sample from a stochastic generator and
+may run into a dead end, hallucinate a step, or react to surface features of c. Following multi-trace
+test-time inference [26], we sample K independent reasoning traces per side and mean-pool their
+per-trace vectors into a robust per-side conditional state,
+(s)
+(s,1)
+(s,2)
+(s,K) 
+hcond = MeanPool hcond , hcond , . . . , hcond ,
+
+4
+
+s ∈ {PK, CK}.
+
+(5)
+
+3.3
+
+Belief Estimation and Decision with Abstention
+
+This section turns SABER’s two self-awareness signals into an actionable belief decision. We first
+combine the self-prior and conditional reasoning representations into joint representations for the
+PK and CK sides. We then estimate separate PK-side and CK-side reliability beliefs using two
+lightweight predictors and map them into a 4-cell decision space with explicit abstention.
+Joint Representation. For each side s, we combine the self-prior with the corresponding conditional
+reasoning representation to form a side-specific joint representation,
+(s) 
+z (s) = ffuse hq , hcond ,
+
+s ∈ {PK, CK},
+
+(6)
+
+where ffuse concatenates the self-prior with the side-specific reasoning representation. Notably, the
+same self-prior plays complementary roles across the two sides. For PK, it reflects the model’s initial
+confidence in its own parametric knowledge. For CK, it reflects how much the model may need to
+lean on external evidence. Combined with the corresponding source-conditioned reasoning state, this
+prior yields a side-specific joint representation used to estimate the reliability of each answer path.
+Per-side Correctness Predictor. Because SABER’s self-awareness signals are anchored in groundtruth answer correctness, the PK-side and CK-side paths give rise to two independent correctness
+questions whose outcomes span four possible combinations. Along this line, we employ two
+lightweight correctness predictors, one for each side, each taking the concatenation of the two joint
+representations as input and outputting a scalar reliability belief,
+
+p̂s = fpred,s [z (PK) ; z (CK) ] , s ∈ {PK, CK}.
+(7)
+The shared input allows each predictor to draw on evidence from both sides, such as using CKside unreliability to sharpen the PK-side judgment, while the independent outputs preserve all four
+reliability outcomes and feed directly into the 4-cell decision space. The two predictors are trained
+independently with binary cross-entropy on yPK and yCK from our constructed ground-truth-aligned
+benchmark. The LLM backbone remains frozen throughout. Only the parameters of predictors are
+updated, adding few trainable parameters and negligible inference cost. Architecture and training
+hyperparameters of the two predictors, together with the multi-trace generation parameters used to
+produce the conditional reasoning traces, are reported in Appendix A.
+4-Cell Decision with Abstention. Thresholding the two reliability beliefs (p̂PK , p̂CK ) at τ assigns
+each instance to one of the four cells defined in §2. For the three reliable cells, SABER returns
+the PK answer on C10 , the CK answer on C01 , or the candidate with the higher reliability belief
+on C11 , all without invoking the LLM again. The C00 cell, where neither side is reliable, supports
+two deployment modes. The default mode falls back to the higher-belief candidate, preserving
+full coverage for low-stakes settings, while the abstention mode returns I don’t know, suiting highstakes settings where unsupported answers are costly. The threshold τ controls how often SABER
+commits to an answer and, under abstention, trades coverage against answer risk. As shown in §4.2,
+sweeping τ produces a continuous risk-coverage curve that existing methods cannot match, making τ
+a deployment-relevant control knob rather than a purely internal hyperparameter.
+
+4
+
+Experiments
+
+We run experiments on the five datasets in our ground-truth-aligned benchmark from §2. We
+compare against ten methods from four categories. (1) Vanilla baselines. Vanilla LLM (ClosedBook) and Vanilla RAG. (2) Verbal self-evaluation. Internal-Eval, Context-Eval, Implicit-SCR,
+and Explicit-SCR [12], which prompt the LLM to judge source reliability or its own confidence. (3)
+Probability- and probe-based heuristics. TPC [29] which compares the token-level probability,
+and TACS-LR [34] that uses a linear probe for context filtering. (4) Trained methods. CR-DPO
+[12], a DPO-style extension of Explicit-SCR, and R-Tuning [35], which fine-tunes the LLM with
+uncertain instances. Descriptions are provided in Appendix C. We evaluate all methods using the
+benchmark metrics from §2, namely end-to-end answer accuracy (Acc), Context Faithfulness (CF),
+Knowledge Faithfulness (KF), and Macro Faithfulness Score (MFS). Selective-answering metrics
+(Score, Coverage, RC , abstention F1 ) are introduced in §4.2 and used only there to study abstention
+decisions. Computational cost is reported in Appendix F.
+5
+
+Table 1: Main results on Llama-3.1-8B and Llama-3.2-3B. We report Acc (↑), CF, KF, and MFS (↑),
+all as percentages, on five datasets. ConFiQA combines its three sub-tasks (QA / MR / MC) into a
+single dataset due to the limited space (breakdown is in Appendix E.1). Since CF or KF alone can be
+saturated by always trusting one source, MFS is the primary conflict-faithfulness metric. For Acc and
+MFS, the best is highlighted with a blue background and the second-best with a green background.
+Method
+
+Acc↑
+
+ConFiQA
+ConflictQA
+ConflictBank
+CF
+KF MFS↑ Acc↑ CF
+KF MFS↑ Acc↑ CF
+KF MFS↑ Acc↑
+
+TriviaQA
+CF
+KF MFS↑ Acc↑
+
+CF
+
+NQ
+KF
+
+MFS↑
+
+Llama-3.1-8B
+Closed-Book
+Vanilla RAG
+
+31.2 7.9 100.0 53.9
+57.0 100.0 17.5 58.7
+
+22.7 3.0 100.0 51.5
+46.8 100.0 7.5 53.7
+
+23.5 0.6 100.0 50.3
+69.4 100.0 1.7 50.9
+
+80.8 16.7 100.0 58.3
+57.1 100.0 4.2 52.1
+
+41.3 6.3 100.0 53.2
+46.7 100.0 4.1 52.0
+
+Internal-Eval
+Context-Eval
+Implicit-SCR
+Explicit-SCR
+
+45.4
+39.2
+53.7
+40.0
+
+55.3
+34.5
+78.6
+45.6
+
+62.8
+85.7
+43.9
+75.3
+
+59.0
+60.1
+61.3
+60.5
+
+31.9
+31.7
+47.3
+40.9
+
+37.6
+36.6
+89.5
+73.9
+
+72.1
+79.6
+36.1
+52.4
+
+54.9
+58.1
+62.8
+63.1
+
+61.2
+58.9
+29.3
+22.2
+
+78.1
+61.6
+39.6
+23.8
+
+38.1
+90.3
+5.1
+28.7
+
+58.1
+76.0
+22.4
+26.3
+
+78.8
+75.4
+65.0
+63.3
+
+50.0
+62.5
+91.7
+83.3
+
+85.9
+73.2
+36.6
+56.3
+
+68.0
+67.9
+64.1
+69.8
+
+49.6
+45.9
+50.4
+46.3
+
+66.7
+52.4
+88.9
+73.0
+
+59.2
+67.3
+32.7
+53.1
+
+62.9
+59.9
+60.8
+63.0
+
+TPC
+TACS-LR
+
+55.1
+43.6
+
+86.6
+59.7
+
+60.5
+30.5
+
+73.6
+45.1
+
+47.0
+42.9
+
+92.7
+90.1
+
+34.7
+12.2
+
+63.7
+51.2
+
+69.6
+33.8
+
+92.3
+46.8
+
+36.4
+3.7
+
+64.3
+25.2
+
+68.8
+53.8
+
+91.7
+87.5
+
+40.8
+5.6
+
+66.3
+46.6
+
+51.7
+47.5
+
+93.7
+92.1
+
+36.7
+20.4
+
+65.2
+56.2
+
+R-Tuning
+CR-DPO
+
+20.7
+47.9
+
+9.1
+60.1
+
+32.7
+77.1
+
+20.9
+68.6
+
+10.5
+53.8
+
+2.6
+94.9
+
+28.3
+81.6
+
+15.5
+88.2
+
+2.3
+52.3
+
+0.0
+50.3
+
+8.4
+85.8
+
+4.2
+68.0
+
+72.5
+84.2
+
+28.6
+95.8
+
+82.1
+88.7
+
+55.4
+92.3
+
+33.9
+61.2
+
+18.8
+79.4
+
+58.8
+73.5
+
+38.8
+76.4
+
+SABER (Ours) 58.4
+
+92.8
+
+72.2
+
+82.5
+
+53.5
+
+97.0
+
+85.0
+
+91.0
+
+80.2
+
+97.0
+
+88.1
+
+92.5
+
+85.2
+
+66.7
+
+98.6
+
+82.6
+
+52.1
+
+73.0
+
+65.3
+
+69.2
+
+Llama-3.2-3B
+Closed-Book
+Vanilla RAG
+
+23.9 5.5 100.0 52.7
+50.3 100.0 9.7 54.8
+
+13.9 0.8 100.0 50.4
+42.0 100.0 5.4 52.7
+
+16.8 0.3 100.0 50.1
+63.5 100.0 0.8 50.4
+
+73.3 3.2 100.0 51.6
+52.1 100.0 7.1 53.6
+
+36.4 7.6 100.0 53.8
+43.8 100.0 4.7 52.3
+
+Internal-Eval
+Context-Eval
+Implicit-SCR
+Explicit-SCR
+
+41.1
+46.6
+41.7
+28.1
+
+62.3
+77.4
+68.3
+32.8
+
+60.7
+63.7
+24.9
+70.4
+
+61.5
+70.6
+46.6
+51.6
+
+37.2
+29.5
+41.3
+27.6
+
+74.1
+51.9
+88.1
+54.6
+
+65.0
+68.1
+20.3
+68.5
+
+69.5
+60.0
+54.2
+61.6
+
+59.6
+49.9
+64.7
+27.8
+
+81.0
+61.5
+93.3
+33.2
+
+62.1
+82.3
+7.3
+50.0
+
+71.5
+71.9
+50.3
+41.6
+
+72.1
+57.6
+48.2
+52.1
+
+78.6
+26.7
+11.5
+42.9
+
+69.9
+53.7
+47.7
+52.1
+
+43.8
+39.9
+43.0
+30.6
+
+56.1
+57.6
+91.0
+60.6
+
+67.4
+44.2
+11.4
+27.9
+
+61.8
+50.9
+51.2
+44.3
+
+TPC
+TACS-LR
+
+50.7
+38.6
+
+90.6
+63.7
+
+56.9
+20.4
+
+73.7
+42.0
+
+41.4
+36.7
+
+92.4
+82.9
+
+37.8
+6.2
+
+65.1
+44.6
+
+57.0
+60.7
+
+85.0
+90.0
+
+24.2
+4.0
+
+54.6
+47.0
+
+67.9 100.0 48.8
+51.4 90.3 21.4
+
+74.4
+55.9
+
+47.5
+40.9
+
+93.9
+84.8
+
+30.2
+13.6
+
+62.1
+49.2
+
+R-Tuning
+CR-DPO
+
+3.0
+34.6
+
+0.9
+41.7
+
+7.0
+81.5
+
+4.0
+61.6
+
+0.4
+39.8
+
+0.0
+79.2
+
+0.9
+85.6
+
+0.5
+82.4
+
+0.2
+39.2
+
+0.0
+44.5
+
+0.8
+69.4
+
+0.4
+56.9
+
+42.5
+63.7
+
+15.1
+67.7
+
+55.9
+76.2
+
+35.5
+72.0
+
+23.1
+40.1
+
+10.9
+56.1
+
+45.7
+55.8
+
+28.3
+55.9
+
+SABER (Ours) 54.1
+
+94.8
+
+79.4
+
+87.1
+
+46.9
+
+97.9
+
+82.9
+
+90.4
+
+70.9
+
+97.6
+
+82.3
+
+89.9
+
+77.9
+
+77.4
+
+85.7
+
+81.6
+
+54.1
+
+90.9
+
+69.8
+
+80.3
+
+4.1
+
+61.3
+80.6
+83.9
+61.3
+
+Main Results
+
+Tables 1 and 2 report Acc, CF, KF, and MFS on five datasets across four LLM backbones from Llama
+and Qwen. We highlight four observations.
+(1) SABER consistently outperforms all inference-time baselines on Acc and MFS. Across
+the 20 backbone-dataset settings, SABER achieves the strongest Acc in all but one setting and the
+strongest MFS in every setting. Its gains over the best inference-time baseline reach +10.6% Acc
+on (Llama-3.1-8B, ConflictBank) and +27.3% MFS on (Llama-3.1-8B, ConflictQA). On average,
+SABER leads by +3.4% in Acc and +15.4% in MFS.
+(2) SABER is competitive with fully fine-tuned CR-DPO while keeping the LLM frozen. CRDPO’s gains concentrate on larger LLMs, whereas SABER matches or exceeds CR-DPO in most
+settings and strictly dominates it on both 3B models across all datasets and metrics. This shows that
+SABER’s hidden-state reliability signal can rival full DPO fine-tuning, especially on smaller models.
+(3) SABER’s MFS gains substantially exceed its Acc gains, indicating that its main advantage
+is conflict resolution rather than raw accuracy. Several baselines can obtain reasonable Acc by
+always favoring CK, as in Vanilla-RAG, or PK, as in Closed-Book, but they sacrifice either KF or
+CF. SABER maintains high CF and KF simultaneously, deciding when to trust context and when to
+preserve internal knowledge. Its only inference-time Acc loss on (Qwen-2.5-7B, ConFiQA) is offset
+by a +15.7% MFS gain, illustrating the bias-vs-symmetry trade-off of prompt-only methods.
+(4) Acc gains are larger on Llama than on Qwen, while MFS gains remain uniform across
+families. SABER’s mean Acc lead is +4.9% on Llama and +2.0% on Qwen, while MFS gains stay
+between +14% and +16% on both families. The narrower Qwen Acc margin reflects the stronger
+Implicit-SCR baseline on Qwen rather than model scale, and the uniform MFS gain shows that
+SABER’s conflict-resolution advantage transfers across families even when the Acc gap narrows.
+4.2
+
+Selective Answering with Abstention
+
+We further evaluate whether SABER and prompt-based baselines can refuse to answer when neither
+PK nor CK is reliable. For a fair comparison, we augment each prompt-based baseline with an
+explicit instruction to respond I don’t know as an option. SABER abstains when both probe scores fall
+6
+
+Table 2: Main results on Qwen-2.5-7B and Qwen-2.5-3B. Same setup as Table 1.
+Method
+
+Acc↑
+
+ConFiQA
+ConflictQA
+ConflictBank
+CF
+KF MFS↑ Acc↑ CF
+KF MFS↑ Acc↑ CF
+KF MFS↑ Acc↑
+
+TriviaQA
+CF
+KF MFS↑ Acc↑
+
+CF
+
+NQ
+KF
+
+MFS↑
+
+Qwen-2.5-7B
+Closed-Book
+Vanilla RAG
+
+30.1 4.1 100.0 52.0
+52.1 100.0 6.7 53.4
+
+14.6 1.3 100.0 50.6
+44.5 100.0 7.0 53.5
+
+18.8 1.1 100.0 50.6
+66.5 100.0 0.0 50.0
+
+56.7 9.4 100.0 54.7
+52.9 100.0 3.9 52.0
+
+26.4 2.6 100.0 51.3
+47.5 100.0 0.0 50.0
+
+Internal-Eval
+Context-Eval
+Implicit-SCR
+Explicit-SCR
+
+51.6
+44.8
+59.5
+40.6
+
+83.3
+53.6
+90.4
+57.3
+
+55.6
+89.2
+59.9
+44.7
+
+69.5
+71.4
+75.2
+51.0
+
+38.2
+31.0
+47.8
+34.8
+
+72.1
+55.9
+94.5
+70.7
+
+63.0
+50.0
+36.0
+30.0
+
+67.6
+53.0
+65.3
+50.3
+
+59.4
+60.7
+68.6
+58.6
+
+78.9
+82.5
+93.1
+81.2
+
+43.4
+42.7
+13.3
+28.7
+
+61.1
+62.6
+53.2
+54.9
+
+65.4 71.7 84.3
+59.2 79.2 51.0
+67.1 100.0 52.9
+50.0 62.3 51.0
+
+78.0
+65.1
+76.5
+56.6
+
+43.4
+44.6
+52.5
+41.3
+
+70.5
+75.6
+93.6
+65.4
+
+58.1
+48.4
+35.5
+54.8
+
+64.3
+62.0
+64.5
+60.1
+
+TPC
+TACS-LR
+
+52.8
+45.4
+
+92.7
+67.1
+
+43.9
+35.1
+
+68.3
+51.1
+
+44.3
+41.9
+
+96.0
+84.0
+
+27.0
+13.0
+
+61.5
+48.5
+
+66.4
+65.8
+
+94.7
+90.7
+
+25.2
+13.3
+
+59.9
+52.0
+
+58.8
+55.4
+
+92.5
+94.3
+
+33.3
+19.6
+
+62.9
+57.0
+
+50.0
+47.9
+
+97.4
+89.7
+
+29.0
+19.4
+
+63.2
+54.5
+
+R-Tuning
+CR-DPO
+
+38.0
+51.6
+
+18.3
+83.3
+
+78.2
+57.9
+
+48.3
+70.6
+
+15.9
+47.8
+
+4.4
+98.5
+
+70.9
+61.0
+
+37.7
+79.8
+
+18.5
+62.8
+
+5.1
+85.7
+
+55.0
+41.3
+
+30.1
+63.5
+
+67.5
+72.5
+
+34.7
+92.5
+
+93.1
+86.3
+
+63.9
+89.4
+
+33.5
+49.6
+
+16.7
+78.2
+
+81.8
+71.0
+
+49.3
+74.6
+
+SABER (Ours) 57.0
+
+91.8
+
+90.1
+
+90.9
+
+49.6
+
+99.3
+
+90.0
+
+94.6
+
+73.5
+
+96.4
+
+75.5
+
+86.0
+
+71.2
+
+86.8
+
+88.2
+
+87.5
+
+53.7
+
+92.3
+
+71.0
+
+81.6
+
+Qwen-2.5-3B
+Closed-Book
+Vanilla RAG
+
+24.8 4.7 100.0 52.3
+52.7 100.0 9.1 54.5
+
+9.1
+1.1 100.0 50.6
+42.1 100.0 7.0 53.5
+
+13.6 0.3 100.0 50.1
+65.9 100.0 0.9 50.4
+
+47.5 8.2 100.0 54.1
+51.7 100.0 8.7 54.3
+
+27.3 2.7 100.0 51.4
+45.5 100.0 6.5 53.2
+
+Internal-Eval
+Context-Eval
+Implicit-SCR
+Explicit-SCR
+
+45.8
+30.8
+53.2
+39.8
+
+74.1
+22.0
+86.3
+69.2
+
+40.2
+96.7
+33.0
+35.5
+
+57.1
+59.4
+59.6
+52.4
+
+30.6
+12.3
+43.4
+31.8
+
+64.9
+13.8
+92.9
+78.4
+
+57.9
+70.2
+19.3
+14.0
+
+61.4
+42.0
+56.1
+46.2
+
+41.8
+39.6
+66.4
+47.1
+
+53.5
+47.3
+93.2
+72.1
+
+51.7
+70.7
+5.2
+7.8
+
+52.6
+59.0
+49.2
+39.9
+
+63.3
+49.6
+53.3
+39.6
+
+86.9
+21.3
+93.4
+83.6
+
+78.3
+95.7
+26.1
+17.4
+
+82.6
+58.5
+59.8
+50.5
+
+41.7
+31.0
+48.3
+31.4
+
+58.1
+29.7
+95.9
+71.6
+
+83.9
+71.0
+19.4
+9.7
+
+71.0
+50.3
+57.7
+40.6
+
+TPC
+TACS-LR
+
+52.4
+45.9
+
+93.3
+81.3
+
+39.1
+17.4
+
+66.2
+49.4
+
+41.6
+39.5
+
+96.7
+90.9
+
+40.4
+3.5
+
+68.5
+47.2
+
+63.0
+62.3
+
+90.9
+89.0
+
+24.1
+0.0
+
+57.5
+44.5
+
+55.4
+50.4
+
+95.1
+90.2
+
+30.4
+15.2
+
+62.8
+52.7
+
+46.7
+45.0
+
+98.6
+94.6
+
+25.8
+12.9
+
+62.2
+53.7
+
+R-Tuning
+CR-DPO
+
+41.8
+48.3
+
+31.2
+85.4
+
+76.0
+34.8
+
+53.6
+60.1
+
+10.4
+38.6
+
+6.4
+92.2
+
+46.2
+31.6
+
+26.3
+61.9
+
+8.6
+48.8
+
+1.9
+69.1
+
+40.9
+32.8
+
+21.4
+50.9
+
+56.2
+54.2
+
+35.5
+83.6
+
+80.8
+60.9
+
+58.2
+72.2
+
+28.1
+36.0
+
+11.7
+73.0
+
+78.8
+22.6
+
+45.3
+47.8
+
+SABER (Ours) 55.9
+
+94.0
+
+76.4
+
+85.2
+
+44.0
+
+98.0
+
+75.4
+
+86.7
+
+71.6
+
+97.6
+
+73.3
+
+85.4
+
+63.7
+
+85.2
+
+87.0
+
+86.1
+
+50.0
+
+97.3
+
+45.2
+
+71.2
+
+below a shared threshold τ = 0.5, the natural midpoint of the [0, 1] belief scale. This default is used
+across all backbones, with no per-backbone tuning. Following the selective-prediction framework of
+Geifman and El-Yaniv [8], each answered instance receives +1 if correct and −1 if wrong, while
+abstentions receive 0. We report four metrics in percent. Score aggregates this utility and measures the
+answer-abstain trade-off. Coverage (Cov) is the fraction of questions answered. Risk on answered
+(RC ) is the error rate among answered questions. Abstention F1 (F1 ) measures how well abstentions
+match the gold abstention set, namely instances where neither source is correct.
+Main comparison. Table 3 reports results across four backbones. We highlight three observations.
+(1) SABER achieves the best abstention-aware performance on every backbone. It obtains the
+highest Score, lowest Risk on answered, and highest abstention F1, with Implicit-SCR consistently
+second on Score. The stable gap suggests that prompt-based abstention can only elicit what the model
+verbalizes about uncertainty, while reliable refusal requires access to internal belief states.
+(2) SABER’s Score advantage grows as backbone size decreases. The gain over the strongest
+baseline increases from +18.5% on Llama-3.1-8B to +24.6% on Qwen-2.5-7B, +27.1% on Llama3.2-3B, and +32.0% on Qwen-2.5-3B. This pattern suggests that prompt-based I don’t know behavior
+depends on instruction-following capacity and degrades on smaller models, whereas SABER’s
+hidden-state-based decision avoids this dependency.
+(3) Judgement-style baselines fail structurally under abstention. Context-Eval, Explicit-SCR,
+and Internal-Eval answer most questions and achieve much lower abstention F1 than SABER. Their
+verbal-judgement prompts still frame the task as choosing whether to trust PK or CK, leaving no
+natural role for abstention. Reliable refusal therefore requires belief estimation, not an instruction.
+Risk-coverage analysis. The main comparison uses one operating point. To test whether SABER’s
+advantage is robust, we sweep its abstention threshold τ over [0.05, 0.95] in steps of 0.05 and trace the
+full risk-coverage curve. Each baseline yields a single Coverage-Risk point determined by its prompt
+template. Figure 3 visualizes this comparison, and full sweep numbers are reported in Appendix E.2.
+(4) SABER’s risk-coverage curve Pareto-dominates every prompt-based baseline on all four
+backbones. At Implicit-SCR’s Coverage, SABER reduces Risk on answered by 19% to 53% relative
+across the four backbones, with the largest reduction on Llama-3.1-8B. Prompt-based methods commit
+to one operating point, whereas SABER’s continuous threshold τ provides a deployment-relevant
+knob for trading willingness to answer against answer risk without retraining.
+(5) SABER’s Score remains stable over τ ∈ [0.40, 0.55]. The per-backbone fluctuation is at most
+0.009, showing that the default τ = 0.5 does not require per-backbone recalibration. This stability
+7
+
+Table 3: Selective answering results across four backbones over the whole benchmark (τ = 0.5).
+We report Score (↑), Coverage (Cov), Risk on answered (RC , ↓), and abstention F1 (F1 , ↑), all as
+percentages. For Score, RC , and F1 , within each backbone block the best value is highlighted with a
+blue background and the second-best with a green background; Coverage receives no markings.
+Method
+
+Llama-3.1-8B
+Qwen-2.5-7B
+Llama-3.2-3B
+Qwen-2.5-3B
+Score↑ Cov RC ↓ F1 ↑ Score↑ Cov RC ↓ F1 ↑ Score↑ Cov RC ↓ F1 ↑ Score↑ Cov RC ↓ F1 ↑
+
+Closed-Book
+Vanilla RAG
+
+−3.0
+19.8
+
+50.6 53.0 50.1
+72.9 36.4 49.6
+
+1.7
+11.1
+
+23.2 46.4 58.0
+87.1 43.6 27.9
+
+Internal-Eval
+Context-Eval
+Implicit-SCR
+Explicit-SCR
+
+0.5
+−7.6
+25.4
+−8.7
+
+89.2
+99.2
+59.8
+97.0
+
+0.8
+−1.8
+18.8
+11.4
+
+45.3
+77.6
+81.6
+43.7
+
+TACS-LR
+
+13.6
+
+64.4 39.5 49.9
+
+8.7
+
+68.3 43.7 42.8
+
+5.4
+
+68.7
+
+46.1 47.5
+
+5.1
+
+71.2 46.4 40.6
+
+SABER (Ours)
+
+43.9
+
+65.0 16.2 72.5
+
+43.4
+
+58.5 12.9 78.0
+
+38.5
+
+58.6
+
+17.2 76.8
+
+39.6
+
+60.0 17.0 76.6
+
+49.7 20.0
+53.8 3.3
+28.8 56.2
+54.5 8.3
+
+Risk on answered
+
+Llama-3.1-8B (Oracle 0.61)
+
+49.2
+51.1
+38.5
+36.9
+
+−5.0
+8.2
+
+37.0
+79.4
+
+−0.3
+6.2
+
+56.8 57.3
+44.9 43.1
+
+6.3 52.4 62.3
+79.5 46.1 35.8
+
+50.4 −11.9 72.5 58.2 38.3 −6.8 68.4 54.9 40.8
+27.3 −34.6 100.0 67.3 0.1 −33.5 99.3 66.9 1.9
+39.8 11.4
+70.7 41.9 51.0
+7.6
+73.0 44.8 42.0
+55.4 −34.2 97.6 67.5 4.9 −5.9 43.2 56.8 54.5
+
+Qwen-2.5-7B (Oracle 0.59)
+
+Llama-3.2-3B (Oracle 0.56)
+
+Qwen-2.5-3B (Oracle 0.54)
+
+0.6
+0.4
+0.2
+0.0
+0.0
+
+0.2
+
+0.4
+
+0.6
+
+0.8
+
+1.0
+
+Coverage
+CB
+Vanilla-RAG
+
+0.0
+
+0.2
+
+0.4
+
+0.6
+
+Coverage
+Internal-Eval
+Context-Eval
+
+0.8
+
+1.0
+
+0.0
+
+Implicit-SCR
+Explicit-SCR
+
+0.2
+
+0.4
+
+0.6
+
+0.8
+
+Coverage
+TACS-LR
+SABER ( -sweep)
+
+1.0
+
+0.0
+
+0.2
+
+0.4
+
+0.6
+
+Coverage
+SABER =0.5
+Oracle
+
+0.8
+
+1.0
+
+Figure 3: Risk-coverage curves. Each panel corresponds to one LLM backbone, and lower-left
+indicates better performance. SABER (red curve) sweeps its abstention threshold τ over [0.05, 0.95],
+while each prompt-based baseline yields a single (Coverage, Risk on answered) point. The dark red
+star marks SABER at the default τ = 0.5, and the gold star marks the Oracle.
+is consistent with the view that confident instances concentrate away from the decision boundary,
+making Score insensitive to small threshold changes.
+4.3
+
+Ablation Studies
+
+To assess which components drive SABER’s performance, we compare the full method with four
+reduced variants: a prior-only baseline (Prior, using only the query-side hidden state), two conditionalonly variants (C1 and C3 , using one or three mean-pooled traces), and a single-trace joint variant
+(P +C1 ). Our full method, SABER, is the joint variant with K=3, equivalent to P +C3 . Figure 4
+reports Acc and MFS, with SABER bars outlined in red. We highlight three observations.
+(1) Each component contributes to SABER’s overall performance. Every reduced variant trails
+SABER in both Acc and MFS on all four backbones. Among the single-component removals,
+dropping multi-trace averaging from the joint configuration causes the largest MFS reduction, up to
+3.2% on Qwen-2.5-3B. This indicates that the components capture complementary signals.
+(2) The source-conditional reasoning representation drives most of the gain. Conditional-only
+variants C1 and C3 improve over the prior-only baseline by an average of +2.8% Acc and +13.4%
+MFS across the four backbones. This indicates that the post-reasoning, source-conditioned state
+carries most reliability information, while the query-only prior is useful but insufficient alone.
+(3) Multi-trace averaging benefits all backbones, with the largest gain on the smallest model.
+For example, on Qwen-2.5-3B, increasing K from 1 to 3 in the joint variant, from P +C1 to SABER,
+raises MFS from 84.1% to 87.3% (+3.2%), the largest gain across the four backbones. This suggests
+that mean-pooling multiple conditional traces reduces noise from single samples, and the noise
+reduction matters most when the underlying LLM backbone is smaller.
+4.4
+
+Layer Sensitivity
+
+We examine SABER’s sensitivity to the prior layer ℓp and conditional layer ℓc . Figure 5 sweeps both
+layers at stride 2 over the two Llama backbones. The best layer pair lies within a broad high-accuracy
+plateau in the mid-to-late depth range. For both Llama-3.1-8B and Llama-3.2-3B, the 90th-percentile
+region covers more than one third of the grid, and the selected layer pair (red square) lies inside this
+region rather than at an isolated peak. The selected layer pair on each Llama backbone falls between
+8
+
+61.1
+
+60.7
+
+60
+
+.3
+85.961
+
+82.4
+
+57.8
+
+MFS (right)
+
+Qwen-2.5-7B
+
+62.0
+84.8
+
+88.9
+
+86.4
+
+58.6
+
+58.3
+
+55
+
+89.6
+
+88.5
+
+88.5
+58.4
+
+76.1
+54.9
+
+69.1
+
+50
+
+r
+Prio
+
+86.7
+
+84.6
+
+58.9
+
+74.0
+
+55.0
+
+SABER (ours)
+
+Llama-3.2-3B
+
+55.2
+
+55.5
+
+85.8
+
+C 3 P+C 1 ABER
+S
+
+r
+Prio
+
+C1
+
+r
+Prio
+
+C 3 P+C 1 ABER
+S
+
+87.1
+
+56.1
+53.5
+
+52.7
+
+C1
+
+Qwen-2.5-3B
+
+87.9
+
+r
+Prio
+
+C 3 P+C 1 ABER
+S
+
+C1
+
+55.2
+72.3
+
+C1
+
+86.3
+
+56.2
+
+56.0
+
+95
+84.1
+
+56.1
+
+C 3 P+C 1 ABER
+S
+
+87.3
+
+85
+
+MFS (%)
+
+65
+
+Acc (%)
+
+Acc (left)
+
+Llama-3.1-8B
+
+75
+65
+
+prior layer p
+
+Figure 4: Ablation study with four variants across four LLMs over the whole benchmark. Each panel
+reports answer accuracy and MFS. The SABER bars are outlined in red.
+28
+24
+20
+16
+12
+8
+4
+0
+
+Llama-3.1-8B
+
+62.0
+61.5
+
+(10,12) 62.4
+
+61.0
+60.5
+
+0
+
+4
+
+8
+
+12
+
+16
+
+20
+
+24
+
+conditional layer c
+
+28
+
+Llama-3.2-3B
+
+24
+20
+16
+12
+8
+4
+0
+
+56.0
+55.5
+
+(12,12) 56.2
+
+55.0
+54.5
+
+0
+
+4
+
+8
+
+12
+
+16
+
+20
+
+conditional layer c
+
+24
+
+54.0
+
+Figure 5: Layer sensitivity of SABER on the Llama family. Each panel shows end-to-end answer
+accuracy (%) over the grid of (ℓp , ℓc ) at stride 2. Darker cells denote higher accuracy, and the grey
+contour traces the 90th-percentile region. The selected layer pair is marked by the red square. The
+Qwen counterpart is in Appendix E.3.
+roughly 40% and 70% of the total depth L, sitting within the mid-to-late depth band that prior probing
+work identifies as semantically integrated [2, 4]. Thus, SABER is not sensitive to fine-grained layer
+tuning and uses depths known to be informative for internal belief estimation.
+
+5
+
+Related Work
+
+Knowledge Conflict in RAG. Prior benchmarks formalize the CK-PK relation as supportive, contradictory, or irrelevant [19, 30, 29, 3, 24, 18, 11, 31]. This data-level view helps reveal PK-CK
+mismatch, but overlooks each model’s actual answers and their correctness. Along this line, some
+works infer conflicts from token likelihoods or distributional uncertainty [29, 22], some steer generation through decoding interventions or verbal source judgments [22, 12, 25], and others revise
+retrieved evidence or adaptively decide when retrieval is needed [34, 36, 7, 1, 13, 23, 32]. These
+methods improve source coordination, but without correctness estimation, they may still force unsupported answers when abstention is warranted. In contrast, we label PK- and CK-path correctness
+against ground truth and enable calibrated abstention when neither path is reliable.
+Self-Awareness in LLMs. A growing body of work investigates whether LLMs can recognize
+the limits of their own knowledge and reasoning. On the knowledge side, LLMs expose partial
+self-knowledge through calibrated confidence, verbalized uncertainty, answerability estimation, and
+hidden-state probes of latent truthfulness or hallucination risk [15, 17, 6, 4, 2, 33, 5]. On the reasoning
+side, recent work examines whether models can evaluate intermediate reasoning states or anticipate
+response-level failures from internal representations [21, 9]. These studies typically extract a single
+self-awareness signal for post-hoc diagnosis, such as calibration, hallucination detection, or selective
+prediction on the model’s own answer. SABER instead combines a knowledge-boundary self-prior
+with reasoning-reliability self-evaluation into paired PK- and CK-side beliefs, and uses them at
+inference time to choose PK, choose CK, or abstain when both paths fail [8, 35, 28].
+
+6
+
+Conclusion
+
+We presented SABER, a Self-Aware Belief Estimator that resolves RAG knowledge conflicts by
+estimating PK- and CK-side correctness beliefs from frozen LLM hidden states. We also constructed
+a model-specific benchmark labeling PK-only and CK-conditioned answer correctness across four
+Llama and Qwen backbones. SABER improves end-to-end accuracy and faithfulness over strong
+baselines and provides a calibrated abstention signal that Pareto-dominates prompt-based abstainers
+on every backbone. Ablations and layer-sensitivity studies show that these gains come from combining
+a self-prior with source-conditional reasoning representations and remain robust across a broad midto-late layer plateau. More broadly, our results suggest that self-awareness is a promising foundation
+for faithful RAG that can recognize unsupported cases and abstain rather than force an answer.
+9
+
+References
+[1] Akari Asai, Zeqiu Wu, Yizhong Wang, Avirup Sil, and Hannaneh Hajishirzi. Self-rag: Learning
+to retrieve, generate, and critique through self-reflection. In International Conference on
+Learning Representations, 2024.
+[2] Amos Azaria and Tom Mitchell. The internal state of an llm knows when it’s lying. arXiv
+preprint arXiv:2304.13734, 2023.
+[3] Baolong Bi, Shenghua Huang, Yiwei Wang, Tianchi Yang, Zhongyu Zhang, Haizhou Huang,
+Lijie Mei, Junfeng Fang, Zehao Li, Furu Wei, et al. Context-DPO: Aligning language models
+for context-faithfulness. arXiv preprint arXiv:2412.15280, 2024.
+[4] Collin Burns, Haotian Ye, Dan Klein, and Jacob Steinhardt. Discovering latent knowledge in
+language models without supervision. arXiv preprint arXiv:2212.03827, 2022.
+[5] Chao Chen, Kai Liu, Ze Chen, Yi Gu, Yue Wu, Mingyuan Tao, Zhihang Fu, and Jieping Ye.
+INSIDE: LLMs’ internal states retain the power of hallucination detection. In International
+Conference on Learning Representations, 2024.
+[6] Lihu Chen, Gerard de Melo, Fabian M. Suchanek, and Gaël Varoquaux. Query-level uncertainty
+in large language models. In International Conference on Learning Representations, 2026.
+[7] Linfeng Gao, Qinggang Zhang, Baolong Bi, Bo Zeng, Zheng Yuan, Zerui Chen, Zhimin Wei,
+Shenghua Liu, Linlong Xu, Longyue Wang, Weihua Luo, and Jinsong Su. Beyond blackbox interventions: Latent probing for faithful retrieval-augmented generation. arXiv preprint
+arXiv:2510.12460, 2025.
+[8] Yonatan Geifman and Ran El-Yaniv. Selective classification for deep neural networks. In
+Advances in Neural Information Processing Systems, 2017.
+[9] Amirhosein Ghasemabadi and Di Niu. Can llms predict their own failures? self-awareness via
+internal circuits. arXiv preprint arXiv:2512.20578, 2026.
+[10] Minghao Guo, Qingcheng Zeng, Xujiang Zhao, Yanchi Liu, Wenchao Yu, Mengnan Du, Haifeng
+Chen, and Wei Cheng. DeepSieve: Information sieving via LLM-as-a-knowledge-router. In
+Findings of the Association for Computational Linguistics: EACL 2026, 2026.
+[11] Yufang Hou, Alessandra Pascale, Javier Carnerero-Cano, Tigran Tchrakian, Radu Marinescu,
+Elizabeth Daly, Inkit Padhi, and Prasanna Sattigeri. WikiContradict: A benchmark for evaluating
+LLMs on real-world knowledge conflicts from Wikipedia. In Advances in Neural Information
+Processing Systems, 2024. Datasets and Benchmarks Track.
+[12] Yukun Huang, Sanxing Chen, Hongyi Cai, and Bhuwan Dhingra. To trust or not to trust?
+enhancing large language models’ situated faithfulness to external contexts. In International
+Conference on Learning Representations, 2025.
+[13] Soyeong Jeong, Jinheon Baek, Sukmin Cho, Sung Ju Hwang, and Jong C. Park. Adaptive-rag:
+Learning to adapt retrieval-augmented large language models through question complexity. In
+Proceedings of the 2024 Conference of the North American Chapter of the Association for
+Computational Linguistics, 2024.
+[14] Mingyu Jin, Kai Mei, Wujiang Xu, Mingjie Sun, Ruixiang Tang, Mengnan Du, Zirui Liu, and
+Yongfeng Zhang. Massive values in self-attention modules are the key to contextual knowledge
+understanding. In International Conference on Machine Learning, 2025.
+[15] Saurav Kadavath, Tom Conerly, Amanda Askell, Tom Henighan, Dawn Drain, Ethan Perez,
+Nicholas Schiefer, Zac Hatfield-Dodds, Nova DasSarma, Eli Tran-Johnson, et al. Language
+models (mostly) know what they know. arXiv preprint arXiv:2207.05221, 2022.
+[16] Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir Karpukhin, Naman
+Goyal, Heinrich Küttler, Mike Lewis, Wen-tau Yih, Tim Rocktäschel, Sebastian Riedel, and
+Douwe Kiela. Retrieval-augmented generation for knowledge-intensive nlp tasks. In Advances
+in Neural Information Processing Systems, 2020.
+10
+
+[17] Stephanie Lin, Jacob Hilton, and Owain Evans. Teaching models to express their uncertainty in
+words. arXiv preprint arXiv:2205.14334, 2022.
+[18] Shayne Longpre, Kartik Perisetla, Anthony Chen, Nikhil Ramesh, Chris DuBois, and
+Sameer Singh. Entity-based knowledge conflicts in question answering. arXiv preprint
+arXiv:2109.05052, 2021.
+[19] Alex Mallen, Akari Asai, Victor Zhong, Rajarshi Das, Daniel Khashabi, and Hannaneh Hajishirzi. When not to trust language models: Investigating effectiveness of parametric and
+non-parametric memories. In Proceedings of the 61st Annual Meeting of the Association for
+Computational Linguistics, 2023.
+[20] Kai Mei, Jiang Guo, Shuaichen Chang, Mingwen Dong, Dongkyu Lee, Xing Niu, and Jiarong
+Jiang. R-WoM: Retrieval-augmented world model for computer-use agents. arXiv preprint
+arXiv:2510.11892, 2025.
+[21] Jingwei Ni, Ekaterina Fadeeva, Tianyi Wu, Mubashara Akhtar, Jiaheng Zhang, Elliott Ash,
+Markus Leippold, Timothy Baldwin, See-Kiong Ng, Artem Shelmanov, and Mrinmaya Sachan.
+Reprobe: Efficient test-time scaling of multi-step reasoning by probing internal states of large
+language models. arXiv preprint arXiv:2511.06209, 2026.
+[22] Weijia Shi, Xiaochuang Han, Mike Lewis, Yulia Tsvetkov, Luke Zettlemoyer, and Scott
+Yih. Trusting your evidence: Hallucinate less with context-aware decoding. arXiv preprint
+arXiv:2305.14739, 2024.
+[23] Weihang Su, Yichen Tang, Qingyao Ai, Zhijing Wu, and Yiqun Liu. Dragin: Dynamic retrieval
+augmented generation based on the information needs of large language models. arXiv preprint
+arXiv:2403.10081, 2024.
+[24] Zhaochen Su, Jun Zhang, Xiaoye Qu, Tong Zhu, Yanshu Li, Jiashuo Sun, Juntao Li, Min
+Zhang, and Yu Cheng. ConflictBank: A benchmark for evaluating knowledge conflicts in large
+language models. arXiv preprint arXiv:2408.12076, 2024.
+[25] Han Wang, Akshat Shrivastava, Junyi Jessy Hu, Yash Lal, Manzil Zaheer, Mohammad Javad
+Hosseini, Sheng-Chieh Lin, Veselin Stoyanov, and Wen-tau Yih. AdaCAD: Adaptively decoding to balance conflicts between contextual and parametric knowledge. arXiv preprint
+arXiv:2409.07394, 2025.
+[26] Xuezhi Wang, Jason Wei, Dale Schuurmans, Quoc V. Le, Ed H. Chi, Sharan Narang, Aakanksha
+Chowdhery, and Denny Zhou. Self-consistency improves chain of thought reasoning in language
+models. In International Conference on Learning Representations, 2023.
+[27] Ziqi Wang, Xi Zhu, Shuhang Lin, Haochen Xue, Minghao Guo, and Yongfeng Zhang.
+RAGRouter-Bench: A dataset and benchmark for adaptive RAG routing. arXiv preprint
+arXiv:2602.00296, 2026.
+[28] Bingbing Wen, Jihan Yao, Shangbin Feng, Chenjun Xu, Yulia Tsvetkov, Bill Howe, and Lucy Lu
+Wang. Know your limits: A survey of abstention in large language models. arXiv preprint
+arXiv:2407.18418, 2025.
+[29] Kevin Wu, Eric Wu, and James Zou. Clasheval: Quantifying the tug-of-war between an llm’s
+internal prior and external evidence. In Advances in Neural Information Processing Systems,
+2024. Datasets and Benchmarks Track.
+[30] Jian Xie, Kai Zhang, Jiangjie Chen, Renze Lou, and Yu Su. Adaptive chameleon or stubborn
+sloth: Revealing the behavior of large language models in knowledge conflicts. In International
+Conference on Learning Representations, 2024.
+[31] Rongwu Xu, Zehan Qi, Zhijiang Guo, Cunxiang Wang, Hongru Wang, Yue Zhang, and Wei Xu.
+Knowledge conflicts for LLMs: A survey. In Proceedings of the 2024 Conference on Empirical
+Methods in Natural Language Processing, 2024.
+11
+
+[32] Zijun Yao, Weijian Qi, Liangming Pan, Shulin Cao, Linmei Hu, Weichuan Liu, Lei Hou, and
+Juanzi Li. SeaKR: Self-aware knowledge retrieval for adaptive retrieval augmented generation.
+arXiv preprint arXiv:2406.19215, 2025.
+[33] Zhangyue Yin, Qiushi Sun, Qipeng Guo, Jiawen Wu, Xipeng Qiu, and Xuanjing Huang. Do
+large language models know what they don’t know? In Findings of the Association for
+Computational Linguistics: ACL 2023, 2023.
+[34] Tian Yu, Shaolei Zhang, and Yang Feng. Truth-aware context selection: Mitigating hallucinations of large language models being misled by untruthful contexts. arXiv preprint
+arXiv:2403.07556, 2024.
+[35] Hanning Zhang, Shizhe Diao, Yong Lin, Yi R. Fung, Qing Lian, Xingyao Wang, Yangyi Chen,
+Heng Ji, and Tong Zhang. R-Tuning: Instructing large language models to say ‘I don’t know’.
+In Proceedings of the 2024 Conference of the North American Chapter of the Association for
+Computational Linguistics, 2024.
+[36] Qinggang Zhang, Zhishang Xiang, Yilin Xiao, Le Wang, Junhui Li, Xinrun Wang, and Jinsong
+Su. Faithfulrag: Fact-level conflict modeling for context-faithful retrieval-augmented generation.
+arXiv preprint arXiv:2506.08938, 2025.
+
+12
+
+Appendix
+A
+
+Implementation Details
+
+A.1
+
+Probe architecture and training
+
+The two side-specific reliability predictors fpred,PK and fpred,CK share the same architecture and
+training recipe, summarised in Table 4. The LLM backbone is kept frozen throughout.
+Table 4: Probe architecture and training hyperparameters for the two reliability predictors fpred,PK
+and fpred,CK , which share the same architecture and training recipe.
+
+A.2
+
+Component
+
+Setting
+
+Hidden sizes
+Activation
+Dropout
+Input normalisation
+Optimiser
+Learning rate
+Weight decay
+Batch size
+Loss
+Max epochs
+Early stopping
+Seed
+
+(256, 128)
+ReLU
+0.2
+Per-feature standardisation (fit on train)
+AdamW
+1×10−3
+1×10−4
+256
+Binary cross-entropy with logits
+50
+On validation AUROC, patience 8
+42
+
+Multi-trace generation
+
+We sample K=3 reasoning traces per side using the parameters in Table 5. The same parameters are
+applied to both PK-side and CK-side trace generation across all four backbones.
+Table 5: Sampling parameters for multi-trace reasoning generation. Each trace is sampled independently with a different seed, and the same parameters are used on both PK and CK sides across all
+four backbones.
+
+A.3
+
+Parameter
+
+Value
+
+Number of traces K
+Decoding
+Temperature
+Top-p
+Repetition penalty
+Max new tokens
+Per-trace seeds
+
+3
+Stochastic sampling
+0.9
+1.0
+1.05
+256
+{0, 1, 2}
+
+Metric definitions
+
+All metrics are computed on the same test set of N instances. Each instance is mapped, by aliasmatching the closed-book PK answer and the context-grounded CK answer against the gold, to one
+of four reliability cells C00 , C01 , C10 , C11 , where Cab collects the instances on which PK is correct
+iff a = 1 and CK is correct iff b = 1.
+Main-results metrics (§4.1; Tables 1, 2, 8, 9). For each instance i, let ci ∈ {0, 1} indicate whether
+the method’s answer alias-matches the gold. The four main-results metrics describe a method along
+two axes: how often it produces the right answer overall, and how it handles the two single-source
+cells where the right answer is reachable from only one of {PK, CK}.
+• Acc (Answer accuracy). The fraction of instances on which the method’s answer aliasmatches the gold. This is the bottom-line correctness rate; it does not distinguish how the
+13
+
+method arrived at the answer or which cell the instance came from.
+N
+1 X
+Acc =
+ci .
+N i=1
+
+(8)
+
+• CF (Context Faithfulness). Accuracy restricted to the cell C01 , where only the context
+carries the correct answer. CF asks: when the model would be wrong from its parametric
+knowledge alone but the retrieved context contains the right answer, does the method actually
+follow the context? A high CF indicates that the method effectively absorbs information
+from a trustworthy context.
+1 X
+CF =
+ci .
+(9)
+|C01 |
+i∈C01
+
+• KF (Knowledge Faithfulness). The mirror of CF, restricted to C10 , where only parametric
+knowledge is correct and the retrieved context is misleading. KF asks: when the context
+would lead the model astray, does the method preserve its internally-correct PK answer? A
+high KF indicates that the method is robust to a misleading context.
+1 X
+KF =
+ci .
+(10)
+|C10 |
+i∈C10
+
+• MFS (Macro Faithfulness Score). The unweighted mean of CF and KF. MFS balances the
+two failure modes, over-trusting context and over-trusting memory, into a single number;
+a method that inflates Acc by collapsing onto one source will register near-zero on either
+CF or KF and so drag MFS down. We treat MFS as the primary single-number measure of
+conflict-resolution quality.
+
+MFS = 21 CF + KF .
+(11)
+Selective-answering metrics (§4.2; Table 3). Each instance falls into exactly one of three outcomes
+– answered correctly, answered wrongly, or abstained – with counts N+ , N− , N0 satisfying N+ +
+N− + N0 = N . Let A denote the set of instances on which the method abstained, and let G = C00
+denote the gold-abstain set (instances on which neither PK nor CK is correct).
+• Score. The mean per-instance utility under the selective-prediction scheme of Geifman
+and El-Yaniv [8]: a correct answer is worth +1, a wrong answer −1, and an abstention 0.
+Equivalently, Score is the gap between the number of correct and wrong answers normalised
+by the test-set size. Concretely, define the per-instance utility
+
++1 if instance i is answered correctly,
+ui = −1 if instance i is answered wrongly,
+(12)
+
+0 if instance i is abstained.
+The aggregate Score is then
+N
+
+Score =
+
+N+ − N −
+1 X
+ui =
+.
+N i=1
+N
+
+(13)
+
+Score rewards a method only when correct answers outweigh wrong ones; because abstaining
+contributes zero, a method that refuses everywhere collapses to Score = 0 rather than going
+negative, which prevents trivial gaming by silence.
+• Cov (Coverage). The fraction of instances on which the method commits to an answer.
+Coverage measures willingness to answer; we report it as a diagnostic axis rather than a
+goal, since it can be raised arbitrarily by simply refusing to abstain.
+N+ + N −
+Cov =
+.
+(14)
+N
+• RC (Risk on answered). The error rate among the answered instances, ignoring abstentions.
+RC measures the conditional quality of the answers a method does commit to; reporting it
+together with Cov exposes the trade-off between answering more and answering reliably.
+N−
+RC =
+.
+(15)
+N+ + N −
+14
+
+• F1 (Abstention F1). The F1 of the abstain decisions against the gold-abstain set G = C00 ,
+treating abstain as the positive class. F1 measures how targeted the refusals are: a method
+that abstains on everything reaches near-perfect recall but very low precision, while a method
+that never abstains scores zero on both, so F1 penalises both blanket caution and reckless
+answering.
+2 |A ∩ G|
+F1 =
+.
+(16)
+|A| + |G|
+Together, Score, Cov, RC , and F1 span three complementary axes, including net utility (Score), the
+answer-versus-refuse trade-off (Cov, RC ), and abstain targeting (F1 ), that resist gaming by any single
+failure mode.
+
+B
+
+Datasets
+
+B.1
+
+Source datasets
+
+Our benchmark draws from five publicly released QA datasets, each exposing a controlled form of
+PK–CK conflict.
+• ConFiQA [3]: A QA benchmark where the retrieved context is modified by counterfactual
+substitution to assert an answer that contradicts the ground truth. We use all three sub-tasks
+(QA, MR, MC), which differ in question structure but share the same conflict-construction
+pipeline.
+• ConflictQA-PopQA [30]: Built from PopQA queries on which the LLM has previously
+given a wrong answer; the retrieved passage is constructed to support the model’s incorrect
+prediction. This directly probes the model’s tendency to trust a misleading document over
+its own (correct) parametric knowledge.
+• ConflictBank [24]: A synthesised benchmark of factual conflicts covering multiple categories such as entity substitution, temporal mismatch, and attribute alteration. We use a pilot
+subset that spans the main categories.
+• TriviaQA: We use the adversarial-context subset prepared by Huang et al. [12], in which
+the original supporting passage is perturbed to assert a wrong answer, applying the same
+construction style as ConflictQA-PopQA. It tests robustness to misleading context on
+questions about widely-known entities.
+• NQ: We use the adversarial-context subset of Natural Questions prepared by Huang et al.
+[12], applying the same construction as the TriviaQA subset above on naturally-occurring
+user queries. It complements TriviaQA by covering a different query distribution.
+B.2
+
+Benchmark statistics and processing
+
+Table 6: Constructed benchmark sizes per backbone (after processing). The same partition structure
+is used for every backbone, and per-backbone row counts differ slightly because instances that fail
+end-to-end inference are dropped per backbone.
+Sub-dataset
+
+Ntrain
+
+Nval
+
+Ntest
+
+Total
+
+ConFiQA-QA
+ConFiQA-MR
+ConFiQA-MC
+ConflictQA-PopQA
+ConflictBank
+TriviaQA
+NQ
+
+9,600
+9,600
+9,598
+12,834
+9,611
+1,920
+1,934
+
+1,200
+1,200
+1,202
+1,608
+1,197
+240
+242
+
+1,200
+1,200
+1,200
+1,612
+1,192
+240
+242
+
+12,000
+12,000
+12,000
+16,054
+12,000
+2,400
+2,418
+
+Total per backbone
+
+55,097
+
+6,889
+
+6,886
+
+68,872
+
+15
+
+Selection and sampling. We use the publicly released instances in full for ConFiQA, ConflictQAPopQA, TriviaQA, and NQ. For ConflictBank, which is substantially larger than the other datasets,
+we sample a subset of approximately 12,000 instances that spans the main conflict categories. The
+seven datasets are then pooled into a single ground-truth-aligned benchmark that is constructed
+independently for each backbone.
+Labeling answer paths. For every query-context instance, we run the backbone under both the
+PK-only and the CK-conditioned answer paths, and label the resulting answers against the gold
+answer using an alias-aware match cascade match(·, ·). This yields a 4-cell reliability outcome
+(yPK , yCK ) for the instance, indicating which of the two paths produced a correct answer.
+Alias-aware match cascade. The match function compares a generated answer string a against
+the gold answer, or against any of its accepted aliases when the dataset provides a list of equivalents.
+It first applies Unicode normalisation, casefolding, and punctuation stripping, then tries an exact
+string match, and finally falls back to a token-level containment check. The side label ys is set to 1 if
+any of these checks succeeds for as , and to 0 otherwise.
+Filtering and splits. Instances that the backbone cannot run end-to-end (for example due to contextlength truncation) are dropped, which leads to small per-backbone differences in row counts. We
+then split each dataset by query identifier into a 80% / 10% / 10% train / validation / test partition, with
+the same query never appearing across splits, and aggregate the per-dataset partitions into the final
+benchmark whose statistics are reported in Table 6.
+Figure 6 and Table 7 report the resulting 4-cell distribution per (backbone, dataset). The cell
+composition varies substantially across datasets and backbones, which gives our predictors a balanced
+mixture of all four reliability outcomes during training.
+Llama-3.1-8B
+
+100
+
+Qwen-2.5-7B
+
+Llama-3.2-3B
+
+Qwen-2.5-3B
+
+Fraction (%)
+
+80
+60
+40
+20
+0
+
+-QA -MR -MC ctQA ank A-H NQ-H
+FiQA onFiQA onFiQA Confli onflictB TriviaQ
+C
+C
+C
+
+Con
+
+-QA -MR -MC ctQA ank A-H NQ-H
+FiQA onFiQA onFiQA Confli onflictB TriviaQ
+C
+C
+C
+
+-QA -MR -MC ctQA ank A-H NQ-H
+FiQA onFiQA onFiQA Confli onflictB TriviaQ
+C
+C
+C
+
+Con
+
+C00 (neither)
+
+Con
+
+C10 (PK only)
+
+C01 (CK only)
+
+-QA -MR -MC ctQA ank A-H NQ-H
+FiQA onFiQA onFiQA Confli onflictB TriviaQ
+C
+C
+C
+
+Con
+
+C11 (both)
+
+Figure 6: 4-cell reliability distribution of the constructed benchmark. Each stacked bar shows, for
+one (backbone, dataset) pair, the fraction of instances falling into the four cells C00 (neither side
+correct), C10 (only PK correct), C01 (only CK correct), and C11 (both correct).
+
+Table 7: Per-(backbone, dataset) 4-cell distribution as percentages of dataset size, complementing
+Figure 6. Rows within each backbone block sum to approximately 100%.
+Sub-dataset
+
+Llama-3.1-8B
+Qwen-2.5-7B
+Llama-3.2-3B
+Qwen-2.5-3B
+C00 C10 C01 C11 C00 C10 C01 C11 C00 C10 C01 C11 C00 C10 C01 C11
+
+ConFiQA-QA
+ConFiQA-MR
+ConFiQA-MC
+ConflictQA-PopQA
+ConflictBank
+TriviaQA
+NQ
+
+33.9 8.7 24.6 32.8
+47.8 4.4 37.4 10.4
+52.1 5.6 33.2 9.0
+48.0 8.6 31.8 11.7
+19.0 14.1 59.3 7.7
+18.0 32.7 10.3 39.0
+39.7 15.5 25.3 19.4
+
+C
+
+38.3 12.7 27.6 21.5
+45.6 7.1 32.7 14.7
+47.6 8.1 31.6 12.7
+51.8 6.6 34.6 7.0
+21.9 13.8 58.3 6.0
+25.8 24.9 20.2 29.1
+44.7 11.1 31.8 12.4
+
+37.4 12.1 27.4 23.0
+53.0 4.1 37.2 5.7
+54.8 4.5 35.4 5.4
+53.6 6.2 33.8 6.5
+27.6 10.4 57.2 4.9
+20.2 32.0 13.6 34.3
+42.6 15.0 27.0 15.3
+
+40.9 9.6 30.3 19.1
+48.4 6.4 35.8 9.4
+50.2 6.7 34.3 8.8
+56.7 5.0 33.1 5.2
+31.6 9.0 55.8 3.6
+36.7 19.5 23.6 20.2
+50.7 8.1 33.0 8.3
+
+Baselines
+
+We compare against ten baselines that span four design philosophies for handling PK–CK conflict:
+vanilla retrieve-or-not, verbal self-evaluation, probability- or probe-based heuristics, and fine-tuning.
+16
+
+• Closed-Book: The LLM answers from its parametric memory alone, with no retrieved context. We include it as a non-RAG reference point that characterises the intrinsic knowledge
+of each backbone before any document is supplied.
+• Vanilla RAG [16]: The standard retrieve-then-read setup, where the LLM answers conditioned on a top-retrieved passage without any further filtering or confidence signal. As the
+most widely deployed RAG variant, it serves as the natural reference point for any method
+that adds reliability awareness on top of retrieval.
+• Internal-Eval [12]: After producing an internal (PK) answer, the LLM is prompted to judge
+whether that answer is correct, and the routing decision uses this self-judgement to choose
+between the PK answer and the retrieved context. It represents a self-confidence-based
+approach grounded in the model’s own assessment of its parametric knowledge.
+• Context-Eval [12]: A counterpart to Internal-Eval on the context side: the LLM is asked
+whether the retrieved passage is reliable enough to be trusted before producing the answer.
+It isolates the contextual-reliability axis of the routing decision.
+• Implicit-SCR [12]: Samples multiple answers under each source path and uses output
+consistency as an implicit confidence proxy, taking the most consistent answer as the
+prediction. It is among the strongest prompt-only baselines reported in prior work on
+knowledge conflict.
+• Explicit-SCR [12]: Prompts the LLM to directly compare its PK answer against the CK
+answer and pick the more reliable one in a single call, the most direct prompting strategy for
+source arbitration without any auxiliary model or training.
+• TPC [29]: Follows the answer path whose token-level probability is higher under the LLM’s
+distribution, treating output likelihood as a confidence signal. It represents a probabilitybased heuristic that operates at decoding time without any extra prompting or training.
+• TACS-LR [34]: Trains a linear probe on the LLM’s hidden states to score and filter
+individual context tokens, retaining only those judged reliable before generating the answer.
+As a published probe-based method, it tests whether token-level hidden-state filtering alone
+can cover the routing benefits we aim for.
+• CR-DPO [12]: Fine-tunes the LLM backbone using Direct Preference Optimisation on
+conflict-resolution preference pairs, extending Explicit-SCR with parametric updates. It
+serves as a fine-tuning-based comparison point that bounds the gain achievable when the
+backbone itself is allowed to be retrained.
+• R-Tuning [35]: Fine-tunes the LLM backbone on an instruction-tuning dataset that explicitly
+teaches it to respond I don’t know on questions whose answers it does not reliably know,
+rather than confabulating one. Although introduced in a non-RAG setting, R-Tuning is a
+natural training-based comparison point for SABER’s calibrated abstention: both aim at
+honest refusal when the model lacks reliable knowledge, but R-Tuning achieves it through
+parametric updates while SABER does so through a frozen-backbone hidden-state probe.
+
+D
+
+Prompt Templates
+
+D.1
+
+Benchmark construction prompts
+
+The PK-only and CK-conditioned answer paths used to label the benchmark (Eq. 1) are produced
+with the two prompts below. They share the same system instruction and differ only in whether the
+retrieved context is included before the question.
+PK answer prompt (closed-book, benchmark construction)
+[System] Answer the question with a short phrase.
+[User] Question: {question}
+Answer:
+
+17
+
+CK answer prompt (with retrieved context, benchmark construction)
+[System] Answer the question with a short phrase.
+[User] Context: {ck_text}
+Question: {question}
+Answer:
+
+D.2
+
+Self-prior
+
+The self-prior representation hq in Eq. 3 is read from a forward pass on the raw query string alone,
+with no system message and no instruction template, so that the hidden state reflects the model’s
+pre-context belief without being biased by surface phrasing.
+Self-prior prompt
+{question}
+
+D.3
+
+PK-side reasoning generation
+
+PK reasoning generation prompt
+You will be given a question. Assume your own knowledge is correct and complete for this question. Reason
+step by step using ONLY your prior knowledge — do NOT use any external sources. End with one final
+answer on the last line.
+Question: {question}
+Reasoning:
+
+D.4
+
+CK-side reasoning generation
+
+CK reasoning generation prompt
+You will be given a question and a document. Assume the document is reliable and contains the correct
+facts needed to answer the question. Reason step by step using ONLY the information in the document.
+End with one final answer on the last line.
+Question: {question}
+Document: {ck_text}
+Reasoning:
+
+D.5
+
+Self-evaluation
+
+Self-evaluation prompt
+You are evaluating a proposed reasoning for a question. Use your own knowledge to judge whether the
+reasoning is factually reliable.
+Question: {question}
+Proposed reasoning: {reasoning}
+Is the reasoning above factually reliable?
+(A) Yes
+(B) No
+Answer:
+
+D.6
+
+Baseline prompts and abstention modifications
+
+We adopt the original baseline prompts from their respective sources [12, 29, 34] and apply only
+minimal edits to align their input format with our (question, document, gold answer) schema. The
+modifications described in this subsection are used only for the abstention experiment (§4.2); the
+main-results comparison (§4.1) uses each baseline’s original prompt without any abstention suffix. For
+the abstention experiment, each prompt-only baseline is augmented with a single trailing instruction
+18
+
+that allows the model to refuse to answer; the rest of the original prompt, including any in-context
+examples, is kept verbatim. For instance, the Implicit-SCR system instruction is modified as shown
+below.
+Implicit-SCR system instruction (original [12])
+You will be given a question and a document. The document may not be trustworthy. Use your judgment
+to assess the reliability of the document. Then, based on both your assessment and your own knowledge,
+provide the best possible answer.
+Implicit-SCR system instruction (our abstention variant)
+You will be given a question and a document. The document may not be trustworthy. Use your judgment
+to assess the reliability of the document. Then, based on both your assessment and your own knowledge,
+provide the best possible answer. If you cannot answer the question accurately based on either your
+own knowledge or the provided document, respond exactly with: I don’t know.
+
+The same single-sentence abstention suffix is appended to the system instructions of all other promptonly baselines.
+
+E
+
+Additional Results
+
+E.1
+
+Per-sub-task breakdown of main results
+
+Tables 1 and 2 in the main paper report ConFiQA as a single column averaged across its three subtasks (QA, MR, MC). Tables 8 and 9 below give the per-sub-task breakdown for those three sub-tasks;
+numbers on the other four datasets (ConflictQA, ConflictBank, TriviaQA, NQ) are unchanged and
+can be read directly from the main-paper tables.
+Table 8: Per-sub-task breakdown of ConFiQA on the Llama family. We report Acc (↑), CF, KF, and
+MFS (↑), all as percentages, on the three ConFiQA sub-tasks (QA / MR / MC). For Acc and MFS,
+within each (backbone, sub-task) cell the best value is highlighted with a blue background and the
+second-best with a green background.
+ConFiQA-QA
+ConFiQA-MR
+ConFiQA-MC
+CF
+KF MFS↑ Acc↑ CF
+KF MFS↑ Acc↑ CF
+KF MFS↑
+
+Method
+
+Acc↑
+
+Closed-Book
+Vanilla RAG
+
+51.2 17.2 100.0 58.6
+65.8 100.0 21.2 60.6
+
+22.3 3.7 100.0 51.8
+57.3 100.0 18.6 59.3
+
+20.0 5.8 100.0 52.9
+47.8 100.0 10.8 55.4
+
+Internal-Eval
+Context-Eval
+Implicit-SCR
+Explicit-SCR
+
+60.3
+57.4
+66.8
+55.3
+
+56.4
+44.0
+83.8
+56.4
+
+79.8
+94.9
+63.6
+79.8
+
+68.1
+69.5
+73.7
+68.1
+
+40.6
+32.8
+52.2
+33.6
+
+54.3
+31.3
+75.9
+40.2
+
+45.8
+81.4
+39.0
+62.7
+
+50.1
+56.3
+57.4
+51.5
+
+35.2
+27.6
+42.1
+31.2
+
+55.6
+31.2
+77.9
+43.9
+
+52.3
+75.4
+18.5
+80.0
+
+53.9
+53.3
+48.2
+62.0
+
+TPC
+TACS-LR
+
+66.4 88.3
+61.5 89.7
+
+67.7
+36.4
+
+78.0
+63.0
+
+52.9 85.4
+39.8 52.6
+
+47.5
+37.3
+
+66.4
+44.9
+
+45.9 86.8
+29.5 45.7
+
+61.5
+15.4
+
+74.2
+30.5
+
+R-Tuning
+CR-DPO
+
+32.4 10.7
+58.6 51.2
+
+41.3
+87.9
+
+26.0
+69.5
+
+14.8 8.6
+46.4 63.7
+
+23.9
+74.6
+
+16.3
+69.1
+
+14.7 8.6
+38.6 62.4
+
+29.1
+63.1
+
+18.9
+62.8
+
+SABER (Ours) 68.2 89.0
+
+74.7
+
+81.9
+
+57.0 92.8
+
+66.1
+
+79.5
+
+50.2 95.4
+
+73.8
+
+84.6
+
+Llama-3.1-8B
+
+Llama-3.2-3B
+Closed-Book
+Vanilla RAG
+
+40.5 10.4 100.0 55.2
+56.0 100.0 10.1 55.0
+
+16.8 4.2 100.0 52.1
+49.2 100.0 7.5 53.8
+
+14.5 2.8 100.0 51.4
+45.8 100.0 10.7 55.4
+
+Internal-Eval
+Context-Eval
+Implicit-SCR
+Explicit-SCR
+
+51.8
+52.6
+58.0
+44.3
+
+59.5
+54.3
+93.9
+47.7
+
+74.1
+88.5
+28.8
+79.1
+
+66.8
+71.4
+61.4
+63.4
+
+37.2
+44.8
+38.0
+22.6
+
+62.2
+86.9
+62.0
+30.0
+
+43.4
+30.2
+22.6
+67.9
+
+52.8
+58.5
+42.3
+49.0
+
+33.6
+41.6
+32.3
+17.3
+
+59.9
+83.2
+58.3
+23.8
+
+53.6
+42.9
+23.2
+53.6
+
+56.7
+63.0
+40.7
+38.7
+
+TPC
+TACS-LR
+
+60.9 93.9
+51.8 86.4
+
+61.9
+21.6
+
+77.9
+54.0
+
+47.2 89.3
+36.2 58.2
+
+41.5
+22.6
+
+65.4
+40.4
+
+43.9 89.3
+31.6 56.2
+
+58.9
+17.9
+
+74.1
+37.0
+
+R-Tuning
+CR-DPO
+
+4.8 0.3
+46.8 43.6
+
+10.6
+89.9
+
+5.5
+66.8
+
+2.2 1.1
+29.6 40.4
+
+4.8
+69.8
+
+3.0
+55.1
+
+1.9 1.1
+27.5 41.5
+
+2.5
+71.4
+
+1.8
+56.5
+
+SABER (Ours) 62.7 91.0
+
+83.5
+
+87.2
+
+51.3 95.8
+
+73.6
+
+84.7
+
+48.2 96.7
+
+75.0
+
+85.9
+
+19
+
+Table 9: Per-sub-task breakdown of ConFiQA on the Qwen family, with the same setup as Table 8.
+ConFiQA-QA
+ConFiQA-MR
+ConFiQA-MC
+CF
+KF MFS↑ Acc↑ CF
+KF MFS↑ Acc↑ CF
+KF MFS↑
+
+Method
+
+Acc↑
+
+Closed-Book
+Vanilla RAG
+
+40.2 6.0 100.0 53.0
+54.8 100.0 6.3 53.1
+
+27.2 4.2 100.0 52.1
+52.8 100.0 10.9 55.4
+
+22.8 2.3 100.0 51.2
+48.8 100.0 3.3 51.6
+
+Internal-Eval
+Context-Eval
+Implicit-SCR
+Explicit-SCR
+
+55.8
+57.5
+67.0
+45.9
+
+67.0
+69.9
+93.5
+57.7
+
+83.6
+89.3
+78.6
+45.3
+
+75.3
+79.6
+86.0
+51.5
+
+50.4
+40.2
+59.0
+39.8
+
+90.5
+47.8
+88.7
+56.7
+
+25.0
+82.6
+40.2
+44.6
+
+57.8
+65.2
+64.4
+50.6
+
+48.5
+36.8
+52.4
+36.2
+
+90.5
+45.1
+89.5
+57.4
+
+37.4
+95.6
+47.3
+44.0
+
+63.9
+70.4
+68.4
+50.7
+
+TPC
+TACS-LR
+
+57.5 93.5
+52.8 79.2
+
+42.1
+39.6
+
+67.8
+59.4
+
+51.3 91.6
+45.2 60.2
+
+37.0
+39.1
+
+64.3
+49.6
+
+49.6 93.1
+38.2 63.3
+
+53.8
+23.1
+
+73.5
+43.2
+
+R-Tuning
+CR-DPO
+
+44.4 14.0
+55.8 75.9
+
+88.2
+67.3
+
+51.1
+71.6
+
+36.3 21.2
+51.2 86.5
+
+69.2
+47.8
+
+45.2
+67.2
+
+33.3 19.2
+47.8 86.7
+
+70.0
+51.6
+
+44.6
+69.2
+
+SABER (Ours) 61.8 87.2
+
+87.4
+
+87.3
+
+55.7 93.4
+
+89.1
+
+91.3
+
+53.4 94.1
+
+95.6
+
+94.9
+
+Qwen-2.5-7B
+
+Qwen-2.5-3B
+
+E.2
+
+Closed-Book
+Vanilla RAG
+
+32.5 5.4 100.0 52.7
+55.5 100.0 10.8 55.4
+
+22.8 4.0 100.0 52.0
+52.7 100.0 5.2 52.6
+
+19.2 4.7 100.0 52.3
+50.0 100.0 11.5 55.8
+
+Internal-Eval
+Context-Eval
+Implicit-SCR
+Explicit-SCR
+
+48.3
+39.9
+57.2
+45.4
+
+61.1
+27.4
+91.6
+77.2
+
+72.5
+98.0
+42.2
+40.2
+
+66.8
+62.7
+66.9
+58.7
+
+45.9
+28.2
+53.8
+37.3
+
+79.2
+20.4
+83.6
+63.2
+
+18.8
+93.8
+31.2
+26.0
+
+49.0
+57.1
+57.4
+44.6
+
+43.2
+24.2
+48.7
+36.7
+
+80.1
+19.0
+84.3
+68.4
+
+24.4
+98.7
+23.1
+41.0
+
+52.2
+58.8
+53.7
+54.7
+
+TPC
+TACS-LR
+
+54.3 91.3
+50.5 90.2
+
+32.4
+15.7
+
+61.8
+53.0
+
+52.2 93.2
+45.9 78.9
+
+34.4
+20.8
+
+63.8
+49.9
+
+50.6 95.1
+41.3 76.1
+
+53.8
+15.4
+
+74.5
+45.7
+
+R-Tuning
+CR-DPO
+
+39.3 17.7
+48.6 73.4
+
+79.6
+46.1
+
+48.7
+59.7
+
+45.4 38.7
+49.0 89.7
+
+80.0
+26.0
+
+59.4
+57.9
+
+40.7 34.9
+47.4 91.3
+
+66.3
+30.8
+
+50.6
+61.1
+
+SABER (Ours) 59.1 93.5
+
+74.5
+
+84.0
+
+56.1 94.8
+
+69.8
+
+82.3
+
+52.7 93.7
+
+87.2
+
+90.4
+
+Threshold sweep on the abstention experiment
+
+Table 10 reports the full threshold sweep used to produce Figure 3. For each backbone, we sweep
+τ over [0.05, 0.95] in steps of 0.05 and report Score, Coverage (Cov), Risk on answered (RC ), and
+abstention F1 (F1 ), all in percent.
+Table 10: Full τ -sweep for SABER’s selective-answering decision rule across four backbone.
+
+E.3
+
+τ
+
+Llama-3.1-8B
+Qwen-2.5-7B
+Llama-3.2-3B
+Qwen-2.5-3B
+Score Cov RC F1 Score Cov RC F1 Score Cov RC F1 Score Cov RC F1
+
+0.05
+0.10
+0.15
+0.20
+0.25
+0.30
+0.35
+0.40
+0.45
+0.50
+0.55
+0.60
+0.65
+0.70
+0.75
+0.80
+0.85
+0.90
+0.95
+
+38.4
+40.2
+41.1
+41.7
+42.4
+43.1
+43.6
+44.0
+44.0
+43.9
+43.7
+43.3
+42.9
+42.5
+41.9
+41.4
+40.2
+38.3
+34.8
+
+84.0
+81.2
+79.2
+77.8
+76.0
+74.3
+72.5
+70.5
+68.3
+65.1
+62.6
+60.8
+58.9
+57.0
+55.2
+53.0
+50.2
+46.9
+41.2
+
+27.1
+25.2
+24.0
+23.2
+22.1
+21.0
+19.9
+18.8
+17.8
+16.3
+15.1
+14.3
+13.6
+12.7
+12.0
+11.0
+10.0
+9.1
+7.8
+
+53.4
+58.8
+61.5
+63.3
+65.1
+66.8
+68.6
+70.3
+71.2
+72.5
+72.9
+73.1
+73.2
+73.6
+73.5
+73.3
+73.2
+72.5
+71.0
+
+32.2
+34.8
+37.0
+39.0
+40.3
+41.7
+42.5
+43.0
+43.4
+43.4
+42.7
+42.4
+41.9
+41.2
+40.0
+39.3
+38.0
+35.7
+32.3
+
+85.1
+80.9
+77.6
+74.3
+71.9
+69.6
+67.4
+64.9
+62.3
+58.5
+56.2
+54.3
+52.2
+50.3
+48.2
+45.9
+43.3
+40.1
+35.5
+
+31.1
+28.5
+26.2
+23.7
+22.0
+20.0
+18.5
+16.9
+15.2
+13.0
+12.0
+10.9
+9.9
+9.0
+8.4
+7.1
+6.1
+5.5
+4.5
+
+50.7
+58.2
+63.8
+68.5
+71.2
+73.4
+75.0
+76.3
+77.3
+78.0
+77.8
+78.0
+78.0
+77.7
+77.2
+76.8
+76.2
+74.9
+73.0
+
+29.0
+32.4
+34.4
+35.5
+36.4
+37.2
+37.7
+38.0
+38.6
+38.5
+38.0
+38.0
+37.4
+37.2
+36.4
+35.7
+34.6
+33.2
+30.4
+
+81.6
+76.6
+73.5
+71.0
+68.5
+66.2
+64.4
+62.5
+60.5
+58.6
+56.0
+53.9
+51.9
+50.0
+47.9
+45.4
+42.9
+40.0
+35.8
+
+32.2
+28.8
+26.6
+25.0
+23.4
+21.9
+20.8
+19.6
+18.1
+17.2
+16.1
+14.8
+14.0
+12.8
+11.9
+10.6
+9.7
+8.5
+7.5
+
+54.8
+62.8
+67.0
+69.8
+71.6
+73.3
+74.6
+75.6
+76.4
+76.8
+76.9
+77.4
+77.5
+77.8
+77.7
+77.7
+77.3
+76.8
+75.4
+
+29.4
+32.2
+34.0
+35.6
+36.9
+37.8
+38.7
+39.2
+39.7
+39.6
+39.5
+39.3
+38.8
+38.5
+37.6
+36.4
+34.8
+33.4
+29.8
+
+83.0
+79.3
+76.1
+73.5
+71.2
+69.0
+67.0
+65.2
+62.6
+60.0
+56.2
+53.9
+51.6
+49.4
+47.3
+44.4
+41.2
+37.9
+32.4
+
+32.3
+29.7
+27.7
+25.8
+24.1
+22.6
+21.1
+19.9
+18.3
+17.0
+14.9
+13.6
+12.4
+11.0
+10.2
+8.9
+7.7
+6.0
+4.1
+
+51.3
+58.1
+62.7
+66.2
+69.2
+71.2
+73.1
+74.4
+75.6
+76.6
+77.1
+77.8
+78.1
+78.2
+78.1
+77.9
+77.6
+77.2
+75.6
+
+Layer-grid heatmap on the Qwen family
+
+Figure 7 shows the Qwen counterpart of Figure 5 on the two Qwen backbones. Both panels exhibit
+a broad high-accuracy plateau around the chosen layer pair, with the optimum on Qwen-2.5-7B
+falling in the mid-to-late depth band as on the Llama family, while Qwen-2.5-3B selects an unusually
+shallow prior layer (ℓp =2) that nevertheless lies inside its own plateau region.
+20
+
+prior layer p
+
+Qwen-2.5-7B
+
+24
+20
+16
+12
+8
+4
+0
+
+59.0
+58.5
+58.0
+
+(14,18) 59.1
+
+57.5
+57.0
+56.5
+
+0
+
+4
+
+8
+
+12
+
+16
+
+20
+
+conditional layer c
+
+24
+
+32
+28
+24
+20
+16
+12
+8
+4
+0
+
+Qwen-2.5-3B
+
+56.0
+55.5
+55.0
+
+(2,20) 56.4
+0
+
+4
+
+8
+
+54.5
+
+12 16 20 24 28 32
+
+conditional layer c
+
+Figure 7: Layer sensitivity of SABER on the Qwen family (counterpart of Figure 5). Each panel
+shows end-to-end answer accuracy (%) over the (ℓp , ℓc ) grid at stride 2. Darker cells denote higher
+accuracy and the grey contour traces the 90th-percentile region. The red square marks the selected
+layer pair.
+E.4
+
+Cross-Dataset (Leave-One-Dataset-Out) Generalization
+
+The main-results setup trains SABER on the union of the seven datasets’ training partitions and
+evaluates on each dataset’s test split, so every dataset contributes both train and test instances.
+This subsection asks a complementary question of how well SABER transfers to a dataset whose
+distribution is unseen during training. We adopt a leave-one-dataset-out (LODO) protocol. For
+each held-out dataset, SABER is retrained on the train, validation, and test instances of the other
+six datasets, then evaluated on the held-out test split. Each fold uses roughly 53K–67K training
+instances, comparable to the main-results training pool, but disjoint from the held-out test split in
+dataset identity. We report results for every backbone–held-out dataset cell.
+Transfer pattern. Table 11 reports per-cell IID versus LODO Acc and MFS, showing that SABER’s
+belief estimator transfers robustly across datasets. On the five typical datasets (ConFiQA-MR,
+ConFiQA-MC, ConFiQA-QA, TriviaQA, and NQ), the LODO Acc gap stays within roughly ±3%
+and the MFS gap within roughly 10% across all four backbones, indicating that the learned PK/CK
+arbitration behaviour is largely dataset-agnostic rather than relying on dataset-specific surface forms.
+The main exceptions are ConflictBank and ConflictQA-PopQA, where the larger drops are explained
+by training-pool composition. These two datasets carry distinctive conflict formats, namely long
+synthetic claim-evidence templates in ConflictBank and engineered counterfactual injections in
+ConflictQA-PopQA, which are absent from the remaining six-dataset pool used to train each LODO
+fold. As a result, LODO SABER has no near-distribution conflict signal to draw on for these specific
+folds, and the gap is expected to close once additional conflict-style datasets enter the pool.
+Comparison against the strongest zero-shot baseline. We further ask whether LODO SABER
+can outperform the strongest prompt-based zero-shot baseline on each held-out cell. To make the
+comparison maximally challenging, we select, for every (backbone, held-out dataset) cell, the best
+single prompt-based baseline and compare against its paired (Acc, MFS). Each row therefore uses
+one real deployable baseline rather than a per-metric oracle, and the baseline enters the comparison at
+the operating point most favorable to conflict faithfulness.
+Table 12 shows that SABER simultaneously dominates on both axes even without seeing the held-out
+distribution during training. It outperforms the strongest baseline on Acc in 19/28 cells and on MFS in
+20/28 cells, with MFS gains frequently in the 15%–30% range. Several cells show large simultaneous
+gains on both metrics, including +28.7 Acc and +28.8 MFS on Qwen-2.5-3B / ConFiQA-MC,
++19.6 Acc and +20.7 MFS on Llama-3.1-8B / ConFiQA-MC, and +18.9 Acc and +15.2 MFS on
+Llama-3.1-8B / TriviaQA.
+This comparison exposes a fundamental trade-off in prompt-only methods. Baselines that achieve high
+MFS, typically the PK-leaning Context-Eval and Internal-Eval, do so by sacrificing Acc, while Accoriented baselines collapse on MFS. SABER avoids this trade-off by learning path-level reliability
+beliefs and remains strong on both Acc and MFS even when trained on datasets disjoint from the
+held-out fold. The remaining losses concentrate on stylistically idiosyncratic folds, most notably
+the larger ConFiQA-QA cells on the Qwen family and the ConflictBank fold, where the six-dataset
+LODO training pool lacks near-distribution signals for those specific surface patterns.
+21
+
+Table 11: Cross-dataset (LODO) generalization of SABER. For each held-out dataset, SABER is
+trained on the union of the other six datasets’ train, validation, and test instances, and evaluated on
+the held-out test split. IID denotes SABER trained on the training partitions of all seven datasets. ∆
+reports LODO minus IID in percentage points.
+IID
+Acc MFS
+
+LODO
+∆ (%)
+Acc MFS ∆Acc ∆MFS
+
+Llama-3.1-8B ConFiQA-QA
+ConFiQA-MR
+ConFiQA-MC
+ConflictQA
+ConflictBank
+TriviaQA
+NQ
+
+68.5
+58.2
+51.1
+53.6
+79.7
+83.9
+54.5
+
+79.6
+74.7
+87.2
+90.5
+88.5
+76.4
+72.8
+
+65.5
+56.9
+50.7
+46.5
+54.3
+82.2
+51.2
+
+72.9
+74.3
+82.7
+65.6
+65.3
+85.1
+63.3
+
+-3.0
+-1.2
+-0.3
+-7.1
+-25.4
+-1.7
+-3.3
+
+-6.6
+-0.5
+-4.5
+-24.9
+-23.2
++8.7
+-9.5
+
+Qwen-2.5-7B
+
+ConFiQA-QA
+ConFiQA-MR
+ConFiQA-MC
+ConflictQA
+ConflictBank
+TriviaQA
+NQ
+
+63.1
+56.2
+53.7
+49.4
+74.7
+71.7
+53.3
+
+89.8
+91.0
+92.6
+93.0
+86.3
+89.5
+79.1
+
+55.8
+55.2
+52.8
+46.0
+52.3
+67.1
+51.7
+
+71.5
+81.9
+88.9
+68.3
+64.5
+80.7
+78.1
+
+-7.3
+-1.1
+-0.9
+-3.3
+-22.4
+-4.6
+-1.7
+
+-18.3
+-9.1
+-3.7
+-24.7
+-21.8
+-8.8
+-1.0
+
+Llama-3.2-3B ConFiQA-QA
+ConFiQA-MR
+ConFiQA-MC
+ConflictQA
+ConflictBank
+TriviaQA
+NQ
+
+64.0
+51.3
+48.0
+47.1
+70.5
+76.2
+50.8
+
+90.6
+85.5
+88.2
+91.5
+87.3
+70.6
+71.0
+
+56.1
+51.6
+47.4
+43.0
+59.6
+69.2
+47.9
+
+72.9
+78.7
+79.0
+67.9
+66.9
+72.7
+64.5
+
+-7.9
++0.3
+-0.6
+-4.2
+-10.8
+-7.1
+-2.9
+
+-17.7
+-6.8
+-9.2
+-23.6
+-20.4
++2.1
+-6.5
+
+Qwen-2.5-3B
+
+59.5
+55.7
+52.5
+44.4
+72.3
+66.2
+50.4
+
+85.7
+80.0
+88.4
+92.1
+90.0
+88.8
+73.5
+
+49.8
+55.8
+52.8
+41.0
+64.3
+60.8
+48.8
+
+65.3
+76.6
+87.7
+73.1
+56.2
+78.7
+74.6
+
+-9.7
++0.1
++0.3
+-3.4
+-8.1
+-5.4
+-1.7
+
+-20.4
+-3.4
+-0.8
+-19.1
+-33.9
+-10.1
++1.0
+
+Backbone
+
+F
+
+Held-out
+
+ConFiQA-QA
+ConFiQA-MR
+ConFiQA-MC
+ConflictQA
+ConflictBank
+TriviaQA
+NQ
+
+Computational Resources
+
+SABER’s predictor trains roughly an order of magnitude faster than R-Tuning and two orders faster
+than CR-DPO, while running on smaller hardware. All experiments were conducted on NVIDIA
+A5000 GPUs with 24 GB memory. Table 13 reports per-backbone training cost for the three trained
+methods. Compared to the two fine-tuning baselines, SABER offers four practical advantages:
+• Smaller predictor, smaller memory footprint. SABER’s MLP predictor uses ∼5M
+trainable parameters and fits within <2 GB peak GPU memory, against ∼14M LoRA
+parameters and 5–10 GB peak memory for R-Tuning and CR-DPO.
+• Single-GPU training. SABER trains on a single A5000, whereas CR-DPO and R-Tuning
+require multi-GPU DDP (4–8 GPUs). This makes SABER accessible to typical academic
+compute budgets without specialised infrastructure.
+• An order of magnitude cheaper than R-Tuning, two orders cheaper than CR-DPO.
+Across the four backbones, SABER’s total predictor training cost is <0.6 GPU-hours,
+against ∼13 GPU-hours for R-Tuning (∼22×) and ∼72 GPU-hours for CR-DPO (∼120×).
+Predictor training and evaluation each take less than 0.2 GPU-hour, even for 8B backbones.
+• Amortised one-time setup, no checkpoint maintenance. SABER’s main up-front cost is
+hidden-state extraction across the four backbones (approximately 15 GPU-hours of effective
+compute for the production run, since multiple extraction jobs share each GPU and inference
+rarely saturates the device), paid once per backbone and amortised across every probe
+variant; the backbone itself stays frozen and reusable. R-Tuning and CR-DPO instead pay
+22
+
+Table 12: LODO SABER vs. the strongest prompt-based zero-shot baseline on each backbone–
+held-out cell. For each cell, we select the best prompt-based baseline among Closed-Book (CB),
+Vanilla RAG (RAG), Internal-Eval (Int-Eval), Context-Eval (Ctx-Eval), Implicit-SCR (Imp-SCR),
+and Explicit-SCR (Exp-SCR), and report its paired Acc and MFS. Bold marks SABER wins, and ∆
+is reported in percent. LODO SABER beats the best baseline on 19/28 cells in Acc and 20/28 cells in
+MFS, showing that it remains strong on both metrics while prompt-only baselines often trade one for
+the other.
+Method
+
+Top-MFS Baseline LODO SABER
+∆ (%)
+Acc
+MFS
+Acc
+MFS
+∆Acc ∆MFS
+
+Llama-3.1-8B ConFiQA-QA
+ConFiQA-MR
+ConFiQA-MC
+ConflictQA
+ConflictBank
+TriviaQA
+NQ
+
+Imp-SCR
+RAG
+Exp-SCR
+Exp-SCR
+Ctx-Eval
+Exp-SCR
+Exp-SCR
+
+66.8
+57.3
+31.2
+40.9
+58.9
+63.3
+46.3
+
+73.7
+59.3
+62.0
+63.1
+76.0
+69.8
+63.0
+
+65.5
+56.9
+50.7
+46.5
+54.3
+82.2
+51.2
+
+72.9
+74.3
+82.7
+65.6
+65.3
+85.1
+63.3
+
+-1.3
+-0.4
++19.6
++5.6
+-4.6
++18.9
++5.0
+
+-0.8
++15.0
++20.7
++2.5
+-10.7
++15.2
++0.2
+
+Qwen-2.5-7B
+
+ConFiQA-QA
+ConFiQA-MR
+ConFiQA-MC
+ConflictQA
+ConflictBank
+TriviaQA
+NQ
+
+Imp-SCR
+Ctx-Eval
+Ctx-Eval
+Int-Eval
+Ctx-Eval
+Int-Eval
+Imp-SCR
+
+67.0
+40.2
+36.8
+38.2
+60.7
+65.4
+52.5
+
+86.0
+65.2
+70.4
+67.6
+62.6
+78.0
+64.5
+
+55.8
+55.2
+52.8
+46.0
+52.3
+67.1
+51.7
+
+71.5
+81.9
+88.9
+68.3
+64.5
+80.7
+78.1
+
+-11.2
++15.0
++15.9
++7.8
+-8.4
++1.7
+-0.8
+
+-14.5
++16.7
++18.5
++0.7
++1.9
++2.7
++13.6
+
+Llama-3.2-3B ConFiQA-QA
+ConFiQA-MR
+ConFiQA-MC
+ConflictQA
+ConflictBank
+TriviaQA
+NQ
+
+Ctx-Eval
+Ctx-Eval
+Ctx-Eval
+Int-Eval
+Ctx-Eval
+Int-Eval
+Int-Eval
+
+52.6
+44.8
+41.6
+37.2
+49.9
+72.1
+43.8
+
+71.4
+58.5
+63.0
+70.7
+71.9
+69.9
+61.8
+
+56.1
+51.6
+47.4
+43.0
+59.6
+69.2
+47.9
+
+72.9
+78.7
+79.0
+67.9
+66.9
+72.7
+64.5
+
++3.5
++6.8
++5.8
++5.8
++9.7
+-2.9
++4.1
+
++1.5
++20.2
++15.9
+-2.8
+-5.0
++2.8
++2.8
+
+Qwen-2.5-3B
+
+Imp-SCR
+Imp-SCR
+Ctx-Eval
+Int-Eval
+Ctx-Eval
+Int-Eval
+Int-Eval
+
+57.2
+53.8
+24.2
+30.6
+39.6
+63.3
+41.7
+
+66.9
+57.4
+58.8
+61.4
+59.0
+82.6
+71.0
+
+49.8
+55.8
+52.8
+41.0
+64.3
+60.8
+48.8
+
+65.3
+76.6
+87.7
+73.1
+56.2
+78.7
+74.6
+
+-7.5
++2.0
++28.7
++10.4
++24.7
+-2.5
++7.0
+
+-1.6
++19.2
++28.8
++11.7
+-2.8
+-3.8
++3.6
+
+Backbone
+
+Held-out
+
+ConFiQA-QA
+ConFiQA-MR
+ConFiQA-MC
+ConflictQA
+ConflictBank
+TriviaQA
+NQ
+
+their full training cost whenever the backbone, dataset, or hyperparameters change, and
+must maintain a forked checkpoint alongside the base model.
+Taken together, even when the one-time hidden-state extraction is included in the budget, SABER’s
+total effective compute (approximately 15 GPU-hours) is substantially less than CR-DPO (∼72
+GPU-hours, ∼5× less) and comparable to R-Tuning (∼13 GPU-hours), while running on a single
+A5000 at a fraction of either baseline’s memory footprint. Once the cached states are in place, every
+subsequent probe re-training takes minutes rather than hours, so the total compute gap widens further
+as soon as more than one probe configuration is explored. We therefore view SABER as the most
+practical of the three trained approaches to deploy and iterate on, particularly for groups without
+large-scale multi-GPU infrastructure.
+
+G
+
+Limitations
+
+We discuss several limitations of our study, primarily as scope choices that motivate future work.
+Backbone scope. Our experiments cover four open-weight instruction-tuned backbones from the
+Llama family, Llama-3.1-8B and Llama-3.2-3B, and the Qwen family, Qwen-2.5-7B and Qwen-2.53B. Extending SABER to substantially larger backbones, where hidden states may exhibit different
+self-awareness profiles, is left to future work.
+23
+
+Table 13: Per-backbone training cost on NVIDIA A5000 (24 GB). SABER’s one-time hidden-state
+extraction (not shown) costs ∼5 GPU-h per 8B backbone and ∼3 GPU-h per 3B backbone (∼15
+GPU-h total of effective compute for the production run, with multiple extraction jobs sharing each
+GPU), amortised across every variant trained on the cached states.
+CR-DPO
+
+R-Tuning
+
+SABER predictor
+
+∼14M (LoRA)
+∼10 GB
+8×A5000
+
+∼14M (LoRA)
+∼5 GB
+4–8×A5000
+
+∼5M (MLP)
+<2 GB
+1×A5000
+
+GPU-h on Llama-3.1-8B
+GPU-h on Llama-3.2-3B
+GPU-h on Qwen-2.5-7B
+GPU-h on Qwen-2.5-3B
+
+21
+14
+23
+14
+
+5.3
+2.3
+2.3
+3.0
+
+<0.2
+<0.1
+<0.2
+<0.1
+
+Total GPU-h
+
+∼72
+
+∼13
+
+<0.6
+
+Trainable params
+Peak GPU memory
+Hardware (DDP)
+
+Retrieval scope. Our study assumes that the retrieved context has already been supplied and
+focuses on the well-defined problem of resolving knowledge conflict between this context and the
+model’s parametric knowledge. We do not address the upstream retrieval process itself, including
+how candidate passages are selected, ranked, or pre-filtered from a corpus, which is an orthogonal
+line of work.
+Static benchmark. Our benchmark labels four fixed LLMs at a single point in time. As new LLMs
+are released, per-backbone PK- and CK-path correctness labels need to be re-collected. The labeling
+pipeline in Eq. 1–2 is fully reproducible, but incurs non-trivial inference cost for each new backbone.
+
+H
+
+Broader Impacts
+
+SABER aims to make retrieval-augmented generation more honest by enabling calibrated abstention
+when neither the parametric nor the contextual answer path is reliable. Its intended positive impact
+is to reduce confidently wrong outputs in LLM-based question answering. We do not anticipate
+substantial negative societal impacts specific to our method.
+
+24
+
+

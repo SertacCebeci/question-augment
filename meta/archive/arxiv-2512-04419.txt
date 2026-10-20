@@ -1,0 +1,2328 @@
+Solving LLM Repetition Problem in Production:
+A Comprehensive Study of Multiple Solutions
+Weiwei Wang∗
+
+Weijie Zou†
+
+Jiyong Min‡
+
+arXiv:2512.04419v1 [cs.AI] 4 Dec 2025
+
+December 5, 2025
+
+Abstract
+The repetition problem, where Large Language Models (LLMs) continuously
+generate repetitive content without proper termination, poses a critical challenge
+in production deployments, causing severe performance degradation and system
+stalling. This paper presents a comprehensive investigation and multiple practical
+solutions for the repetition problem encountered in real-world batch code interpretation tasks, combining first-hand production experience with extensive experimental
+validation.
+We identify three distinct repetition patterns: (1) business rule generation repetition, (2) method call relationship analysis repetition, and (3) PlantUML diagram syntax generation repetition. Through rigorous theoretical analysis based on
+Markov models, we establish that the root cause lies in greedy decoding’s inability to
+escape repetitive loops, exacerbated by self-reinforcement effects. Our comprehensive experimental evaluation demonstrates three viable solutions: (1) Beam Search
+decoding with early_stopping=True serves as a universal post-hoc mechanism
+that effectively resolves all three repetition patterns, though it addresses symptoms
+rather than root causes; (2) presence_penalty hyperparameter provides an effective solution specifically for BadCase 1; and (3) Direct Preference Optimization
+(DPO) fine-tuning offers a universal model-level solution for all three BadCases,
+addressing repetition at its fundamental level.
+The primary value of this work lies in combining first-hand production experience with extensive experimental validation to rigorously demonstrate the feasibility and effectiveness of these solutions. Our main contributions include systematic
+theoretical analysis of repetition mechanisms, comprehensive evaluation of multiple
+solutions with task-specific applicability mapping, identification of early_stopping
+as the critical parameter for Beam Search effectiveness, and practical productionready solutions validated in real deployment environments. This work provides
+actionable insights and proven methodologies for deploying LLMs in production
+environments where deterministic, high-quality outputs are essential.
+
+Keywords: LLM Repetition Problem, Beam Search, Direct Preference Optimization,
+Presence Penalty, Text Generation, Greedy Decoding, vLLM
+∗
+
+Shenzhen Sunline Tech Co., Ltd, weiweiw404@gmail.com
+Shenzhen Sunline Tech Co., Ltd, rootshellexp@gmail.com
+‡
+Shenzhen Sunline Tech Co., Ltd, johnmin2450254666@gmail.com
+†
+
+1
+
+1
+
+Introduction
+
+1.1 Research Background
+Large Language Models (LLMs) have become increasingly important in real-world applications, demonstrating exceptional capabilities in various domains including natural
+language understanding, code generation, and system analysis. The practical deployment
+of LLMs in production environments has opened new possibilities for automating complex
+tasks that previously required significant human expertise.
+In particular, code interpretation tasks have emerged as a critical application area
+where LLMs can assist developers in understanding complex codebases, generating documentation, and analyzing system architectures. These applications require LLMs to
+process multiple code segments sequentially, maintaining context across different levels
+of abstraction (transactions, service methods, etc.), and generating structured outputs
+such as business rules and PlantUML diagrams.
+However, as LLMs are deployed in increasingly complex and demanding scenarios,
+certain behavioral anomalies have been observed that can significantly impact system
+performance and reliability. One such critical issue is the repetition problem, which manifests as the model continuously generating repetitive content without proper termination.
+
+1.2 Problem Statement
+The repetition problem, commonly known as the ”repeater” problem, occurs when LLMs
+continuously generate repetitive text in a loop during inference. In our specific case study
+involving batch code interpretation, we observed the following phenomena:
+• The model experiences significant stalling during batch processing
+• The model continuously streams repetitive content without interruption
+• Generation continues until reaching the maximum token limit (max_tokens)
+• Processing time increases dramatically from normal operation (28 minutes) to problematic scenarios (40-160 minutes)
+This problem has substantial practical implications. In a batch processing scenario
+where 20 transactions are processed sequentially, the occurrence of the repetition problem
+can increase total processing time by 43% to 471%, severely impacting system throughput and resource utilization. The high reproducibility rate (75-80% across different deployment modes) makes this a critical issue that requires systematic investigation and
+resolution.
+
+1.3 Research Significance
+Addressing the repetition problem is of paramount importance for the practical deployment of LLMs in production environments. The contributions of this work include:
+• Practical Problem Solving: We provide a systematic approach to resolving a
+real-world performance issue that significantly impacts production systems.
+2
+
+• Deployment Optimization: Our solution offers insights into LLM deployment
+optimization that can benefit other similar applications.
+• Critical Parameter Discovery: We identify and validate the early_stopping
+parameter as the decisive factor for Beam Search effectiveness. Our experiments
+reveal a dramatic difference: early_stopping=True achieves near-zero repetition
+rate, while early_stopping=False still exhibits significant repetition rate, demonstrating that this parameter is not optional but essential for solving the repetition
+problem.
+• Framework Integration: Our work addresses parameter passing issues between
+different frameworks (FastChat and vLLM), which is a common challenge in realworld deployments.
+
+1.4 Paper Structure
+The remainder of this paper is organized as follows: Section 2 reviews related work on repetition problems in text generation and decoding strategies. Section 3 presents a detailed
+problem description and analysis of our specific application scenario. Section 4 provides
+theoretical analysis of the root causes of the repetition problem. Section 5 describes our
+solution design including Beam Search, presence penalty, and DPO fine-tuning. Section
+6 discusses the solution’s advantages, limitations, and best practices. Finally, Section 7
+concludes the paper with a summary of contributions and future work. Detailed BadCase
+examples, DPO dataset examples, mathematical proofs, and implementation details are
+provided in the Appendix.
+
+2
+
+Related Work
+
+2.1 Research on Repetition Problems in LLM Text Generation
+The repetition problem in neural text generation has been an active area of research.
+A seminal work is ”Learning to break the Loop: Analyzing and Mitigating Repetitions
+for Natural Text Generation” [1], which establishes that repetition problems are fundamentally related to decoding strategy. Other works have explored neural text degeneration [8, 11] and various mitigation approaches including repetition penalty [12, 13],
+length normalization [7, 14], diversity-promoting methods [15, 17], and training-based solutions [1]. However, these methods often require careful tuning, introduce randomness,
+or require costly model retraining.
+
+2.2 Decoding Strategy Research
+Text generation in LLMs involves prefill and decoding stages. Greedy decoding, which
+selects the highest-probability token at each step, is computationally eﬀicient but particularly susceptible to repetition problems as it cannot explore alternative paths. Beam
+Search addresses this limitation by maintaining multiple candidate sequences simultaneously [7, 20, 21], allowing exploration of multiple paths and escape from repetitive loops.
+
+3
+
+The beam width parameter (k) controls the number of candidate sequences, with empirical studies showing values between 3 and 10 are typically optimal [7, 10]. Various
+Beam Search variants have been proposed including diverse beam search [15, 16], length
+penalty [14], and constrained beam search [22,23]. Other decoding strategies include Topk sampling [9], Top-p (Nucleus) sampling [17], temperature scaling [18], and contrastive
+search [19]. However, these sampling-based methods introduce randomness that may be
+undesirable in deterministic production environments and may not effectively address
+systematic repetition patterns due to self-reinforcement effects.
+
+3
+
+Problem Description and Analysis
+
+3.1 Application Scenario
+Our investigation is motivated by a real-world application involving batch code interpretation for financial transaction systems. The system processes transactions in batches, where
+each batch contains 20 transactions that are executed sequentially. The processing workflow includes transaction discovery, service method processing (with recursive method
+drilling, business rule generation, and PlantUML code generation), transaction-level processing, and diagram generation. Under normal operating conditions, the processing time
+for a single transaction is approximately 28 minutes. Detailed workflow diagram, processing time statistics, and LLM call frequency analysis are provided in Appendix C.1 and
+C.2.
+To investigate the system behavior in production, we conducted experiments comparing two deployment modes for vLLM (Mode 1: LoRA-enabled; Mode 2: Merged model).
+When running 20 transactions sequentially in batch mode across multiple experimental
+runs, we observed significant time discrepancies: the system exhibits severe performance
+degradation in a significant proportion of experimental runs (75-80% occurrence rate),
+with processing time increasing dramatically from normal operation to problematic scenarios. This time discrepancy indicates an underlying issue that causes system stalling
+during batch processing. Detailed experimental comparison results are provided in Appendix C.2.
+
+3.2 BadCase Analysis: Root Cause of Time Discrepancy
+Log analysis revealed that the stalling behavior corresponds exactly to the repetition
+problem, where the model continuously outputs repetitive content without stopping until
+reaching the max_tokens limit. We identified three distinct BadCase types:
+• BadCase 1: Business rule generation repetition - model generates valid rules initially but then falls into repeating similar conditional patterns.
+• BadCase 2: Method call relationship analysis repetition - model correctly identifies
+call relationships initially but then repeatedly outputs the same method name.
+• BadCase 3: PlantUML diagram syntax generation repetition - model generates
+valid PlantUML code initially but then repeatedly generates closing statements.
+
+4
+
+All three BadCase types share a common characteristic: the model becomes trapped in
+repetitive loops during text generation, leading to significant processing delays. Detailed
+case-by-case analysis with complete examples is provided in Appendix A.
+To understand why these repetition patterns occur and how they can be systematically addressed, we now turn to theoretical analysis. The following section provides a
+mathematical foundation for understanding the root causes of the repetition problem,
+which will inform our solution design.
+
+4
+
+Theoretical Analysis of the Repetition Problem
+
+4.1 Root Cause Analysis
+Based on Markov model analysis, the repetition problem in LLMs can be understood
+through three key mechanisms: (1) Context Repetition Leading to Probability
+Enhancement: When the context contains repeated patterns, the model tends to increase the probability of tokens that appeared previously, learning a shortcut to copy from
+recent history. (2) Self-Reinforcement Effect: The probability of repetition increases
+monotonically with the number of historical repetitions, creating a positive feedback loop.
+(3) High Initial Probability Reinforcement: Sentences with higher initial probabilities exhibit stronger self-reinforcement effects. Detailed mathematical formalization is
+provided in Appendix C.8.
+
+4.2 Limitations of Greedy Decoding
+Greedy decoding, which selects the highest-probability token at each step, is particularly
+vulnerable to the repetition problem for several reasons:
+1. Single-Path Exploration: Greedy decoding maintains only one candidate sequence, so once a repetitive pattern begins, there is no mechanism to explore alternative paths.
+2. No Look-Ahead: The algorithm makes decisions based only on immediate probabilities, without considering long-term consequences or recognizing repetitive patterns.
+3. Amplification of Self-Reinforcement: Since greedy decoding always selects the
+highest-probability token, and repetitive tokens have elevated probabilities due to
+self-reinforcement, the algorithm naturally continues the repetition cycle.
+The self-reinforcement effect combined with greedy decoding creates a scenario where
+the model becomes trapped in a loop, continuously generating repetitive content until
+external constraints (such as max_tokens) force termination.
+
+4.3 Mathematical Modeling
+We model the repetition problem using a Markov chain where the state represents whether
+we are in a repetitive pattern. The repetition probability evolves according to a recurrence
+5
+
+relation that captures the cumulative effect where each repetition makes future repetitions
+more likely. Under greedy decoding with self-reinforcement effects, once the model enters
+a repetitive state, the expected escape time is infinite, explaining why greedy decoding
+cannot break out of repetition loops.
+Beam Search addresses this limitation by maintaining multiple candidate sequences.
+With beam width B ≥ 2 and proper early stopping, Beam Search can escape repetitive
+loops by maintaining at least one non-repetitive candidate sequence, provided that the
+initial probability gap between repetitive and non-repetitive continuations is bounded.
+Detailed mathematical modeling, proofs of propositions, theoretical predictions vs experimental validation, and critical beam width analysis are provided in Appendix C.8.
+The early stopping mechanism plays a critical role: when early_stopping=True, the
+algorithm terminates once it finds B complete sequences, preventing exhaustive search
+that might lead back to repetitive patterns. This ensures that diverse candidates are
+preserved throughout the search process.
+Building on this theoretical foundation, we now present practical solutions that address the repetition problem at different levels. The following section describes three
+complementary approaches: Beam Search as a post-hoc mechanism, presence penalty for
+task-specific cases, and DPO fine-tuning as a model-level solution.
+
+5
+
+Solution Design
+
+Based on the theoretical understanding of the repetition problem and our analysis of
+the three BadCases, we have explored multiple solutions. Through analysis and experimental validation, we discovered that all three BadCase types can be effectively resolved
+using Beam Search decoding strategy, which serves as an effective inference-time solution. However, as Beam Search operates as a post-hoc mechanism that addresses the
+symptom rather than the root cause at the model level, we further explored alternative
+solutions that provide more fundamental approaches to the repetition problem. This section presents a comprehensive comparison of solutions and their applicability to different
+BadCase scenarios.
+
+5.1 Solution 1: Beam Search Decoding Strategy
+Through analysis of the three BadCases, we found that all of them can be effectively
+resolved using Beam Search decoding strategy. Beam Search serves as an inference-time
+solution that effectively resolves repetition problems across all three BadCase types without requiring model modifications.
+Principle and Algorithm Beam Search maintains multiple candidate sequences (beams)
+at each decoding step, selecting the top-k candidates based on cumulative joint probability rather than just the single highest-probability token. Unlike greedy decoding which
+maintains only one candidate sequence, Beam Search’s multi-path exploration allows it to
+consider alternative continuations when one path becomes repetitive, providing a mech-
+
+6
+
+anism to escape repetition loops. The cumulative score for a sequence is computed as:
+Score(w1 , . . . , wt ) =
+
+t
+∑
+
+log P (wi |w1 , . . . , wi−1 )
+
+(1)
+
+i=1
+
+Critical Parameter Configuration For Beam Search to function correctly in vLLM,
+the following parameters must be set as specified:
+• use_beam_search: Must be True
+• best_of: Beam width, set to 5 (provides good balance between exploration and
+eﬀiciency)
+• temperature: Must be 0 (deterministic decoding)
+• top_p: Must be 1 (no nucleus filtering)
+• top_k: Must be -1 (no top-k filtering)
+• early_stopping: Must be True (critical!)
+The early_stopping parameter is the most critical factor for solving the repetition
+problem. This is our key finding: when set to True, Beam Search stops as soon as
+best_of number of candidate results are found, allowing rapid termination and preserving diverse candidates. When set to False or Never, the algorithm continues searching
+indefinitely, potentially leading back to repetitive patterns. Our experimental validation
+(Table 4) demonstrates that early_stopping=True achieves 0% repetition rate, while
+early_stopping=False still exhibits 60% repetition rate—a dramatic difference that underscores the critical importance of this parameter. This finding contradicts the common
+assumption that Beam Search alone is suﬀicient; rather, early_stopping=True is an
+essential requirement, not an optional optimization.
+Implementation Notes We initially used FastChat integrated with vLLM, but discovered that sampling parameters were not being correctly passed. We implemented a
+solution using the extra_body approach to correctly pass sampling parameters. Detailed
+implementation notes and framework integration considerations are provided in Appendix
+C.12.
+Experimental Validation Experimental validation demonstrates that Beam Search
+with early_stopping=True completely eliminates the repetition problem and restores
+normal processing time. In stark contrast, Beam Search with early_stopping=False
+still exhibits problematic behavior, confirming that early_stopping=True is not merely
+beneficial but essential for actually solving the repetition problem. This dramatic difference represents our most significant finding: the early_stopping parameter is the decisive factor that determines whether Beam Search succeeds or fails in addressing repetition
+problems. Detailed experimental results, performance comparison tables, and statistical
+analysis are provided in Appendix C.4.
+
+7
+
+Ablation Studies To understand the individual contribution of each parameter, we
+conducted ablation studies systematically varying key parameters. The results unequivocally confirm that early_stopping=True is the most critical parameter. This finding
+demonstrates that early_stopping is not just one of many parameters but the determining factor for success. Other parameters (beam width, temperature, etc.) have secondary
+effects, but without early_stopping=True, Beam Search cannot effectively solve the
+repetition problem. Detailed ablation study results including beam width impact and
+presence_penalty value analysis are provided in Appendix C.11.
+
+5.2 Solution 2: Presence Penalty for BadCase 1
+While Beam Search serves as an effective post-hoc mechanism, we explored alternative
+solutions that address the repetition problem at different levels. For BadCase 1 (business
+rule generation repetition), we found that the presence_penalty hyperparameter can
+effectively mitigate repetition issues.
+Principle and Mechanism The presence_penalty parameter penalizes tokens that
+have already appeared in the generated text, reducing their probability of being selected
+again. This mechanism helps prevent repetitive patterns by decreasing the likelihood of
+repeating recently generated tokens.
+Experimental Validation We conducted experiments to evaluate the effectiveness of
+presence_penalty for BadCase 1. The results demonstrate that setting presence_penalty=1.2
+effectively eliminates repetition problems. Detailed experimental results and statistical
+analysis are provided in Appendix C.5.
+Limitations However, this approach has limitations: (1) Task-specific: Only effective
+for BadCase 1, not applicable to BadCase 2 and BadCase 3. (2) Parameter tuning:
+Requires careful tuning of the penalty value for optimal results. (3) Inference-time
+adjustment: Still a post-hoc mechanism, similar to Beam Search.
+
+5.3 Solution 3: Direct Preference Optimization (DPO) for All
+BadCases
+While BadCase 1 can be effectively addressed using presence_penalty at the inferencetime parameter level, Direct Preference Optimization (DPO) fine-tuning provides a universal model-level solution that can be applied to all three BadCase types. Unlike presence_penalty, which is only effective for BadCase 1, DPO fine-tuning addresses repetition
+problems at the model level by fundamentally modifying the model’s behavior through
+preference-based learning.
+DPO Approach Overview DPO fine-tuning trains the model to prefer non-repetitive
+outputs over repetitive ones by using preference datasets that explicitly contrast chosen
+(correct, non-repetitive) responses with rejected (repetitive) responses.
+
+8
+
+Dataset Construction We developed a systematic approach to construct DPO preference datasets using a power-of-2 repetition pattern (2, 4, 8, 16 repetitions). For each
+BadCase type, we construct preference pairs where the chosen response is correct and nonrepetitive, while the rejected response contains repetitive patterns. The detailed dataset
+construction methodology and complete DPO dataset examples for all BadCase types are
+provided in Appendix C.3 and B.
+Experimental Validation We conducted DPO fine-tuning experiments on all three
+BadCase types using the LlamaFactory framework with 4×A100 GPUs. The experimental results demonstrate that DPO fine-tuning effectively addresses repetition problems
+across all three BadCase types, achieving significant reduction in repetition rates. Additionally, processing time improvements after DPO fine-tuning restored normal operation
+performance. Detailed experimental results, statistical analysis, setup, and configuration
+are provided in Appendix C.6 and C.7.
+Advantages and Limitations DPO fine-tuning offers several advantages: (1) addresses repetition at the model level through fine-tuning, (2) can fundamentally change
+model behavior to avoid repetition, (3) effective for all BadCase types, providing a universal model-level solution, and (4) particularly valuable for BadCase 2 and BadCase 3,
+where presence_penalty fails. However, it has limitations: (1) requires model fine-tuning,
+which is computationally expensive (15-18 GPU hours per BadCase type), (2) requires
+careful dataset construction and generalization, and (3) may need periodic retraining as
+new bad cases emerge.
+
+5.4 Solution Comparison Summary
+Table 1 summarizes the applicability of different solutions to each BadCase type:
+
+Solution
+
+Table 1: Solution Applicability Comparison
+BadCase 1 BadCase 2 BadCase 3
+
+Beam Search (post-hoc)
+Presence Penalty
+DPO Fine-tuning
+
+✓
+✓
+✓
+
+✓
+×
+✓
+
+✓
+×
+✓
+
+Beam Search serves as a universal post-hoc mechanism effective for all three BadCase
+types. Presence penalty is effective only for BadCase 1, while DPO fine-tuning provides
+a universal model-level solution. The solution applicability comparison is summarized in
+Table 1.
+
+6
+
+Discussion
+
+6.1 Solution Advantages
+Our comprehensive study presents multiple solutions with distinct advantages: Beam
+Search serves as a universal inference-time solution with universal applicability, imme9
+
+diate deployment capability, proven effectiveness, and deterministic outputs. Presence
+Penalty offers a lightweight alternative specifically for BadCase 1 with simple configuration and minimal overhead, though its task-specific nature limits broader applicability. DPO Fine-tuning provides a fundamental model-level solution with universal
+applicability and long-term benefits, though it requires upfront training cost. Detailed
+comparison of advantages and trade-offs is discussed in Section 6.
+
+6.2 Limitations and Considerations
+While effective, our solution has some limitations: (1) Computational Overhead:
+Beam Search requires increased memory and processing time compared to greedy decoding, though this overhead is minimal compared to the performance degradation from
+repetition problems. (2) Strict Parameter Requirements: The solution requires strict
+adherence to parameter configuration, especially early_stopping=True, and careful parameter passing between frameworks. (3) Context-Dependent Effectiveness: Effectiveness may vary depending on the specific model, task, and deployment scenario. Detailed overhead analysis, computational overhead tables, performance-overhead tradeoff
+figures, and effectiveness analysis are provided in Appendix C.9 and C.10.
+
+6.3 Best Practice Recommendations
+Based on our experience, we recommend the following best practices: (1) verify all required Beam Search parameters are correctly set, especially early_stopping=True, (2)
+ensure proper parameter propagation between frameworks (e.g., FastChat + vLLM), and
+(3) implement monitoring and logging to detect repetition problems. Detailed parameter configuration checklists, integration considerations, and monitoring guidelines are
+provided in Appendix C.13.
+
+7
+
+Conclusion
+
+7.1 Main Contributions
+This paper makes the following contributions:
+1. Systematic Root Cause Analysis: We provide a comprehensive analysis of
+the LLM repetition problem across three distinct BadCase types, explaining causes
+through Markov model theory, including context repetition effects, self-reinforcement
+mechanisms, and high initial probability reinforcement.
+2. Comprehensive Solution Evaluation: We evaluate multiple solutions: Beam
+Search as a universal inference-time solution effective for all three BadCases, presence_penalty for BadCase 1, and DPO fine-tuning as a universal model-level solution for all three BadCases, providing a complete solution landscape.
+3. Task-specific Solution Mapping: We identify which solutions are effective for
+which BadCase types, enabling practitioners to choose the most appropriate approach based on their specific requirements and constraints.
+10
+
+4. Critical Parameter Discovery: We identify and validate that early_stopping=True
+is the decisive factor for Beam Search effectiveness. Our experiments reveal a dramatic difference: early_stopping=True achieves near-zero repetition rate, while
+early_stopping=False still exhibits significant repetition rate. This finding demonstrates that early_stopping is not optional but essential—a critical insight that
+contradicts common assumptions about Beam Search. We also demonstrate the
+effectiveness of presence_penalty for BadCase 1.
+5. DPO Dataset Construction Methodology: We present a systematic approach
+for constructing DPO preference datasets using generalization and power-of-2 repetition patterns, providing a scalable methodology for addressing repetition at the
+model level.
+6. Complete Production Solutions: We provide complete, practical solutions including troubleshooting processes, parameter configuration details, and framework
+integration considerations that enable immediate application in production environments.
+Our experimental results demonstrate that: (1) Beam Search with early_stopping=True
+completely eliminates repetition problems across all BadCase types, (2) presence_penalty
+effectively resolves BadCase 1 repetition, and (3) DPO fine-tuning provides a universal
+model-level solution for all three BadCases. All solutions effectively restore normal processing performance, demonstrating significant improvements over baseline approaches.
+
+7.2 Future Work
+Several directions for future research emerge:
+1. Hybrid Solutions: Explore combinations of different solutions (e.g., Beam Search
++ presence_penalty) for enhanced effectiveness or reduced computational overhead.
+2. Adaptive Solution Selection: Develop mechanisms to automatically select the
+most appropriate solution based on input characteristics or detected repetition patterns.
+3. Optimal Parameter Configuration: Investigate optimal beam width and other
+parameter settings for different scenarios, tasks, and model sizes. Develop adaptive
+parameter selection mechanisms.
+4. Automated Parameter Tuning: Develop automated systems for parameter tuning that can adapt to different models and tasks without manual configuration.
+5. Framework Integration Improvements: Work toward more robust parameter
+passing mechanisms between different frameworks to reduce integration challenges.
+6. Repetition Detection: Develop real-time detection mechanisms for repetition
+problems that can trigger adaptive responses or fallback strategies.
+
+11
+
+References
+[1] Su, J., Xu, C., Cai, S., Wu, Y., and Yu, X. (2022). Learning to break the loop:
+Analyzing and mitigating repetitions for natural text generation. arXiv preprint
+arXiv:2206.02369. Available at: https://arxiv.org/pdf/2206.02369
+[2] Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu, C., Gonzalez, J., Zhang, H.,
+and Stoica, I. (2023). Eﬀicient memory management for large language model serving with pagedattention. Proceedings of the 29th Symposium on Operating Systems
+Principles, 611-626.
+[3] vLLM Oﬀicial Documentation. https://docs.vllm.ai/
+[4] vLLM Source Code Repository. https://github.com/vllm-project/vllm
+[5] FastChat: An open platform for training, serving, and evaluating large language
+model based chatbots. https://github.com/lm-sys/FastChat
+[6] Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A. N., Kaiser,
+L., and Polosukhin, I. (2017). Attention is all you need. Advances in Neural Information Processing Systems, 30.
+[7] Freitag, M., and Al-Onaizan, Y. (2017). Beam search strategies for neural machine
+translation. Proceedings of the First Workshop on Neural Machine Translation, 56-60.
+[8] Holtzman, A., Buys, J., Du, L., Forbes, M., and Choi, Y. (2020). The curious case
+of neural text degeneration. International Conference on Learning Representations.
+[9] Fan, A., Lewis, M., and Dauphin, Y. (2018). Hierarchical neural story generation.
+Proceedings of the 56th Annual Meeting of the Association for Computational Linguistics, 889-898.
+[10] Wiher, G., Meister, C., and Cotterell, R. (2022). On decoding strategies for neural
+text generators. Transactions of the Association for Computational Linguistics, 10,
+997-1012.
+[11] Welleck, S., Kulikov, I., Roller, S., Dinan, E., Cho, K., and Weston, J. (2020). Neural
+text generation with unlikelihood training. International Conference on Learning
+Representations.
+[12] Klein, G., Kim, Y., Deng, Y., Senellart, J., and Rush, A. M. (2017). OpenNMT:
+Open-source toolkit for neural machine translation. Proceedings of ACL 2017, System
+Demonstrations, 67-72.
+[13] Paul, G., Shalyminov, I., and Yu, Z. (2019). Improving neural conversational models
+with entropy-based data filtering. Proceedings of the 57th Annual Meeting of the
+Association for Computational Linguistics, 5659-5664.
+[14] Murray, K., and Chiang, D. (2018). Correcting length bias in neural machine translation. Proceedings of the Third Conference on Machine Translation: Research Papers,
+212-223.
+12
+
+[15] Vijayakumar, A. K., Cogswell, M., Selvaraju, R. R., Sun, Q., Lee, C., Crandall, D.,
+and Batra, D. (2016). Diverse beam search: Decoding diverse solutions from neural
+sequence models. arXiv preprint arXiv:1610.02424.
+[16] Li, J., Galley, M., Brockett, C., Spithourakis, G. P., Gao, J., and Dolan, B. (2016).
+A persona-based neural conversation model. Proceedings of the 54th Annual Meeting
+of the Association for Computational Linguistics, 994-1003.
+[17] Holtzman, A., Buys, J., Du, L., Forbes, M., and Choi, Y. (2019). The curious case
+of neural text degeneration. arXiv preprint arXiv:1904.09751.
+[18] Ackley, D. H., Hinton, G. E., and Sejnowski, T. J. (1985). A learning algorithm for
+Boltzmann machines. Cognitive Science, 9(1), 147-169.
+[19] Su, Y., Lan, T., Wang, Y., Yogatama, D., Kong, L., and Collier, N. (2022). A
+contrastive framework for neural text generation. Advances in Neural Information
+Processing Systems, 35, 21548-21561.
+[20] Lowerre, B. T. (1976). The HARPY speech recognition system. PhD thesis, Carnegie
+Mellon University.
+[21] Ott, M., Auli, M., Grangier, D., and Ranzato, M. (2018). Analyzing uncertainty in
+neural machine translation. International Conference on Machine Learning, 39563965.
+[22] Post, M., and Vilar, D. (2018). Fast lexically constrained decoding with dynamic
+beam allocation for neural machine translation. Proceedings of the 2018 Conference
+of the North American Chapter of the Association for Computational Linguistics:
+Human Language Technologies, 1314-1324.
+[23] Hokamp, C., and Liu, Q. (2017). Lexically constrained decoding for sequence generation using grid beam search. Proceedings of the 55th Annual Meeting of the
+Association for Computational Linguistics, 1535-1546.
+[24] Wolf, T., Debut, L., Sanh, V., Chaumond, J., Delangue, C., Moi, A., ... and Rush, A.
+M. (2020). Transformers: State-of-the-art natural language processing. Proceedings of
+the 2020 Conference on Empirical Methods in Natural Language Processing: System
+Demonstrations, 38-45.
+[25] NVIDIA TensorRT-LLM
+TensorRT-LLM/
+
+Documentation.
+
+[26] NVIDIA
+FasterTransformer
+FasterTransformer
+
+https://nvidia.github.io/
+
+Library.
+
+https://github.com/NVIDIA/
+
+[27] Hugging Face Text Generation Inference.
+text-generation-inference
+
+https://github.com/huggingface/
+
+[28] Devlin, J., Chang, M. W., Lee, K., and Toutanova, K. (2019). BERT: Pre-training of
+deep bidirectional transformers for language understanding. Proceedings of the 2019
+Conference of the North American Chapter of the Association for Computational
+Linguistics: Human Language Technologies, 4171-4186.
+13
+
+[29] Brown, T., Mann, B., Ryder, N., Subbiah, M., Kaplan, J. D., Dhariwal, P., ... and
+Amodei, D. (2020). Language models are few-shot learners. Advances in Neural
+Information Processing Systems, 33, 1877-1901.
+[30] Touvron, H., Lavril, T., Izacard, G., Martinet, X., Lachaux, M. A., Lacroix, T., ...
+and Lample, G. (2023). LLaMA: Open and eﬀicient foundation language models.
+arXiv preprint arXiv:2302.13971.
+[31] Radford, A., Wu, J., Child, R., Luan, D., Amodei, D., and Sutskever, I. (2019).
+Language models are unsupervised multitask learners. OpenAI Blog.
+
+Appendix
+Note: All experimental data, code implementations, and detailed records are available in
+our GitHub repository: https://github.com/charles-wang888/llm-output-repetition.
+
+A
+
+BadCase Examples
+
+This appendix provides detailed examples of the three BadCase types discussed in Section
+3.2.
+
+A.1 BadCase 1: Business Rule Generation
+A.1.1
+1
+
+Expected Output Format
+
+该 方 法 主 要 用 于 检 查 账 户 解 控 条 件， 业 务 规 则 如 下：
+
+2
+3
+
+1. 检 查 【 控 制 解 控 标 志 】
+
+4
+5
+
+1.1 如 果 【 控 制 解 控 标 志 】 等 于 " 解 控 " ， 则 报 错 ： " 指 定 控 制 编 号 的 账 户 控
+制 已 经 解 除 控 制"
+
+6
+7
+
+2. 检 查 【 资 金 账 号 】
+
+8
+9
+
+2.1 如 果 【 资 金 账 号 】 不 等 于 【 输 入 . 资 金 账 号 】 ， 则 报 错 ： " 输 入 的 资 金
+账 号 与 控 制 资 金 账 号 不 一 致"
+
+10
+11
+
+3. 检 查 交 易 渠 道
+
+12
+13
+
+3.1 如 果 交 易 渠 道 为 柜 面 ( 【 公 共 上 下 文 . 渠 道 代 码 】 ==" 柜 面 ") 且 【 公 共 上
+下 文.交 易 柜 员】 不 等 于 【交 易 柜 员 号】， 则 报 错："柜 面 解 控 请 在 原 控
+制 机 构 办 理"
+
+14
+15
+
+4. 检 查 【 冻 结 来 源 】 是 否 为 " 冻 结 "
+
+16
+17
+
+4.1 如 果 【 冻 结 来 源 】 等 于 " 冻 结 " 且 当 前 日 期 小 于 等 于 【 控 制 结 束 日
+期】：
+
+14
+
+18
+
+4.1.1 构 建 【 有 权 机 关 执 法 信 息 】 。
+
+19
+20
+
+4.1.2 调 用 【 有 权 机 关 执 法 信 息 . 检 查 执 法 执 行 方 信 息 】 。
+
+21
+22
+
+4.1.3 调 用 【 有 权 机 构 执 法 信 息 . 检 查 解 控 执 法 执 行 方 信 息 】 。
+
+23
+24
+25
+
+5. 检 查 【 冻 结 操 作 标 志 】 并 且 【 限 制 类 型 】 为 " 金 额 冻 结 "
+
+26
+27
+
+5.1 检 查 【 冻 结 操 作 标 志 】 是 否 为 " 解 控 "
+
+28
+
+5.1.1 如 果 【 解 控 金 额 】 <0 ， 则 报 错 :" 解 控 金 额 必 须 大 于 0"
+
+29
+30
+
+5.1.2 如 果 【 解 控 金 额 】 >[ 需 冻 / 控 金 额 - 已 解 控 金 额 ] ， 则 报 错 ： " 解
+控 金 额 不 能 大 于 控 制 金 额"
+
+31
+
+32
+33
+
+5.2 检 查 【 冻 结 操 作 标 志 】 是 否 为 " 部 分 解 冻 "
+
+34
+
+5.2.1 如 果 【 解 控 金 额 】 <0 ， 则 报 错 :" 解 控 金 额 必 须 大 于 0"
+
+35
+36
+
+5.2.2 如 果 【 限 制 类 型 】 不 等 于 " 金 额 冻 结 " ， 则 报 错 ： " 只 有 金 额 冻 结
+才 能 进 行 部 分 解 冻"
+
+37
+
+38
+
+5.2.3 如 果 【 解 控 金 额 】 >= [ 需 冻 / 控 金 额 - 已 解 控 金 额 ] ， 则 报 错 ： "
+部 分 解 冻 解 控 金 额 不 能 大 于 控 制 金 额"
+
+39
+
+Listing 1: Expected Output Format for Business Rules
+
+A.1.2
+1
+
+Actual BadCase Output
+
+该 方 法 主 要 用 于 检 查 账 户 解 控 条件,其 主 要 业 务 规 则 如 下:
+
+2
+3
+
+1 、 如 果 [this. 控 制 解 控 标 志 ] 等 于 " 解 控 " ， 则 报 错 ： "YACTB127 - 指 定 控 制 编 号
+的 账 户 控 制 已 经 解 除 控 制 ";
+
+4
+5
+
+2 、 如 果 [this. 资 金 账 号 ] 不 等 于 [ 输 入 . 资 金 账 号 ] ， 则 报 错 ： "YACTB128 - 输 入
+的 资 金 账 号 与 控 制 资 金 账 号 不 一 致 ";
+
+6
+7
+
+3 、 如 果 交 易 渠 道 为 柜 面 ( 公 共 上 下 文 . 渠 道 代 码 ==" 柜 面 ") 且 [ 公 共 上 下 文 . 交 易
+柜 员 ] 不 等 于 [this. 交 易 柜 员 号 ] ， 则 报 错 ： "YACTB129 - 柜 面 解 控 请 在 原 控 制
+机 构 办 理 ";
+
+8
+9
+
+4 、 如 果 [this. 冻 结 来 源 ] 等 于 " 冻 结 ", 检 查 执 法 人 信 息 ， 信 息 ：
+
+10
+11
+
+4.1 、 根 据 [ 输 入 . 执 法 人 执 法 信 息 LawEnforcementInfo ] 的 调 用 对 应 构 造 方 法 构
+建 【 有 权 机 关 执 法 信 息 ControlEnforcement 】 # 解 控 执 法 人 信 息 。
+
+12
+13
+
+4.2 、 调 用 # 解 控 执 法 人 信 息 的 [ 检 查 执 法 执 行 方 信 息 ] 方 法 。
+
+15
+
+14
+15
+
+4.3 、 调 用 [this. 有 权 机 构 执 法 信 息 ] 的 [ 检 查 解 控 执 法 执 行 方 信 息 ] 方 法 ;( 输
+入 ： 输 入 . 执 法 人 执 法 信 息 LawEnforcementInfo )
+
+16
+17
+
+5 、 如 果 [ 输 入 . 冻 结 操 作 标 志 ] 等 于 " 解 控 " 且 [this. 限 制 类 型 ] 等 于 " 金 额 冻 结 " ，
+处 理 如 下：
+
+18
+19
+
+5.1 、 如 果 [ 输 入 . 解 控 金 额 ]<0 ， 则 报 错 :" YACTB132 - 解 控 金 额 必 须 大 于 0" ；
+
+20
+21
+
+5.2 、 如 果 [ 输 入 . 解 控 金 额 ]>[ this. 需 冻 / 控 金 额 ]-[ this. 已 解 控 金 额 ] ， 则 报
+错 ： "YACTB133 - 解 控 金 额 不 能 大 于 控 制 金 额 ";
+
+22
+23
+
+6、 如 果[输 入.冻 结 操 作 标 志]等 于"部 分 解 冻"， 处 理 如 下：
+
+24
+25
+
+6.1 、 如 果 [ 输 入 . 解 控 金 额 ]<0 ， 则 报 错 :" YACTB132 - 解 控 金 额 必 须 大 于 0" ；
+
+26
+27
+
+6.2 、 如 果 [this. 限 制 类 型 ] 不 等 于 " 金 额 冻 结 " ， 则 报 错 ： "YACTB134 - 只 有 金 额
+冻 结 才 能 进 行 部 分 解 冻 ";
+
+28
+29
+
+6.3 、 如 果 [ 输 入 . 解 控 金 额 ] >=[ this. 需 冻 / 控 金 额 ]-[ this. 已 解 控 金 额 ] ， 则 报
+错 ： "YACTB136 - 部 分 解 冻 解 控 金 额 不 能 大 于 控 制 金 额 ";
+
+30
+31
+
+7 、 如 果 [ 输 入 . 冻 结 操 作 标 志 ] 等 于 " 解 控 " 且 [this. 限 制 类 型 ] 等 于 " 账 户 冻 结 " ，
+则 报 错 ： "YACTB135 - 账 户 冻 结 只 能 进 行 全 部 解 冻 ";
+
+32
+33
+
+8 、 如 果 [ 输 入 . 冻 结 操 作 标 志 ] 等 于 " 部 分 解 冻 " 且 [this. 限 制 类 型 ] 等 于 " 账 户 冻
+结 " ， 则 报 错 ： "YACTB135 - 账 户 冻 结 只 能 进 行 全 部 解 冻 ";
+
+34
+35
+
+9 、 如 果 [ 输 入 . 冻 结 操 作 标 志 ] 等 于 " 解 控 " 且 [this. 限 制 类 型 ] 等 于 " 账 户 止 付 " ，
+则 报 错 ： "YACTB135 - 账 户 止 付 只 能 进 行 全 部 解 冻 ";
+
+36
+37
+
+10 、 如 果 [ 输 入 . 冻 结 操 作 标 志 ] 等 于 " 部 分 解 冻 " 且 [this. 限 制 类 型 ] 等 于 " 账 户 止
+付 " ， 则 报 错 ： "YACTB135 - 账 户 止 付 只 能 进 行 全 部 解 冻 ";
+
+38
+39
+
+11 、 如 果 [ 输 入 . 冻 结 操 作 标 志 ] 等 于 " 解 控 " 且 [this. 限 制 类 型 ] 等 于 " 账 户 只 收 不
+付 " ， 则 报 错 ： "YACTB135 - 账 户 只 收 不 付 只 能 进 行 全 部 解 冻 ";
+
+40
+41
+
+12 、 如 果 [ 输 入 . 冻 结 操 作 标 志 ] 等 于 " 部 分 解 冻 " 且 [this. 限 制 类 型 ] 等 于 " 账 户 只
+收 不 付 " ， 则 报 错 ： "YACTB135 - 账 户 只 收 不 付 只 能 进 行 全 部 解 冻 ";
+
+42
+43
+
+13 、 如 果 [ 输 入 . 冻 结 操 作 标 志 ] 等 于 " 解 控 " 且 [this. 限 制 类 型 ] 等 于 " 账 户 只 付 不
+收 " ， 则 报 错 ： "YACTB135 - 账 户 只 付 不 收 只 能 进 行 全 部 解 冻 ";
+
+44
+45
+
+14 、 如 果 [ 输 入 . 冻 结 操 作 标 志 ] 等 于 " 部 分 解 冻 " 且 [this. 限 制 类 型 ] 等 于 " 账 户 只
+付 不 收 " ， 则 报 错 ： "YACTB135 - 账 户 只 付 不 收 只 能 进 行 全 部 解 冻 ";
+
+46
+47
+
+15 、 如 果 [ 输 入 . 冻 结 操 作 标 志 ] 等 于 " 解 控 " 且 [this. 限 制 类 型 ] 等 于 " 账 户 不 收 不
+付 " ， 则 报 错 ： "YACTB135 - 账 户 不 收 不 付 只 能 进 行 全 部 解 冻 ";
+
+48
+
+16
+
+49
+
+16 、 如 果 [ 输 入 . 冻 结 操 作 标 志 ] 等 于 " 部 分 解 冻 " 且 [this. 限 制 类 型 ] 等 于 " 账 户 不
+收 不 付 " ， 则 报 错 ： "YACTB135 - 账 户 不 收 不 付 只 能 进 行 全 部 解 冻 ";
+
+50
+51
+
+17 、 如 果 [ 输 入 . 冻 结 操 作 标 志 ] 等 于 " 解 控 " 且 [this. 限 制 类 型 ] 等 于 " 账 户 只 收 不
+付 " ， 则 报 错 ： "YACTB135 - 账 户 只 收 不 付 只 能 进 行 全 部 解 冻 ";
+
+52
+53
+
+18 、 如 果 [ 输 入 . 冻 结 操 作 标 志 ] 等 于 " 部 分 解 冻 " 且 [this. 限 制 类 型 ] 等 于 " 账 户 只
+收 不 付 " ， 则 报 错 ： "YACTB135 - 账 户 只 收 不 付 只 能 进 行 全 部 解 冻 ";
+
+54
+55
+
+19 、 如 果 [ 输 入 . 冻 结 操 作 标 志 ] 等 于 " 解 控 " 且 [this. 限 制 类 型 ] 等 于 " 账 户 只 付 不
+收 " ， 则 报 错 ： "YACTB135 - 账 户 只 付 不 收 只 能 进 行 全 部 解 冻 ";
+
+56
+57
+
+20 、 如 果 [ 输 入 . 冻 结 操 作 标 志 ] 等 于 " 部 分 解 冻 " 且 [this. 限 制 类 型 ] 等 于 " 账 户 只
+付 不 收 " ， 则 报 错 ： "YACTB135 - 账 户 只 付 不 收 只 能 进 行 全 部 解 冻 ";
+
+58
+59
+
+21 、 如 果 [ 输 入 . 冻 结 操 作 标 志 ] 等 于 " 解 控 " 且 [this. 限 制 类 型 ] 等 于 " 账 户 不 收 不
+付 " ， 则 报 错 ： "YACTB135 - 账 户 不 收 不 付 只 能 进 行 全 部 解 冻 ";
+
+60
+61
+
+22 、 如 果 [ 输 入 . 冻 结 操 作 标 志 ] 等 于 " 部 分 解 冻 " 且 [this. 限 制 类 型 ] 等 于 " 账 户 不
+收 不 付 " ， 则 报 错 ： "YACTB135 - 账 户 不 收 不 付 只 能 进 行 全 部 解 冻 ";
+
+62
+63
+
+23 、 如 果 [ 输 入 . 冻 结 操 作 标 志 ] 等 于 " 解 控 " 且 [this. 限 制 类 型 ] 等 于 " 账 户 只 收 不
+付 " ， 则 报 错 ： "YACTB135 - 账 户 只 收 不 付 只 能 进 行 全 部 解 冻 ";
+
+64
+65
+
+[... continues with repeated similar rule patterns until max_tokens
+...]
+
+Listing 2: BadCase 1: Business Rule Generation Repetition
+
+A.2 BadCase 2: Method Call Relationship Analysis
+A.2.1
+
+Expected Output
+
+KcAcctCurtPoDao : selectOne_odb1
+BizCommonUtil : copyProperties
+3 KbAcctBindClassiPoDao : selectAll_odb2
+4 KcAcctFixbPoDao : selectOne_odb1
+5 KbAcctRstrctPoDao : selectAll_odb2
+6 KbAcctFreezeQueuePoDao : selectAll_odb4
+1
+2
+
+Listing 3: Expected Output for Method Call Relationship Analysis
+
+A.2.2
+
+Actual BadCase Output
+
+KcAcctCurtPoDao : selectOne_odb1
+2 BizCommonUtil : copyProperties
+1
+
+17
+
+BizCommonUtil : copyProperties
+BizCommonUtil : copyProperties
+5 BizCommonUtil : copyProperties
+6 BizCommonUtil : copyProperties
+7 BizCommonUtil : copyProperties
+8 BizCommonUtil : copyProperties
+9 KbAcctBindClassiPoDao : selectAll_odb2
+10 BizCommonUtil : copyProperties
+11 BizCommonUtil : copyProperties
+12 BizCommonUtil : copyProperties
+13 KcAcctFixbPoDao : selectOne_odb1
+14 BizCommonUtil : copyProperties
+15 BizCommonUtil : copyProperties
+16 BizCommonUtil : copyProperties
+17 BizCommonUtil : copyProperties
+18 BizCommonUtil : copyProperties
+19 BizCommonUtil : copyProperties
+20 BizCommonUtil : copyProperties
+21 BizCommonUtil : copyProperties
+22 BizCommonUtil : copyProperties
+23 BizCommonUtil : copyProperties
+24 BizCommonUtil : copyProperties
+25 BizCommonUtil : copyProperties
+26 BizCommonUtil : copyProperties
+27 BizCommonUtil : copyProperties
+28 BizCommonUtil : copyProperties
+29 BizCommonUtil : copyProperties
+30 [... continues with many more repetitions of BizCommonUtil :
+copyProperties ...]
+3
+4
+
+Listing 4: BadCase 2: Method Call Relationship Analysis Repetition
+
+A.3 BadCase 3: PlantUML Diagram Syntax Generation
+A.3.1
+1
+
+Expected Output
+
+@startuml
+
+2
+
+start
+:接 收 柜 面 变 更 账 户 形 态 请 求;
+5 :检 查 账 户 形 态 变 更 条 件;
+6 note right: 转 换 输 入 ， 调 用 【 个 人 存 款 账 户 】 方 法
+7 if ( 账 户 不 存 在 ?) then ( 是 )
+8 : 报 错 :" YACTB001 - 账 户 {} 不 存 在 ";
+9 ....
+10 if ( 起 始 日 期 为 上 次 结 息 日 ?) then ( 是 )
+11 : 检 查 起 始 日 期 为 最 近 交 易 日 期 ;
+12 if ( 起 始 日 期 为 最 近 交 易 日 期 ?) then ( 是 )
+3
+4
+
+18
+
+:检 查 形 态 变 更 时 间 限 制;
+if ( 可 变 更 日 期 > 当 前 系 统 日 期 ?) then ( 是 )
+15 : 报 错 :" YACTB234 - 可 变 更 日 期 大 于 当 前 系 统 日 期 ， 不 允 许 变 更 账 户 形 态 ";
+16 else ( 否 )
+17 : 检 查 账 户 目 标 状 态 ;
+18 if ( 目 标 状 态 不 为 正 常 ?) then ( 是 )
+19 : 报 错 :" YACTB052 - 账 户 目 标 状 态 不 是 正 常 ， 不 允 许 变 更 账 户 形 态 ";
+20 else ( 否 )
+21 : 检 查 账 户 状 态 ;
+22 if ( 账 户 状 态 为 转 营 业 外 收 入 ?) then ( 是 )
+23 : 获 取 配 置 信 息 ;
+24 else ( 否 )
+25 : 变 更 账 户 形 态 ;
+26 endif
+27 : 返 回 处 理 结 果 ;
+28 stop
+29 @enduml
+13
+14
+
+Listing 5: Expected Output for PlantUML Diagram Syntax Generation
+
+A.3.2
+1
+
+Actual BadCase Output
+
+@startuml
+
+2
+
+start
+:接 收 柜 面 变 更 账 户 形 态 请 求;
+5 :检 查 账 户 形 态 变 更 条 件;
+6 note right: 转 换 输 入 ， 调 用 【 个 人 存 款 账 户 】 方 法
+7 if ( 账 户 不 存 在 ?) then ( 是 )
+8 : 报 错 :" YACTB001 - 账 户 {} 不 存 在 ";
+9 ....
+3
+4
+
+10
+
+if ( 起 始 日 期 为 上 次 结 息 日 ?) then ( 是 )
+:检 查 起 始 日 期 为 最 近 交 易 日 期;
+13 if ( 起 始 日 期 为 最 近 交 易 日 期 ?) then ( 是 )
+14 : 检 查 形 态 变 更 时 间 限 制 ;
+15 if ( 可 变 更 日 期 > 当 前 系 统 日 期 ?) then ( 是 )
+16 : 报 错 :" YACTB234 - 可 变 更 日 期 大 于 当 前 系 统 日 期 ， 不 允 许 变 更 账 户 形 态 ";
+17 else ( 否 )
+18 : 检 查 账 户 目 标 状 态 ;
+19 if ( 目 标 状 态 不 为 正 常 ?) then ( 是 )
+20 : 报 错 :" YACTB052 - 账 户 目 标 状 态 不 是 正 常 ， 不 允 许 变 更 账 户 形 态 ";
+21 else ( 否 )
+22 : 检 查 账 户 状 态 ;
+23 if ( 账 户 状 态 为 转 营 业 外 收 入 ?) then ( 是 )
+24 : 获 取 配 置 信 息 ;
+25 else ( 否 )
+26 : 变 更 账 户 形 态 ;
+11
+12
+
+19
+
+endif
+endif
+29 endif
+30 endif
+31 endif
+32 endif
+33 endif
+34 [... continues with many more repetitions of endif statements until
+max_tokens ...]
+27
+28
+
+Listing 6: BadCase 3: PlantUML Diagram Syntax Generation Repetition
+
+B
+
+DPO Dataset Examples
+
+This appendix provides detailed DPO preference dataset examples for all three BadCase
+types discussed in Section 5.3.
+
+B.1 BadCase 1: Business Rule Generation DPO Dataset
+Note: For improved readability, the JSON string values in the following examples are
+formatted with actual line breaks instead of escape sequences (
+n). In the actual JSON format used for training, these line breaks are represented as
+n escape sequences within single-line strings.
+{
+" instruction ":
+3 " 请 从 代 码 片 段 中 摘 要 出 该 段 代 码 的 主 要 功 能 , 并 描 述 其 主 要 业 务 逻 辑 。 ",
+1
+2
+
+4
+5
+6
+7
+8
+
+"input ":
+"< 这 是 一 段 代 码 >...." ,
+
+9
+10
+11
+12
+13
+
+" chosen ":
+"该 方 法 主 要 用 于 维 护 个 人 存 款 证 明 信 息， 业 务 规 则 如 下:
+
+14
+
+1. 如 果 【 维 护 个 人 存 款 证 明 输 入 】 的 存 款 证 明 操 作 方 式 为 重 打 :
+1.1 将 【 个 人 存 款 证 明 子 合 约 】 的 打 印 次 数 】 加 1 。
+17 1.2 将 【 个 人 存 款 证 明 子 合 约 】 的 累 计 签 发 份 数 】 加 【 维 护 个 人 存 款 证 明 输 入 】 的 申
+请 份 数。
+18 1.3 初 始 化 并 更 新 个 人 存 款 证 明 凭 证 信 息 :
+19 1.4 设 置 【 维 护 个 人 存 款 证 明 输 入 】 的 有 效 标 志 为 使 用 。
+15
+16
+
+20
+21
+22
+
+2. 如 果 【 维 护 个 人 存 款 证 明 输 入 】 的 存 款 证 明 操 作 方 式 为 撤 销 :
+2.1 更 新 个 人 存 款 证 明 子 合 约 信 息 ",
+
+23
+24
+25
+
+20
+
+26
+27
+
+" rejected ":
+"该 方 法 主 要 用 于 维 护 个 人 存 款 证 明 信 息， 业 务 规 则 如 下:
+
+28
+
+1. 如 果 【 维 护 个 人 存 款 证 明 输 入 】 的 存 款 证 明 操 作 方 式 为 重 打 :
+1.1 将 【 个 人 存 款 证 明 子 合 约 】 的 打 印 次 数 】 加 1 。
+31 1.2 将 【 个 人 存 款 证 明 子 合 约 】 的 累 计 签 发 份 数 】 加 【 维 护 个 人 存 款 证 明 输 入 】 的 申
+请 份 数。
+32 1.3 初 始 化 并 更 新 个 人 存 款 证 明 凭 证 信 息 :
+33 1.3.1 设 置 【 个 人 存 款 证 明 凭 证 信 息 】 的 存 款 证 明 登 记 号 为 当 前 存 款 证 明 登 记 号 。
+34 1.3.2 设 置 【 个 人 存 款 证 明 凭 证 信 息 】 的 凭 证 号 码 为 8 位 数 ， 不 足 补 0 。
+35 1.3.3 设 置 【 个 人 存 款 证 明 凭 证 信 息 】 的 打 印 日 期 为 当 前 交 易 日 期 。
+36 1.3.4 将 【 个 人 存 款 证 明 凭 证 信 息 】 的 撤 销 日 期 置 空 。
+37 1.3.5 设 置 【 个 人 存 款 证 明 凭 证 信 息 】 的 打 印 次 数 为 当 前 打 印 次 数 。
+38 1.3.6 设 置 【 个 人 存 款 证 明 凭 证 信 息 】 的 有 效 标 志 为 是 。
+39 1.3.7 设 置 【 个 人 存 款 证 明 凭 证 信 息 】 的 数 据 更 新 标 志 为 已 更 新 。
+40 1.4 设 置 【 维 护 个 人 存 款 证 明 输 入 】 的 有 效 标 志 为 使 用 。
+29
+30
+
+41
+
+2. 如 果 【 维 护 个 人 存 款 证 明 输 入 】 的 存 款 证 明 操 作 方 式 为 撤 销 :
+2.1 更 新 个 人 存 款 证 明 子 合 约 信 息 :
+44 2.1.1 将 【 个 人 存 款 证 明 子 合 约 】 的 累 计 回 收 份 数 加 1 。
+45 2.1.2 如 果 【 个 人 存 款 证 明 子 合 约 】 的 累 计 回 收 份 数 】 等 于 【 个 人 存 款 证 明 子 合 约 】
+的 累 计 签 发 份 数:
+46 2.1.2.1 设 置 【 个 人 存 款 证 明 子 合 约 】 的 撤 销 日 期 为 当 前 交 易 日 期 。
+47 2.1.2.2 设 置 【 个 人 存 款 证 明 子 合 约 】 的 凭 证 信 息 :
+48 2.1.2.2.1 设 置 【 个 人 存 款 证 明 子 合 约 】 的 凭 证 信 息 的 撤 销 日 期 为 当 前 交 易 日 期 。
+49 2.1.2.2.2 设 置 【 个 人 存 款 证 明 子 合 约 】 的 凭 证 信 息 的 有 效 标 志 为 否 。
+50 2.1.2.3 设 置 【 个 人 存 款 证 明 合 约 信 息 】 :
+51 2.1.2.3.1 设 置 【 个 人 存 款 证 明 合 约 信 息 】 的 有 效 标 志 为 否 。
+52 2.1.2.3.2 设 置 【 个 人 存 款 证 明 合 约 信 息 】 的 数 据 更 新 标 志 为 已 更 新 。
+53 2.1.2.4 设 置 【 维 护 个 人 存 款 证 明 输 入 】 的 有 效 标 志 为 停 用 。
+54 2.1.3 如 果 不 相 等 :
+55 2.1.3.1 重 复 【 维 护 个 人 存 款 证 明 输 入 】 的 申 请 份 数 次 :
+56 2.1.3.1.1 设 置 起 始 凭 证 号 码 。
+57 2.1.3.1.2 初 始 化 并 更 新 个 人 存 款 证 明 凭 证 信 息 :
+58 2.1.3.1.2.1 设 置 【 个 人 存 款 证 明 凭 证 信 息 】 的 有 效 标 志 为 否 。
+59 2.1.3.1.2.2 设 置 【 个 人 存 款 证 明 凭 证 信 息 】 的 撤 销 日 期 为 当 前 交 易 日 期 。
+60 2.1.3.1.2.3 设 置 【 个 人 存 款 证 明 凭 证 信 息 】 的 数 据 更 新 标 志 为 已 更 新 。
+61 2.1.3.1.2.4 设 置 【 个 人 存 款 证 明 凭 证 信 息 】 的 数 据 更 新 标 志 为 已 更 新 。
+62 2.1.3.1.2.5 设 置 【 个 人 存 款 证 明 凭 证 信 息 】 的 数 据 更 新 标 志 为 已 更 新 。
+63 2.1.3.1.2.6 设 置 【 个 人 存 款 证 明 凭 证 信 息 】 的 数 据 更 新 标 志 为 已 更 新 。
+64 2.1.3.1.2.7 设 置 【 个 人 存 款 证 明 凭 证 信 息 】 的 数 据 更 新 标 志 为 已 更 新 。
+65 2.1.3.1.2.8 设 置 【 个 人 存 款 证 明 凭 证 信 息 】 的 数 据 更 新 标 志 为 已 更 新 。
+66 2.1.3.1.2.9 设 置 【 个 人 存 款 证 明 凭 证 信 息 】 的 数 据 更 新 标 志 为 已 更 新 。
+67 2.1.3.1.2.10 设 置 【 个 人 存 款 证 明 凭 证 信 息 】 的 数 据 更 新 标 志 为 已 更 新 。
+68 2.1.3.1.2.11 设 置 【 个 人 存 款 证 明 凭 证 信 息 】 的 数 据 更 新 标 志 为 已 更 新 。
+69 2.1.3.1.2.12 设 置 【 个 人 存 款 证 明 凭 证 信 息 】 的 数 据 更 新 标 志 为 已 更 新 。
+70 2.1.3.1.2.13 设 置 【 个 人 存 款 证 明 凭 证 信 息 】 的 数 据 更 新 标 志 为 已 更 新 。
+71 2.1.3.1.2.14 设 置 【 个 人 存 款 证 明 凭 证 信 息 】 的 数 据 更 新 标 志 为 已 更 新 。
+72 2.1.3.1.2.15 设 置 【 个 人 存 款 证 明 凭 证 信 息 】 的 数 据 更 新 标 志 为 已 更 新 。
+73 2.1.3.1.2.16 设 置 【 个 人 存 款 证 明 凭 证 信 息 】 的 数 据 更 新 标 志 为 已 更 新 。
+74 [... ' 设 置 【 个 人 存 款 证 明 凭 证 信 息 】 的 数 据 更 新 标 志 为 已 更 新 。 ' repeated 2, 4,
+8, and 16 times respectively ...]"
+75 }
+42
+43
+
+21
+
+Listing 7: DPO Preference Dataset Example (BadCase 1)
+Note: The rejected example shows repetition of the business rule statement ” 设置【个
+人存款证明凭证信息】的数据更新标志为已更新。” (Set the data update flag of deposit
+certificate voucher information to updated). Similar to BadCase 2 and 3, we construct four
+groups of rejected examples with varying degrees of repetition (2, 4, 8, or 16 repetitions),
+enabling the model to learn to avoid generating repetitive business rule descriptions.
+
+B.2 BadCase 2: Method Call Relationship Analysis DPO Dataset
+{
+" instruction ":
+3 " 你 是 一 个 具 有 丰 富 银 行 金 融 业 务 经 验 的 java 开 发 高 手 。 你 的 任 务 是 根 据 用 户 提 供 的 信
+息 提 取 java 方 法 体 代 码 中 的 函 数 调 用 关 系 。
+1
+2
+
+4
+
+<具 体 要 求 >
+1. 只 提 取 在 导 包 信 息 中 明 确 列 出 的 类 的 方 法 调 用 。
+7 2. 对 于 方 法 体 内 容 中 的 get 、 set 方 法 的 赋 值 不 需 要 提 取 调 用 信 息 。
+8 3. 不 要 臆 测 或 添 加 方 法 体 内 容 代 码 中 没 有 的 调 用 信 息 。
+9 4. 若 方 法 体 内 容 中 没 有 符 合 条 件 的 调 用 信 息 ， 请 直 接 输 出 空 。
+10 5. 忽 略 所 有 不 在 导 包 信 息 中 的 类 的 方 法 调 用 ， 无 论 它 们 是 什 么 类 型 的 调 用 。
+11 6. 确 保 输 出 结 果 中 不 包 含 重 复 的 调 用 ， 每 个 唯 一 的 调 用 只 输 出 一 次 。
+12 7. 严 格 按 照 输 出 格 式 进 行 输 出 ， 不 要 添 加 任 何 额 外 内 容 。
+5
+6
+
+13
+
+<输 出 格 式 >
+按 照 \" 类 名 : 方 法 名 \" 格 式 输 出 结 果 。 每 个 调 用 占 一 行 。 不 需 要 任 何 额 外 描 述 或 总
+结。 如 果 没 有 符 合 条 件 的 调 用， 输 出 为 空。
+16 示 例 ：
+17 PersonalDepositContractRepo : addDepositCertSubContract
+14
+15
+
+18
+19
+
+</ 输 出 格 式 >",
+
+20
+21
+22
+23
+24
+
+"input ":
+"请 根 据 以 下 导 包 信 息、 方 法 体 内 容、 类 属 性 并 学 习 示 例 提 取 函 数 的 所 有 调 用 信
+息：
+
+25
+26
+
+< 一 段 方 法 体 ... >" ,
+
+27
+28
+29
+
+" chosen ":
+" KbAcctRstrctPoDao : selectAll_odb5
+32 KbAcctRstrctPoDao : selectAll_odb4
+33 SysUtil : getInstance
+34 BizCommonUtil : copyProperties
+35 Collectors : toList ",
+30
+31
+
+36
+37
+38
+
+22
+
+" rejected ":
+" KbAcctRstrctPoDao : selectAll_odb5
+41 KbAcctRstrctPoDao : selectAll_odb4
+42 SysUtil : getInstance
+43 BizCommonUtil : copyProperties
+44 BizCommonUtil : copyProperties
+45 BizCommonUtil : copyProperties
+46 BizCommonUtil : copyProperties
+47 BizCommonUtil : copyProperties
+48 BizCommonUtil : copyProperties
+49 BizCommonUtil : copyProperties
+50 BizCommonUtil : copyProperties
+51 BizCommonUtil : copyProperties
+52 [... 'BizCommonUtil : copyProperties ' repeated 2, 4, 8, and 16 times
+respectively ...]"
+53 }
+39
+40
+
+Listing 8: DPO Preference Dataset Example (BadCase 2)
+Note: This example shows 8 repetitions of BizCommonUtil:copyProperties. We
+construct four groups of rejected examples with 2, 4, 8, and 16 repetitions respectively.
+
+B.3 BadCase 3: PlantUML Diagram Syntax Generation DPO
+Dataset
+{
+" instruction ":
+3 " 你 是 一 个 具 有 丰 富 银 行 金 融 业 务 经 验 的 专 家 , 同 时 你 精 通 PlantUML 语 法 。 您 的 目 的
+是 帮 助 用 户 理 解 业 务 流 程， 提 供 业 务 功 能 整 个 过 程 的 流 程 展 示。 您 的 任 务 是 根 据 用
+户 提 供 的 交 易 描 述 内 容 使 用 PlantUML DSL 生 成 交 易 流 程 图 。
+4 <具 体 要 求 >
+5 1. 使 用 PlantUML 活 动 图 （ Activity Diagram ） 语 法 描 述 业 务 流 程 。
+6 2. 生 成 单 一 、 完 整 的 流 程 图 ， 不 拆 分 。
+7 3. 确 保 PlantUML 语 法 逻 辑 描 述 的 正 确 性 。
+8 4. 严 格 遵 守 PlantUML 语 法 规 则 ， 确 保 生 成 的 代 码 可 以 被 PlantUML 解 析 器 正 确 解
+析。
+9 5. 确 保 所 有 的 消 息 流 向 （ 箭 头 ） 使 用 正 确 。
+10 6. 确 保 没 有 悬 空 或 未 闭 合 的 结 构 。
+11 7. 将 复 杂 的 业 务 逻 辑 简 化 为 基 本 的 流 程 步 骤 。
+12 8. 使 用 简 洁 明 了 的 描 述 ， 避 免 过 长 的 文 本 可 能 导 致 的 格 式 问 题 。
+13 9. 限 制 使 用 以 下 PlantUML 元 素 ： start , stop , if/else , while , fork , join , :
+action , note , partition 。
+14 10. 使 用 默 认 样 式 和 颜 色 ， 不 添 加 额 外 的 样 式 指 令 。
+15 11. 适 当 使 用 note 来 解 释 重 要 步 骤 或 决 策 点 ， 但 不 要 过 度 使 用 。
+16 < 错 误 检 查 列 表 >
+17 生 成 代 码 后 ， 请 检 查 以 下 几 点 ：
+18 1. 确 保 start 和 stop 只 出 现 一 次 。
+19 2. 检 查 所 有 的 if/else 结 构 是 否 正 确 闭 合 。
+20 3. 确 保 所 有 的 while 循 环 都 有 明 确 的 结 束 条 件 。
+21 4. 检 查 是 否 存 在 任 何 悬 空 的 节 点 或 箭 头 。
+22 5. 确 保 所 有 的 note 都 正 确 附 加 到 相 应 的 活 动 或 决 策 点 。
+23 < 输 出 格 式 >
+1
+2
+
+23
+
+仅 输 出 完 整 的 PlantUML 代 码 ， 包 括 @startuml 和 @enduml 标 记 。 不 要 包 含 任 何 解
+释 或 额 外 文 本。 确 保 代 码 块 正 确 封 装。 格 式 如 下：
+25 @startuml
+26 xxxx
+27 xxxx
+28 xxxx
+29 @enduml
+30 在 生 成 代 码 时 ， 请 保 守 行 事 ， 宁 可 牺 牲 一 些 复 杂 度 ， 也 要 确 保 生 成 的 代 码 100% 可 以
+被 PlantUML 解 析 。 如 果 您 对 某 个 语 法 结 构 有 任 何 疑 虑 ， 请 选 择 更 简 单 、 更 可 靠 的
+替 代 方 案 。 ",
+24
+
+31
+32
+33
+
+"input ":
+" 请 根 据 以 下 交 易 描 述 并 学 习 参 考 示 例 生 成 相 应 的 PlantUML 活 动 图 代 码 ：
+36 < 交 易 描 述 >
+37 # 交 易 名 称 : 柜 面 收 费
+38 ## 交 易 - 服 务 编 排 逻 辑
+39 .... < 这 里 是 一 段 完 整 的 交 易 描 述 >",
+34
+35
+
+40
+41
+42
+
+" chosen ":
+" @startuml
+45 start
+46 : 柜 面 收 费 ;
+43
+44
+
+47
+
+partition \" 检 查 个 人 存 款 产 品 合 约 账 户 支 取 条 件 \" {
+:根 据 资 金 账 号 获 取 账 户 信 息;
+50
+if ( 账 户 信 息 为 空 ?) then ( 是 )
+51
+: 报 错 : YACTB001 - 账 户 不 存 在 ;
+52
+stop
+53
+else ( 否 )
+54
+:调 用 【个 人 存 款 账 户】 领 域 对 象 的 【检 查 个 人 存 款 账 户 资 金 支 取 条 件
+checkDrawAcctFund 】 方 法 ;
+55
+note right
+56
+检 查 输 入 字 段 、 账 户 状 态 、 II/III 类 账 户 取 现 限 制 、
+57
+账 户 可 用 资 金 余 额、 最 小 留 存 余 额、 限 额 等
+58
+end note
+59
+endif
+48
+49
+
+60
+
+if ( 账 户 为 整 存 整 取 账 户 ?) then ( 是 )
+if ( 交 易 日 期 < 到 期 日 ?) then ( 是 )
+:设 置 支 取 类 型 为 提 前 支 取;
+else ( 否 )
+:设 置 支 取 类 型 为 正 常 支 取;
+endif
+endif
+
+61
+62
+63
+64
+65
+66
+67
+68
+
+}
+
+69
+
+partition \" 查 询 账 户 \" {
+if ( 输 入 定 活 标 志 为 活 期 或 空 ?) then ( 是 )
+72
+:根 据 资 金 账 号 查 询 活 期 存 款 账 户 表;
+73
+if ( 记 录 存 在 ?) then ( 是 )
+74
+:构 建 账 户 状 态 和 余 额 对 象;
+75
+if ( 账 户 分 类 为 电 子 现 金 账 户 ?) then ( 是 )
+70
+71
+
+24
+
+:构 建 电 子 现 金 账 户 领 域 对 象;
+else ( 否 )
+if ( 账 户 为 II/III 类 户 ?) then ( 是 )
+:查 询 绑 定I类 户 登 记 簿;
+:构 建 绑 定I类 账 户 登 记 簿 领 域 对 象 列 表;
+endif
+:构 建 个 人 活 期 存 款 账 户 领 域 对 象;
+endif
+endif
+else ( 否 )
+:根 据 资 金 账 号 查 询 定 期 存 款 账 户 表;
+if ( 记 录 不 存 在 ?) then ( 是 )
+stop
+endif
+:根 据 账 户 分 类 构 建 对 应 的 定 期 存 款 账 户 领 域 对 象;
+endif
+
+76
+77
+78
+79
+80
+81
+82
+83
+84
+85
+86
+87
+88
+89
+90
+91
+92
+
+:获 取 账 户 冻 结 控 制 信 息;
+:构 建 控 制 措 施 组 合 领 域 对 象;
+
+93
+94
+95
+
+}
+
+96
+
+partition \" 支 取 个 人 存 款 账 户 资 金 \" {
+:查 询 账 户;
+99
+if ( 未 查 到 账 户 信 息 ?) then ( 是 )
+100
+: 报 错 : YACTB001 - 账 户 不 存 在 ;
+101
+stop
+102
+endif
+97
+98
+
+103
+104
+105
+106
+107
+108
+
+:查 询 账 户 利 息 信 息;
+if ( 未 查 到 账 户 利 息 信 息 ?) then ( 是 )
+: 报 错 : YACTB007 ;
+stop
+endif
+
+109
+110
+111
+112
+113
+114
+115
+116
+117
+118
+
+:校 验 可 用 资 金 余 额 和 交 易 金 额;
+if ( 可 用 资 金 余 额 + 交 易 限 额 < 交 易 金 额 ) then ( 是 )
+: 报 错 : YACTB086 ;
+stop
+else ( 否 )
+if ( 可 用 资 金 余 额 < 交 易 金 额 ) then ( 是 )
+:交 易 金 额 = 可 用 资 金 余 额;
+endif
+endif
+
+119
+120
+121
+122
+123
+
+:更 新 账 户 余 额;
+:更 新 积 数;
+:调 用 客 户 指 定 限 额 检 查;
+:调 用 客 户 类 全 局 限 额 检 查;
+
+124
+125
+126
+127
+
+:更 新 账 户 余 额 到 数 据 库;
+:更 新 账 户 利 息 积 数;
+:更 新 账 户 利 息 定 义 表 到 数 据 库;
+
+128
+129
+130
+131
+
+:登 记 余 额 变 化 明 细;
+note left
+设 置 渠 道 代 码、 第 三 方 交 易 码、 内 部 交 易 码、
+
+25
+
+交 易 营 业 机 构、 交 易 柜 员、 授 权 柜 员、 交 易 日 期、
+交 易 时 间、 柜 员 流 水 号 等 字 段
+end note
+
+132
+133
+134
+135
+
+:登 记 会 计 核 算 流 水;
+:登 记 冲 正 事 件;
+
+136
+137
+138
+
+:构 建 应 用 服 务 输 出;
+
+139
+140
+
+}
+
+141
+
+:返 回 处 理 结 果;
+stop
+144 @enduml ",
+142
+143
+
+145
+146
+147
+
+" rejected ":
+" @startuml
+150 title 柜 面 收 费 - 服 务 业 务 规 则
+151 start
+152 : 检 查 个 人 存 款 产 品 合 约 账 户 支 取 条 件 ;
+153 note right : 根 据 资 金 账 号 获 取 账 户 信 息
+154 if ( 账 户 信 息 为 空 ) then ( 是 )
+155 : 报 错 : \" YACTB001 - 账 户 {} 不 存 在 \";
+156 else ( 否 )
+157 : 检 查 个 人 存 款 账 户 资 金 支 取 条 件 ;
+158 note right : 输 入 字 段 检 查
+159 if ( 交 易 金 额 为 空 或 为 0) then ( 是 )
+160 : 报 错 : \" YACTB077 - 交 易 金 额 不 能 为 空 或 为 0\";
+161 elseif ( 交 易 币 种 !=\"156 - 人 民 币 \" 且 钞 汇 标 志 为 空 ) then ( 是 )
+162 : 报 错 : \" YACTB078 - 外 币 交 易 ， 必 须 上 送 钞 汇 标 志 \";
+163 elseif ( 交 易 币 种 !=\"156 - 人 民 币 \") then ( 是 )
+164 note right : 钞 汇 标 志 检 查
+165 if ( 钞 汇 标 志 不 一 致 ) then ( 是 )
+166 : 报 错 : \" YACTB017 - 钞 汇 标 志 不 一 致 \";
+167 elseif ( 钞 汇 标 志 ==\" 现 钞 \" 且 现 转 标 志 !=\" 现 金 \") then ( 是 )
+168 : 报 错 : \" YACTB079 - 当 前 账 户 为 现 钞 账 户 ， 不 允 许 转 账 支 取 \";
+169 elseif ( 钞 汇 标 志 ==\" 现 汇 \" 且 现 转 标 志 !=\" 转 账 \") then ( 是 )
+170 : 报 错 : \" YACTB080 - 当 前 账 户 为 现 汇 账 户 ， 不 允 许 现 金 支 取 \";
+171 elseif ( 账 户 币 种 代 码 !=[ 交 易 币 种 ]) then ( 是 )
+172 : 报 错 : \" YACTB081 - 交 易 币 种 与 账 户 币 种 不 一 致 \";
+173 elseif ( 交 易 金 额 <=0) then ( 是 )
+174 : 报 错 : \" YACTB082 - 交 易 金 额 不 能 小 于 等 于 0\";
+175 else ( 否 )
+176 : 检 查 账 户 状 态 ;
+177 note right : 账 户 状 态 检 查
+178 if ( 账 户 状 态 !=\" 正 常 \") then ( 是 )
+179 : 报 错 : \" YACTB083 - 账 户 状 态 为 转 营 业 外 收 入 ， 不 允 许 支 取 资 金 \";
+180 elseif ( 控 制 措 施 组 合 . 限 制 状 态 ==\" 只 收 不 付 \" 或 者 \" 封 闭 冻 结 \") then ( 是 )
+181 : 报 错 : \" YACTB084 - 账 户 已 被 冻 结 控 制 ， 不 允 许 支 取 资 金 \";
+182 else ( 否 )
+183 : 未 当 面 核 实 的 II/III 类 账 户 ， 不 允 许 取 现 ;
+184 note right : 未 当 面 核 实 的 II/III 类 账 户 检 查
+185 if ( 账 户 属 性 ==\"302 - II 类 账 户 \" 或 \"303 - III 类 账 户 \" 且 是 否 面 核 标 志 ==\" 否 \" 且 现
+转 标 志 ==\" 现 金 \") then ( 是 )
+186 : 报 错 : \" YACTB085 - 未 当 前 核 实 的 二 三 类 账 户 不 允 许 支 取 现 金 \";
+148
+149
+
+26
+
+else ( 否 )
+:检 查 账 户 可 用 资 金 余 额;
+189 note right : 账 户 可 用 资 金 余 额 检 查
+190 if ( 账 户 可 用 资 金 余 额 < 交 易 金 额 ) then ( 是 )
+191 : 报 错 : \" YACTB086 - 账 户 可 用 余 额 不 足 \";
+192 else ( 否 )
+193 : 检 查 账 户 最 小 留 存 余 额 ;
+194 note right : 账 户 最 小 留 存 余 额 检 查
+195 if ( 最 小 留 存 余 额 !=0) then ( 是 )
+196 : 计 算 支 取 后 账 户 余 额 ;
+197 if ( 支 取 后 账 户 余 额 < 最 小 留 存 余 额 ) then ( 是 )
+198 : 报 错 : \" YACTB087 - 交 易 后 余 额 小 于 账 户 最 小 留 存 余 额 ， 请 进 行 销 户 \";
+199 else ( 否 )
+200 : 限 额 检 查 ;
+201 note right : 限 额 检 查
+202 : 构 建 统 一 限 额 检 查 输 入 ;
+203 : 调 用 统 一 限 额 处 理 SDK;
+204 endif
+205 endif
+206 endif
+207 endif
+208 endif
+209 endif
+210 endif
+211 endif
+212 endif
+213 endif
+214 endif
+215 endif
+216 endif
+217 endif
+218 endif
+219 endif
+220 endif
+221 endif
+222 [... 'endif ' repeated 2, 4, 8, and 16 times respectively ...]"
+223 }
+187
+188
+
+Listing 9: DPO Preference Dataset Example (BadCase 3)
+Note: The rejected example shows excessive endif statements that are incorrectly
+generated. Similar to BadCase 2, we construct four groups of rejected examples with
+varying degrees of repetition (excessive endif statements), enabling the model to learn
+proper PlantUML syntax structure and avoid generating unnecessary closing statements.
+
+C
+
+Additional Details
+
+C.1
+
+Transaction Processing Workflow Details
+
+The transaction processing workflow is illustrated in Figure 1:
+The complete processing steps for a single transaction are detailed as follows:
+1. Transaction Discovery: Analyze transaction definition files to identify service
+27
+
+Step 2: For each Service Method
+
+Step 1
+Discovery
+(No LLM)
+
+LLM Processing
+Tool (No LLM)
+
+2-1: Drill
+LLM
+2-5s
+
+Step 3
+Trans
+Code
+5-9s
+
+2-2: Rules
+LLM
+3-14s
+
+Step 4
+Diag
+JAR
+
+2-3: Code
+LLM
+5-9s
+
+2-4: Diagram
+Generation
+
+Figure 1: Transaction Processing Workflow: Sequential steps showing LLM involvement
+methods participating in the orchestration. This step does not require LLM involvement.
+2. Service Method Processing: For each service method Mi in the transaction, the
+following sub-steps are executed:
+• 2-1 Recursive Method Drilling: Recursively identify service methods called
+by the current service method. This step requires LLM involvement (1 or more
+times, depending on recursion depth). Normal processing time: 2-5 seconds
+per call.
+• 2-2 Business Rule Generation: Generate business rules based on service
+method code. This step requires LLM involvement (1 time per method). Normal processing time: 3-14 seconds.
+• 2-3 PlantUML Code Generation: Convert business rules into PlantUML
+flowchart code. This step requires LLM involvement (1 time per method).
+Normal processing time: 5-9 seconds.
+• 2-4 PlantUML Diagram Generation: Convert PlantUML code to diagrams using JAR tools. This step does not require LLM involvement.
+3. Transaction-Level Processing: Concatenate business rules from all service methods in order and convert to transaction-level PlantUML flowchart code. This step
+requires LLM involvement (1 time per transaction). Normal processing time: 5-9
+seconds.
+4. Transaction Diagram Generation: Convert transaction PlantUML code to diagrams using JAR tools. This step does not require LLM involvement.
+
+28
+
+C.2
+
+Processing Time Statistics
+
+Table 2 presents the experimental comparison of processing time discrepancies across
+different deployment modes:
+Table 2: Experimental Comparison: Processing Time Discrepancy
+Mode
+
+Occurrence Rate
+
+Normal Time
+
+Problematic Time
+
+Time Increase
+
+Mode 1 (LoRA)
+Mode 2 (Merged)
+
+80% (8/10 runs)
+75% (3/4 runs)
+
+28 min
+28 min
+
+100-160 min
+40-70 min
+
+257%-471%
+43%-150%
+
+For a transaction T orchestrated from k service methods T = Orchestrate(M1 , M2 , . . . , Mk ),
+where service method i has a recursion depth of Di , the total number of LLM calls is:
+Total Calls = 1 +
+
+k
+∑
+
+(2)
+
+(Di + 1 + 1)
+
+i=1
+
+This formula accounts for:
+• One call for transaction-level processing (Step 3)
+• For each service method i:
+– Di calls for recursive method drilling (Step 2-1)
+– 1 call for business rule generation (Step 2-2)
+– 1 call for PlantUML code generation (Step 2-3)
+Under normal operating conditions, the processing time for a single transaction is
+distributed across different stages as shown in Table 3:
+Table 3: Normal Processing Time Statistics per Transaction
+Processing Stage Description
+Time Range
+Step 1
+Step 2-1
+Step 2-2
+Step 2-3
+Step 2-4
+Step 3
+Step 4
+
+Transaction Discovery (No LLM)
+Method Drilling (LLM)
+Business Rule Generation (LLM)
+PlantUML Code Generation (LLM)
+PlantUML Diagram (JAR Tool)
+Transaction-Level Code (LLM)
+Transaction Diagram (JAR Tool)
+
+Negligible
+2-5 sec per call
+3-14 sec per method
+5-9 sec per method
+Negligible
+5-9 sec per transaction
+Negligible
+∼28 min
+
+Total Normal Processing Time
+
+C.3
+
+DPO Dataset Construction Methodology
+
+We developed a systematic approach to construct DPO preference datasets:
+
+29
+
+1. Generalization: For examples that exhibit repetition, we first generalize them to
+create variants that capture the same pattern without directly using the exact bad
+case. This ensures the model learns generalizable patterns rather than memorizing
+specific examples.
+2. Repetition Reproduction: We verify that generalized examples also exhibit repetition problems, confirming that the repetition pattern is not specific to the original
+bad case.
+3. Preference Dataset Construction: For each generalized example, we construct
+preference pairs:
+• Chosen: The correct, non-repetitive output (standard answer)
+• Rejected: Repetitive outputs with varying degrees of repetition, constructed
+using powers of 2:
+– First group: rejected examples with 2 repetitions
+– Second group: rejected examples with 4 repetitions
+– Third group: rejected examples with 8 repetitions
+– Fourth group: rejected examples with 16 repetitions
+4. Model Fine-tuning: Using LlamaFactory framework, we perform DPO finetuning on the existing code interpretation model using the constructed preference
+dataset.
+
+C.4
+
+Beam Search Experimental Results
+
+Table 4 presents the performance comparison of different Beam Search configurations:
+Table 4: Performance Comparison: Beam Search Configurations
+Configuration
+Time (min) Rep. Rate Success Rate
+Baseline (No Beam Search)
+Beam Search, early_stop=False
+Beam Search, early_stop=True
+
+91.9 ± 48.3
+73.5 ± 35.2
+27.8 ± 1.8
+
+77.3%
+60.0%
+0%
+
+22.7%
+40.0%
+100%
+
+Runs: Baseline 22, early_stop=False 10, early_stop=True 20.
+Statistical significance: early_stop=True vs False, p < 0.001 (Fisher’s exact test).
+Time difference: early_stop=True vs Baseline, p < 0.001 (Welch’s t-test, unequal variances).
+
+C.5
+
+Presence Penalty Experimental Results
+
+Table 5 presents the effectiveness of presence penalty for BadCase 1:
+
+30
+
+Table 5: Effectiveness of Presence Penalty for BadCase 1
+Experiment Run
+presence_penalty Repetition Cases Repetition Rate
+First Run (30 cases)
+Second Run (30 cases)
+Second Run (30 cases)
+
+Not used
+Not used
+1.2
+
+4 out of 30
+9 out of 30
+0 out of 30
+
+13.3%
+30.0%
+0%
+
+Statistical significance: presence_penalty=1.2 vs Not used, p < 0.001 (Fisher’s exact test).
+
+C.6
+
+DPO Experimental Setup
+
+The fine-tuning process utilized 4×A100 GPUs with the following configuration:
+• Learning rate: 5e-6
+• Batch size: 4
+• Training epochs: 3
+• Framework: LlamaFactory
+• Repetition pattern: Power-of-2 (2, 4, 8, 16 repetitions)
+
+C.7
+
+DPO Detailed Results
+
+Table 6 presents the DPO fine-tuning effectiveness across BadCase types:
+Table 6: DPO Fine-tuning Effectiveness Across BadCase Types
+BadCase Rep. Rate Rep. Rate Reduction
+Training
+Before
+After
+Cost
+BadCase 1
+BadCase 2
+BadCase 3
+
+13-30%
+60%
+45%
+
+0%
+2%
+0%
+
+100%
+96.7%
+100%
+
+4.2h (16.8 GPU-h)
+3.8h (15.2 GPU-h)
+4.5h (18.0 GPU-h)
+
+Training on 4×A100 GPUs. Test cases: BC1=30, BC2=25, BC3=28.
+Statistical significance: All BadCases show p < 0.001 (Fisher’s exact test) comparing before vs after.
+
+We also evaluated the impact of different repetition degrees in the training data. Table
+7 shows the effectiveness of training with different repetition patterns:
+The results indicate that training with higher repetition degrees (8 and 16) or mixed
+repetition patterns yields the best performance, achieving near-complete elimination of
+repetition problems.
+
+C.8
+
+Mathematical Proofs
+
+C.8.1
+
+Proof of Proposition 2
+
+Proof. Let pr (t) denote the probability of a repetitive continuation at step t, and pn (t)
+denote the probability of a non-repetitive continuation. Given the self-reinforcement
+31
+
+Table 7: Effectiveness of Different Repetition Degrees in DPO Training
+Training
+BC1
+BC2
+BC3
+Avg
+Rep. Degree
+Rep. Rate Rep. Rate Rep. Rate Effect.
+2 reps
+4 reps
+8 reps
+16 reps
+Mixed (2,4,8,16)
+
+5%
+2%
+0%
+0%
+0%
+
+8%
+4%
+2%
+2%
+2%
+
+6%
+3%
+0%
+0%
+0%
+
+93.3%
+96.7%
+99.3%
+99.3%
+99.3%
+
+Post-training repetition rates on test sets. BC=BadCase.
+
+effect, we have:
+pr (t + 1) = pr (t) · α(rt ) > pr (t)
+
+(3)
+
+For greedy decoding, once pr (t) > pn (t), the algorithm will always select the repetitive
+continuation, leading to an infinite loop.
+For Beam Search with beam width B, at each step we maintain the top-B candidates
+based on cumulative log-probability:
+Scorei (t) =
+
+t
+∑
+
+(i)
+
+(i)
+
+(i)
+
+log P (wj |w1 , . . . , wj−1 )
+
+(4)
+
+j=1
+
+Even if the repetitive continuation has higher per-step probability, the cumulative
+score over a longer horizon may favor non-repetitive sequences. Specifically, if there exists
+a non-repetitive continuation with:
+t+L
+∑
+j=t+1
+
+log pn (j) >
+
+t+L
+∑
+
+log pr (j) − δ
+
+(5)
+
+j=t+1
+
+where δ is the initial probability gap, then Beam Search with B ≥ 2 can maintain at
+least one non-repetitive candidate, provided that:
+⌈
+⌉
+log(1/ϵ)
+B≥
+(6)
+log(1/pn (t))
+where ϵ is the desired probability of maintaining a non-repetitive candidate. With early
+stopping, the algorithm terminates once B complete sequences are found, ensuring that
+at least one non-repetitive sequence is preserved if it exists in the top-B candidates.
+C.8.2
+
+Theoretical Prediction vs Experimental Validation
+
+To validate our theoretical model, we compared theoretical predictions with experimental
+observations. Table 8 presents the comparison:
+The comparison demonstrates strong agreement between theoretical predictions and
+experimental observations, validating our Markov model’s accuracy. The small discrepancies (2-4%) are within expected measurement variance and can be attributed to:
+• Model-specific variations in probability distributions
+32
+
+Metric
+
+Table 8: Theoretical Predictions vs Experimental Observations
+Theoretical Experimental Error
+
+Agreement
+
+±2.3%
+≤ 1 step
+0%
+±3.6%
+–
+
+High
+High
+Exact
+High
+Consistent
+
+Repetition probability (greedy)
+Escape time (beam k = 5)
+Memory overhead (beam k = 5)
+Time overhead (beam k = 5)
+Optimal beam width
+
+77.3%
+≤ 5 steps
+5×
+15-20%
+k ∈ [3, 10]
+
+75-80%
+3-4 steps
+5×
+18.6%
+k=5
+
+Theoretical predictions based on Markov model with γ = 0.15, rmax = 10.
+
+• Context-dependent effects not fully captured by the simplified Markov model
+• Measurement noise in production environments
+C.8.3
+
+Critical Beam Width Analysis
+
+Based on our theoretical model, we can derive the minimum beam width required to
+escape repetition with high probability. For a given repetition probability pr and desired
+escape probability Pescape ≥ 0.95, the minimum beam width is:
+⌉
+⌈
+log(1 − Pescape )
+(7)
+kmin =
+log(pr )
+For our observed repetition probability of pr ≈ 0.77, this yields kmin ≈ 3.2, confirming
+that k = 5 provides a safety margin while maintaining reasonable computational overhead.
+This theoretical analysis aligns with our empirical finding that beam widths in the range
+of 3-10 are effective, with k = 5 providing optimal balance.
+
+C.9
+
+Computational Overhead Analysis
+
+The measurements demonstrate that with beam width k = 5, Beam Search requires
+approximately 5× the KV cache memory (62.5 GB vs 12.5 GB) and increases processing
+time by 18.6% (33.2 min vs 28.0 min) compared to greedy decoding. However, this
+overhead is minimal compared to the performance degradation from repetition problems
+(up to 471% time increase from 28 min to 160 min). The overhead can be quantified as:
+memory overhead ≈ k× (single sequence memory), computational overhead ≈ O(k × N )
+where N is the sequence length.
+Figure 2 illustrates the performance-overhead tradeoff across different beam widths:
+
+C.10
+
+Effectiveness Analysis
+
+While our experiments show consistent results, the effectiveness may vary depending on
+the specific model, task, and deployment scenario. Theoretical analysis suggests that the
+solution is most effective when:
+• The probability gap between repetitive and non-repetitive continuations is bounded
+(as stated in Proposition 2)
+33
+
++900%
+
+Overhead (%)
+57.5%
+
+6
+
+Time Overhead
+Memory Overhead
++400%
+4
+
++200%
+2
+
+18.6%
+
+8.9%
+
+Beam Width (k)
+
+0
+k=1
+
+k=3
+
+Optimal (k = 5)
+
+k=5
+
+Figure 2: Performance-Overhead Tradeoff: Time and Memory Overhead vs Beam Width
+• The beam width k is suﬀicient to maintain at least one non-repetitive candidate
+• The model has learned reasonable probability distributions over the vocabulary
+For models with severe training issues or extremely repetitive training data, additional techniques (such as repetition penalty) may be necessary in combination with
+Beam Search.
+Regarding optimal beam width selection: While we used k = 5 based on empirical
+evidence, the optimal beam width depends on the specific task and computational budget.
+Larger beam widths provide better exploration but with diminishing returns. Our analysis
+suggests that beam widths in the range of 3-10 are typically suﬀicient, with k = 5 providing
+a good balance between quality and computational cost for most scenarios.
+
+C.11
+
+Ablation Studies
+
+To understand the individual contribution of each parameter, we conducted ablation
+studies systematically varying key parameters while keeping others fixed. Table 9 presents
+the results:
+The ablation study reveals critical insights:
+• Early Stopping is Essential: Regardless of beam width, early_stopping=False
+fails to eliminate repetition (45-60% repetition rate), while early_stopping=True
+achieves 0-5% repetition rate. This confirms that early_stopping is the most critical
+parameter.
+
+34
+
+Table 9: Ablation Study: Individual Parameter Impact on Repetition Elimination
+Configuration
+Beam Width Early Stop Rep. Rate Time (min)
+Baseline (Greedy)
+k = 3, early_stop=False
+k = 3, early_stop=True
+k = 5, early_stop=False
+k = 5, early_stop=True
+k = 10, early_stop=False
+k = 10, early_stop=True
+
+1
+3
+3
+5
+5
+10
+10
+
+N/A
+False
+True
+False
+True
+False
+True
+
+77.3%
+45%
+5%
+60%
+0%
+55%
+0%
+
+91.9
+65.2
+29.5
+73.5
+27.8
+78.3
+30.1
+
+All configs: temperature=0, top_p=1, top_k=-1.
+
+• Beam Width Impact: With early_stopping=True, increasing beam width from
+k = 3 to k = 5 reduces repetition rate from 5% to 0%, but further increase to k = 10
+provides no additional benefit while increasing computational overhead.
+• Optimal Configuration: The combination of k = 5 and early_stopping=True
+provides the best balance, achieving 0% repetition rate with moderate computational overhead (+18.6%).
+We also conducted ablation studies on presence_penalty values for BadCase 1. Table
+10 shows the results:
+Table 10: Ablation Study: Presence Penalty Value Impact on BadCase 1
+presence_penalty Repetition Rate
+Quality Score
+0.0 (No penalty)
+0.5
+0.8
+1.0
+1.2
+1.5
+2.0
+
+13-30%
+8-15%
+3-8%
+1-3%
+0%
+0%
+0%
+
+Baseline
+-2%
+-1%
++1%
++2%
+-1%
+-5%
+
+Quality score based on human evaluation of business rule completeness and accuracy.
+
+The results indicate that presence_penalty=1.2 provides optimal balance between
+repetition elimination and output quality, with higher values (1.5-2.0) causing quality
+degradation due to over-penalization.
+
+C.12
+
+Implementation Notes
+
+We initially used FastChat integrated with vLLM, but discovered that sampling parameters were not being correctly passed. We implemented a solution using the extra_body
+approach to correctly pass sampling parameters from FastChat to vLLM, ensuring that
+all Beam Search parameters were properly propagated to vLLM’s inference engine.
+
+35
+
+C.12.1
+
+Integration Considerations
+
+• Parameter Passing: When using multiple frameworks (e.g., FastChat + vLLM),
+investigate the parameter passing mechanism and use appropriate methods (e.g.,
+extra_body) to ensure correct propagation.
+• Framework-Specific Validation: Different frameworks may have different validation logic. Review framework source code to understand parameter checking
+mechanisms (e.g., vLLM’s _verify_beam_search() method).
+• Logging and Monitoring: Implement logging to capture actual parameter values
+used during inference, enabling verification and debugging.
+
+C.13
+
+Best Practice Recommendations
+
+C.13.1
+
+Parameter Configuration Checklist
+
+When implementing Beam Search to solve repetition problems:
+1. Verify all required parameters are set:
+• use_beam_search=True
+• best_of=5 (or appropriate beam width)
+• temperature=0
+• top_p=1
+• top_k=-1
+• early_stopping=True (critical!)
+2. Verify parameter propagation: Check actual parameter values in the inference
+framework to confirm they are correctly passed from API layers.
+3. Test with known problematic cases to validate effectiveness.
+C.13.2
+
+Integration Considerations
+
+• Parameter Passing: When using multiple frameworks (e.g., FastChat + vLLM),
+investigate the parameter passing mechanism and use appropriate methods (e.g.,
+extra_body) to ensure correct propagation.
+• Framework-Specific Validation: Different frameworks may have different validation logic. Review framework source code to understand parameter checking
+mechanisms (e.g., vLLM’s _verify_beam_search() method).
+• Logging and Monitoring: Implement logging to capture actual parameter values
+used during inference, enabling verification and debugging.
+
+36
+
+C.13.3
+
+Monitoring and Debugging
+
+• Monitor processing times and identify anomalies that might indicate repetition problems.
+• Log output samples to detect repetitive patterns.
+• Track parameter configurations across different deployment environments.
+• Maintain a test suite with known problematic cases for regression testing.
+
+37
+
+

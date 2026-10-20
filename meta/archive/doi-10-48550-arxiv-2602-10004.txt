@@ -1,0 +1,1544 @@
+ESTAR: E ARLY-S TOPPING T OKEN -AWARE R EASON ING FOR E FFICIENT I NFERENCE
+Junda Wang†, Zhichao Yang‡, Dongxu Zhang‡, Sanjit Singh Batra*‡, Robert E. Tillman*‡
+†
+
+University of Massachusetts Amherst ‡Optum AI
+Correspondence to: sanjit.batra@optum.com, rob.tillman@optum.com
+
+*
+
+arXiv:2602.10004v1 [cs.AI] 10 Feb 2026
+
+A BSTRACT
+Large reasoning models (LRMs) achieve state-of-the-art performance by generating long chains-of-thought, but often waste computation on redundant reasoning
+after the correct answer has already been reached. We introduce Early-Stopping
+for Token-Aware Reasoning (ESTAR) that detects and reduces such reasoning
+redundancy to improve efficiency without sacrificing accuracy. Our method combines (i) a trajectory-based classifier that identifies when reasoning can be safely
+stopped, (ii) supervised fine-tuning to teach LRMs to propose self-generated <stop>
+signals, and (iii) <stop>-aware reinforcement learning that truncates rollouts at selfgenerated stop points with compute-aware rewards. Experiments on four reasoning
+datasets show that ESTAR reduces reasoning length by about x3.7 (from 4799 to
+1290) while preserving accuracy (74.9% vs. 74.2%), with strong cross-domain
+generalization. These results highlight early stopping as a simple yet powerful
+mechanism for improving reasoning efficiency in LRMs.
+
+Figure 1: Early-stopping chain-of-thought and its impact on the model’s response. The x-axis
+shows reasoning progress (fraction of steps relative to the full chain-of-thought when prompting
+off-the-shelf LRMs in thinking mode). The y-axis shows the proportion of generated answers that
+match the model’s own final answer (Consistency; left panel) or the proportion of generated answers
+that match the ground-truth answers (Accuracy; right panel) on MATH500. The early stop trend
+is constructed by prompting LRMs in thinking mode, splitting each response into steps, eliciting a
+predicted answer at each step, and plotting the fraction of steps against the proportion of matching
+answers across questions. The curve divides the plot into a top blue region (already matched) and a
+bottom green region (not yet matched). The red box shows the zone of optimal reasoning efficiency.
+
+1
+
+I NTRODUCTION
+
+Large reasoning models (LRMs) like OpenAI o1 and DeepSeek-R1 push the frontier of machine
+reasoning by generating long chains of thought (Li et al., 2025), achieving SOTA across medical
+QA, scientific reasoning, and math (Tang et al., 2025b; Rein et al., 2023; Hendrycks et al., 2021). A
+common way to boost accuracy is simply to allocate more reasoning tokens (Sheng et al., 2025; Yao
+et al., 2023; Tran et al., 2024), since longer thinking can self-correct via self-verification (He et al.,
+1
+
+2025; Prystawski et al., 2023). Yet this also invites redundant steps (Qu et al., 2025; Sui et al., 2025),
+inflating CoT length, slowing responses, and degrading user experience (Kumar et al., 2025).
+To reduce CoT length, prior work has explored three main directions: explicit control of CoT length,
+adaptive control of CoT length, and incorporating the CoT length into the loss function. Methods
+for explicit control of the length of the CoT constrain the model’s output length by, for instance,
+prompting a dummy thinking box so that the model outputs solutions directly Ma et al. (2025).
+Methods for adaptive control of the CoT length approach training LRMs to switch between two
+discrete modes of Thinking and NoThinking (no CoT), rewarding models for skipping reasoning on
+easier cases while maintaining accuracy on harder ones(Zhang et al., 2025b). Finally, some methods
+introduce a length penalty on the CoT length in on-policy reinforcement learning to generate shorter
+responses (Chang et al., 2025; Arora & Zanette, 2025).
+(a) Example of redundant reasoning
+Question:
+A 28-year-old man presents to his primary care provider complaining of
+intermittent stomach pain, non-bloody diarrhea, and weight loss for the
+last 3 months. He has occasional abdominal pain and fever. This condition
+makes studying difficult. He has tried omeprazole and dietary changes
+with no improvement. ... Which of the following best explains these
+findings?
+
+(b) Traditional chain-of-thought
+Necessary Thinking
+
+Q
+
+Whole Thinking
+Redundant Thinking
+
+S1
+
+S2
+
+S3
+
+S4
+
+S1
+
+S2
+
+S3
+
+Stop
+
+Stop
+
+C
+
+A
+
+Ground-Truth Answer: C
+Response with chain-of-thought (5273 Reasoning Tokens):
+<think> S1: Okay, let's try to figure this out.The patient is a 28-year-old
+man with intermittent stomach pain. … Thus the answer is B.
+S2: Wait, Whipple's disease is caused by Tropheryma whippelii, ... Thus
+the answer is C.
+S3: Wait, Giardia lamblia is a parasitic infection... Thus the answer is A.
+S4: Wait, Chronic GI is a common symptom for Crohn’s disease... Thus
+the answer is C. </think>
+Considering above thinking, the final answer is <answer>C</answer>
+Response without chain-of-thought (0 Reasoning Tokens):
+</think> <answer>B</answer>
+ESTAR chain-of-thought (1131 Reasoning Tokens):
+<think> S1: Okay, let's try to figure this out.The patient is a 28-year-old
+man with intermittent stomach pain. … Thus the answer is B.
+S2: Wait, Whipple's disease is caused by Tropheryma whippelii, ... Thus
+the answer is C. </think>
+Considering above thinking, the final answer is <answer>C</answer>
+
+B
+
+Stop
+
+(c) ESTAR chain-of-thought
+Early Stop
+
+Q
+
+S1
+
+T1
+
+T2
+
+S2
+
+T3 T4
+
+T5
+
+C
+
+Stop
+Yes
+
+T6
+
+Current answer
+at <stop> is the
+final answer?
+
+A1
+A2
+A3
+
+LightGBM
+
+A4
+
+Token Logits
+
+Figure 2: ESTAR can predict where to halt the CoT. An illustration of (a) redundant reasoning, (b)
+standard efficient reasoning method, (c) our proposed redundant detection with LightGBM. Green
+text: the necessary thinking steps—the portion of the reasoning where the model first arrives at the
+correct answer. Blue text: the redundant thinking steps—extra thinking generated after the correct
+answer has already been reached, often repetitive or even misleading. Purple text: the stop signal—a
+special token that indicates where the model should terminate its reasoning. Red text: the final
+answer—the model’s selected output after completing its reasoning process.
+However, the aforementioned methods overlook the observation that the optimal stopping point for
+the CoT may vary across data points and may lie midway through a reasoning trajectory rather than at
+its start or end. As shown in Figure 1, we examine the impact of the CoT length (reasoning progress)
+from two complementary perspectives: consistency (agreement with the model’s own final prediction;
+left panel) and accuracy (agreement with the ground-truth answer; right panel). The black curves
+reveal that a large fraction (71%) of trajectories converge well before completion—intermediate
+predictions already match the final answer halfway through the process. Existing methods such as
+AdaptThink cannot reliably detect these early-stopping cutoffs for each data point. As shown in
+the example in Figure 2a, the LRM arrives at the correct answer after the necessary thinking steps
+(in green), yet the CoT continues generating additional tokens that introduce redundancy and even
+some temporary errors (in blue). Once the LRM enters the thinking mode, it typically includes both
+necessary as well as redundant steps. Whereas, switching to NoThinking could be less accurate
+(Figure 2b). By jointly examining accuracy and consistency in Figure 1, it becomes evident that
+consistency offers a reliable signal for identifying when reasoning can be safely truncated.
+Building on the observation that reasoning trajectories often converge early, our work investigates the
+following research questions. RQ1: Can we develop a lightweight detector that reliably identifies
+when redundant thinking occurs, so that reasoning can be safely truncated without sacrificing
+accuracy? RQ2: Beyond detection, can LRMs themselves be trained to propose candidate stopping
+2
+
+points, thereby narrowing the search space of potential early-stop positions? RQ3: By integrating
+self-generated stop signals with reinforcement learning, can we further improve efficiency while
+preserving task performance?
+To address the above questions, first, we develop a lightweight method to detect when redundant
+thinking starts. We introduce early-stop step where reasoning is forcibly terminated and an answer is
+elicited. From a certain step, we extract features from LRM output, such as log-probability slopes,
+second-order differences, and stability signals (e.g., agreement across adjacent prefixes, flip counts).
+Using these features, we train a LightGBM classifier (ESTAR-LITE) to predict whether reasoning
+should stop or continue. Across four in-domain reasoning benchmarks (USMLE, JAMA, MATH500,
+AIME2025), ESTAR-LITE maintains at least 95% of the accuracy while shortening CoT by a factor
+of 2–6 compared to LRM in thinking mode. Moreover, on the out-of-domain GPQA dataset, ESTARLITE achieves similar results. It preserves ≥95% accuracy and reducing reasoning length by 2–3
+times, highlighting its strong cross-domain generalization.
+Since detecting redundant thinking at each step is impractical, we design a post-training solution that
+allows LRMs to propose their own stopping points, which are then verified by ESTAR-LITE. We
+construct an SFT dataset by imposing fixed-length checkpoints and forcing an answer, labeling a step
+as positive only if the step’s answer matches the full-think final answer. After ESTSTAR-AR-FT,
+we adapt GRPO with a compute-aware reward that explicitly rewards correct <stop> emissions.
+During training, we truncate rollouts at <stop> and update ESTAR-LITE to stay aligned with the new
+trajectories. This yields our final model, ESTAR. On four reasoning benchmarks, ESTAR reduces
+average CoT length from 4799 to 1290 tokens (a ×3.7 reduction) while retaining 98.9% of the original
+accuracy (74.9% → 74.2%). This outperforms other efficient reasoning baselines: LengthPenalty
+(×1.4 shorter, 97.0% relative accuracy) and AdaptThink (×2.2 shorter, 97.4% relative accuracy). In
+summary, ESTAR achieves substantial efficiency gains without compromising performance.
+
+2
+
+R ELATED W ORK
+
+Efficient reasoning through adaptive thinking The simplest approach is to instruct the model to
+be brief or output fewer steps (Muennighoff et al., 2025; Ma et al., 2025). Another line of research
+trains models to adaptively decide between thinking or not thinking on a per-instance basis (Jiang
+et al., 2025b; Shen et al., 2025; Xu et al., 2025). For example, Zhang et al. (2025b) explicitly teaches
+a model when to think; it encourages the model to choose a direct answer (without thinking) for
+simpler queries while still using the complete CoT on harder queries. Similarly, Thinkless (Fang
+et al., 2025) trains a hybrid reasoner that outputs a special control token <short>, as the first output
+token, to decide the response style. Some methods have also explored routing strategies, such as
+using a separate classifier or heuristic to determine if a query needs CoT or not (Su et al., 2025;
+Marinelli et al., 2025). While binary mode-switching approaches are easy to train, they often require
+careful tuning to avoid overfitting (Yang et al., 2025b; Tang et al., 2025a; Jiang et al., 2025a; Zhang
+et al., 2025a; Wei et al., 2025). Our method differs from these binary mode-switching approaches
+by operating at a finer granularity: rather than an all-or-nothing decisions between reasoning and
+no-reasoning, we detect an early-stopping point within the CoT.
+
+Efficient reasoning with length-based penalties Another line of work injects CoT length into the
+objective to directly optimize for brevity (Hou et al., 2025; Fatemi et al., 2025; Shrivastava et al.,
+2025; Lou et al., 2025; Dai et al., 2025). For instance, Chang et al. (2025) use a cosine length-scaling
+reward with a repetition penalty to suppress long chains during RL, curbing overthinking without
+hurting accuracy; Xiang et al. (2025) similarly penalize extra tokens once a correct answer has
+appeared. While such reward shaping globally biases models toward shorter outputs, it requires
+careful tuning and can induce under-thinking on hard cases (Yang et al., 2025c). In contrast, our
+proposed method directly uses the model’s predicted stop point to truncate the CoT. Consequently,
+instead of just using a generic length penalty, we enforce brevity by halting generation at the detected
+early-stopping token. However, we also incorporate the length of the CoT into the loss function in
+order to reap the benefits of the above methods, while also using our early-stopping classifier.
+3
+
+3
+
+P RELIMINARIES
+
+Given a prompt x = [x1 , . . . , xn ], a reasoning policy πθ produces a sequence
+
+
+y = <think>, y1:ℓ , </think>, yℓ+1:m ,
+where y1:ℓ is the CoT and yℓ+1:m is the conclusion.
+Problem setup.
+
+Let Ω be the complete answer set and A(y) ∈ Ω represents the answer extracted from y. For any prefix
+length t ∈ {0, . . . , ℓ}, we define a forced early stop that appends </think> after y≤t and immediately
+
+elicits a conclusion, yielding a early-stop answer: AES
+= A [<think>, y≤t , </think>, ·] .
+t
+ES
+⋆
+t is a safe stop step if AES
+t = Aℓ ; Our goal is to find the earliest safe stop τ (x) = min{ t ≤ ℓ :
+ES
+ES
+At = Aℓ }.
+
+Posterior viewpoint and safety certificate Define
+ ESthe (implicit) answer posterior distribution if we
+stopped at t: p⃗t = ⃗πθ AES
+x,
+y
+,
+</think>
+, At ∈ Ω.
+≤t
+t
+Let Yt = σ(y≤t ) be the distribution of y≤t , we can define Tail Variation as an expected accumulative
+distribution difference of early stop answers from t to ℓ:
+" ℓ−1
+#
+X
+TVt = E
+∥⃗
+pk+1 − p⃗k ∥1 Yt ,
+k=t
+
+it describes how much variance the final answer is expected if the LRM continues to think after step t.
+Intuitively, a stop is safe when the remaining posterior movement is too small to overturn the current
+mode. This lead to the following theorum:
+Theorem 3.1. Let Ât = arg maxAt pt (At ) and γt = pt (Ât ) − maxAt ̸=Ât pt (At ) be the confidence
+margin. Then, a sufficient (computable) stopping rule is τ † = inf { t : TVt ≤ c γt } , where c is a
+small positive scalar.
+
+4
+
+M ETHODS
+
+We address the challenge of redundancy in CoT by introducing into ESTAR. We address RQ1 by
+building a lightweight instance-wise early-stopping detector which we refer to as ESTAR-LITE.
+ESTAR-LITE decides when to early stop a CoT by using a tabular classifier with features derived
+from the token probabilities. To answer RQ2, we introduce ESTAR-F( INE )T( UNING ) wherein the
+LRM undergoes supervised fine-tuning on curated CoT enabling the model to emit a special <stop>
+token that narrows down the search space of candidate early-stopping tokens. Finally, to answer
+RQ3, we introduce ESTAR which augments ESTAR-FT with a reinforcement learning loss function
+featuring the length of the CoT. At inference time, earlystop is applied if the LRM proposes a <stop>
+token during its reasoning process and the tabular classifier also confirms the consistency of the
+model’s earlystop answer.
+4.1
+
+C LASSIFIER P REDICTION
+
+Goal. At decode step t, the model has generated a CoT prefix y≤t . Our goal is to decide online
+whether to continue generating CoT tokens, or to stop thinking (append </think>) and directly elicit
+the final answer. Intuitively, once the model’s predicted answer is stable, additional CoT tokens
+provide diminishing benefit.
+Connection to the stopping certificate. Appendix §A.1 derives a sufficient stopping condition
+based on the tail variation of the answer posterior. Under these assumptions, this tail variation can be
+related to local changes in the early-stop confidence trajectory:
+TVt ≲ c1
+
+X
+
+Sk + c2
+
+k∈Wt
+
+X
+
+Hk + Rt (w),
+
+(1)
+
+k∈Wt
+
+where Sk and Hk are discrete slope and curvature terms. Because the constants and remainder term
+are unknown, we do not hard-code a closed-form threshold. Instead, we learn a lightweight classifier
+that predicts whether we can stop at the current step.
+4
+
+Algorithm (online stopping). At each decode step t: (i) compute a feature vector ϕt from the
+model’s top-k next-token log-probabilities and short-horizon trajectory statistics; (ii) evaluate a
+LightGBM classifier ρt = Cφ (ϕt ) ∈ [0, 1]; (iii) stop at the earliest t where ρt exceeds a fixed
+threshold τ .
+Features used by ESTAR-LITE. Concretely, we instantiate four feature groups that cover the
+drivers in Eq. (1). Additional details about how to calculate the features are described in Appendix § A.2:
+(1) Instantaneous evidence. At step t, the model induces a next-token distribution πθ (tok | s<t ). We
+map each token to an answer bucket Ω (e.g., canonicalizing token surface forms; for multiple-choice
+tasks this reduces to a letter–option map). For each bucket ω ∈ Ω, we aggregate token-level evidence
+by a log-sum-exp over tokens assigned to ω (denoted as inst_s(ω, t)), and then normalize across Ω to
+obtain a per-class instantaneous probability inst_p(ω, t). Intuitively, inst_p summarizes the model’s
+current local preference over answers before consuming the next token.
+(2) Cumulative path & stability. We maintain a class-wise cumulative evidence vector C(t)
+whose ω-th component accumulates log inst_p(ω, t) from t = 1 to now. The running winner (the
+arg maxω Cω (t)) defines the current predicted answer. From this path we derive several stability cues:
+flips(t) counts the number of winning changes so far, and changed_prev(t) indicates whether token t
+introduced a new winner. Together they measure the stickiness of the decision and the volatility of
+the trajectory.
+(3) Early-stop curvature cues. Let LES
+t denote an early-stopping confidence score (higher is more
+confident to stop). We use its one-step slope S_es(t) to proxy marginal gain from one extra token, and
+its second difference H_es(t) to indicate local saturation or acceleration.
+(4) Token-level confidence statistics. From the per-step token log probabilities inside the predicted
+answer span, we compute the mean µt and variance σt2 (confidence and dispersion), a negativeperplexity proxy neg_ppl(t) (higher means more peaked), and the token length ans_len(t) (longer
+spans often correlate with lower certainty).
+Classifier target. Concatenating these signals yields a stepwise feature vector ϕt . We train a
+classifier Cφ (ϕt ) ∈ [0, 1] with a logistic loss, where yt ∈ 0, 1 marks whether stopping at t preserves
+the final answer. A tree ensemble converts curvature, stability, and evidence cues into a calibrated
+stop probability—data-driven and nonparametric, without hand-tuned thresholds.
+ESTAR-LITE during inference. During inference we update ϕt online and evaluate ρt = Cφ (ϕt )
+at each step. We stop at the earliest t satisfying ρt ≥ τ (τ is set to 0.9 throughout this manuscript)
+and a short patience check (e.g., whether the condition holds for few consecutive steps), then append
+the </think> token and elicit the final answer.
+4.2
+
+S ELF -G ENERATED S TOP C UE VIA SFT
+
+When applying the above classifier during inference, it requires a pre-determined task-wise step
+size during generation (e.g. classifies every 10 CoT tokens). Such global strategy could lead to
+sub-optimal early stopping (as shown in Sec. 6.2). In this section, our goal is to use a similar training
+signals from above to teach the LRM to propose early-stop positions by itself. First, we insert <stop>
+tokens into CoTs at the position where early-stop labels are positive. Then we apply regular teacher
+forcing supervised finetuning on these formatted CoTs. In particular, given a data instance (x, y), we
+first segment its CoT into sentences [s1 ..., sM ]. For each prefix (x, s1:j |M
+j=1 ) we conduct forced early
+stop and let the LRM directly generate AES ; If AES equals AES
+,
+we
+insert
+a <stop> token at sj . The
+ℓ
+′
+<stop>-inserted (x, y ) forms the training data for SFT.
+Two additional enhancements are made to create the training signal. Firstly, to encourage earlier exits,
+we add at most the first 5 <stop> tokens per instance. Secondly, to learn from more challenging data, we
+apply inference scaling (Muennighoff et al., 2025) when CoTs lead to incorrect answers. Concretely,
+given an instance (x, y) where answer is incorrect, we form a new prompt with a hint containing gold
+answer A⋆ : xc = [x, <think>y1:ℓ </think>, h] where h = "Wait, the correct answer is A⋆ " and let
+LRM complete the rest of the reasoning trace. This scaling approach forms an corrected thinking trace
+5
+
+yc that can lead to the gold answer. Then we insert <stop> tokens into yc using the same approach
+described above. This augmentation preserves the original reasoning prefix while supplying positive
+supervision even when the initial trajectory fails. Afterwards, we conduct supervised finetuning on
+the collected training data with the objective of minimizing the cross entropy loss for next word
+prediction.
+4.3
+
+S TOP -AWARE R EINFORCEMENT L EARNING
+
+Supervised finetuning a LLM on off-policy reference data often leads to memorization and may harm
+its generalization ability (Chu et al., 2026). To tackle RQ3, we convert the early stop signals as a
+reward function in reinforcement learning and the objective is to encourage the LRM to generate
+earliest possible <stop> tokens that trigger valid solutions.
+Policy rollout. For a prompt x, the policy πθ generates a whole-thinking sequence y1:ℓgen which
+may contain a set of early stop proposals:
+P(x) = { t ≤ ℓgen : yt = <stop> }.
+For all t ∈ P(x), we force a conclusion and test acceptance:
+AES
+t ∼ πθ (· | x, y≤t , </think>)
+
+⋆
+at = 1{ AES
+t =A }
+
+The rollout is truncated to the earliest safe stop:
+t̃ = : min{ t ∈ P(x) : at = 1 }
+
+
+τ̃ = y1:t̃ , AES
+.
+t̃
+
+If at = 0 for all t ∈ P(x)), we set t̃ = ℓgen for credit assignment. This verify-then-truncate protocol
+ensures that only a verified proposal terminates the rollout; Earlier proposals that fail verification do
+not trigger truncation and therefore receive rewards.
+Reward.
+
+Each proposal before truncation t′ ∈ {t ∈ P(x) ∧ t ≤ t̃} receives the following reward:
+
+⋆
+r(t′ ) = λ1 rfmt (t′ ) + λ2 rstop (t′ ) + λ3 racc AES
+(2)
+t′ , A .
+
+Here rfmt enforces well-formed use/order of <think>, <stop>, </think>; rstop is monotone in earliness
+(e.g., decreasing in t̃ or a normalized progress ratio) and is granted only when t′ = t̃; racc scores the
+final answer against the gold answer.
+Inference. At test time we combine the model’s self-generated <stop> cue with an external classifier
+to decide termination. During inference, whenever a <stop> token is emitted at step t, we treat t as
+an early stop proposal. We then compute the feature vector ϕt online and the classifier produces
+ρt = Cφ (ϕt ). If ρt ≥ τ (optionally after a brief patience check), we accept the stop: append </think>,
+elicit the final answer; otherwise, the model continues the generation before </think> until a new stop
+token is proposed or a budget is reached.
+
+5
+
+E XPERIMENTS
+
+5.1
+
+E XPERIMENTAL S ETUP
+
+Datasets. We evaluate on five public benchmarks USMLE-QA (Jin et al., 2020) and JAMA-QA
+(Chen et al., 2025) are multiple-choice medical QA (closed-form answers). GPQA-Diamond (Rein
+et al., 2023) is a hard STEM multiple-choice set (closed-form answers). Math-500 (Satpute et al.,
+2024) and AIME2025 are open-ended math sets (short textual/numeric answers).
+5.2
+
+RQ1 ESTAR-LITE: ROBUSTNESS AND L OW-C OST P REDICTION E XPERIMENT S ETTINGS
+
+We use a reasoning model, such as Qwen3-8B (Yang et al., 2025a). To train the classifier, we first
+generate the chain-of-thought (CoT) for each data point with temperature 0.6, top-k=20, top-p=0.95,
+repetition penalty 1.2.
+6
+
+Accuracy
+
+Dataset
+USMLE
+JAMA
+GPQA
+MATH500
+AIME
+
+Length
+
+Traditional
+
+ESTAR-LITE
+
+Traditional
+
+ESTAR-LITE
+
+77.53
+57.45
+60.10
+94.00
+70.00
+
+76.83 (99.1%)
+56.55 (98.4%)
+59.50 (99.0%)
+93.20 (99.2%)
+66.67 (95.2%)
+
+2412
+2423
+3882
+3951
+6123
+
+549 (×4.4)
+419 (×5.8)
+1695 (×2.3)
+2019 (×2.0)
+3045 (×2.0)
+
+Table 1: Accuracy and CoT length on LRMs with thinking mode (Traditional) vs. early-stopping
+(ESTAR-LITE) on Qwen3-8B. Parentheses show relative values. ESTAR-LITE typically preserves
+≥95% accuracy while reducing reasoning length by ×2–6.
+We then uniformly slice the CoT at 10%, 20%, . . . , 100% of its length (in number of tokens) and
+append the </think> token to elicit a conclusion with greedy decoding (temperature 0). At each token
+t of the CoT, we log top-20 next-token log-probabilities, bucket tokens into the answer set Ω, and
+compute the online features ϕt .
+We train a LightGBM classifier Cφ (using a binary cross-entropy loss function) on pairs (ϕt , yt )
+from each token t of the CoT using the default hyperparameters: n_estimators=400, num_leaves=63,
+learning_rate=0.07, subsample=0.9, colsample_bytree=0.9. To train LightGBM for Closed QA
+task, we used train data split of USMLE-QA. To train LightGBM for Open QA task, we used
+DEEPSCALE R (Luo et al., 2025). For in-domain evaluation on Open QA tasks, we used MATH500
+and AIME. For in-domain evaluation on Closed QA tasks, we used JAMA-QA and test split of
+USMLE-QA. For out-of-domain evaluation, we used GPQA.
+5.3
+
+RQ2 ESTAR-FT: L EARNING <stop> P ROPOSALS TO R EDUCE E ARLY-S TOPPING
+C ANDIDATES
+
+To introduce the capability of the LRM to self-propose <stop> tokens, we generate supervised
+fine-tuning data on MATH-500. Concretely, for each data point we generate the CoT [y1 , . . . , yℓ ]
+followed by a final answer. We fine-tune with token-level cross-entropy (learning rate = 2×10−5 ;
+8 GPUs), treating the <stop> token as part of the vocabulary so that the LRM learns to emit <stop>
+tokens.
+5.4
+
+RQ3 ESTAR: C ORRECTNESS - VERIFIED <stop> U NDER RL C AN I MPROVE T HINKING
+E FFICIENCY
+
+We modify the traditional reinforcement learning using GRPO by adding a length penalty in the
+reward function using λ1 = 1/4, λ2 = 1/4, λ3 = 1/2 in equation 2. During training, when the
+ES
+⋆
+policy emits a <stop> token at step t, we append a </think> token to obtain AES
+t . If At =A , then we
+truncate the roll-out at token t. We trained batch size 256, nroll-outs =16, for 39 steps. For close-ended
+tasks, we run GRPO on USMLE-QA–Train. For open-ended tasks, we run GRPO on deepscaleR. We
+use GRPO (Shao et al., 2024) in our reinforcement learning process due to its efficient learning with
+rewards from multiple rollouts.
+During inference with ESTAR, when the LRM emits a <stop> token at step t within its CoT, the
+classifier compute a logit ρt =Cφ (ϕt ). If ρt ≥ τ (we set τ = 0.9 across all experiments presented
+in this manuscript), we append the </think> token, elicit the answer, and early-stop; otherwise we
+continue until the next <stop> or the CoT terminates.
+
+6
+
+R ESULTS
+
+6.1
+
+RQ1: ESTAR-LITE: A LIGHTWEIGHT CLASSIFIER TO IDENTIFY WHEN TO EARLY- STOP
+
+ESTAR-LITE leads to efficient inference without sacrificing accuracy Table 1 shows that the
+lightweight classifier within ESTAR-LITE, using a constant threshold τ = 0.9 across datasets,
+achieves substantial efficiency gains with minimal loss in accuracy relative to full-CoT inference
+7
+
+(A) USMLE
+
+(B) JAMA
+
+(C) GPQA
+
+Figure 3: ESTAR-LITE features separate tokens where the answer matches the one with fullCoT. Each panel shows a density–normalized histogram of a feature for two classes: match (the
+token’s answer equals the full-CoT answer) and mismatch (where it does not). Top row: slope_recent;
+bottom row: delta_recent. Vertical dashed lines mark class means (long dash = match; dotted =
+mismatch). Panel titles report Cohen’s d and AUROC, computed on all tokens for that dataset, using
+the feature value as the score (higher ⇒ more likely match). AUROC is the area under the ROC
+curve, i.e., the probability that a randomly chosen match step receives a higher feature value than a
+randomly chosen mismatch step (0.5 = random guessing; 1.0 = perfect).
+when tested on Qwen3-8B. On medical QA, ESTAR-LITE yields a ≥ ×4 improvement in efficiency
+on USMLE while preserving 99.1% of the full-CoT accuracy, and achieves a ×5.8 efficiency
+improvement on JAMA while preserving 98.4% of the full-CoT accuracy. On the hard STEM
+benchmark GPQA, ESTAR-LITE still provides a ≥ ×2 efficiency improvement while retaining
+accuracy to within ≥ 99% of full-CoT performance. We observe analogous behavior on open-ended
+math benchmarks (MATH500 and AIME), where ESTAR-LITE again attains ≥ ×2 efficiency
+improvements while maintaining accuracy to within ≥ 95% of the full-CoT baseline. The same trend
+consistently holds across other LRMs, including Qwen3-32B and DS-R1-Distill-Llama-8B; detailed
+results are provided in Appendix § A.3.
+Taken together, these results indicate strong out-of-domain generalization: ESTAR-LITE is trained
+only on USMLE-QA-train and deepscaleR, yet it maintains a fixed threshold (τ = 0.9) and consistently adapts reasoning length to question difficulty across diverse benchmarks. See Appendix § A.4
+for additional analysis of length adaptation.
+ESTAR-LITE features are discriminative and easy to compute Figure 3 demonstrates that two
+of the ESTAR-LITE features, which are easy to compute, slope_recent and delta_recent, cleanly
+separate CoT steps whose answer already matches the final answer (match) from those that do not
+(mismatch). Because these features are model-agnostic and require access to only the top-k token
+log-probabilities, they are inexpensive to compute during inference.
+ESTAR-LITE classification threshold trades off accuracy vs coverage Appendix § A.5 summarizes the tradeoff between task accuracy (i.e., whether the early-stopped final answer matches
+the ground-truth answer) and coverage (the fraction of examples for which ESTAR-LITE triggers
+early stopping). We observe that as the ESTAR-LITE classification threshold (τ ) decreases, accuracy and the early-stopped CoT length both decrease, while coverage increases. Since accuracy
+remains relatively stable across a range of τ values, we set τ = 0.9 for all analyses presented in this
+manuscript.
+6.2
+
+RQ2: ESTAR-FT: L EARNING <stop> P ROPOSALS TO P RUNE E ARLY-S TOP C ANDIDATES
+
+On MATH-500, if we vary the frequency with which the ESTAR-LITE classifier is invoked, we
+get varying points along the Consistency vs Reasoning length plot shown in Figure 4. Among the
+8
+
+Closed QA
+Method
+GRPO
+O1-Pruner
+FlashThink
+No-Thinking
+AdaptThink
+Length-Penalty
+ESTAR-LITE
+ESTAR-FT
+ESTAR
+
+USMLE
+Acc
+Len
+78.14
+(100.0%)
+76.6
+(98.0%)
+76.83
+(98.3%)
+66.2
+(84.7%)
+76.4
+(97.8%)
+76.6
+(98.0%)
+76.83
+(98.3%)
+77.10
+(98.7%)
+77.13
+(98.7%)
+
+2732
+(x1.0)
+1472
+(x1.9)
+1693
+(x1.6)
+315
+(x8.7)
+987
+(x2.8)
+1325
+(x2.1)
+549
+(x5.0)
+645
+(x4.2)
+388
+(x7.0)
+
+Open QA
+
+JAMA
+Acc
+Len
+57.8
+(100.0%)
+53.2
+(92.0%)
+55.8
+(96.5%)
+48.2
+(83.4%)
+55.8
+(96.5%)
+55.4
+(95.8%)
+56.6
+(97.8%)
+57.2
+(99.0%)
+56.10
+(97.1%)
+
+2634
+(x1.0)
+1981
+(x1.3)
+2161
+(x1.2)
+369
+(x7.1)
+1102
+(x2.4)
+1872
+(x1.4)
+419
+(x6.3)
+689
+(x3.8)
+352
+(x7.5)
+
+MATH500
+Acc
+Len
+94.0
+(100.0%)
+91.6
+(97.4%)
+93.8
+(99.8%)
+85.0
+(90.4%)
+93.8
+(99.8%)
+92.4
+(98.3%)
+93.2
+(99.1%)
+93.4
+(99.4%)
+93.8
+(99.8%)
+
+3962
+(x1.0)
+2856
+(x1.4)
+3050
+(x1.4)
+1139
+(x3.5)
+2130
+(x1.9)
+3190
+(x1.2)
+2019
+(x2.0)
+2401
+(x1.7)
+635
+(x6.2)
+
+AIME
+Acc
+Len
+70.00
+(100.0%)
+66.67
+(95.2%)
+66.67
+(95.2%)
+26.67
+(38.1%)
+66.67
+(95.2%)
+66.67
+(95.2%)
+66.67
+(95.2%)
+66.67
+(95.2%)
+70.00
+(100.0%)
+
+9871
+(x1.0)
+7841
+(x1.3)
+6504
+(x1.5)
+1513
+(x6.5)
+4513
+(x2.2)
+7324
+(x1.3)
+3045
+(x3.2)
+3413
+(x2.9)
+3788
+(x2.6)
+
+Table 2: Accuracy / length by method, grouped by task type. Closed QA (USMLE, JAMA) has
+a single correct option; Open QA (MATH500, AIME2025) requires free-form numeric/algebraic
+answers. For each dataset, Acc is test accuracy (in %), and Len is the average output token length of
+the response (including reasoning, if any).
+markers corresponding to ESTAR-LITE, we vary the classifier invocation frequency from every 20
+tokens up to every 200 tokens (i.e., 20, 40, . . . , 200). The lightest marker denotes the most frequent
+setting, in which the classifier is invoked every 20 tokens. We observe that invoking the classifier
+more frequently (lighter markers) lead to shorter reasoning length (represented by the x-axis) with a
+marginal drop in consistency (represented by the y-axis).
+ESTAR-FT presents an alternative to the strategy of tuning this frequency of invoking the ESTARLITE classifier. In ESTAR-FT, since the LRM is fine-tuned to reliably emit <stop> tokens, its
+consistency is better than the best choice the frequency of ESTAR-LITE while having a shorter
+early-stopped CoT length. ESTAR-FT is therefore able to adaptively determine when to emit a <stop>
+token and thereby reduce the CoT length without sacrificing accuracy. LRMs can thus be supervised
+fine-tuned to propose accurate early-stopping tokens that improve the tradeoff between accuracy and
+number of invocations to the ESTAR-LITE classifier.
+6.3
+
+RQ3: ESTAR: C ORRECTNESS - VERIFIED <stop> UNDER RL CAN IMPROVE THINKING
+EFFICIENCY
+
+We compare methods on two families of tasks: Closed QA (USMLE, JAMA; single correct option)
+and Open QA (MATH500, AIME2025; free-form numeric/algebraic answers) as shown in Table 2.
+For each dataset, Acc denotes test accuracy (%) and Len denotes the average number of output tokens,
+including the (early-stopped) CoT.
+Across all datasets, ESTAR consistently attains high accuracy with substantially shorter CoTs
+compared to reinforcement learning baselines (GRPO). In particular, relative to GRPO, ESTAR
+reduces the early-stopped CoT length by ∼7× on Closed QA and by ∼6× on MATH500 while
+maintaining > 97% of the corresponding accuracy. On AIME, ESTAR incurs no accuracy loss (70.0%
+vs. 70.0%) while using ∼2.6× fewer tokens.
+ESTAR also exhibits a superior accuracy–efficiency tradeoff relative to AdaptThink. For example,
+on MATH500 it matches AdaptThink’s 93.8% accuracy with ≈70% fewer tokens (635 vs. 2130),
+and on USMLE it improves accuracy (77.1% vs. 76.4%) while reducing tokens by ≈61% (388
+vs. 987). Adding an explicit length penalty reduces CoT length relative to GRPO (e.g., USMLE:
+2732→1325, ×2.1), but achieves substantially smaller reductions than ESTAR (2732→388, ×7.0) and
+9
+
+Consistency
+
+Reasoning Progress
+Figure 4: ESTAR and ESTAR-FT stop earlier, achieving high consistency with fewer checks.
+is accompanied by larger accuracy drops (e.g., USMLE: 78.14%→76.6% vs. 77.13% for ESTAR).
+No-Thinking, by construction, yields the shortest generations; however, it suffers substantial accuracy
+drops across datasets.
+
+7
+
+C ONCLUSION
+
+Strategies for making inference with large reasoning models more efficient, such as global penalties
+or coarse mode switches (e.g., introducing a length penalty, AdaptThink etc.) cannot detect midtrajectory convergence and thus waste computation. In this manuscript, we introduce ESTAR which
+combines a lighweight classifier to predict consistency with the answer derived using a full CoT
+and per-instance proposals to train a policy to act on them only when correctness is verified. This
+turns an exhaustive scan over all sentence boundaries into validating a small set of candidates. This
+targeted truncation consistently delivers ×4–10 CoT length reductions (and therefore efficiency
+gains) with essentially unchanged accuracy, demonstrating that efficiency gains need not trade off
+performance. Our results establish a path toward practical reasoning systems that are both accurate
+and compute-efficient.
+
+R EFERENCES
+Daman Arora and Andrea Zanette. Training language models to reason efficiently. ArXiv,
+abs/2502.04463, 2025. URL https://api.semanticscholar.org/CorpusID:276235717.
+Edward Y. Chang, Yuxuan Tong, Morry Niu, Graham Neubig, and Xiang Yue. Demystifying long chain-of-thought reasoning in llms. ArXiv, abs/2502.03373, 2025. URL https:
+//api.semanticscholar.org/CorpusID:276116814.
+Hanjie Chen, Zhouxiang Fang, Yash Singla, and Mark Dredze. Benchmarking large language models
+on answering and explaining challenging medical questions. In Luis Chiruzzo, Alan Ritter, and
+Lu Wang (eds.), Proceedings of the 2025 Conference of the Nations of the Americas Chapter of
+the Association for Computational Linguistics: Human Language Technologies (Volume 1: Long
+Papers), pp. 3563–3599, Albuquerque, New Mexico, April 2025. Association for Computational
+Linguistics. ISBN 979-8-89176-189-6. doi: 10.18653/v1/2025.naacl-long.182. URL https:
+//aclanthology.org/2025.naacl-long.182/.
+Tianzhe Chu, Yuexiang Zhai, Jihan Yang, Shengbang Tong, Saining Xie, Dale Schuurmans, Quoc V
+Le, Sergey Levine, and Yi Ma. Sft memorizes, rl generalizes: A comparative study of foundation
+model post-training. In Forty-second International Conference on Machine Learning, 2026.
+10
+
+Muzhi Dai, Chenxu Yang, and Qingyi Si. S-grpo: Early exit via reinforcement learning in reasoning models. ArXiv, abs/2505.07686, 2025. URL https://api.semanticscholar.org/CorpusID:
+278534462.
+Gongfan Fang, Xinyin Ma, and Xinchao Wang. Thinkless: Llm learns when to think. ArXiv,
+abs/2505.13379, 2025. URL https://api.semanticscholar.org/CorpusID:278769001.
+Mehdi Fatemi, Banafsheh Rafiee, Mingjie Tang, and Kartik Talamadupula. Concise reasoning via
+reinforcement learning. ArXiv, abs/2504.05185, 2025. URL https://api.semanticscholar.org/
+CorpusID:277621270.
+Haoyang He, Zihua Rong, Kun Ji, Chenyang Li, Qing Huang, Chong Xia, Lan Yang, and Honggang
+Zhang. Rethinking reasoning quality in large language models through enhanced chain-of-thought
+via rl. arXiv preprint arXiv:2509.06024, 2025.
+Dan Hendrycks, Collin Burns, Saurav Kadavath, Akul Arora, Steven Basart, Eric Tang, Dawn Xiaodong Song, and Jacob Steinhardt. Measuring mathematical problem solving with the math dataset.
+ArXiv, abs/2103.03874, 2021. URL https://api.semanticscholar.org/CorpusID:232134851.
+Bairu Hou, Yang Zhang, Jiabao Ji, Yujian Liu, Kaizhi Qian, Jacob Andreas, and Shiyu Chang.
+Thinkprune: Pruning long chain-of-thought of llms via reinforcement learning. ArXiv,
+abs/2504.01296, 2025. URL https://api.semanticscholar.org/CorpusID:277502250.
+Guochao Jiang, Guofeng Quan, Zepeng Ding, Ziqin Luo, Dixuan Wang, and Zheng Hu. Flashthink:
+An early exit method for efficient reasoning. ArXiv, abs/2505.13949, 2025a. URL https://api.
+semanticscholar.org/CorpusID:278768915.
+Lingjie Jiang, Xun Wu, Shaohan Huang, Qingxiu Dong, Zewen Chi, Li Dong, Xingxing Zhang,
+Tengchao Lv, Lei Cui, and Furu Wei. Think only when you need with large hybrid-reasoning
+models. ArXiv, abs/2505.14631, 2025b. URL https://api.semanticscholar.org/CorpusID:
+278768506.
+Di Jin, Eileen Pan, Nassim Oufattole, Wei-Hung Weng, Hanyi Fang, and Peter Szolovits. What disease
+does this patient have? a large-scale open domain question answering dataset from medical exams.
+ArXiv, abs/2009.13081, 2020. URL https://api.semanticscholar.org/CorpusID:221970190.
+Abhinav Kumar, Jaechul Roh, Ali Naseh, Marzena Karpinska, Mohit Iyyer, Amir Houmansadr, and
+Eugene Bagdasarian. Overthink: Slowdown attacks on reasoning llms. ArXiv, abs/2502.02542,
+2025. URL https://api.semanticscholar.org/CorpusID:276107163.
+Zhong-Zhi Li, Duzhen Zhang, Ming-Liang Zhang, Jiaxin Zhang, Zengyan Liu, Yuxuan Yao, Haotian
+Xu, Junhao Zheng, Pei-Jie Wang, Xiuyi Chen, Yingying Zhang, Fei Yin, Jiahua Dong, Zhijiang Guo,
+Le Song, and Cheng-Lin Liu. From system 1 to system 2: A survey of reasoning large language models. ArXiv, abs/2502.17419, 2025. URL https://api.semanticscholar.org/CorpusID:276575321.
+Chenwei Lou, Zewei Sun, Xinnian Liang, Meng Qu, Wei Shen, Wenqi Wang, Yuntao Li, Qingping
+Yang, and Shuangzhi Wu. Adacot: Pareto-optimal adaptive chain-of-thought triggering via reinforcement learning. ArXiv, abs/2505.11896, 2025. URL https://api.semanticscholar.org/
+CorpusID:278739729.
+Michael Luo, Sijun Tan, Justin Wong, Xiaoxiang Shi, William Y. Tang, Manan Roongta, Colin Cai,
+Jeffrey Luo, Li Erran Li, Raluca Ada Popa, and Ion Stoica. Deepscaler: Surpassing o1-preview
+with a 1.5b model by scaling rl, 2025. Notion Blog.
+Wenjie Ma, Jingxuan He, Charlie Snell, Tyler Griggs, Sewon Min, and Matei Zaharia. Reasoning models can be effective without thinking. ArXiv, abs/2504.09858, 2025. URL https:
+//api.semanticscholar.org/CorpusID:277781570.
+Ryan Marinelli, Josef Pichlmeier, and Tamás Bisztray. Harnessing chain-of-thought metadata
+for task routing and adversarial prompt detection. ArXiv, abs/2503.21464, 2025. URL https:
+//api.semanticscholar.org/CorpusID:277349330.
+11
+
+Niklas Muennighoff, Zitong Yang, Weijia Shi, Xiang Lisa Li, Fei-Fei Li, Hanna Hajishirzi, Luke S.
+Zettlemoyer, Percy Liang, Emmanuel J. Candès, and Tatsunori Hashimoto. s1: Simple testtime scaling. ArXiv, abs/2501.19393, 2025. URL https://api.semanticscholar.org/CorpusID:
+276079693.
+Ben Prystawski, Michael Y. Li, and Noah Goodman. Why think step by step? reasoning emerges
+from the locality of experience. In Thirty-seventh Conference on Neural Information Processing
+Systems, 2023. URL https://openreview.net/forum?id=rcXXNFVlEn.
+Xiaoye Qu, Yafu Li, Zhao yu Su, Weigao Sun, Jianhao Yan, Dongrui Liu, Ganqu Cui, Daizong
+Liu, Shuxian Liang, Junxian He, Peng Li, Wei Wei, Jing Shao, Chaochao Lu, Yue Zhang, XianSheng Hua, Bowen Zhou, and Yu Cheng. A survey of efficient reasoning for large reasoning
+models: Language, multimodality, and beyond. ArXiv, abs/2503.21614, 2025. URL https:
+//api.semanticscholar.org/CorpusID:277349297.
+David Rein, Betty Li Hou, Asa Cooper Stickland, Jackson Petty, Richard Yuanzhe Pang, Julien Dirani,
+Julian Michael, and Samuel R. Bowman. Gpqa: A graduate-level google-proof q&a benchmark.
+ArXiv, abs/2311.12022, 2023. URL https://api.semanticscholar.org/CorpusID:265295009.
+Ankit Satpute, Noah Gießing, André Greiner-Petter, Moritz Schubotz, Olaf Teschke, Akiko Aizawa,
+and Bela Gipp. Can llms master math? investigating large language models on math stack exchange.
+Proceedings of the 47th International ACM SIGIR Conference on Research and Development in
+Information Retrieval, 2024. URL https://api.semanticscholar.org/CorpusID:268819830.
+Zhihong Shao, Peiyi Wang, Qihao Zhu, Runxin Xu, Junxiao Song, Xiao Bi, Haowei Zhang,
+Mingchuan Zhang, YK Li, et al. Deepseekmath: Pushing the limits of mathematical reasoning in open language models. arXiv preprint arXiv:2402.03300, 2024.
+Yi Shen, Jian Zhang, Jie fu Huang, Shuming Shi, Wenjing Zhang, Jiangze Yan, Ning Wang, Kai
+Wang, and Shiguo Lian. Dast: Difficulty-adaptive slow-thinking for large reasoning models. ArXiv,
+abs/2503.04472, 2025. URL https://api.semanticscholar.org/CorpusID:276813665.
+Leheng Sheng, An Zhang, Zijian Wu, Weixiang Zhao, Changshuo Shen, Yi Zhang, Xiang Wang, and
+Tat-Seng Chua. On reasoning strength planning in large reasoning models. ArXiv, abs/2506.08390,
+2025. URL https://api.semanticscholar.org/CorpusID:279260806.
+Vaishnavi Shrivastava, Ahmed Awadallah, Vidhisha Balachandran, Shivam Garg, Harkirat Singh
+Behl, and Dimitris Papailiopoulos. Sample more to think less: Group filtered policy optimization
+for concise reasoning. ArXiv, abs/2508.09726, 2025. URL https://api.semanticscholar.org/
+CorpusID:280642282.
+Jiayuan Su, Fulin Lin, Zhaopeng Feng, Han Zheng, Teng Wang, Zhenyu Xiao, Xinlong Zhao, Zuozhu
+Liu, Lu Cheng, and Hongwei Wang. Cp-router: An uncertainty-aware router between llm and lrm.
+ArXiv, abs/2505.19970, 2025. URL https://api.semanticscholar.org/CorpusID:278912098.
+Yang Sui, Yu-Neng Chuang, Guanchu Wang, Jiamu Zhang, Tianyi Zhang, Jiayi Yuan, Hongyi
+Liu, Andrew Wen, Shaochen Zhong, Hanjie Chen, and Xia Hu. Stop overthinking: A survey
+on efficient reasoning for large language models. ArXiv, abs/2503.16419, 2025. URL https:
+//api.semanticscholar.org/CorpusID:277150783.
+Siao Tang, Xinyin Ma, Gongfan Fang, and Xinchao Wang. Concisehint: Boosting efficient reasoning
+via continuous concise hints during generation. ArXiv, abs/2506.18810, 2025a. URL https:
+//api.semanticscholar.org/CorpusID:279999281.
+Xiangru Tang, Yanjun Shao, Jiwoong Sohn, Jiapeng Chen, Jiayi Zhang, Jinyu Xiang, Fang Wu,
+Yilun Zhao, Chenglin Wu, Wenqi Shi, Arman Cohan, and Mark Gerstein. Medagentsbench:
+Benchmarking thinking models and agent frameworks for complex medical reasoning. ArXiv,
+abs/2503.07459, 2025b. URL https://api.semanticscholar.org/CorpusID:276929039.
+Hieu Tran, Zonghai Yao, Junda Wang, Yifan Zhang, Zhichao Yang, and Hong Yu. Rare: Retrievalaugmented reasoning enhancement for large language models. In Annual Meeting of the Association for Computational Linguistics, 2024. URL https://api.semanticscholar.org/CorpusID:
+274465063.
+12
+
+Zihao Wei, Liang Pang, Jiahao Liu, Jingcheng Deng, Shicheng Xu, Zenghao Duan, Jingang Wang,
+Fei Sun, Xunliang Cai, Huawei Shen, et al. Stop spinning wheels: Mitigating llm overthinking via
+mining patterns for early reasoning exit. arXiv preprint arXiv:2508.17627, 2025.
+Violet Xiang, Chase Blagden, Rafael Rafailov, nathan lile, Sang Truong, Chelsea Finn, and Nick Haber.
+Just enough thinking: Efficient reasoning with adaptive length penalties reinforcement learning.
+ArXiv, abs/2506.05256, 2025. URL https://api.semanticscholar.org/CorpusID:279244687.
+Silei Xu, Wenhao Xie, Lingxiao Zhao, and Pengcheng He. Chain of draft: Thinking faster by
+writing less. ArXiv, abs/2502.18600, 2025. URL https://api.semanticscholar.org/CorpusID:
+276618268.
+An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu, Chang
+Gao, Chengen Huang, Chenxu Lv, Chujie Zheng, Dayiheng Liu, Fan Zhou, Fei Huang, Feng
+Hu, Hao Ge, Haoran Wei, Huan Lin, Jialong Tang, Jian Yang, Jianhong Tu, Jianwei Zhang,
+Jianxin Yang, Jiaxin Yang, Jingren Zhou, Jingren Zhou, Junyan Lin, Kai Dang, Keqin Bao, KePei Yang, Le Yu, Li-Chun Deng, Mei Li, Min Xue, Mingze Li, Pei Zhang, Peng Wang, Qin
+Zhu, Rui Men, Ruize Gao, Shi-Qiang Liu, Shuang Luo, Tianhao Li, Tianyi Tang, Wenbiao
+Yin, Xingzhang Ren, Xinyu Wang, Xinyu Zhang, Xuancheng Ren, Yang Fan, Yang Su, YiChao Zhang, Yinger Zhang, Yu Wan, Yuqiong Liu, Zekun Wang, Zeyu Cui, Zhenru Zhang,
+Zhipeng Zhou, and Zihan Qiu. Qwen3 technical report. ArXiv, abs/2505.09388, 2025a. URL
+https://api.semanticscholar.org/CorpusID:278602855.
+Chenxu Yang, Qingyi Si, Yongjie Duan, Zheliang Zhu, Chenyu Zhu, Zheng Lin, Li Cao, and
+Weiping Wang. Dynamic early exit in reasoning models. ArXiv, abs/2504.15895, 2025b. URL
+https://api.semanticscholar.org/CorpusID:277994255.
+Junjie Yang, Ke Lin, and Xing Yu. Think when you need: Self-adaptive chain-of-thought learning.
+ArXiv, abs/2504.03234, 2025c. URL https://api.semanticscholar.org/CorpusID:277596355.
+Shunyu Yao, Dian Yu, Jeffrey Zhao, Izhak Shafran, Tom Griffiths, Yuan Cao, and Karthik
+Narasimhan. Tree of thoughts: Deliberate problem solving with large language models.
+In A. Oh, T. Naumann, A. Globerson, K. Saenko, M. Hardt, and S. Levine (eds.), Advances in Neural Information Processing Systems, volume 36, pp. 11809–11822. Curran
+Associates, Inc., 2023. URL https://proceedings.neurips.cc/paper_files/paper/2023/file/
+271db9922b8d1f4dd7aaef84ed5ac703-Paper-Conference.pdf.
+Anqi Zhang, Yulin Chen, Jane Pan, Chen Zhao, Aurojit Panda, Jinyang Li, and He He. Reasoning
+models know when they’re right: Probing hidden states for self-verification. ArXiv, abs/2504.05419,
+2025a. URL https://api.semanticscholar.org/CorpusID:277627067.
+Jiajie Zhang, Nianyi Lin, Lei Hou, Ling Feng, and Juanzi Li. Adaptthink: Reasoning models can learn
+when to think. ArXiv, abs/2505.13417, 2025b. URL https://api.semanticscholar.org/CorpusID:
+278769267.
+
+A
+
+A PPENDIX
+
+A.1
+
+M OTIVATION
+
+Generative setup. Consider a reasoning model πθ that, given a prompt x = [x1 , . . . , xn ], produces
+
+
+y = <think>, y1 , . . . , yℓ , </think>, yℓ+2 , . . . , ym .
+The segment [y1 , . . . , yℓ ] is the whole-thinking portion; </think> marks the transition to the conclusion [yℓ+2 , . . . , ym ]. The sequence y is sampled from πθ (· | x) with the standard autoregressive
+factorization
+m
+Y
+
+πθ (y | x) =
+πθ yt x, y<t .
+t=1
+
+13
+
+Let Ω be the answer set and let A(y) ∈ Ω denote the answer extracted from the conclusion. For any
+thinking length t ∈ {0, . . . , ℓ}, define a forced early stop that truncates at t by appending </think>
+and immediately eliciting a conclusion; denote the induced answer by
+
+AES
+= A [ <think>, y≤t , </think>, · ] .
+t
+ES
+A prefix t is a safe stopping point if AES
+t = Aℓ ; the earliest safe stop is
+ES
+τ ⋆ (x) = min{ t ≤ ℓ : AES
+t = Aℓ }.
+
+Finite-horizon optimal stopping. Thinking has a finite horizon. Let ℓ(x) be the number of wholethinking tokens before </think>, write the thinking trace as y1:ℓ = (y1 , . . . , yℓ ), and let the observed
+prefix be y≤t = (y1 , . . . , yt ) with information Yt = σ(y≤t ). Define the answer posterior the model
+would use if we stopped at t:
+
+p⃗t = ⃗πθ AES
+x, y≤t , </think> , AES
+t
+t ∈ Ω.
+So we could get:
+∥⃗
+pℓ − p⃗t ∥1 ≤
+
+ℓ−1
+X
+
+∥⃗
+pk+1 − p⃗k ∥1 .
+
+k=t
+
+where ℓ = ℓ(x) denote the number of whole-thinking tokens produced before the delimiter </think>
+for instance x (so the thinking trace is s1:ℓ ). Define tail variation
+#
+" ℓ−1
+X
+TVt = E
+∥pk+1 − pk ∥1 Yt ,
+k=t
+
+which necessarily satisfies TVt ↓ 0 as t ↑ ℓ. Let Ât = arg maxAt pt (At ) and
+γt = pt (Ât ) − max pt (At )
+At ̸=Ât
+
+be the confidence margin. A sufficient safety condition is that the tail cannot overturn the current
+prediction, e.g.
+TVt ≤ c γt ,
+for a small constant c reflecting the Lipschitz sensitivity of the argmax map.1
+We use the following tractable sufficient rule as a computable certificate:
+τ † = inf{ t : TVt ≤ c γt },
+i.e., stop when the remaining room for posterior change is too small to overturn the current decision.
+Why exact evaluation is hard. Both TVt and γt depend on the future posterior path {pk }k>t
+and the continuation policy, so computing them online would require simulating counterfactual
+continuations—prohibitively expensive at decode time. Moreover, pt is implicit in hidden states and
+not directly observable.
+Theorem A.1 (From optimal stopping to curvature-based proxies.). At each prefix t we (conceptually) force </think> and define the early-stop confidence
+
+ES
+LES
+t = log πθ At | x, s≤t , </think>
+Assuming mild smoothness of the path t 7→ LES
+t , a local second-order finite-difference expansion
+along token time yields
+ES
+ES
+ES
+ES
+LES
++ St + 12 Ht ,
+St := LES
+Ht := LES
+t+1 ≈ Lt
+t − Lt−1 ,
+t − 2Lt−1 + Lt−2 .
+Here St is the one-step marginal gain and
+p Ht the discrete curvature (plateau indicator). One-step
+posterior drift satisfies ∥pt+1 − pt ∥1 ≤ 2 KL(pt+1 ∥ pt ); while the KL is unobserved, small |St |
+and near-zero |Ht | indicate that LES
+t has entered a local plateau, making further drift—and thus tail
+variation—negligible.
+X
+X
+TVt ≲ c1
+Sk + c2
+Hk + Rt (w),
+k∈Wt
+1
+
+k∈Wt
+
+If the posterior can move by at most TVt and the lead is γt , the predicted answer is stable.
+
+14
+
+A.2
+
+F EATURES FOR C LASSIFIER
+
+Feature design and notation (complete). We work with a stepwise CoT trace. At each step
+t = 1, 2, . . . the model has history s<t and produces an answer fragment. We denote the model’s
+next-token distribution by πθ (tok | s<t ) over the vocabulary V.
+Answer buckets. Let Ω be the finite set of answer “buckets” (e.g., {A, B, C, D}; for open-form tasks
+Ω can be a canonical-expression set).
+We aggregate token log-probabilities at step t by bucket:
+n
+inst_s(ω, t) = LSE log πθ (w | s<t )}, ω ∈ Ω
+
+exp inst_s(ω, t)
+.
+inst_p(ω, t) = P
+′
+_
+ω ′ ∈Ω exp inst s(ω , t)
+
+(1) Instantaneous evidence.
+
+(3)
+(4)
+
+Definitions used here: inst_s(ω, t) is the bucket-level log-evidence (log-sum-exp over tokens mapped
+to ω); inst_p(ω, t) is the normalized instantaneous probability over Ω.
+(2) Cumulative path & stability. From instantaneous probabilities we maintain class-wise running
+evidences
+Cω (t) = Cω (t − 1) + log inst_p(ω, t),
+
+Cω (0) = 0,
+
+(5)
+
+and the current winner ω̂t = arg maxω Cω (t) with margin
+∆t = Cω̂t (t) − max Cω (t).
+
+(6)
+
+ω̸=ω̂t
+
+We expose stability indicators
+run_len(t) =
+
+{τ ≤ t : ω̂τ = ω̂t } ,
+
+flips(t) =
+
+t
+X
+
+1{ω̂τ ̸= ω̂τ −1 },
+
+(7)
+
+τ =2
+changed_prev(t) = 1{ω̂t ̸= ω̂t−1 }.
+
+(8)
+
+Meanings: ∆t is the winner’s log-margin; run_len is the current run length of the winner; flips counts
+winner changes up to t; changed_prev is the most recent-change flag.
+(3) Early-stop curvature cues. Let LES
+t be the early-stop confidence instantiated at step t as the
+log-probability sum over the answer tokens generated at step t (i.e., the sum of token log-probs inside
+the first closing brace of \boxed{·}). We model its short-horizon kinematics:
+ES
+ES
+S_es(t) = Lt − Lt−1
+
+(discrete slope),
+(second difference),
+
+H_es(t) = S_es(t) − S_es(t − 1)
+
+(9)
+(10)
+(11)
+
+We further fit a quadratic on a sliding window of length W :
+2
+LES
+τ ≈ a τ + b τ + c,
+
+τ ∈ {t − W + 1, . . . , t},
+
+Hyperparameters used in practice: short-horizon size K ∈ {3, . . . }, quadratic window W ∈ {5, . . . },
+anchor index t0 ∈ [t − W + 1, t] (we use the window start). All finite differences use zero when the
+needed past terms are absent (e.g., at the beginning of a trajectory).
+(4) Answer-token statistics. Let the step-level answer span at step t contain nt tokens with
+t
+log-probabilities {ℓi }ni=1
+. We compute
+n
+
+µt =
+
+t
+1 X
+ℓi ,
+nt i=1
+
+n
+
+σt2 =
+
+t
+1 X
+(ℓi − µt )2 ,
+nt i=1
+
+neg_ppl(t) = −µt ,
+
+ans_len(t) = nt .
+
+(12)
+
+Fallback: if per-token logs are not available, µt backs off to the exported average log-probability and
+nt to the exported answer length.
+15
+
+(5) Feature vector and learning. The stepwise feature aggregates stability, curvature/kinematics,
+and token statistics:
+h ∆t , run_len(t), flips(t), changed_prev(t) (stability) i
+ϕt = S_es(t), H_es(t), (curvature/kinematics)
+.
+µt , σt2 , neg_ppl(t), ans_len(t) (token stats)
+explicitly excluding the absolute step ratio.
+We learn a stop/continue classifier Cφ : ϕt 7→ [0, 1] from labeled samples (ϕt , yt ) with the logistic
+objective
+N
+
+i
+1 Xh
+min
+− yt log σ fφ (ϕt ) − (1 − yt ) log 1 − σ(fφ (ϕt )) ,
+φ
+N t=1
+where yt = 1 iff stopping at t preserves the final answer (i.e., the winner at t equals the final winner),
+fφ is the tree-ensemble score, and σ is the sigmoid.
+A.3
+
+ESTAR-LITE GENERALIZES ACROSS DIFFERENT LRM S
+
+Table Suppl. 1 further demonstrates the robustness of ESTAR-LITE across a diverse range of backbone
+models. Across all evaluated architectures, ESTAR-LITE shortens generation length by a factor of
+approximately ×1.4–×6.6 while keeping accuracy within about ≈1% absolute of the vanilla baseline,
+and in several cases even yielding modest improvements. For example, on MATH500, ESTAR-LITE
+reduces reasoning length from 3193 to 1771 tokens (×1.8) for Qwen3-4B and from 3285 to 2076
+tokens (×1.6) for Qwen3-32B, with only minor accuracy changes (0.924→0.916 and 0.974→0.970,
+respectively). On DeepSeek-R1-Distill-Qwen-7B, ESTAR-LITE achieves substantial efficiency gains
+(×1.7) while slightly improving accuracy (0.928→0.930). Similarly, on DeepSeek-R1-Distill-Llama8B, ESTAR-LITE preserves accuracy exactly (0.890→0.890) while reducing generation length by a
+factor of ×1.4.
+A.4
+
+ESTAR-LITE C OT LENGTH AND QUESTION DIFFICULTY
+
+Figure Suppl. 1: Bin plot of reasoning progress on Math500. AdaptThink is in yellow and ESTARLITE in blue.
+To better understand how models allocate reasoning effort, we constructed a bin plot where the x-axis
+represents reasoning progress (the fraction of reasoning steps relative to a full CoT), as derived from
+16
+
+Model
+
+Accuracy
+
+Dataset
+
+Length
+
+Traditional
+
+ESTAR-LITE
+
+Traditional
+
+ESTAR-LITE
+
+Qwen3-4B
+
+USMLE
+JAMA
+GPQA
+MATH500
+AIME
+
+72.0
+52.0
+54.0
+92.4
+60.0
+
+71.2 (98.9%)
+51.4 (98.8%)
+53.4 (98.9%)
+91.6 (99.1%)
+57.5 (95.8%)
+
+2613
+2641
+4131
+3193
+6433
+
+1114 (×2.3)
+1028 (×2.6)
+2057 (×2.0)
+1771 (×1.8)
+3551 (×1.8)
+
+Qwen3-8B
+
+USMLE
+JAMA
+GPQA
+MATH500
+AIME
+
+77.5
+57.4
+60.1
+94.0
+70.0
+
+76.8 (99.1%)
+56.5 (98.4%)
+59.5 (99.0%)
+93.2 (99.2%)
+66.6 (95.2%)
+
+2412
+2423
+3882
+3951
+6123
+
+549 (×4.4)
+419 (×5.8)
+1695 (×2.3)
+2019 (×2.0)
+3045 (×2.0)
+
+Qwen3-14B
+
+USMLE
+JAMA
+GPQA
+MATH500
+AIME
+
+77.8
+59.7
+66.6
+94.0
+70.0
+
+77.0 (99.0%)
+59.8 (100.2%)
+66.6 (100.0%)
+93.2 (99.1%)
+66.6 (95.2%)
+
+1985
+2047
+4312
+3525
+5789
+
+302 (×6.6)
+438 (×4.7)
+1161 (×3.7)
+1314 (×2.7)
+2891 (×2.0)
+
+Qwen3-32B
+
+USMLE
+JAMA
+GPQA
+MATH500
+AIME
+
+81.0
+63.5
+70.0
+97.4
+78.0
+
+80.4 (99.3%)
+63.0 (99.2%)
+69.7 (99.6%)
+97.0 (99.6%)
+75.5 (96.8%)
+
+1767
+1854
+4118
+3285
+5643
+
+314 (×6.0)
+358 (×5.3)
+1159 (×3.8)
+2076 (×1.6)
+2621 (×2.2)
+
+DS-R1-Distill-Llama-8B
+
+USMLE
+JAMA
+GPQA
+MATH500
+AIME
+
+76.0
+56.0
+63.0
+89.0
+67.0
+
+75.3 (99.1%)
+55.4 (98.9%)
+62.5 (99.2%)
+89.0 (100.0%)
+64.5 (96.3%)
+
+2520
+2555
+4275
+4173
+6016
+
+755 (×3.3)
+784 (×3.3)
+1514 (×2.9)
+2928 (×1.4)
+3057 (×2.0)
+
+DS-R1-Distill-Qwen-7B
+
+USMLE
+JAMA
+GPQA
+MATH500
+AIME
+
+78.0
+58.5
+65.0
+92.8
+69.0
+
+77.4 (99.2%)
+58.0 (99.1%)
+64.6 (99.4%)
+93.0 (100.2%)
+66.5 (96.4%)
+
+2318
+2331
+4067
+2994
+5842
+
+618 (×3.8)
+651 (×3.6)
+1447 (×2.9)
+1716 (×1.7)
+2826 (×2.1)
+
+Table Suppl. 1: Accuracy and CoT length on LRMs with thinking mode (Traditional) vs. earlystopping (ESTAR-LITE). Parentheses show relative values. ESTAR-LITE typically preserves ≥99%
+accuracy while reducing reasoning length by ×2–6.
+
+prompting off-the-shelf Qwen3-8B. As shown in Figure Suppl. 1, AdaptThink follows a bimodal
+distribution, with most questions concentrated at the beginning (x=0–0.1) or end (x=0.9–1.0) of the
+reasoning spectrum. In contrast, ESTAR-LITE demonstrates a more uniform distribution across the
+entire range. This suggests that ESTAR-LITE engages in reasoning more flexibly, adjusting its depth
+based on the demands of each question, while Adapthink tends to either reason minimally or commit
+to full chains without intermediate granularity.
+We further tested whether CoT length correlates with question difficulty using the Math500 dataset,
+which provides expert-labeled difficulty levels. Kendall’s tau correlation between difficulty and
+reasoning progress was 0.490 for AdaptThink and 0.554 for ESTAR-LITE, showing that both models
+adjust reasoning based on difficulty, but ESTAR-LITE does so more reliably. This stronger alignment
+supports the view that ESTAR-LITE allocates effort more selectively, reasoning deeply only when
+necessary, rather than applying a fixed strategy.
+17
+
+A.5
+
+ESTAR-LITE CLASSIFICATION THRESHOLD TRADES OFF
+Threshold (τ )
+
+Accuracy
+
+Length
+
+Coverage
+
+0.99
+0.95
+0.90
+0.85
+0.80
+
+77.53%
+76.94%
+76.83%
+75.10%
+73.76%
+
+463
+344
+276
+223
+185
+
+87.5%
+92.9%
+95.2%
+96.9%
+97.5%
+
+Table Suppl. 2: Tradeoff between Accuracy and early-stopped CoT Length as a function of the
+ESTAR-LITE classification threshold (τ ). Accuracy: fraction of data points where the early-stopped
+answer matches the ground-truth answer. Length: median CoT length with early-stopping using
+ESTAR-LITE. Coverage: percentage of data points for which the ESTAR-LITE led to early-stopping.
+
+18
+
+

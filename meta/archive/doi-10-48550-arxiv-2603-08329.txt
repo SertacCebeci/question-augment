@@ -1,0 +1,1194 @@
+SPD-RAG: Sub-Agent Per Document Retrieval-Augmented Generation
+Yagiz Can Akay1 Muhammed Yusuf Kartal1 Esra Alparslan1
+Faruk Ortakoyluoglu1 Arda Akpinar2
+1
+TOBB University of Economics and Technology 2 OSTIM Technical University
+{y.akay, m.kartal, ealparslan, fortakoyluoglu}@etu.edu.tr 230206003@ostimteknik.edu.tr
+
+Abstract
+
+arXiv:2603.08329v1 [cs.CL] 9 Mar 2026
+
+Answering complex, real-world queries often
+requires synthesizing facts scattered across vast
+document corpora. In these settings, standard retrieval-augmented generation (RAG)
+pipelines suffer from incomplete evidence coverage, while long-context large language models (LLMs) struggle to reason reliably over
+massive inputs. We introduce SPD-RAG, a
+hierarchical multi-agent framework for exhaustive cross-document question answering that decomposes the problem along the document axis.
+Each document is processed by a dedicated
+document-level agent operating only on its own
+content, enabling focused retrieval, while a coordinator dispatches tasks to relevant agents
+and aggregates their partial answers. Agent
+outputs are synthesized by merging partial answers through a token-bounded synthesis layer
+(which supports recursive map-reduce for massive corpora). This document-level specialization with centralized fusion improves scalability and answer quality in heterogeneous multidocument settings while yielding a modular,
+extensible retrieval pipeline. On the LOONG
+benchmark (EMNLP 2024) for long-context
+multi-document QA, SPD-RAG achieves an
+Avg Score of 58.1 (GPT-5 evaluation), outperforming Normal RAG (33.0) and Agentic RAG
+(32.8) while using only 38% of the API cost of
+a full-context baseline (68.0).
+
+1
+
+Introduction
+
+Large language models (LLMs) and the agentic
+systems built around them are increasingly used
+for complex information search tasks (Guo et al.,
+2024). Real-world questions often require synthesizing evidence scattered across many documents,
+such as assessing a company’s financial risks across
+years of reports or integrating findings from multiple scientific papers.1 Such questions are natural
+1
+
+Examples inspired by scenarios in the Loong benchmark (Wang et al., 2024a).
+
+and common, yet expose critical coverage and reasoning bottlenecks in current NLP systems.
+Traditional single-index or single-agent retrieval
+systems struggle to maintain both scalability and
+contextual relevance over large, heterogeneous corpora, especially for long or structurally complex
+documents. Standard RAG pipelines retrieve a
+fixed number of documents K and process them
+within a single context window (Lewis et al., 2020),
+which fails when answers depend on information
+distributed across many documents, since evidence
+beyond the top-K results is typically discarded in
+a single retrieval pass. Long-context LLMs extend context windows to 128K–2M tokens (Gemini
+Team et al., 2024), but empirical evidence shows
+that reasoning quality degrades significantly as context length increases (Liu et al., 2023). This suggests that the bottleneck is not only retrieval, but
+also reasoning at scale over many documents and
+hundreds of thousands of tokens.
+In this work, we introduce SPD-RAG
+(Sub-agent per Document Retrieval-Augmented
+Generation), a hierarchical multi-agent architecture
+for exhaustive multi-document question answering
+that factors the problem along the document axis
+rather than the task axis. Instead of forcing a
+single model to hunt through a massive global
+index, SPD-RAG uses a central coordinator to
+decompose the user’s query into shared instructions. It then deploys a dedicated, cost-efficient
+sub-agent to each document in the corpus. These
+agents operate entirely in parallel, treating their
+assigned documents as isolated retrieval universes
+to extract relevant findings. Finally, a synthesis
+model aggregates these document-grounded
+findings—employing a recursive merging fallback
+for exceptionally large corpora—to construct a
+comprehensive, final answer. Our codebase and
+datasets used in this paper can be found at
+https://github.com/NebulAICompany/
+SPD-RAG.
+
+Our contributions are as follows:
+• We propose SPD-RAG, a hierarchical multiagent framework that combines per-document
+agentic RAG with a centralized synthesis
+layer, where cost-efficient document agents
+are coordinated by a smarter coordinator
+agent, enabling document-level specialization
+and parallel execution while allowing each
+document to be analyzed in depth to ensure
+that all relevant information is incorporated
+without missing critical evidence.
+• We evaluate on the Loong benchmark (Wang
+et al., 2024a), which includes multi-document
+QA instances over financial reports and academic papers with an average of 11 documents per instance and context lengths from
+10K to beyond 250K tokens, and show that
+our system substantially outperforms standard
+RAG and Agentic RAG baselines under GPT5-judged Avg Score (adapted from Loong’s
+GPT-4-judged protocol; see §4.3), with gains
+of around +25 points (76% higher average
+score) compared to Normal RAG and Agentic
+RAG baselines.
+• We analyze ablations, document type and task
+complexity effects, and cost–quality tradeoffs,
+showing that SPD-RAG attains over 85% of
+full-context baseline quality at roughly 38%
+of the API cost.
+
+2
+
+Related Work
+
+2.1
+
+LLM-Based Multi-Agent Systems
+
+LLM-based multi-agent systems are increasingly
+used for complex task solving. Guo et al. (2024)
+provide a comprehensive survey of agent profiles,
+communication protocols, and collaboration strategies. Hierarchical architectures such as MegaAgent (Wang et al., 2024b), which demonstrates autonomous cooperation among up to 590 agents via
+multi-level task decomposition, and AgentOrchestra (Zhang et al., 2025), which achieves state-of-theart performance on GAIA using a central planning
+agent and specialized sub-agents, exemplify this
+trend.
+Scaling laws for multi-agent systems offer quantitative guidance for architecture design. Kim et al.
+(2025) evaluate 180 configurations across five architectures, finding that centralized coordination
+yields an 80.9% improvement on parallelizable
+
+tasks, but that multi-agent overhead grows superlinearly. Their result that independent agents amplify
+errors by 17.2× compared to 4.4× for centralized
+systems directly motivates our coordinator-based
+design. The taxonomy of hierarchical multi-agent
+systems by Moore (2025) further classifies design
+patterns along five axes: control hierarchy, information flow, role delegation, temporal layering, and
+communication structure.
+2.2 Long Document and Multi-Document QA
+Long documents that exceed LLM context windows are often handled via divide-and-conquer
+strategies. LLM×MapReduce (Zhou et al., 2025)
+formalizes two key challenges: inter-chunk dependency (one chunk depends on context from another)
+and inter-chunk conflict (chunks provide contradictory information), and proposes structured information protocols and in-context confidence calibration
+to mitigate them. ToM (Guo et al., 2025) extends
+this approach with a hierarchical DocTree representation for recursive reasoning.
+For multi-document QA, LongAgent (Zhao et al.,
+2024) splits a 128K-token document into chunks
+assigned to member agents, with a leader agent
+orchestrating discussions and inter-member communication to reduce hallucinations. However,
+LongAgent targets a single long document rather
+than multiple independent documents that may conflict. DocAgent (Sun et al., 2025) uses a multiagent framework that mimics human reading via
+a tree-structured outline and reviewer agent, while
+MDocAgent (Han et al., 2025) employs five specialized agents for multi-modal document understanding.
+2.3
+
+Hierarchical and Recursive
+Summarization
+
+Our hierarchical merging mechanism builds on treebased retrieval and recursive summarization. RAPTOR (Sarthi et al., 2024) recursively embeds, clusters, and summarizes text chunks to construct a
+bottom-up tree with multiple abstraction levels; retrieving from the appropriate level yields a 20% absolute accuracy gain on QuALITY. Ou and Lapata
+(2025) show that hierarchical merging can amplify
+hallucinations during recursive summarization and
+propose context-aware augmentation strategies that
+replace intermediate summaries with relevant input
+context, which we adopt in our merging protocol.
+
+2.4
+
+Graph-Based Document Analysis
+
+Graph-based document analysis is particularly effective for global sensemaking queries.
+GraphRAG (Edge et al., 2024) constructs a knowledge graph of entities and relations from source
+documents and applies hierarchical community
+detection (e.g., the Leiden algorithm (Traag et al.,
+2019)) to obtain multi-level communities with
+textual summaries. At query time, it retrieves
+relevant communities, elicits community-level
+partial answers, and aggregates them via a
+map–reduce–style procedure. A survey on LLMempowered knowledge graph construction (Bian,
+2025) highlights how LLMs are reshaping the
+classical knowledge graph pipeline across three
+key stages: ontology engineering, knowledge
+extraction, and knowledge fusion. Our work is
+complementary: instead of inducing an explicit
+knowledge graph, SPD-RAG operates directly
+over agent-produced textual summaries and
+performs similarity-guided recursive synthesis
+across many documents.
+
+2.5
+
+Benchmarks for Multi-Document
+Reasoning
+
+The Loong benchmark (Wang et al., 2024a)
+evaluates long-context LLMs on extended multidocument QA where every document is relevant
+("Leave No Document Behind") across financial,
+legal, and academic domains in English and Chinese. It spans four task types with context lengths
+from 10K to over 250K tokens, and even strong
+frontier models achieve only modest Avg Scores
+and medium perfect-answer rates, underscoring the
+difficulty of reasoning over many long, all-relevant
+documents.
+Complementary datasets probe other aspects of
+multi-document reasoning. MoNaCo (Wolfson
+et al., 2025) focuses on natural questions over
+dozens of Wikipedia pages, MEBench (Lin et al.,
+2025) on high-entity-density QA, FanOutQA (Zhu
+et al., 2024) on multi-hop questions with
+long cross-document evidence chains, and
+HoloBench (Maekawa et al., 2024) on databasestyle aggregation over unstructured text. Taken
+together, these benchmarks show that scalable
+multi-document reasoning remains an open
+challenge, with Loong emphasizing the especially
+demanding all-relevant, long-context regime.
+
+3
+
+Methodology
+
+Figure 1 presents an overview of the SPD-RAG
+architecture. The system processes a query through
+three layers: the Coordination Layer (§3.1), the
+Parallel Retrieval Layer (§3.2), and the Synthesis
+Layer (§3.3).
+3.1
+
+Coordination Layer
+
+Given a query q and corpus D, the system first
+processes the query through a coordinator agent.
+The coordinator’s role is to decompose the user
+query into a Shared Instruction Set for Documents and Synthesis Directives. It generates a
+WriteTodos structured object containing (a) a list
+of sub_agent_todos: atomic, self-contained extraction tasks specifying exactly what fields, entities, or numeric values to extract (the shared instructions); and (b) a synthesis_directive (2–4
+sentences) instructing the downstream Synthesis
+Layer on how to prioritize and structure the merged
+response.
+3.2
+
+Parallel Retrieval Layer
+
+We assign a dedicated sub-agent αi to each document di in the corpus. Each sub-agent operates as
+an independent RAG loop over its assigned document, guided by the shared instruction set from the
+Coordination Layer.
+Document-Scoped Retrieval and Reasoning.
+Each document di serves as an isolated retrieval
+universe; the assigned sub-agent is strictly constrained to search tool calls within di , preventing
+cross-document distractor chunks from degrading
+local extraction. Each sub-agent receives the
+original query q, its assigned document name, and
+the shared instruction set (todo list), then operates
+in an iterative retrieve-and-reason loop. On each
+turn, the agent either issues a search action (a
+focused query string) or a finalize action that
+terminates the loop and emits the documentgrounded findings. The sub-agent prompt instructs
+the agent to attempt at least 2 focused searches
+before concluding a piece of information is
+absent, with a total cap of 5 search calls across
+all tasks. Each search action triggers dense
+vector retrieval over the sub-agent’s dedicated
+per-document Qdrant index. This retrieval uses Cohere embed-v4.0 embeddings (1536-dimensional,
+cosine similarity) to fetch the top k = 15 most
+similar chunks. These chunks are then re-ranked
+by Cohere rerank-v4.0-fast to yield a final set
+
+Figure 1: Overview of SPD-RAG Architecture.
+
+of top_n = 5 chunks per search. The documents
+are split into chunks offline using LangChain’s
+RecursiveCharacterTextSplitter in Markdown mode with a chunk size of 1000 tokens and
+250-token overlap.
+Findings Output. We denote the findings of each
+sub-agent as
+oi = αi (q, di ) = ⟨si , ri ⟩
+
+(1)
+
+where si is the natural language findings report from di and ri ∈ [0, 1] is a scalar relevance/confidence score. These outputs are passed
+to the Synthesis Layer.
+Parallelism. All RAG loops for the documents are dispatched concurrently via LangGraph’s Send API fan-out, which emits one
+Send("document_sub_agent_node", ...) per
+document and executes all targets in parallel within
+LangGraph’s async runtime.
+3.3
+
+Synthesis Layer
+
+While modern LLMs feature extensive context windows, synthesizing hundreds of document reports
+can still exceed these limits or cause ’lost in the
+middle’ degradation. To future-proof the architecture for massive corpora, the Synthesis Layer is
+designed as a dynamic map-reduce pipeline that aggregates findings recursively. The Synthesis Layer
+receives the synthesis directives from the Coordination Layer and the findings {o1 , o2 , . . . , on }
+from the Parallel Retrieval Layer. It aggregates
+and synthesizes the findings recursively through a
+similarity-ordered process until the total findings
+size falls within the target context size to produce
+the final output.
+
+Similarity-Ordered Merge & Synthesis.
+In iteration t, we maintain a set of find(t)
+(t)
+ings/summaries S (t) = {s1 , . . . , sn }. We
+embed each summary using Cohere embed-v4.0
+and compute a cosine-similarity matrix via
+sklearn.metrics.pairwise.cosine_similarity.
+This is converted to a distance matrix
+(t) (t)
+Dij = 1 − cos(si , sj ), which is passed to
+AgglomerativeClustering with n_clusters=1,
+linkage="average" (UPGMA), producing a
+complete dendrogram over all current summaries.
+We traverse the merge tree bottom-up, greedily
+accumulating nodes into a batch as long as the
+total tiktoken count does not exceed the target
+budget of B = 750,000 tokens. Semantically
+similar summaries are grouped first, so each batch
+contains the most similar available summaries
+within the token limit.
+Aggregate and Synthesize Findings. For each
+batch, an LLM is prompted with the concatenated
+findings, the synthesis directive, and the original
+query q to produce an aggregated and synthesized
+summary. All batch synthesis calls within an iteration are issued concurrently via asyncio.gather.
+The merged summaries form the input for the next
+iteration S (t+1) . The same S YNTHESIS prompt
+used at every level of the merging tree is applied even at the final level—there is no separate
+synthesis-only prompt.
+Context Size Condition and Output. The layer
+evaluates whether the total findings size exceeds
+the context size threshold (i.e., |S (t+1) | > 1). If
+the condition is true, the process loops back to the
+similarity-ordered merge and synthesis step. If the
+
+Algorithm 1 Recursive Synthesis
+Require: Findings S = {s1 , . . . , sn }, query q,
+synthesis directive d, context size budget B
+Ensure: Final Output s⋆
+1: while |S| > 1 do
+2:
+E ← C OHERE E MBED(S)
+3:
+D ← 1 − C OSINE S IMILARITY(E)
+4:
+tree ← AGGLOMERATIVE C LUSTER(
+D, linkage = “average”)
+5:
+batches ← G ROUP B Y T OKENS(
+S, tree, B)
+6:
+if |batches| ≥ |S| then
+7:
+batches ← [S]
+8:
+end if
+9:
+S ← A SYNC G ATHER(
+S YNTHESIZE(b, q, d) ∀b ∈ batches)
+10: end while
+11: return S[0]
+condition is false (the total findings size is within
+the context size, leaving a single final summary s⋆ ),
+the process terminates and yields s⋆ as the final
+output. If |S (t+1) | ≥ |S (t) | (no-progress case), the
+entire current level is forced into a single batch to
+guarantee termination.
+Algorithm 1 gives the pseudocode for the general
+recursive synthesis procedure.
+Behavior on Loong. In practice, with Gemini 2.5
+Pro’s 1M-token context window and a budget of
+B = 750,000 tokens, the combined sub-agent findings for all instances in our Loong evaluation set fit
+within a single batch, so the conditional check allowed output after one iteration. The recursive loop
+is therefore a design capability intended for much
+larger corpora, where total findings size genuinely
+exceeds the context size.
+
+4
+
+Experimental Setup
+
+4.1
+
+Dataset
+
+We evaluate SPD-RAG on the Loong benchmark
+(Wang et al., 2024a). Loong is an extended multidocument QA instances in both English and Chinese, with an average of 11 documents per test
+case spanning two real-world scenarios: financial
+reports and academic papers. Each test case is
+constructed so that every document is relevant to
+the final answer ("Leave No Document Behind",
+meaning a correct response requires synthesizing
+evidence from all provided documents), and is annotated under one of four task types: Spotlight
+
+Locating, Comparison, Clustering, or Chain of
+Reasoning, with context lengths ranging from 10K
+to beyond 250K tokens. We evaluate on the English and Set 4 (200k-250k tokens) portion of the
+benchmark only. Our evaluation set comprises 40
+instances involving academic papers and 62 involving financial reports (102 instances total), with the
+four task types distributed as: Spotlight Locating
+(27), Comparison (15), Clustering (49), and Chain
+of Reasoning (11).
+4.2
+
+Baselines
+
+We compare against the following systems, all
+backed by Gemini 2.5 Pro:
+• Baseline (Full Context): All documents for
+each instance are concatenated and provided
+directly in the context window of Gemini 2.5
+Pro, representing the oracle long-context upper bound.
+• Normal RAG: Standard vector search top-K
+retrieval over the full document corpus, followed by LLM reasoning over the retrieved
+chunks.
+• Agentic RAG: A single-agent ReAct-style
+RAG system (implemented via LangGraph/LangChain) that can issue multiple
+iterative retrieval calls over the full global
+corpus. It uses the same embedding and
+re-ranking pipeline as SPD-RAG, but lacks
+per-document specialization.
+4.3
+
+Evaluation Metrics
+
+We report the following metrics, following the
+Loong evaluation protocol (Wang et al., 2024a):
+• Avg Score: An LLM-judged score (0–100)
+measuring the degree to which the predicted
+answer accurately covers the gold answer,
+following the evaluation protocol of Loong
+(Wang et al., 2024a). 2
+• Perfect Rate (PR%): Percentage of queries
+where the system receives a perfect score of
+100.
+2
+
+Because the original legacy GPT-4 model API is unavailable for new scaled evaluations, we adopt GPT-5 as the evaluator. Recent literature increasingly adopts GPT-5 as the
+standard for LLM-as-a-judge protocols due to its superior
+alignment with human grading (Wolfson et al., 2025). While
+our baseline numbers are re-computed under this GPT-5 judge
+for strict fairness, raw scores may not be perfectly 1-to-1 comparable with the originally published Loong leaderboard.
+
+• Avg Token Usage: Mean per-query total (input + output) token usage.
+• Avg Cost (USD): Mean per-query API cost,
+enabling cost-efficiency comparisons.
+• Avg Latency (s): Mean per-query wall-clock
+time.
+4.4
+
+Implementation Details
+
+All systems use Gemini 2.5 Pro (temperature 0.0)
+as the backbone LLM for the coordinator, merging
+layer, and synthesis layer. SPD-RAG document
+sub-agents use Gemini 2.5 Flash for documentscoped retrieval, reducing per-document cost while
+preserving reasoning quality at the merging and
+synthesis stages. GPT-5 is used exclusively as the
+LLM judge for the evaluation of the Avg score and
+is not part of the pipeline itself. Prompts for all
+systems, including baselines, were optimized for
+information extraction and synthesis to ensure fair
+comparison. Full prompt templates for all systems
+are provided in the code repository.
+Indexing. Each
+document
+is
+preindexed into a dedicated Qdrant vector
+collection
+using
+LangChain’s
+RecursiveCharacterTextSplitter
+(Implementation details are provided in the Appendix.).
+Retrieval per sub-agent. Each search tool call
+performs dense vector retrieval over the document index, returning the top-K (k = 15) chunks
+using cosine similarity in Qdrant. These candidates are subsequently re-ranked with Cohere
+rerank-v4.0-fast, and the top top_n = 5 chunks
+are passed to the sub-agent LLM.
+Merging layer. The token budget per merge
+batch is B = 750,000 tokens (75% of Gemini 2.5
+Pro’s 1M context cap). Agglomerative clustering
+uses sklearn with UPGMA linkage and precomputed cosine-distance matrix.
+Parallelism. Document agents run concurrently
+via LangGraph Send API fan-out. Batch synthesis calls within each merge iteration are parallelized with asyncio.gather. Synchronous Cohere API calls are offloaded to the thread pool via
+asyncio.to_thread.
+Safety limits. Each document sub-agent’s iterative retrieval loop is capped at 5 iterations; the
+Agentic RAG baseline caps at 10 iterations.
+
+Cost tracking. Per-query costs are computed
+from LangSmith run metadata (total token counts
+× per-token pricing.
+
+5
+
+Results
+
+5.1
+
+Main Results
+
+Table 1 reports the main results across all systems
+on our Loong evaluation set. Figure 2 illustrates
+these performance differences across the four specific task types.
+SPD-RAG achieves an Avg Score of 58.1, substantially outperforming both Normal RAG (33.0)
+and Agentic RAG (32.8). This corresponds to
+roughly a 25-point absolute improvement (about
+76% relative gain) over standard RAG baselines.
+Furthermore, SPD-RAG more than doubles the
+Perfect Rate (PR) of Agentic RAG (18.6% vs.
+8.8%), indicating that exhaustive document-level
+processing more frequently captures the complete
+set of required facts. Notably, the Agentic RAG
+baseline, despite consuming ∼3× more tokens than
+Normal RAG, does not yield score improvements,
+suggesting that uninstructed iterative retrieval without per-document specialization does not effectively address the coverage challenge in exhaustive
+multi-document settings. While the full-context
+baseline attains the highest quality with an Avg
+Score of 68.0, SPD-RAG reaches 85.4% of this
+performance while consuming only 37.9% of the
+API cost, demonstrating a highly favorable costquality trade-off. The full-context baseline provides a strong upper bound that benefits from all
+documents in one pass. Despite this, SPD-RAG
+narrows the gap to 9.9 points while costing less.
+5.2
+
+Analysis by Task Type
+
+Table 2 breaks down performance by Loong’s four
+task types.
+The task-type breakdown reveals a clear pattern.
+For Spotlight Locating—which requires finding
+a single salient fact across documents—all RAGbased systems perform reasonably well (69–74),
+while the full-context baseline leads (86.6). The
+largest gaps between SPD-RAG and the RAG
+baselines appear in Clustering (+40.5 pts over Normal RAG) and Chain of Reasoning (+26.2 pts over
+Agentic RAG), tasks that require aggregating or
+reasoning over evidence from many documents simultaneously. On the other hand, it nearly matches
+the full-context baseline (42.2 vs. 42.7) on Comparison tasks.
+
+System
+
+Avg Score
+
+PR (%)
+
+Avg Input Tok
+
+Avg Total Tok
+
+Avg Cost ($)
+
+Avg Latency (s)
+
+Oracle Long-Context Baseline
+Baseline (Full Context)
+68.0
+
+31.4
+
+253,085
+
+255,345
+
+0.273
+
+45.6
+
+RAG Baselines
+Normal RAG
+Agentic RAG
+
+33.0
+32.8
+
+13.7
+8.8
+
+22,174
+81,877
+
+27,430
+85,290
+
+0.080
+0.098
+
+42.6
+40.6
+
+Our System
+SPD-RAG
+
+58.1
+
+18.6
+
+193,954
+
+205,683
+
+0.103
+
+54.8
+
+Table 1: Main results on our Loong evaluation set (102 instances: 40 academic paper, 62 financial report). Bold:
+best overall. Underline: best among RAG-based systems.
+
+Figure 2: Comparison of Average Score across the four systems, broken down by task type (Spotlight Locating,
+Comparison, Clustering, and Chain of Reasoning).
+
+5.3
+
+Analysis by Document Domain
+
+As shown in Table 3 and Figure 3 the domain
+breakdown exposes a striking failure mode of standard RAG: both Normal RAG and Agentic RAG
+achieve 0% PR on academic paper instances (Avg
+Scores of 15.2 and 16.8, respectively). Academic
+paper instances in Loong tend to involve long, technical documents with distributed evidence, making
+top-K retrieval especially susceptible to coverage
+failures. SPD-RAG dramatically recovers on this
+domain (60.0 Avg Score), closing most of the gap
+with the full-context baseline (78.8). On financial report instances—which tend to be shorter and
+more structured—all RAG-based systems perform
+better, and the gap between SPD-RAG (56.9) and
+the baseline (61.0) is smaller.
+
+Figure 3: Average score by document domain comparing the Baseline (Full Context), Normal RAG, Agentic
+RAG, and SPD-RAG systems.
+
+System
+
+Spotlight Loc.
+(n = 27)
+
+Comparison
+(n = 15)
+
+Clustering
+(n = 49)
+
+Chain of Reasoning
+(n = 11)
+
+Baseline (Full Context)
+Normal RAG
+Agentic RAG
+SPD-RAG
+
+86.6 / 55.6%
+69.7 / 37.0%
+73.4 / 22.2%
+74.2 / 44.4%
+
+42.7 / 26.7%
+37.7 / 26.7%
+23.3 / 20.0%
+42.2 / 20.0%
+
+67.1 / 14.3%
+15.4 / 0.0%
+16.7 / 0.0%
+57.2 / 4.1%
+
+60.9 / 54.5%
+14.8 / 0.0%
+17.9 / 0.0%
+44.1 / 18.2%
+
+Table 2: Avg Score / PR(%) by Loong task type. Each cell shows Avg Score / PR%.
+
+System
+
+Paper (n = 40)
+
+Financial (n = 62)
+
+Baseline
+Normal RAG
+Agentic RAG
+SPD-RAG
+
+78.8 / 30.0%
+15.2 / 0.0%
+16.8 / 0.0%
+60.0 / 7.5%
+
+61.0 / 32.3%
+44.5 / 22.6%
+43.1 / 14.5%
+56.9 / 25.8%
+
+Table 3: Avg Score / PR(%) by document domain.
+System
+Baseline
+Normal RAG
+Agentic RAG
+SPD-RAG
+
+Avg Score
+
+Avg Cost ($)
+
+Score / $
+
+68.0
+33.0
+32.8
+58.1
+
+0.273
+0.080
+0.098
+0.103
+
+249.1
+412.5
+334.7
+564.1
+
+Table 4: Cost–quality tradeoff.
+
+5.4
+
+Cost–Quality Tradeoff
+
+Figure 4: Cost–Quality tradeoff. The scatter plot illustrates the Pareto frontier for multi-document QA.
+
+SPD-RAG outperforms the RAG baselines in
+the cost–quality trade-off. It achieves a 76%
+higher average score than Normal RAG (58.1 vs.
+33.0) while increasing the per-query cost by only
+$0.023 (Table 4). In contrast, Agentic RAG is
+Pareto-dominated, as it incurs higher cost than
+Normal RAG ($0.098 vs. $0.080) while delivering
+nearly identical quality (32.8 vs. 33.0). Compared
+to the full-context baseline, which achieves an Avg
+Score of 68.0, SPD-RAG reaches 85.4% of the
+quality at only 37.9% of the cost, resulting in a
+2.25× improvement in cost–quality efficiency.
+
+Crucially, the architecture of SPD-RAG enables
+this cost efficiency: by constraining retrieval to
+isolated, single-document spaces, we can reliably
+offload the iterative reasoning to a cheaper model
+(Gemini 2.5 Flash). In contrast, global iterative
+baselines require the reasoning capacity of a frontier model (Gemini 2.5 Pro) to navigate the fully
+concatenated corpus, driving up costs.
+
+6
+
+Discussion
+
+Where SPD-RAG excels. The task-type results
+in Table 2 confirm our core hypothesis: architectural decomposition along the document axis yields
+the largest gains precisely for tasks that require
+exhaustive multi-document synthesis. Clustering
+tasks (+40.5 over Normal RAG) and Chain of Reasoning tasks (+26.2 over Agentic RAG) both demand that the system form a coherent answer from
+evidence distributed across all relevant documents—
+exactly the scenario for which per-document agents
+are designed. For Loong’s Comparison questions,
+the answer is primarily determined by reading out
+a small set of comparable numeric attributes from
+each report and aggregating them, so once document agents have extracted those fields, the synthesizer is effectively operating over a structured
+table, which helps explain why SPD-RAG’s score
+on Comparison tasks (42.2) nearly matches the fullcontext baseline (42.7).
+Remaining gap with the full-context baseline.
+Despite strong gains over RAG baselines, SPDRAG lags the full-context baseline by 9.9 Avg
+Score points overall. Three factors likely contribute: (1) Gemini 2.5 Flash, used for document
+agents due to its cost efficiency, may provide
+weaker agentic reasoning capabilities compared
+to larger models. (2) The coordinator’s sub-task
+generation may under-specify queries for highly
+technical academic content, leading to incomplete information extraction at the document-agent
+level. (3) The maximum context length observed
+in Loong queries was approximately 250k tokens—
+
+only about 25% of the 1M-token context window
+of Gemini 2.5 Pro—potentially limiting the pressure on the full-context baseline. Since SPD-RAG
+is designed to operate on substantially larger contexts, its advantages may become more pronounced
+under more extreme long-context conditions.
+RAG baseline failure on papers. The 0% PR
+rate and 15.2-16.8% Avg Score of both Normal
+RAG and Agentic RAG on academic paper instances highlights a systematic failure of top-K
+retrieval under dense, distributed evidence. Academic papers in Loong often require synthesizing facts spread across abstracts, methods, results,
+and appendices of multiple documents—a regime
+where exhaustive per-document coverage proves
+highly effective. The recovery by SPD-RAG to
+60.0 Avg Score / 7.5% PR in this domain demonstrates the practical value of per-document specialization.
+Latency overhead. SPD-RAG incurs a modest
+latency overhead (54.8 s vs. 40.6–45.6 s for the
+baselines), primarily due to its multi-agent architecture. Although document agents run in parallel, end-to-end latency is still gated by the layered
+pipeline, which requires at least three sequential
+LLM calls (coordination, per-document retrieval,
+and synthesis) rather than a single pass.
+
+on the coordinator’s ability to generate comprehensive sub-tasks: under-specified tasks lead to incomplete document-level extractions, as observed on
+technical academic paper instances. Our evaluation
+is limited to two domains (academic papers and financial reports) from the Loong benchmark; legal,
+medical, or enterprise document corpora may have
+different structural characteristics that alter relative
+performance.
+The synthesis layer of SPD-RAG is designed to
+handle corpora where the combined sub-agent outputs exceed the model’s context window, triggering
+multi-round similarity-based clustering and recursive synthesis. In our Loong experiments, however, Gemini 2.5 Pro’s 1M-token context was sufficient to process all sub-agent summaries in a single
+merge step, so this recursive path was never activated. As a result, the scalability properties of the
+recursive synthesis pipeline—its impact on answer
+quality, redundancy reduction, and cost as document counts grow into the hundreds or thousands—
+remain empirically unvalidated. Evaluating SPDRAG on much larger corpora, and ideally on a new
+benchmark specifically targeting hundreds to thousands of documents per query instance, is an important direction for future work that would more
+directly test the per-document agent design and the
+intended large-database regime.
+
+8
+
+Figure 5: Average per-query latency across systems.
+
+7
+
+Limitations and Future Work
+
+SPD-RAG incurs higher per-query LLM call
+counts than single-pass systems—one call per document agent plus a final synthesis step—which
+increases total token usage compared to standard
+RAG baselines, though it remains at roughly onethird the cost of the full-context baseline ($0.10 vs.
+$0.27 per query) due to the use of Gemini 2.5 Flash
+for document sub-agents. System quality depends
+
+Conclusion
+
+We presented SPD-RAG, a hierarchical multiagent framework designed for exhaustive multidocument question answering. By assigning a dedicated agentic RAG module to each document and
+merging their findings through a similarity-ordered,
+token-bounded tree, our system effectively mitigates the limitations of both traditional top-K retrieval (incomplete coverage) and isolated longcontext processing (degraded reasoning at scale).
+Experiments on the challenging Loong benchmark
+demonstrate that SPD-RAG achieves an average
+score of 58.1, outperforming Normal RAG (33.0)
+and Agentic RAG (32.8) by approximately 25 absolute points (76% higher average score), while
+operating at only 37.9% of the API cost of the
+oracle full-context baseline (68.0). These performance gains are most pronounced in tasks requiring deep cross-document synthesis—such as
+Clustering (+40.5 points) and Chain of Reasoning
+(+26.2 points)—as well as on dense academic papers where standard RAG methods entirely fail.
+
+Ultimately, our findings demonstrate that for
+complex information-seeking queries over large
+corpora, how information is processed is crucial.
+Specifically, ensuring that each document receives
+exhaustive, dedicated agentic attention proves to be
+a more effective, cost-efficient, and scalable strategy than simply expanding how much raw context
+a single model can consume in one pass.
+
+9
+
+Ethics Statement
+
+SPD-RAG is a retrieval-augmented generation
+framework intended to improve access to information distributed across large document collections. The system relies on commercial LLM APIs
+(Gemini 2.5, Cohere), and as with any LLM-based
+pipeline, outputs may contain factual errors and
+should not be treated as authoritative without human verification. The increased number of API
+calls per query relative to single-pass systems results in higher energy consumption, a cost that
+should be weighed against the accuracy gains in
+deployment decisions. Our benchmark evaluations
+are conducted on publicly available datasets and
+involve no human subjects or personal data. During the preparation of this manuscript, AI-assisted
+writing tools were used to help refine language and
+improve clarity. All research design, experiments,
+analysis, and final decisions regarding the content
+were conducted and verified by the authors.
+
+References
+Haonan Bian. 2025.
+LLM-empowered knowledge graph construction: A survey. Preprint,
+arXiv:2510.20345. ArXiv:2510.20345.
+Darren Edge, Ha Trinh, Newman Cheng, Joshua
+Bradley, Alex Chao, Apurva Mody, Steven
+Truitt, Dasha Metropolitansky, Robert Osazuwa
+Ness, and Jonathan Larson. 2024.
+From local to global: A graph RAG approach to queryfocused summarization. Preprint, arXiv:2404.16130.
+ArXiv:2404.16130.
+Gemini Team, Petko Georgiev, Ving Ian Lei, Ryan
+Burnell, Libin Bai, Anmol Gulati, Garrett Tanzer,
+Damien Vincent, Zhufeng Pan, Shibo Wang, and 1
+others. 2024. Gemini 1.5: Unlocking multimodal
+understanding across millions of tokens of context.
+Preprint, arXiv:2403.05530. ArXiv:2403.05530.
+Jiani Guo, Zuchao Li, Jie Wu, Qianren Wang, Yun
+Li, Lefei Zhang, Hai Zhao, and Yujiu Yang. 2025.
+ToM: Leveraging tree-oriented MapReduce for longcontext reasoning in large language models. In Proceedings of the Conference on Empirical Methods in
+Natural Language Processing (EMNLP).
+
+Taicheng Guo, Xiuying Chen, Yaqi Wang, Ruidi Chang,
+Shichao Pei, Nitesh V. Chawla, Olaf Wiest, and Xiangliang Zhang. 2024. Large language model-based
+multi-agents: A survey of progress and challenges.
+Preprint, arXiv:2402.01680. ArXiv:2402.01680.
+Siwei Han, Peng Xia, Ruiyi Zhang, Tong Sun, Yun
+Li, Hongtu Zhu, and Huaxiu Yao. 2025. MDocAgent: A multi-modal multi-agent framework for document understanding. Preprint, arXiv:2503.13964.
+ArXiv:2503.13964.
+Yubin Kim, Ken Gu, Chanwoo Park, Chunjong Park,
+Samuel Schmidgall, A. Ali Heydari, Yao Yan, Zhihan Zhang, Yuchen Zhuang, Mark Malhotra, Paul Pu
+Liang, Hae Won Park, Yuzhe Yang, Xuhai Xu, Yilun
+Du, Shwetak Patel, Tim Althoff, Daniel McDuff,
+and Xin Liu. 2025. Towards a science of scaling agent systems. Preprint, arXiv:2512.08296.
+ArXiv:2512.08296.
+Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio
+Petroni, Vladimir Karpukhin, Naman Goyal, Heinrich Küttler, Mike Lewis, Wen-tau Yih, Tim Rocktäschel, Sebastian Riedel, and Douwe Kiela. 2020.
+Retrieval-augmented generation for knowledgeintensive NLP tasks. In Advances in Neural Information Processing Systems.
+Teng Lin, Yuyu Luo, Honglin Zhang, Jicheng Zhang,
+Chunlin Liu, Kaishun Wu, and Nan Tang. 2025.
+MEBench: Benchmarking large language models for
+cross-document multi-entity question answering. In
+Proceedings of the Conference on Empirical Methods
+in Natural Language Processing (EMNLP).
+Nelson F. Liu, Kevin Lin, John Hewitt, Ashwin Paranjape, Michele Bevilacqua, Fabio Petroni, and Percy
+Liang. 2023. Lost in the middle: How language models use long contexts. Transactions of the Association
+for Computational Linguistics, 12.
+Seiji Maekawa, Hayate Iso, and Nikita Bhutani. 2024.
+Holistic reasoning with long-context LMs: A benchmark for database operations on massive textual data.
+Preprint, arXiv:2410.11996. ArXiv:2410.11996.
+David J. Moore. 2025. A taxonomy of hierarchical
+multi-agent systems: Design patterns, coordination
+mechanisms, and industrial applications. Preprint,
+arXiv:2508.12683. ArXiv:2508.12683.
+Litu Ou and Mirella Lapata. 2025. Context-aware hierarchical merging for long document summarization.
+Preprint, arXiv:2502.00977. ArXiv:2502.00977.
+Parth Sarthi, Salman Abdullah, Aditi Tuli, Shubh
+Khanna, Anna Goldie, and Christopher D. Manning. 2024. RAPTOR: Recursive abstractive processing for tree-organized retrieval.
+Preprint,
+arXiv:2401.18059. ArXiv:2401.18059.
+Li Sun, Liu He, Shuyue Jia, Yangfan He, and Chenyu
+You. 2025. DocAgent: An agentic framework for
+multi-modal long-context document understanding.
+In Proceedings of the Conference on Empirical Methods in Natural Language Processing (EMNLP).
+
+V. A. Traag, L. Waltman, and N. J. van Eck. 2019. From
+louvain to leiden: Guaranteeing well-connected communities. Scientific Reports, 9(1):5233.
+Minzheng Wang, Longze Chen, Cheng Fu, Shengyi
+Liao, Xinghua Zhang, Bingli Wu, Haiyang Yu, Nan
+Xu, Lei Zhang, Run Luo, Yunshui Li, Min Yang, Fei
+Huang, and Yongbin Li. 2024a. Leave no document
+behind: Benchmarking long-context LLMs with extended multi-doc QA. Preprint, arXiv:2406.17419.
+ArXiv:2406.17419.
+Qian Wang, Tianyu Wang, Zhenheng Tang, Qinbin
+Li, Nuo Chen, Jingsheng Liang, and Bingsheng He.
+2024b. Megaagent: A large-scale autonomous LLMbased multi-agent system without predefined SOPs.
+Preprint, arXiv:2408.09955. ArXiv:2408.09955.
+Tomer Wolfson, Harsh Trivedi, Mor Geva, Yoav Goldberg, Dan Roth, Tushar Khot, Ashish Sabharwal,
+and Reut Tsarfaty. 2025. Monaco: More natural and complex questions for reasoning across
+dozens of documents. Preprint, arXiv:2508.11133.
+ArXiv:2508.11133.
+Wentao Zhang, Liang Zeng, Yuzhen Xiao, Yongcong Li, Ce Cui, Yilei Zhao, Rui Hu, Yang Liu,
+Yahui Zhou, and Bo An. 2025. AgentOrchestra:
+A hierarchical multi-agent framework for generalpurpose task solving. Preprint, arXiv:2506.12508.
+ArXiv:2506.12508.
+Jun Zhao, Can Zu, Hao Xu, Yi Lu, Wei He, Yiwen
+Ding, Tao Gui, Qi Zhang, and Xuanjing Huang.
+2024. LongAgent: Scaling language models to 128k
+context through multi-agent collaboration. Preprint,
+arXiv:2402.11550. ArXiv:2402.11550.
+Zihan Zhou, Chong Li, Xinyi Chen, Shuo Wang,
+Yu Chao, Zhili Li, Haoyu Wang, Qi Shi, Zhixing Tan,
+Xu Han, Xiaodong Shi, Zhiyuan Liu, and Maosong
+Sun. 2025. LLM×MapReduce: Simplified longsequence processing using large language models.
+In Proceedings of the Annual Meeting of the Association for Computational Linguistics (ACL).
+Andrew Zhu, Alyssa Hwang, Liam Dugan, and Chris
+Callison-Burch. 2024. FanOutQA: A multi-hop,
+multi-document question answering benchmark for
+large language models. In Proceedings of the Annual Meeting of the Association for Computational
+Linguistics (ACL).
+
+A
+
+Prompts
+
+All
+prompts
+are
+backend/core/prompts.py.
+
+defined
+
+A.1 Coordinator Prompt
+(LEAD_RESEARCHER_PROMPT)
+
+in
+
+extraction tasks and write a synthesis
+directive to guide the downstream
+synthesizer.
+2. Sub-agents (next) — Each document
+is assigned one worker that runs your
+tasks independently.
+Workers search
+their document and report raw findings.
+They run in parallel and cannot see each
+other’s results.
+3. Synthesizer (last) — A downstream
+agent receives ALL worker findings
+and merges them into a single
+coherent response.
+It follows your
+synthesis_directive to decide what to
+prioritize and how to structure the
+output.
+You CANNOT see the names, types, or
+content of the documents.
+Your ONLY job in this step:
+• Produce a list of subagent_todos
+(as structured output): precise
+extraction tasks that will be
+executed independently against EACH
+document by the sub-agents.
+• Produce a synthesis_directive: a
+concise instruction (2–4 sentences)
+for the synthesizer.
+Todo-writing rules:
+• Decompose the user query into
+concrete information requirements.
+• Each todo must be self-contained
+and unambiguous.
+• Prefer atomic tasks over broad
+tasks.
+• Include coverage for: definitions,
+numeric values, constraints, edge
+cases, error modes, and any
+explicit recommendations required
+by the user query.
+• Design a robust extraction list
+that works for ANY document in the
+set.
+Important Constraints:
+• Do not assume any document contains
+the answer. Write todos that can
+be answered with either “Found” or
+“Not found in this document.”
+• Tell the worker WHAT to extract, not
+HOW to extract it.
+• Do not synthesize, summarize, or
+attempt to answer the user query
+yourself.
+
+A.2 Document Sub-Agent Prompt
+(RESEARCH_SYSTEM_PROMPT)
+You are a sub-agent investigating a
+single document: {file_name}.
+
+You are a lead researcher coordinating
+a RAG-based analysis to answer a user
+query.
+
+You
+operate
+inside
+an
+iterative
+retrieval loop. On each turn you output
+exactly one structured action:
+
+Pipeline Architecture:
+1. YOU (now) — Decompose the query into
+
+• action="search": Issue a focused
+query to retrieve information from
+
+• Follow the synthesis directive
+above — it defines your main goal,
+priorities, and output structure.
+• Keep only information that directly
+helps answer the query. Discard
+tangential content.
+• Preserve exact numbers, names,
+dates, and caveats.
+• Remove redundancy.
+If the same
+fact appears multiple times, keep
+it once.
+• Do NOT invent or infer facts not
+present in the findings.
+• Same language as the findings
+(default English if mixed).
+
+the document.
+Set query to a
+specific, targeted search string.
+Set reasoning to why this query is
+needed.
+• action="finalize":
+You
+have
+gathered sufficient evidence to
+address ALL assigned tasks. Set
+findings to your complete extracted
+report. Set reasoning to a brief
+summary of what you found.
+Investigation principles:
+1. Start by identifying the key facts
+required for each task.
+2. Issue ONE focused query per turn
+— prefer specific terms over broad
+phrases.
+3. Expand to synonyms or paraphrases
+if initial results are incomplete.
+4. Issue
+separate
+queries
+for
+different aspects of a task.
+5. Keep searching until every task is
+covered with concrete evidence or
+confirmed absent.
+6. Do NOT attempt to answer the user
+query directly — extract raw facts
+only.
+7. Do NOT finalize a task as ’Not
+found’ after only a single focused
+search.
+At least attempt 2
+focused searches before concluding
+information is absent.
+8. Do NOT focus on very specific terms,
+but rather on the general context
+of the task. Always try to find the
+most relevant information.
+9. You must use AT MOST 5 searches to
+answer a task. DO NOT OVERUSE THE
+SEARCH TOOL.
+Finalize report format:
+For each
+assigned task, output either “Found:
+[exact answer with supporting evidence]”
+or “Not found in this document.” Always
+report exact numbers, names, and dates.
+Never approximate or infer beyond the
+document.
+
+A.3 Merge / Synthesis Prompt
+(SYNTHESIS_PROMPT)
+This prompt is used uniformly at every level of the
+recursive merging tree, including the final synthesis
+step. There is no separate final-answer prompt.
+You are a research synthesizer. Merge
+the following sub-agent findings into
+one compact, information-dense response
+for the user.
+Query: {query }
+Synthesis Directive:
+{synthesis_directive}
+Findings Batch: {findings }
+Rules:
+
+B
+
+Implementation Details
+
+Models. The coordinator, the merging layer,
+and the synthesis layer use gemini-2.5-pro
+(temperature 0.0).
+Document sub-agents
+use gemini-2.5-flash (temperature 0.0) for
+document-scoped retrieval. The LLM judge
+(GPT-5) is separate and is used only for the
+evaluation of the Avg score. Model constants are
+defined in backend/shared/constants.py.
+Hyperparameters.
+Parameter
+
+Value
+
+Chunk size (tokens)
+Chunk overlap (tokens)
+Tokenizer
+Embedding model
+Embedding dimension
+Similarity metric
+Merge token budget B
+Dense retrieval top-K
+Reranker
+Reranker top-N
+Sub-agent iteration safety limit
+Clustering algorithm
+Clustering metric
+
+1000
+250
+tiktoken cl100k_base
+Cohere embed-v4.0
+1536
+Cosine
+750,000 tokens
+15
+Cohere rerank-v4.0-fast
+5
+5
+Agglomerative (UPGMA)
+Precomputed cosine distance
+
+Cost
+measurement. Per-query
+costs
+are pulled from LangSmith run metadata
+(extract_langsmith_info.py) using modelspecific per-token pricing.
+
+

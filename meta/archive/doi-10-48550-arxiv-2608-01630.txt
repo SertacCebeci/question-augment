@@ -1,0 +1,2205 @@
+RIN G: Retrieval-Internalized Generation for Continual Large-Scale
+Knowledge Injection
+Shicheng Xu1,2 Liang Pang1 * Liyi Chen3 Zihao Wei1,2 Jingcheng Deng1,2
+Yan Gao3 Yi Wu3 Yao Hu3 Huawei Shen1 Xueqi Cheng1
+1
+State Key Laboratory of AI Safety, Institute of Computing Technology, CAS
+2
+University of Chinese Academy of Sciences 3 Xiaohongshu Inc.
+xushicheng21s@ict.ac.cn
+
+arXiv:2608.01630v1 [cs.CL] 3 Aug 2026
+
+Abstract
+
+appended to the LLM’s context, grounding generation in external evidence (Gao et al., 2023b; Wei
+et al., 2026; Deng et al., 2025a).
+Despite RAG’s success, its reliance on external
+retrievers introduces significant inference latency
+and engineering complexity, and even generative
+retrieval (Li et al., 2025) still depends on an external corpus for content mapping. Research has
+thus pivoted toward purely parametric injection,
+but existing approaches face severe bottlenecks:
+Knowledge Editing (Zhang et al., 2024) and Continual Learning (Wang et al., 2024a) struggle with
+unstructured updates (Deng et al., 2025b) and catastrophic forgetting (Nguyen et al., 2019); Modular
+Injection methods (KBLAM (Wang et al., 2025),
+SR-KI (Yu et al., 2026)) require memory linear in
+corpus size; and Parametric RAG (Su et al., 2025)
+still depends on an external search engine to identify relevant documents at inference. A scalable,
+fully parametric solution that matches RAG’s performance remains elusive.
+To address this gap, we propose to internalize
+external search within the LLM parameters and
+call this holistic paradigm spanning both architecture and training Retrieval-Internalized Generation (RING), in direct contrast to RAG: where
+RAG augments the LLM with an external retriever,
+RING internalizes the retriever inside the LLM as
+a learned policy via the joint co-design of architecture and training. The central thesis of RING is that
+the bottleneck of parametric knowledge injection
+is not how to store knowledge in weights, but how
+to search those weights at inference time. Prior
+parametric methods all pair internal memory with a
+fixed or rule-based retrieval mechanism—attention
+similarity (KBLAM, SR-KI), kNN imitation (MLP
+Memory), hierarchical pruning (AtlasKV), or unsupervised routing (LAG)—and consequently underperform RAG at scale. RING is the first to learn the
+parametric retrieval policy end-to-end via reinforcement learning: hierarchical rewards over routing
+
+Retrieval-augmented generation (RAG) improves factuality but adds latency and engineering overhead at serving time. We propose
+RING (Retrieval-Internalized Generation), a
+holistic paradigm spanning both architecture
+and training that injects large-scale external
+knowledge into a Mixture-of-Memory Experts
+and learns parametric search over this internal
+memory via reinforcement learning, removing
+the external retriever entirely. Training proceeds in three stages: continued pre-training injects new corpora into a Knowledge Expert via
+our novel Dual Causal Attention; supervised
+fine-tuning teaches a “search-then-answer” pattern; and reinforcement learning with hierarchical rewards optimizes the routing-and-search
+policy over the parametric memory. Unlike
+prior parametric injection methods that pair
+internal memory with a fixed or rule-based
+retriever, RING learns its retrieval policy directly from task signals. We further frame
+RING theoretically as a search-free approximation to the classical RAG objective. To
+evaluate large-scale injection of genuinely new
+knowledge without test-time leakage, we further construct News-2025, a benchmark built
+from news strictly post-dating the base LLM’s
+pretraining cutoff. RING matches or surpasses
+both search-based RAG and parametric injection baselines in accuracy and efficiency.
+
+1
+
+Introduction
+
+Large language models (LLMs) store factual
+knowledge in their parameters (Hu et al., 2024) but
+struggle to assimilate new knowledge reliably, leading to hallucinations and outdated outputs (Wang
+et al., 2023). Retrieval-Augmented Generation
+(RAG) addresses this by bridging LLMs with external knowledge sources (Lewis et al., 2020; Xu
+et al., 2024a): relevant documents are retrieved and
+*
+
+pangliang@ict.ac.cn
+
+Corresponding authors.
+
+1
+
+(a) Conventional RAG
+Offline Indexing
+
+Online Service
+Text Database
+
+Index
+
+Embedding
+Model
+
+Text
+Database
+
+Index
+
+Very Heavy and Long Pipeline!
+
+Embedding
+Model
+
+Question
+
+LLM
+
+Response
+
+(b) Our RING
+Online Service Do Not Need Search!
+
+Offline Injection
+Stage1: Memorization
+
+Stage 2, 3: SFT & RL for Search from Parameters
+LLM
+
+LLM
+
+Text
+Database
+
+Know
+
+Basic
+
+Question
+
+Know
+
+LLM
+Response
+
+Basic
+
+Question
+
+Know
+
+Basic
+
+Response
+
+Figure 1: Overview of RING versus Conventional RAG. Unlike traditional methods that depend on external
+embedding models and vector databases (top), RING (bottom) unifies indexing and retrieval within the LLM
+parameters via a Mixture-of-Experts architecture. This design shifts retrieval computation to the training stage,
+achieving high-efficiency search-free inference for RAG.
+
+accuracy, search relevance, and answer correctness
+train the model to jointly select which expert holds
+the relevant knowledge and which sub-region inside that expert to attend to. This transforms parametric retrieval from a static lookup into a trainable
+behavior, eliminating the external index entirely
+while yielding cost profiles that scale with model
+FLOPs rather than index size.
+Architecture. RING augments a dense LLM
+with a sparse Mixture-of-Memory Experts: a Basic
+Expert preserves the original LLM weights to mitigate catastrophic forgetting; a Knowledge Expert
+parametrically memorizes and indexes the new corpus; and a learnable Router selects between them at
+each token, integrating newly injected knowledge
+with the LLM’s base reasoning.
+Three-Stage Training. RING operationalizes
+this architecture with a CPT–SFT–RL pipeline. (i)
+Continued Pre-training injects the new corpus into
+the Knowledge Expert via our novel Dual Causal
+Attention (DCA), which models new passages bidirectionally while preserving the LLM’s causal generation (Zhang et al., 2025b). (ii) Supervised FineTuning teaches a search-then-answer response pattern within a single generative pass, with no external retriever. (iii) Reinforcement Learning is
+the core of our pipeline and the locus of RING’s
+main innovation. Drawing on evidence that RL
+improves an LLM’s ability to sample useful trajectories from its own parameter space (Chen et al.,
+2026), we cast parametric retrieval as a policy optimization problem and use hierarchical rewards
+to simultaneously train (a) the Router to select the
+right expert, (b) the Knowledge Expert to surface
+the relevant memory fragment, and (c) the generator to answer grounded in that fragment. The result
+
+is a fully learned parametric retriever—unlike all
+prior parametric injection methods whose retrieval
+mechanism is hand-designed and frozen.
+Theoretical Grounding. We further formulate
+RING as a discrete latent variable model and prove
+that the Knowledge Expert acts as a differentiable
+Key–Value memory index, while our CPT–SFT–
+RL pipeline performs variational inference that
+maximizes the Evidence Lower Bound, theoretically guaranteeing RING’s capacity to approximate
+the classical RAG objective.
+News-2025 Benchmark. To rigorously evaluate
+large-scale injection of genuinely new knowledge
+without test-time leakage, we construct News-2025,
+a bilingual benchmark of ∼170k Chinese / English
+news documents (341M tokens) strictly post-dating
+the base LLM’s pretraining cutoff, so that correct
+answers cannot come from pre-existing knowledge
+or associative reasoning. Our contributions are:
+• We propose Retrieval-Internalized Generation
+(RING), a holistic paradigm spanning both
+architecture and training that eliminates external search by internalizing both indexing and
+retrieval into LLM parameters.
+• We construct News-2025, a bilingual postcutoff benchmark for contamination-free evaluation of knowledge injection at scale.
+• Empirically, RING outperforms parametric
+injection baselines on News-2025, matches
+strong RAG pipelines in accuracy, and runs
+3×–19× faster than RAG at inference.
+
+2
+
+Related Work
+
+Retrieval-Augmented Generation RAG combines a parametric LLM with an external retriever
+to ground generation in retrieved text (Lewis et al.,
+2
+
+2020; Izacard and Grave, 2021), but introduces latency and engineering overhead at serving time.
+Generative retrieval (Tay et al., 2022; Li et al.,
+2025; Bevilacqua et al., 2022) replaces vector
+search with a generative process predicting document IDs, yet still depends on an external corpus
+to resolve IDs into content. RING instead parameterizes retrieval entirely within the LLM, removing
+all runtime dependence on external search.
+Parameterized Knowledge Injection Parameterized knowledge injection internalizes external
+information into model weights. Continual learning (Shi et al., 2025) suffers from catastrophic forgetting on unstructured updates; knowledge editing
+(e.g., MEMIT (Meng et al., 2022)) is limited to
+atomic facts; modular injection (KBLAM (Wang
+et al., 2025), SR-KI (Yu et al., 2026)) has memory
+linear in corpus size; Parametric RAG (Su et al.,
+2025) parameterizes documents via adapters but
+still queries an external retriever at inference; TempLoRA (Wang et al., 2024b) produces ephemeral
+adapters for long context, not permanent memorization. RING unifies memory, retrieval, and generation inside the LLM, achieving fully parametric,
+search-free augmentation at scale.
+
+3
+
+RING
+
+3.1
+
+Model Architecture
+
+(ℓ) 
+
+,
+
+(ℓ)
+
+×
+SiLU
+Memory
+Up
+
+MLP
+
+Search
+Gate
+
+Convert
+
+Router
+(Sparse)
+
+Self
+Attention
+
+Self Attention
+(a) Dense Model
+
+(b) RING: Sparse Model
+
+Figure 2: Model Architecture in our RING.
+
+residual connections to simplify the expression):
+(ℓ+1)
+
+h̃t
+
+=
+
+i
+
+
+X h (ℓ)
+(ℓ)
+(ℓ)
+1 gt = k Ek ht .
+
+(1)
+
+k∈K
+
+Parameter Separation We further separate the
+parameters of knowledge expert Eknw into memory
+m and search E s . This ensures that subseEknw
+knw
+quent training of search capabilities will not affect
+the original memory and allows for incremental
+addition of new memory data. As shown in Figm consists of memory up and down proure 2, Eknw
+s
+jection layers and Eknw
+is a gate projection followed by a Sigmoid Linear Unit (SiLU) function.
+This design is inspired by existing observations
+that up and down projection layers in Transformers
+are important key-value memories responsible for
+organizing the massive amounts of knowledge in
+LLMs (Geva et al., 2021). In our design, Memory
+Down is used to store knowledge, while Memory
+Up is a parametric index of the stored knowledge.
+Search Gate works in conjunction with SiLU to
+reweight indexes for different queries in order to
+acquire corresponding knowledge in text generation. This parameter separation avoids interference
+between different training stages in RING.
+3.2 Continued Pre-training for Memorization
+Data Preprocess Given a large-scale unstructured knowledge base D that requires LLMs to
+memorize (just like the corpus for retrieval in conventional RAG). We perform data preprocessing to
+construct training data for CPT in RING. During
+this process, we segment each unstructured long
+document into multiple non-overlapping fragments,
+each consisting of three consecutive sentences. We
+combine the document title and the fragment content into a JSON-formatted text as:
+
+Sparse Routing At layer ℓ and position t with
+(ℓ)
+hidden state ht , the Router first produces expert
+(ℓ)
+(ℓ)
+probabilities pt and makes a top-1 selection gt :
+(ℓ)
+
+Memory
+Down
+
+Knowledge
+Expert
+
+Basic Expert
+
+Overview As shown in Figure 2, RING replaces
+a dense decoder with a sparse MoE layer stack
+composed of a basic expert Ebase and a knowledge
+expert Eknw . This is initialized by duplicating the
+MLP weights; the basic expert retains the original
+weights, while the knowledge expert is initialized
+by the original MLP and used for subsequent new
+knowledge memorization. A Router rϕ produces
+a sparse gate gt ∈ 0, 1 at each layer and position,
+deciding which expert computes the token’s transformation. Ebase preserves general abilities and
+minimizes forgetting, while Eknw parameterizes
+the external corpus and acts as an implicit index.
+
+pt = softmax Wr(ℓ) ht
+
+Decoder Layer (MoE)
+
+Decoder Layer
+
+(ℓ)
+
+gt = arg max pt,k .
+k∈K
+
+Let the expert set be K = {base, knw}, and denote
+(ℓ)
+by Ek (·) the transformation of expert k at layer ℓ.
+With hard (top-1) routing (we omit LayerNorm and
+
+u={"title": "title of the document",
+"content": "content of the fragment"}
+
+3
+
+Token Sequence (left to right)
+
+Token Sequence (left to right)
+
+paradigm designed to integrate knowledge retrieval
+seamlessly within the LLM’s generation process.
+When the LLM receives a query, it first identifies whether new, externally injected knowledge
+is required to answer the question. If so, it performs a parametric retrieval from the knowledge
+expert Eknw to generate the top-1 relevant fragment. This fragment is enclosed within special
+tokens <retrieval> and </retrieval>. The retrieved fragment is typically short (with about 200
+tokens) to avoid excessive additional computational
+overhead during generation. Once the relevant fragment is identified, the LLM transitions to the next
+phase where it generates the final answer within
+the <answer> and </answer> tags. This design
+follows the natural generative flow.
+
+Token Sequence (left to right)
+
+Token Sequence (left to right)
+
+Token Sequence (left to right)
+Standard Causal Attention
+
+Token Sequence (left to right)
+
+1
+2
+
+Dual Causal Attention
+
+1
+4
+
+Dual Causal Attention
+
+Figure 3: Dual Causal Attention. The white areas are
+visible tokens, the black areas are masked tokens, and
+the shaded areas represent invalid tokens.
+
+which is the unit for memorization and search in
+the CPT, SFT, and RL stages. To ensure the semantic integrity of the long documents, we also
+add the full text of the document to the training
+set in CPT. However, this full-text data is only for
+memory assistance and will not be generated during the downstream search process. After the above
+process on the entire corpus, we obtain the CPT
+training set DCPT .
+
+Instruction Fine-tuning Data and Loss To
+bootstrap the Search-then-Answer behavior, we
+use Qwen3-235B to synthesize {(qi , ai , ri )} triples
+from documents in DCPT , where ri is a reference
+span justifying ai , and align each ri to a memory
+unit u⋆i ∈ DCPT via exact string match (triples
+without a match are discarded). Each accepted
+triple is formatted as a search-then-answer target
+string with u⋆i in the <retrieval> block and ai
+in the <answer> block. We mix in no-retrieval instructions from a generic corpus to teach “retrieve
+only when needed.” The model is trained with standard cross-entropy on the target string. During SFT
+we freeze the CPT Memory Down/Up and only update the Router and Search Gate, ensuring retrieval
+behavior is learned without overwriting memorized
+content. Full data recipe, target template, and loss
+formulation are in Appendix B.
+
+Dual Causal Attention CPT injects new knowledge into the Knowledge Expert. While bidirectional attention is known to be more effective for
+memorization (Zhang et al., 2025b), the LLM’s
+autoregressive causal mask conflicts with it. We
+propose Dual Causal Attention (DCA): each CPT
+example is run with three attention masks M (α) ,
+α ∈ {1, 12 , 14 }, that partition the sequence into a
+target block Bα (causally masked internally) and
+a complement Cα (visible as backward evidence);
+the resulting
+P per-mask NLL losses are combined as
+LDCA = α λα L(α) (Figure 3). α = 1 recovers
+standard causal pre-training; α ∈ { 12 , 41 } introduce
+bidirectional supervision without leaking future targets inside Bα . At inference, only M (1) is used,
+so generation remains strictly autoregressive. Formal mask definitions, the per-block NLL, and the
+combined loss are given in Appendix A.5.
+
+3.4
+
+RL stage in our RING aims to enable the LLM
+to learn a generalizable ability to retrieve information from its parametric knowledge base. Drawing
+on existing research that RL enhances the LLM’s
+ability to sample more effectively from its parameter space (Chen et al., 2026; Deng et al., 2026),
+we find this process closely mirrors traditional retrieval, where the goal is to identify the most relevant document to answer a query from a library.
+Hence, we believe RL holds great potential in enabling the LLM to perform generative retrieval directly from its parametric knowledge base. After
+the SFT phase, which provides the LLM with a basic Search-then-Answer paradigm, we apply RL to
+
+Training CPT freezes the entire model except the
+Knowledge Expert’s Memory Down and Memory
+Up projections, and forces the Router to dispatch
+every token to the Knowledge Expert. Optimizing LDCA on DCPT concentrates injected knowledge into the storing (Memory Down) and indexing
+(Memory Up) projections while preserving the base
+model’s capabilities.
+3.3
+
+Reinforcement Learning for Search from
+the Parametric Knowledge
+
+SFT for Search-then-Answer
+
+Search-then-Answer Paradigm In the SFT
+stage, we introduce a novel Search-then-Answer
+4
+
+teach the LLM how to search for the most relevant
+memory units from the parametric knowledge base.
+The RL algorithm we use is GSPO (Zheng et al.,
+2025). The reward structure is designed to guide
+the LLM’s generative retrieval, rank and answer
+process in three ways:
+1. Format Reward. (Rformat ) When facing
+instruction that is relevant to the external knowledge, the LLM must adhere to the Search-thenAnswer format. The response should first include the retrieval block enclosed within the tokens
+<retrieval> and </retrieval>, followed by the
+answer within <answer> and </answer>. If the
+format is correct, the reward is 1; otherwise, it is 0.
+2. Search Reward. (Rsearch ) This reward
+aims to guide LLM to find the most matching units from the external corpus DCPT memorized in the CPT stage, and output the memory units in <retrieval> ... </retrieval>, we
+introduce a dense reward mechanism to achieve
+this. This mechanism extracts the title and
+content of the memory unit within <retrieval>
+and </retrieval> of the LLM’s generated sequences, and then calculates a series of rewards
+to guide the LLM’s learning of both retrieval and
+re-ranking in its generation. The design principle
+of these rewards is to encourage LLM to generate
+units that are highly consistent with correct mem1
+ory units. (1) Learning to Retrieve Reward (Rdense
+):
+This reward measures the normalized longest common substring (LCS) length between the retrieved
+memory unit’s title and the title of the correct
+memory unit. A higher LCS indicates better retrieval performance, and a higher reward is given.
+2
+(2) Learning to Rerank Reward (Rdense
+): This reward measures the normalized LCS between the
+retrieved memory unit’s content and the content
+of the correct memory unit. This reward encourages the model to select more relevant content conditioned on the already fuzzy-matched titles. (3)
+3
+Exact Match Reward (Rdense
+): This reward checks
+if the reference passage (ref) is exactly present in
+the generated content. If the reference is present,
+the reward is 1; otherwise, the reward is 0. This reward helps the model to retrieve exact top-1 ground
+truth. The combined search reward is:
+
+semantically similar, but incorrect, responses that
+still satisfy the reward conditions. Literal matching
+is straightforward and prevents such issues.
+3. Answer Reward. (Ranswer ) The LLM’s answer, enclosed in the <answer> block, is compared to the correct reference answer. We use
+Qwen3-30B-A3B to judge whether the LLM’s generated answer matches the correct answer. If the
+answer is correct, the reward is 1; if it is incorrect,
+the reward is 0.
+The total reward is the sum of the rewards:
+Rtotal = λformat Rformat +λanswer Ranswer +λsearch Rsearch ,
+where λformat , λanswer , and λsearch are hyperparameters in Section C.4. By RL, LLM learns to retrieve
+and generate from the parametric knowledge base.
+
+4
+
+Theoretical Analysis
+
+We formulate RING as a principled discrete latent
+variable model that approximates the classical RAG
+objective. This theoretically justifies our MoE architecture and the training pipeline. Detailed proofs
+are provided in Appendix A.
+Latent Evidence and RING Approximation
+Let x be the query, y the answer, and U = {uz }N
+z=1
+the universe of injected memory units. Conventional RAG marginalizes over a retrieved latent
+variable z:
+p(y | x) =
+
+N
+X
+
+p(z | x, U ) pθ (y | x, uz ).
+
+(3)
+
+z=1
+
+Conventional RAG relies on a non-parametric p(z |
+x, U) via external vector search. RING parameterizes this retrieval fully internally as:
+pΘ (y, z | x) = pϕ (z | x) · pθgen (y | x, uz ; Θmem ),
+| {z } |
+{z
+}
+Router & Gate
+
+Knowledge Expert
+
+where Θmem stores U. We prove in Theorem A.4
+that RING’s hypothesis space contains explicit topK RAG, implying that parametric retrieval can
+theoretically match external search expressivity
+(Corollary A.5).
+
+1
+2
+3
+Rsearch = λa Rdense
++ λb Rdense
++ λc Rdense
+, (2)
+
+Knowledge Expert as Key-Value Memory We
+justify our specific Knowledge Expert architecture
+by showing it is structurally isomorphic to a differentiable Key-Value retrieval mechanism. As
+derived in Proposition A.2, the computation of the
+
+λa , λb , and λc are hyperparameters in Section C.4.
+We use exact substring matching rather than semantic matching because we observe with semantic matching, the model might learn to generate
+5
+
+Knowledge Expert Eknw (h) is:
+X
+Eknw (h) =
+SiLU(⟨gi , h⟩)⟨ki , h⟩ vi ,
+|
+{z
+}
+i
+
+the expected reward. As shown in Lemma A.8, our
+dense search rewards (e.g., LCS) serve as a proxy
+for the unobserved latent posterior, guiding the retrieval policy to maximize the ELBO’s expectation
+term even without explicit supervision.
+
+(4)
+
+Attention Score αi (h)
+
+where ki (rows of Wup ) act as Keys, vi (cols of
+Wdown ) as Values, and gi as a query-dependent
+Search Gate. Lemma A.3 suggests that with
+learned gating, this mechanism approaches Maximum Inner Product Search, allowing precise retrieval from millions of parametric slots.
+
+Experiments
+
+5.1
+
+Datasets
+
+News-2025 is our constructed bilingual benchmark
+of 170k Chinese news documents (341.93M tokens) from June–July 2025, translated to English
+with DeepSeek-R1-0528. Since the base LLM
+(Qwen3) predates this period, correct answers are
+hard to be obtained from pre-existing parametric
+knowledge or associative reasoning, isolating each
+method’s true injection-and-utilization capability.
+We construct News-2025 to probe the two capabilities RING targets: the injection of large-scale
+new knowledge and the utilization of this injected
+parametric knowledge. The corpus is partitioned
+into subsets for CPT, SFT, and RL (Appendix B).
+The CPT set includes the whole documents collection, which serves as the external knowledge
+base DCPT that needs to be injected. The SFT set
+is designed to teach the model the “Search-thenAnswer” paradigm. The RL set is used for the training of “search from parametric knowledge”. As for
+the test set, we sample a held-out document set and
+use GPT-5 to construct 10k QA pairs whose source
+documents do not appear in SFT or RL, jointly
+probing the injection-and-utilization capability.
+
+Training as Variational Inference We aim to
+maximize the marginal log-likelihood of generating
+the correct answer, log pΘ (y | x). Since marginalizing over all latent memory units z is intractable,
+we maximize the Evidence Lower Bound (ELBO).
+Introducing a variational posterior q(z | x, y) over
+the evidence (derivation in Eq. (16)):
+
+
+pΘ (y, z | x)
+log pΘ (y | x) ≥ Eq(z|x,y) log
+q(z | x, y)
+= Eq(z|x,y) [log pθgen (y | x, uz )]
+|
+{z
+}
+Generation (Reconstruction)
+
+− KL(q(z | x, y) || pϕ (z | x)) .
+{z
+}
+|
+Retrieval (Alignment)
+
+This decomposition provides a unified theoretical
+view of our three-stage pipeline:
+CPT (Evidence Maximization): The generation
+term log p(y|x, uz ) fundamentally relies on the
+model’s ability to comprehend and reconstruct the
+memory unit uz . By minimizing the DCA loss
+(Prop. A.7), CPT injects U into Θmem , ensuring
+that conditioned on a retrieved z, the likelihood of
+generating relevant tokens is maximized. We prove
+in Prop. A.7 that DCA provides a tighter bound on
+conditional entropy than standard causal attention,
+theoretically guaranteeing more efficient storage.
+SFT (Posterior Alignment): In SFT, we are given
+the ground truth evidence u⋆ . This is equivalent to
+setting the variational posterior to a delta function
+q(z | x, y) = δ(z = z ⋆ ). The ELBO maximization
+then simplifies to standard supervised learning:
+
+max log pθgen (y | x, u⋆ ) + log pϕ (z ⋆ | x) .
+{z
+}
+|
+{z
+} |
+Answer Generation
+
+5
+
+5.2
+
+Baselines
+
+We group baselines into three categories (Table 1; full descriptions in Appendix C.3): (i) Conventional RAG (Top-1) with SOTA embedders
+BGE-M3 (Chen et al., 2024), OpenAI-Emb-3L,
+Gemini-Embedding (Lee et al., 2025), and Qwen3Embedding (Zhang et al., 2025a); (ii) Stronger
+RAG Pipelines (all using Qwen3-8B-Emb): Top-k
+retrieval with k ∈ {3, 5, 10}, cross-encoder reranking on top-10 to top-3 (BGE-Reranker-v2-m3 (Li
+et al., 2023) and Qwen3-Reranker-4B (Zhang et al.,
+2025a)), HyDE (Gao et al., 2023a), and base-LLM
+Query Rewrite; (iii) Parametric Knowledge Injection: Full Tuning, LoRA Tuning, modular methods KBLAM (Wang et al., 2025) and SR-KI (Yu
+et al., 2026), and three recent retriever-imitating
+methods closest to RING in spirit—LAG (Fleshman and Van Durme, 2025) (per-document LoRA +
+data-free routing), MLP Memory (Wei et al., 2025)
+
+Retrieval Supervision
+
+(5)
+This forces the router policy pϕ to align with the
+"ideal" posterior defined by the dataset.
+RL (Generalizing the Policy): When ground
+truth evidence is unavailable or multiple valid snippets exist, the fixed posterior δ(z = z ⋆ ) is suboptimal. RL optimizes the policy pϕ (z|x) to maximize
+6
+
+Table 1: Performance on News-2025 (English & Chinese), reported as Accuracy (%) and Time To First Token (TTFT,
+seconds). “Top-k” denotes the number of documents prepended to the LLM. “+Rerank” denotes retrieve-top-10
+with the best embedding followed by a cross-encoder reranker selecting top-3. Bold marks the global best in each
+column; underline marks the best within the K NOWLEDGE I NJECTION W ITHOUT E XTERNAL S EARCH group
+(where RING belongs). When the same entry is best both globally and within the group, only bold is used.
+Based on Qwen3-8B
+Method
+
+Search
+
+English
+
+Based on Qwen3-14B
+
+Chinese
+
+English
+
+Chinese
+
+Acc (↑) TTFT (↓) Acc (↑) TTFT (↓) Acc (↑) TTFT (↓) Acc (↑) TTFT (↓)
+Original LLM
+
+None
+
+6.75
+
+7.15
+
+0.35
+
+7.26
+
+0.57
+
+7.73
+
+0.48
+
+K NOWLEDGE I NJECTION W ITH E XTERNAL S EARCH (RAG, T OP -1)
+BGE-M3
+28.57
+1.32
+28.94
+Gemini-Emb-Exp 32.76
+3.46
+34.12
+RAG
+OpenAI-Emb-3L
+29.99
+3.95
+30.97
+Qwen3-0.6B-Emb 30.84
+1.29
+32.17
+Qwen3-8B-Emb
+33.83
+1.81
+35.28
+
+1.41
+3.52
+3.88
+1.45
+1.73
+
+26.54
+30.72
+27.96
+30.41
+31.80
+
+2.20
+4.25
+4.80
+2.21
+2.60
+
+27.88
+32.17
+29.35
+31.84
+33.26
+
+2.32
+4.39
+4.54
+2.19
+2.55
+
+S TRONGER RAG P IPELINES
+RAG (Top-3)
+Qwen3-8B-Emb
+RAG (Top-5)
+Qwen3-8B-Emb
+RAG (Top-10)
+Qwen3-8B-Emb
++Rerank (BGE-v2-m3)
+Qwen3-8B-Emb
++Rerank (Qwen3-Rerank) Qwen3-8B-Emb
++HyDE
+Qwen3-8B-Emb
++Query Rewrite
+Qwen3-8B-Emb
+
+36.42
+37.18
+36.85
+38.73
+39.51
+36.94
+35.62
+
+K NOWLEDGE I NJECTION W ITHOUT E XTERNAL S EARCH
+Lora-Tuning
+None
+21.37
+Full-Tuning
+None
+26.92
+KBLAM
+None
+29.13
+SR-KI
+None
+31.85
+LAG
+None
+24.51
+MLP Memory
+None
+28.45
+AtlasKV
+None
+32.46
+RING (ours)
+None
+35.08
+
+0.30
+
+2.85
+4.05
+6.45
+3.45
+4.05
+5.15
+3.85
+
+37.91
+38.65
+38.34
+40.21
+41.05
+38.42
+37.18
+
+2.78
+3.92
+6.22
+3.32
+3.88
+4.92
+3.68
+
+34.05
+35.21
+35.94
+37.42
+38.26
+34.85
+33.74
+
+3.55
+4.85
+7.62
+4.18
+4.85
+6.75
+4.72
+
+35.62
+36.84
+37.61
+39.18
+39.82
+36.51
+35.42
+
+3.42
+4.68
+7.35
+4.05
+4.68
+6.48
+4.55
+
+0.34
+0.39
+2.25
+2.03
+0.78
+0.55
+1.85
+0.40
+
+22.12
+27.06
+28.32
+29.22
+23.86
+27.34
+30.18
+32.36
+
+0.32
+0.34
+2.15
+2.09
+0.82
+0.52
+1.72
+0.49
+
+22.70
+28.78
+33.21
+36.65
+28.34
+32.18
+37.62
+41.19
+
+0.65
+0.60
+3.65
+3.20
+1.18
+0.88
+2.65
+0.78
+
+26.37
+31.83
+33.48
+33.50
+27.62
+30.95
+34.85
+37.92
+
+0.60
+0.58
+2.98
+2.85
+1.12
+0.85
+2.48
+0.75
+
+posed into ⟨h, r, t⟩ triples, and hierarchical KV
+pruning still incurs non-trivial attention overhead
+(TTFT 1.85s vs. 0.40s). MLP Memory is fast
+(TTFT 0.55s, comparable to Full-Tuning) but its
+probability-interpolation interface cannot resolve
+fine-grained factual queries with the same precision
+as KV injection. LAG is the weakest of the three:
+data-free per-token adapter routing was designed
+for libraries on the order of 103 adapters, and false
+selections compound as the library scales to our
+170k-document corpus. The advantage widens on
+Qwen3-14B, where RING exceeds every parametric baseline by at least 3.5 points.
+
+(kNN-distribution imitation), and AtlasKV (Huang
+et al., 2025) (compressed KV-cache injection). Unlike all parametric baselines whose retrieval mechanism is hand-designed and frozen, RING (i) keeps
+a separate Basic Expert to prevent forgetting, (ii)
+injects via bidirectional DCA, and (iii) learns retrieval end-to-end via RL with dense rewards.
+5.3
+
+Main Results
+
+The specific experimental settings can be found in
+Section C. The main results are in Table 1.
+vs. Parametric Knowledge Injection. RING dominates every parametric injection baseline on both
+languages and both backbones. With Qwen3-8B,
+RING reaches 35.08%/32.36% (EN/ZH), exceeding the strongest prior method SR-KI by 3.23 and
+3.14 points. Among the three recently proposed
+retriever-imitating baselines, AtlasKV is the closest
+competitor since KV-level injection retains finergrained semantics than logit-level interpolation;
+however, its KG2KV pipeline loses information
+when news passages cannot be cleanly decom-
+
+vs. External-Search RAG. RING occupies the
+accuracy–latency Pareto frontier. On the 8B backbone, the strongest pipeline (Qwen3-Reranker on
+top-10, output top-3) surpasses RING by 4.43
+EN/8.69 ZH points but at 10× TTFT (4.05s
+vs. 0.40s); on 14B the trade-off flips—RING
+(41.19/37.92) beats this same pipeline on EN and
+trails by under 2 points on ZH while remaining 6×
+faster. Lighter Top-k retrieval plateaus near 37% on
+7
+
+30
+25
+20
+RING (Ours)
+KBLAM
+Full Fine-Tuning
+LoRA Fine-Tuning
+
+15
+10
+
+Table 2: Ablation study of RING. Performance is reported as the accuracy (%) on English dataset.
+
+35
+
+Accuracy on Original Knowledge (%)
+
+Accuracy on Original Knowledge (%)
+
+35
+
+20
+
+30
+
+40
+
+50
+
+60
+
+70
+
+80
+
+Injected Data Size (k documents)
+
+90
+
+(a) Sequential Injection
+
+100
+
+30
+25
+
+Configuration
+
+20
+RING (Ours)
+KBLAM
+Full Fine-Tuning
+LoRA Fine-Tuning
+
+15
+10
+
+20
+
+30
+
+40
+
+50
+
+60
+
+70
+
+80
+
+Injected Data Size (k documents)
+
+90
+
+100
+
+(b) Mixed Training
+
+Figure 4: Comparison of knowledge retention strategies. (a) Sequential injection means the model is trained
+strictly on the sequence of new knowledge. (b) Mixed
+training means introduces a replay buffer of original
+data during training to mitigate forgetting.
+
+8B with diminishing returns (k=10 pushes TTFT
+to 6.45s); HyDE and Query Rewrite add LLM forwards without statistically meaningful gains over
+Top-3, since the base LLM cannot expand queries
+for post-cutoff news.
+Latency. RING’s TTFT matches Full-Tuning—
+the only other paradigm without inference-time
+computation beyond a forward pass—and is the
+lowest among all evaluated methods: 3–19× faster
+than every RAG variant and 3–6× faster than KVinjection baselines, confirming that RING internalizes retrieval at minimal serving cost.
+5.4
+
+Accuracy (↑)
+
+1. Impact of Model Architecture
+Dense (Standard)
+Sparse (MoE)
+Sparse + Gate (Ours)
+
+30.59
+32.71
+35.08
+
+2. Impact of Attention Mechanism
+Uni-directional Attention (Standard)
+Dual Causal Attention (Ours)
+
+33.49
+35.08
+
+3. Impact of Training Stages
+SFT Only
+SFT + RL
+
+28.41
+35.08
+
+4. Impact of Reward Components in RL
+RL w/ Rformat + Ranswer (Answer Reward)
+RL w/ Rformat + Ranswer + Rsearch (Search Reward)
+
+32.17
+35.08
+
+SFT
+RL 800 step
+RL 1600 step
+RL 2400 step
+RL 3200 step
+
+0.30
+
+0.4
+
+0.20
+
+Score
+
+QA Accuracy
+
+0.25
+
+Accuracy Performance
+
+0.5
+
+0.15
+
+0.3
+
+0.2
+
+0.10
+0.05
+
+0.1
+
+Raw Data
+Accuracy (Trend)
+
+0.00
+0
+
+2
+
+4
+
+6
+
+PPL (Perplexity)
+
+8
+
+10
+
+12
+
+400
+
+800
+
+1200
+
+1600
+
+2000
+
+2400
+
+Training Steps
+
+2800
+
+3200
+
+3600
+
+4000
+
+(a) PPL-Accuracy mapping (b) (Q&A accuracy) varies by
+through RL training steps.
+the RL training steps.
+
+Figure 5: (a) We plot the linear relationship between
+Perplexity (x) and Q&A Accuracy (y) for SFT and four
+RL checkpoints. (b) We show the training dynamics of
+Q&A accuracy in RL training.
+
+Analysis
+
+fine-grained retrieval supervision.
+
+Incremental Updating of New Knowledge We
+evaluate robustness to catastrophic forgetting by
+injecting 20k to 100k documents and comparing
+against baselines (Figure 4) under two settings. (1)
+Sequential Injection: training only on new data
+causes severe forgetting for conventional methods:
+Full Fine-Tuning drops from ∼27% to ∼12% at
+100k, with LoRA and KBLAM also degrading noticeably. In contrast, RING remains stable, keeping
+accuracy above 30%, indicating effective isolation
+of new memories via parameter separation. (2)
+Mixed Training: adding replay flattens the baselines’ curves, but RING still achieves the best overall retention, staying > 33% while KBLAM and
+Full Fine-Tuning plateau around ∼25% to ∼18%.
+
+Effect of RL To investigate how RL facilitates
+the utilization of parametric knowledge, we analyze the relationship between memorization quality
+(PPL) and QA accuracy. Figure 5a shows two key
+findings. (1) Better utilization under good memorization: in the low-PPL region, RL markedly
+improves accuracy (SFT ∼20% → RL > 32%),
+indicating that memorization alone is not sufficient
+and RL helps the model reliably activate and use
+stored knowledge. (2) Stronger grounding on parametric memory: as RL proceeds, the PPL–accuracy
+curve becomes much steeper—accuracy becomes
+tightly coupled with memorization quality. When
+PPL is high, the RL model degrades sharply, suggesting reduced reliance on pre-trained priors and
+fewer “lucky guesses.” RL bridges memorization
+and effective retrieval-based usage of parametric
+knowledge.
+
+Ablation Study We ablate key components of
+RING in Table 2. (1) Architecture: Sparse MoE
+improves 30.59%→32.71%, and adding our gating further boosts to 35.08%. (2) Attention: DCA
+outperforms standard causal attention (35.08% vs.
+33.49%). (3) Training: RL is essential—SFT only
+reaches 28.41%, while SFT+RL achieves 35.08%.
+(4) Rewards: search reward beats answer-only reward (35.08% vs. 32.17%), showing the benefit of
+
+6
+
+Conclusion
+
+We introduce RING, a fully parametric, searchfree RAG framework that unifies indexing, retrieval, and generation inside a LLM. RING injects
+8
+
+Ethical Considerations
+
+large-scale new knowledge into a dedicated Knowledge Expert via continued pre-training with Dual
+Causal Attention, and learns to search-then-answer
+through supervised fine-tuning and reinforcement
+learning. We further provide a latent-variable view
+connecting RING to the classical RAG objective,
+showing it as a search-free approximation with a
+principled inference interpretation. Experiments
+show that RING matches or exceeds search-based
+RAG baselines while reducing inference latency.
+
+This paper proposes RING, a search-free retrievalaugmented generation framework that internalizes
+indexing and retrieval into model parameters to
+reduce latency and deployment complexity. The
+primary positive impact is enabling more efficient
+and accessible knowledge-augmented systems, especially in settings where maintaining external retrieval infrastructure is costly or impractical.
+Potential risks are similar to those of other LLMbased systems. Because retrieval is performed parametrically, errors in memorization or retrieval may
+lead to confident but incorrect outputs, and harmful or biased content present in the injected corpus could be reinforced or surfaced during generation. In addition, internalizing knowledge may
+make it harder to audit, trace, or remove specific
+information compared to external retrieval, raising
+concerns around data governance and privacy if
+sensitive data were injected.
+To mitigate these risks, RING should be used
+with careful dataset curation and filtering, privacypreserving data handling, and evaluation for bias
+and safety. Where high-stakes decisions are involved, we recommend adding safeguards such
+as refusal policies, post-hoc verification, and
+provenance-aware logging or optional external validation. We hope this work encourages further
+research on controllable, auditable, and safe parametric knowledge integration.
+
+Limitations
+First, RING targets settings where a large knowledge corpus is relatively stable and can be internalized before deployment. Unlike conventional
+RAG systems, which can update an external index
+by adding or deleting documents, RING requires
+additional training to refresh the parametric memory. This makes it less suitable for highly dynamic
+knowledge sources unless efficient incremental update strategies are developed.
+Second, although RING generates an explicit
+<retrieval> block, this generated evidence is not
+identical to returning a verbatim document from an
+external database. The model may compress, paraphrase, or occasionally distort memorized content,
+which can make auditing and provenance tracking
+harder than in search-based RAG. Applications that
+require strict citation fidelity or legal traceability
+may still benefit from hybrid designs that combine
+parametric retrieval with external verification.
+
+References
+
+Third, our experiments focus on knowledgeintensive question answering over a constructed
+news corpus. While this setting stresses large-scale
+memorization and evidence selection, it does not
+cover all retrieval scenarios, such as multi-hop web
+search, rapidly changing facts, multilingual knowledge bases, or long-form generation with many
+cited sources. Extending RING to these settings is
+an important direction for future work.
+
+Michele Bevilacqua, Giuseppe Ottaviano, Patrick Lewis,
+Scott Yih, Sebastian Riedel, and Fabio Petroni. 2022.
+Autoregressive search engines: Generating substrings
+as document identifiers. Advances in Neural Information Processing Systems, 35:31668–31683.
+
+Finally, the proposed training pipeline introduces
+non-trivial upfront cost. Continued pre-training
+with Dual Causal Attention, supervised searchthen-answer learning, and RL with dense retrieval
+rewards require carefully constructed data and substantial computation. The inference benefits of
+search-free generation should therefore be weighed
+against the cost of building and maintaining the
+parametric memory.
+
+Zhiqi Chen, Rui Lu, Andrew Zhao, Zhaokai Wang, Yang
+Yue, Shiji Song, and Gao Huang. 2026. Does reinforcement learning really incentivize reasoning capacity in llms beyond the base model? Advances in
+Neural Information Processing Systems, 38:57654–
+57689.
+
+Jianlv Chen, Shitao Xiao, Peitian Zhang, Kun Luo, Defu
+Lian, and Zheng Liu. 2024. Bge m3-embedding:
+Multi-lingual, multi-functionality, multi-granularity
+text embeddings through self-knowledge distillation.
+arXiv preprint arXiv:2402.03216, 4(5).
+
+Jingcheng Deng, Liang Pang, Zihao Wei, Shicheng Xu,
+Zenghao Duan, Kun Xu, Yang Song, Huawei Shen,
+and Xueqi Cheng. 2025a. Latent reasoning in llms
+as a vocabulary-space superposition.
+
+9
+
+Jingcheng Deng, Zihao Wei, Liang Pang, Hanxing Ding,
+Huawei Shen, and Xueqi Cheng. 2025b. Everything
+is editable: Extend knowledge editing to unstructured
+data in large language models. In International Conference on Learning Representations, volume 2025,
+pages 628–652.
+
+Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio
+Petroni, Vladimir Karpukhin, Naman Goyal, Heinrich Küttler, Mike Lewis, Wen-tau Yih, Tim Rocktäschel, and 1 others. 2020. Retrieval-augmented generation for knowledge-intensive nlp tasks. Advances
+in neural information processing systems, 33:9459–
+9474.
+
+Jingcheng Deng, Zihao Wei, Liang Pang, Junhong
+Wu, Shicheng Xu, Zenghao Duan, and Huawei
+Shen. 2026. Latent-grpo: Group relative policy
+optimization for latent reasoning. arXiv preprint
+arXiv:2604.27998.
+
+Chaofan Li, Zheng Liu, Shitao Xiao, and Yingxia Shao.
+2023. Making large language models a better foundation for dense retrieval. Preprint, arXiv:2312.15503.
+Xiaoxi Li, Jiajie Jin, Yujia Zhou, Yuyao Zhang, Peitian
+Zhang, Yutao Zhu, and Zhicheng Dou. 2025. From
+matching to generation: A survey on generative information retrieval. ACM Transactions on Information
+Systems, 43(3):1–62.
+
+Zenghao Duan, Yuxin Tian, Zhiyi Yin, Liang Pang,
+Jingcheng Deng, Zihao Wei, Shicheng Xu, Yuyao
+Ge, and Xueqi Cheng. 2026. Skillattack: Automated
+red teaming of agent skills through attack path refinement. arXiv preprint arXiv:2604.04989.
+
+Kevin Meng, Arnab Sen Sharma, Alex Andonian,
+Yonatan Belinkov, and David Bau. 2022. Massediting memory in a transformer. arXiv preprint
+arXiv:2210.07229.
+
+William Fleshman and Benjamin Van Durme.
+2025.
+Lora-augmented generation (lag) for
+knowledge-intensive language tasks. arXiv preprint
+arXiv:2507.05346.
+
+Cuong V Nguyen, Alessandro Achille, Michael Lam,
+Tal Hassner, Vijay Mahadevan, and Stefano Soatto.
+2019.
+Toward understanding catastrophic forgetting in continual learning.
+arXiv preprint
+arXiv:1908.01091.
+
+Luyu Gao, Xueguang Ma, Jimmy Lin, and Jamie Callan.
+2023a. Precise zero-shot dense retrieval without relevance labels. In Proceedings of the 61st Annual
+Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pages 1762–1777.
+
+Haizhou Shi, Zihao Xu, Hengyi Wang, Weiyi Qin,
+Wenyuan Wang, Yibin Wang, Zifeng Wang, Sayna
+Ebrahimi, and Hao Wang. 2025. Continual learning
+of large language models: A comprehensive survey.
+ACM Computing Surveys, 58(5):1–42.
+
+Yunfan Gao, Yun Xiong, Xinyu Gao, Kangxiang Jia,
+Jinliu Pan, Yuxi Bi, Yixin Dai, Jiawei Sun, Haofen
+Wang, Haofen Wang, and 1 others. 2023b. Retrievalaugmented generation for large language models: A
+survey. arXiv preprint arXiv:2312.10997, 2(1):32.
+
+Weihang Su, Yichen Tang, Qingyao Ai, Junxi Yan,
+Changyue Wang, Hongning Wang, Ziyi Ye, Yujia
+Zhou, and Yiqun Liu. 2025. Parametric retrieval
+augmented generation. In Proceedings of the 48th
+International ACM SIGIR Conference on Research
+and Development in Information Retrieval, pages
+1240–1250.
+
+Mor Geva, Roei Schuster, Jonathan Berant, and Omer
+Levy. 2021. Transformer feed-forward layers are
+key-value memories. In Proceedings of the 2021
+Conference on Empirical Methods in Natural Language Processing, pages 5484–5495.
+Xuming Hu, Junzhe Chen, Xiaochuan Li, Yufei Guo, Lijie Wen, Philip Yu, and Zhijiang Guo. 2024. Towards
+understanding factual knowledge of large language
+models. In International Conference on Learning
+Representations, volume 2024, pages 28680–28715.
+
+Yi Tay, Vinh Tran, Mostafa Dehghani, Jianmo Ni, Dara
+Bahri, Harsh Mehta, Zhen Qin, Kai Hui, Zhe Zhao,
+Jai Gupta, and 1 others. 2022. Transformer memory
+as a differentiable search index. Advances in neural
+information processing systems, 35:21831–21843.
+
+Haoyu Huang, Hong Ting Tsang, Jiaxin Bai, Xi Peng,
+Gong Zhang, and Yangqiu Song. 2025.
+Atlaskv: Augmenting llms with billion-scale knowledge graphs in 20gb vram.
+arXiv preprint
+arXiv:2510.17934.
+
+Cunxiang Wang, Xiaoze Liu, Yuanhao Yue, Xiangru
+Tang, Tianhang Zhang, Cheng Jiayang, Yunzhi Yao,
+Wenyang Gao, Xuming Hu, Zehan Qi, and 1 others.
+2023. Survey on factuality in large language models:
+Knowledge, retrieval and domain-specificity. arXiv
+preprint arXiv:2310.07521.
+
+Gautier Izacard and Edouard Grave. 2021. Leveraging
+passage retrieval with generative models for open domain question answering. In Proceedings of the 16th
+conference of the european chapter of the association
+for computational linguistics: main volume, pages
+874–880.
+
+Liyuan Wang, Xingxing Zhang, Hang Su, and Jun Zhu.
+2024a. A comprehensive survey of continual learning: Theory, method and application. IEEE transactions on pattern analysis and machine intelligence,
+46(8):5362–5383.
+
+Jinhyuk Lee, Feiyang Chen, Sahil Dua, Daniel
+Cer, Madhuri Shanbhogue, Iftekhar Naim, Gustavo Hernández Ábrego, Zhe Li, Kaifeng Chen, Henrique Schechter Vera, and 1 others. 2025. Gemini
+embedding: Generalizable embeddings from gemini.
+arXiv preprint arXiv:2503.07891.
+
+Xi Wang, Taketomo Isazawa, Liana Mikaelyan, and
+James Hensman. 2025. Kblam: Knowledge base
+augmented language model. In International Conference on Learning Representations, volume 2025,
+pages 51629–51658.
+
+10
+
+Yan Wang, Dongyang Ma, and Deng Cai. 2024b. With
+greater text comes greater necessity: Inference-time
+training helps long text generation. arXiv preprint
+arXiv:2401.11504.
+
+Liu, Rui Men, An Yang, and 1 others. 2025.
+Group sequence policy optimization. arXiv preprint
+arXiv:2507.18071.
+
+A
+
+Rubin Wei, Jiaqi Cao, Jiarui Wang, Jushi Kai, Qipeng
+Guo, Bowen Zhou, and Zhouhan Lin. 2025. Mlp
+memory: A retriever-pretrained memory for large
+language models. arXiv preprint arXiv:2508.01832.
+
+Theoretical Framework
+
+This section provides a principled view of RING
+as a search-free approximation to the classical
+Retrieval-Augmented Generation (RAG) objective.
+Our key message is: (i) classical RAG can be written as marginalizing a discrete latent evidence variable over a corpus; (ii) RING parameterizes this latent retrieval distribution entirely within the model
+(router + knowledge expert), after injecting the corpus into Θmem via CPT; and (iii) our CPT–SFT–RL
+pipeline can be interpreted as optimizing a variational lower bound and an evidence-selection policy.
+
+Zihao Wei, Wenjie Shi, Liang Pang, Jingcheng Deng,
+Shicheng Xu, Shasha Guo, Zenghao Duan, Jiahao Liu, Jingang Wang, Huawei Shen, and 1 others. 2026. Dynamic rollout editing for reducing
+overthinking in rl-trained reasoning models. arXiv
+preprint arXiv:2606.17890.
+Shicheng Xu, Liang Pang, Huawei Shen, and Xueqi
+Cheng. 2025. A theory for token-level harmonization
+in retrieval-augmented generation. In International
+Conference on Learning Representations, volume
+2025, pages 36616–36642.
+
+A.1
+
+Problem Formulation: Discrete Latent
+Evidence for RAG
+
+Shicheng Xu, Liang Pang, Huawei Shen, Xueqi Cheng,
+and Tat-Seng Chua. 2024a. Search-in-the-chain: Interactively enhancing large language models with
+search for knowledge-intensive tasks. In Proceedings
+of the ACM Web Conference 2024, pages 1362–1373.
+
+Let the external knowledge corpus be D, and let
+
+Shicheng Xu, Liang Pang, Mo Yu, Fandong Meng,
+Huawei Shen, Xueqi Cheng, and Jie Zhou. 2024b.
+Unsupervised information refinement training of
+large language models for retrieval-augmented generation. In Proceedings of the 62nd annual meeting of
+the association for computational linguistics (volume
+1: Long papers), pages 133–145.
+
+denote the set of memory units derived from D
+after preprocessing (Section 3.2): each uz is the
+JSON-style fragment {title, content} (possibly truncated) used consistently in CPT/SFT/RL.
+Given a query x and target answer y, we model
+knowledge-intensive generation with a discrete latent evidence index z ∈ {1, . . . , N }:
+
+U = {uz }N
+z=1
+
+Bohan Yu, Wei Huang, and Kang Liu. 2026. Sr-ki:
+Scalable and real-time knowledge integration into
+llms via supervised attention. In Proceedings of
+the AAAI Conference on Artificial Intelligence, volume 40, pages 34486–34494.
+
+p(y | x, U) =
+
+N
+X
+
+p(z | x, U ) pθgen (y | x, uz ).
+
+z=1
+
+(6)
+Here p(z | x, U) is the retrieval distribution, and
+pθgen (y | x, uz ) is the generator conditioned on
+evidence uz (Xu et al., 2025, 2024b; Duan et al.,
+2026).
+
+Ningyu Zhang, Yunzhi Yao, Bozhong Tian, Peng Wang,
+Shumin Deng, Mengru Wang, Zekun Xi, Shengyu
+Mao, Jintian Zhang, Yuansheng Ni, and 1 others.
+2024. A comprehensive study of knowledge editing for large language models. arXiv preprint
+arXiv:2401.01286.
+
+Explicit (search-based) RAG as truncated
+marginalization In conventional RAG, p(z |
+x, U) is implemented by an external retriever (e.g.,
+embedding similarity + ANN search) with score
+sη (x, uz ):
+
+Yanzhao Zhang, Mingxin Li, Dingkun Long, Xin Zhang,
+Huan Lin, Baosong Yang, Pengjun Xie, An Yang,
+Dayiheng Liu, Junyang Lin, and 1 others. 2025a.
+Qwen3 embedding: Advancing text embedding and
+reranking through foundation models. arXiv preprint
+arXiv:2506.05176.
+
+exp(sη (x, uz ))
+pη (z | x, U ) = PN
+.
+j=1 exp(sη (x, uj ))
+
+Yuwei Zhang, Wenhao Yu, Shangbin Feng, Yifan
+Zhu, Letian Peng, Jayanth Srinivasa, Gaowen Liu,
+and Jingbo Shang. 2025b. Bidirectional lms are
+better knowledge memorizers? a benchmark for
+real-world knowledge injection. arXiv preprint
+arXiv:2505.12306.
+
+Since N is large, systems typically retrieve a top-K
+set TK (x) and renormalize:
+X
+pRAG (y | x, U) ≈
+p̃η (z | x, U ) pθgen (y | x, uz ),
+z∈TK (x)
+
+(7)
+
+Chujie Zheng, Shixuan Liu, Mingze Li, Xiong-Hui
+Chen, Bowen Yu, Chang Gao, Kai Dang, Yuqiong
+
+where p̃η (z) = pη (z)/
+11
+
+′
+z ′ ∈TK (x) pη (z ).
+
+P
+
+where ∆ = az ⋆ − maxz̸=z ⋆ az is the score gap.
+Therefore, when the evidence posterior is peaked
+(large ∆), the top-1 evidence approximation is
+provably close to the full marginal in Eq. (9).
+
+A.2 RING Objective: Search-Free Parametric
+Retrieval
+RING eliminates external access to U at inference
+by (i) injecting U into the knowledge expert parameters during CPT, and (ii) learning a parametric
+retrieval policy during SFT/RL.
+
+A.3
+
+Architecture View: Knowledge Expert as
+Parametric Key–Value Retrieval
+
+Definition A.1 (RING Latent Evidence Objective). Let Θ = (Θ̄, Θmem , ϕ), where Θ̄ denotes all frozen backbone parameters (including
+the base expert and attention blocks), Θmem =
+(ℓ)
+(ℓ)
+{Wknw,down , Wknw,up }L
+ℓ=1 are the trainable memory
+projections in the knowledge expert (Section 3.2),
+and ϕ are the parameters of the router rϕ (and the
+s ). We define the parametric
+Search Gate in Eknw
+joint model
+
+We now connect RING’s knowledge expert to a
+differentiable retrieval mechanism.
+
+Connection to <retrieval> generation In the
+Search-then-Answer paradigm (Section 3.3), RING
+explicitly generates a retrieval block that is intended to reproduce (one of) the memorized units
+uz . Thus, we can interpret pϕ (z | x) as the induced
+probability that the model generates unit uz inside
+<retrieval>...</retrieval> given the question
+x.
+
+by gi the i-th row of Wknw,gate , and by vi the i-th
+
+Top-1 (MAP) evidence approximation and an
+error bound In practice, RING often aims to
+retrieve a single best unit (top-1) before answering.
+Define a score
+
+Hence each hidden representation h acts as a query,
+the rows of Wknw,up (modulated by the Search Gate)
+act as keys, and the columns of Wknw,down act as
+values.
+
+Single-layer view Consider the knowledge expert MLP at layer ℓ applied to a hidden state
+h ∈ Rd . With the Memory Up/Down and Search
+Gate separation (Section 3.1), a convenient abstraction is the gated-MLP form (e.g., SiLU-gating):
+
+
+(ℓ)
+(ℓ)
+(ℓ)
+Eknw (h) = Wknw,down SiLU Wknw,gate h
+
+pΘ (y, z | x) = pϕ (z | x) pθgen (y | x, uz ; Θmem , Θ̄),
+(ℓ)
+⊙ Wknw,up h ,
+(11)
+(8)
+and the marginal
+(ℓ)
+(ℓ)
+where Wknw,down and Wknw,up belong to Θmem
+N
+(ℓ)
+X
+(trainable in CPT), while Wknw,gate corresponds to
+pΘ (y | x) =
+pϕ (z | x) pθgen (y | x, uz ; Θmem , Θ̄).
+s
+the Search Gate parameters in Eknw
+(trainable in
+z=1
+(9) SFT/RL).
+At inference, RING does not query U externally; Proposition A.2 (Gated-MLP as Key–Value Memthe dependence on U is realized only through the
+ory Readout). Let dff be the intermediate width of
+(ℓ)
+(ℓ)
+injected parameters Θmem .
+the MLP, and denote by ki the i-th row of Wknw,up ,
+(ℓ)
+
+(ℓ)
+
+(ℓ)
+
+(ℓ)
+
+column of Wknw,down . Then Eq. (11) can be written
+as
+(ℓ)
+
+Eknw (h) =
+
+dff
+X
+
+(ℓ)
+
+(ℓ)
+
+αi (h) vi ,
+
+i=1
+
+(ℓ)
+(ℓ)
+(ℓ)
+αi (h) = SiLU ⟨gi , h⟩ · ⟨ki , h⟩.
+
+(12)
+
+az = log pϕ (z | x)+log pθgen (y | x, uz ; Θmem , Θ̄), Proof. Expand the matrix products in Eq. (11)
+coordinate-wise: Wknw,down h and Wknw,gate h pro⋆
+duce dff scalar activations; the elementwise product
+and let z = arg maxz az . Then log-sum-exp
+yields
+coefficients αi (h), and the final multiplicayields a standard approximation bound:
+tion by Wknw,down sums columns weighted by these
+N
+X
+coefficients.
+0 ≤ log
+eaz − az ⋆
+Lemma A.3 (Approximate MIPS via Low-Temperz=1
+
+
+X
+ature Softmax). Let si (h) be any scalar scores (e.g.,
+= log 1 +
+eaz −az⋆
+si (h) = αi (h) or an affine transform thereof). Dez̸=z ⋆
+fine πβ (i | h) = softmaxi (βsi (h)) and the read
+(10) out R (h) = P π (i | h) v . If the maximizer
+≤ log 1 + (N − 1)e−∆ ,
+i
+β
+i β
+12
+
+i⋆ = arg maxi si (h) is unique, then πβ (i⋆ | h) →
+1 and Rβ (h) → vi⋆ as β → ∞.
+
+achievable risk of RING is no worse than that of
+explicit top-K RAG on the same domain:
+
+
+inf R pΘ ≤ inf R pRAG .
+
+Proof. This is the standard low-temperature limit
+of softmax: probability mass concentrates on the
+unique argmax as β → ∞.
+
+Θ
+
+Remark A.6 (When can RING be strictly better?).
+Even with identical backbone generators, explicit
+RAG is constrained by external retrieval form (e.g.,
+embedding similarity), ANN approximation, topK truncation, and finite prompt/context budget.
+RING jointly optimizes routing and generation and
+can learn task-aligned evidence selection beyond
+embedding similarity, potentially achieving lower
+risk on distributions where similarity search is a
+suboptimal proxy for selecting evidence.
+
+Two-level sparsity: router vs. memory-slot selection RING has two complementary sparsity
+mechanisms: (i) the router rϕ selects between ex(ℓ)
+perts Ebase and Eknw via gt (Section 3.1), controlling when to consult injected knowledge; (ii)
+within Eknw , the gated-MLP readout (Eq. (12)) acts
+as a differentiable retrieval over a large number of
+implicit memory slots, controlling what knowledge
+is activated. This provides a parameter-space analogue of similarity search.
+A.4
+
+A.5 Dual Causal Attention: Formal Mask and
+Loss Definitions
+
+Why RING Can Match or Exceed
+Explicit RAG
+
+We give the full formal specification of the Dual
+Causal Attention (DCA) objective used in CPT
+(Section 3.2).
+Let a token sequence be x1:T = (x1 , . . . , xT )
+and consider a decoder layer with queries, keys,
+and values Q, K, V ∈ RT ×d . For a binary mask
+M ∈ {0, 1}T ×T , the masked attention is
+
+
+QK ⊤
+Attn(Q, K, V ; M ) = softmax √ + log M V,
+d
+with log 0 := −∞, log 1 := 0.
+
+We formalize the comparison as a hypothesis-class
+inclusion argument.
+Theorem A.4 (Expressivity Dominance on the
+Query Domain). Assume that after CPT, the injected parameters Θmem store the evidence units
+{uz }N
+z=1 with sufficient fidelity, and that the
+router/Search Gate parameters ϕ have enough capacity to represent the same retrieval distribution
+as an external retriever on the query domain of
+interest; i.e., for all relevant x,
+pϕ (z | x) ≈ p̃η (z | x, U )
+
+η,θgen
+
+For α ∈ {1, 12 , 14 }, let Kα = ⌊αT ⌋ and define
+the target block Bα = {1, . . . , Kα } and its complement Cα = {Kα + 1, . . . , T }. The masks
+M (α) ∈ {0, 1}T ×T specify which source positions
+j are visible when predicting position i. For α = 1
+(1)
+the standard causal mask is Mi,j = 1[ j ≤ i ]; for
+α ∈ { 12 , 41 } the dual causal mask is
+(
+1,
+i ∈ Bα , j ≤ i or j ∈ Cα ,
+(α)
+Mi,j =
+1[ j ≤ i ], i ∈ Cα .
+(13)
+
+for z ∈ TK (x),
+
+up to arbitrarily small error. Then for any explicit
+top-K RAG model in Eq. (7), there exists a RING
+instance in Eq. (9) that matches its conditional distribution p(y | x) arbitrarily well on that domain
+(in total variation / KL, depending on the approximation metric).
+Proof sketch. Construct pϕ (z | x) to approximate
+the external truncated-retrieval distribution p̃η (z |
+x, U) on TK (x), and set the conditional generator pθgen (y | x, uz ) to match the same evidenceconditioned generator. Since the evidence units
+are stored in Θmem , RING can reproduce the same
+mixture in Eq. (7) without external search.
+
+Thus, when predicting tokens inside Bα , the model
+preserves causality within Bα (no look-ahead to
+future targets in the block) while attending to all of
+Cα as backward evidence; positions in Cα retain
+the standard causal constraint.
+For each α, the negative log-likelihood over the
+corresponding target block is
+
+
+1 X
+L(α) =
+− log pθ xt x1:T ; M (α) ,
+|Bα |
+t∈Bα
+(14)
+
+Corollary A.5 (Best Achievable NLL is Not Worse
+(Under Capacity Assumptions)). Let R(f ) =
+E(x,y)∼P ⋆ [− log pf (y | x)] be population NLL. Under the assumptions of Theorem A.4, the optimal
+13
+
+where pθ (· | x1:T ; M (α) ) is obtained by running the
+network on the full sequence with mask M (α) and
+reading logits only at positions t ∈ Bα . The three
+losses are combined as
+
+Any training objective that allows tokens in the target block to condition on a superset of information
+(as DCA does for the target block) has an optimal
+achievable negative log-likelihood no larger than
+that of standard causal conditioning, because the
+model can always learn to ignore additional context. Consequently, DCA can provide a tighter (not
+looser) upper bound on the conditional entropy of
+the target block given its complement, improving
+the information available for storing bidirectional
+dependencies into Θmem during CPT.
+
+LDCA = λ1 L(1) + λ2 L(1/2) + λ3 L(1/4) . (15)
+In practice, the same training example is passed
+three times (once per mask), gradients are accumulated according to Eq. (14) and mixed via Eq. (15);
+at inference, only M (1) is used.
+A.6
+
+Step 2 (SFT): supervised posterior collapse via
+<retrieval> In SFT, each instruction sample
+provides a gold evidence unit u⋆ = uz ⋆ obtained
+by exact string match (Section 3.3). Setting q(z |
+x, y) = δ(z = z ⋆ ) in Eq. (16) yields the supervised
+objective
+
+Training as Variational Inference:
+Linking CPT–SFT–RL to an ELBO
+
+We derive an evidence lower bound (ELBO) for the
+discrete latent model in Eq. (8).
+ELBO with a variational posterior Introduce a
+variational posterior q(z | x, y). Then
+
+max log pϕ (z ⋆ | x) + log pθgen (y | x, uz ⋆ ),
+
+log pΘ (y | x)
+
+which corresponds exactly to teacher-forcing on the
+<retrieval> block (learning evidence selection)
+and the <answer> block (learning answer synthesis given evidence). Freezing Θmem during SFT
+prevents overwriting the memorized corpus and
+focuses learning on rϕ and the Search Gate.
+
+N
+X
+
+pϕ (z | x) pθgen (y | x, uz )
+= log
+q(z | x, y)
+q(z | x, y)
+z=1
+
+
+≥ Eq log pθgen (y | x, uz )
+|
+{z
+}
+reconstruction
+
+(16)
+− KL q(z | x, y) ∥ pϕ (z | x) .
+|
+{z
+}
+
+Step 3 (RL): learning a generalizable evidenceselection policy After SFT, we apply RLVR to
+further align the evidence-selection behavior with
+task success. Because different implementations
+may define “rewards” or “penalties” with opposite signs, we present the RL objective in a signagnostic form.
+Let ℓfmt , ℓans , ℓdense ∈ [0, 1] denote penalties (lower is better) for (i) format compliance,
+(ii) verified answer correctness, and (iii) evidence match (e.g., overlap/LCS-based signals on
+title/content), respectively. Define the total
+penalty
+
+posterior–policy alignment
+
+At test time, RING uses the policy pϕ (z | x) (or its
+top-1 approximation), while q(z | x, y) is only a
+training-time analysis tool.
+Step 1 (CPT): fitting the parametric memory Θmem During CPT, we force routing to
+the knowledge expert and update only Θmem =
+(ℓ)
+(ℓ)
+{Wknw,up , Wknw,down }, optimizing the DCA objective on DCPT (Section 3.2). This stage increases
+the capacity of pθgen (· | x, uz ) to represent and
+reproduce evidence units uz through the knowledge expert, preparing the model for subsequent
+evidence selection.
+
+ℓtotal = λfmt ℓfmt + λans ℓans + λdense ℓdense ,
+
+A principled view of DCA DCA provides additional right-context evidence for predicting tokens
+in a target block while retaining autoregressive generation at inference. The key theoretical property
+we rely on is monotonicity of optimal conditional
+cross-entropy with respect to conditioning sets.
+
+and maximize the negative penalty (equivalently,
+minimize expected penalty):
+
+
+max Ez∼pϕ (·|x) − ℓtotal (z, x, y)
+ϕ
+
+
+⇐⇒ min Ez∼pϕ (·|x) ℓtotal (z, x, y) .
+
+Proposition A.7 (DCA Does Not Worsen the Optimal Conditional Cross-Entropy). Consider predicting a target block conditioned on its complement.
+
+This formulation is compatible with either convention (reward-as-1-for-correct or penalty-as-1-forincorrect).
+
+ϕ
+
+14
+
+instruction-style question, ai is a concise answer
+grounded in d, and ri is an explicit reference span
+from d that justifies ai . We control n to balance
+coverage and cost.
+
+Lemma A.8 (Dense Penalties Improve Credit Assignment for Retrieval). Suppose ℓans is sparse
+(many actions z receive identical penalties because answer correctness is hard to achieve), while
+ℓdense (z, z ⋆ ) varies smoothly with the match quality between the sampled evidence z and the gold
+evidence z ⋆ . Then optimizing E[ℓdense ] provides
+informative gradients for the policy pϕ (z | x) even
+when ℓans provides little signal, accelerating the
+concentration of pϕ (· | x) around high-quality evidence choices.
+
+Reference–Memory Alignment Let U = {uj }
+be the set of memory units in DCPT . We align
+each reference ri to its corresponding memory unit
+u ∈ DCPT via exact string match: the pair is accepted only if there exists a u⋆i ∈ U that matches
+ri ; otherwise the triple is discarded. The accepted
+u⋆i is truncated to at most 256 tokens to bound generation cost.
+
+Remark A.9 (Relation to the ELBO). When the
+dense signal correlates with evidence correctness,
+minimizing expected penalty can be viewed as a
+practical surrogate for reducing the mismatch between the policy pϕ (z | x) and the ideal posterior
+over evidence. This complements the supervised
+alignment in SFT and improves generalization of
+evidence selection beyond exact-match supervision.
+
+B
+
+Target Template Each retained triple is
+converted into a search-then-answer target
+string that the model must autoregressively
+produce given the question.
+Concretely,
+Instruction: xin = qi ; Response: y tg =
+I can retrieve this passage to answer
+the question <retrieval> u⋆i </retrieval>
+<answer> ai </answer>. The <retrieval> block
+supervises generative retrieval, and the <answer>
+block supervises final answering.
+
+Datasets
+
+Memorization Set (CPT): We collect the raw
+news corpus and segment it into fine-grained units,
+resulting in approximately 1.6 million fragments.
+This set serves as the external knowledge base
+DCPT that needs to be injected.
+Instruction Set (SFT): Based on the CPT corpus, we generate 317k instruction-following samples using the pipeline described in Section 3.3.
+These samples are designed to teach the model
+the “Search-then-Answer” paradigm. The detailed
+construction recipe is given below.
+Alignment Set (RL): We construct a further
+200k samples specifically for the RL stage.
+B.1
+
+Retrieve-only-when-needed To prevent the
+model from always emitting <retrieval>, we
+mix in no-retrieval instructions from a generic instruction corpus G (math, coding, reasoning), for
+which the response does not follow the Searchthen-Answer template. The final SFT set is
+I = {(q, u⋆ , a)} ∪ {(q, ∅, a)}, stratified into
+train/dev/test by document ID to prevent leakage.
+During training we interleave I with a general instruction set to stabilize early learning and improve
+instruction following.
+Loss Given input xin and target y tg , the parameters θ are optimized with standard cross-entropy:
+
+Instruction Fine-tuning Data
+Construction Details
+
+tg
+h |y
+i
+X|
+tg 
+LSFT (θ) = E(q,u⋆ ,a)∼I − log pθ yttg | xin , y<t
+,
+
+We expand the main-text description of the SFT
+data pipeline.
+Let D be the external corpus to be injected and
+DCPT the preprocessed set of memory units used
+during CPT (each unit u is the JSON-style {title,
+content} fragment defined in Section 3.2). We
+subsample documents S ⊆ D with rate ρ ∈ (0, 1],
+a tunable hyperparameter trading off coverage
+against training cost.
+
+t=1
+
+where the presence of the <retrieval> block directly supervises the decision to retrieve.
+
+C
+
+Experimental Setting
+
+C.1
+
+Inference Pipelines
+
+To ensure a rigorous and fair comparison between
+the parametric and external retrieval paradigms,
+we strictly utilize the identical knowledge corpus
+for all methods. For conventional search-based
+RAG baselines, the inference pipeline follows a
+
+Triple
+Synthesis We
+employ
+qwen3-235b-a22b-instruct-2507
+to
+produce n supervision triples {(qi , ai , ri )}ni=1 per
+sampled document d ∈ S, where qi is an
+15
+
+Parametric Knowledge Injection and Memorization These baselines aim to inject the external
+corpus D directly into the model parameters. (1)
+Full Tuning: standard full-parameter CPT on the
+raw corpus DCPT followed by instruction tuning
+on large-scale Q&A pairs constructed from D. (2)
+LoRA Tuning: same training set as Full Tuning but
+applied via LoRA. (3) Modular Injection: methods that mount knowledge into the LLM’s computational flow, including KBLAM (Wang et al.,
+2025) and SR-KI (Yu et al., 2026). (4) RetrieverImitating Parametric Memory: three recent
+methods closest to RING in spirit—LAG (Fleshman and Van Durme, 2025) attaches per-document
+LoRA adapters and selects them at inference via
+data-free routing; MLP Memory (Wei et al., 2025)
+pretrains a dedicated MLP to imitate a kNN retriever’s distribution; AtlasKV (Huang et al., 2025)
+stores billion-scale knowledge as compressed key–
+value caches augmented into the LLM. A significant drawback of (3) and partially of (4) is that
+GPU memory usage grows with the size of the
+injected corpus. Compared with these baselines,
+RING (i) keeps a separate Basic Expert to prevent
+forgetting, (ii) injects the corpus via bidirectional
+DCA rather than fitting a retriever’s logits or storing raw KV slabs, and (iii) learns when and what
+to retrieve through RL with dense rewards rather
+than via a fixed similarity-based mechanism.
+
+standard retrieve-then-generate workflow: given a
+query, the system searches the external vector index
+to retrieve the relevant documents. This retrieved
+context is then provided to the LLM to guide answer generation. In contrast, our RING operates
+in a search-free manner. The model is presented
+solely with the query, and the retrieval process is
+internalized. The model directly generates the answer by leveraging the knowledge encoded within
+its parameters (specifically the Knowledge Expert),
+completely eliminating the interaction with external search engines during inference.
+C.2
+
+Evaluation Metrics
+
+We assess performance based on factual accuracy.
+The ground truth answers in our benchmark are preprocessed to be concise and unambiguous. To scale
+the evaluation, we employ a model-based judge
+using DeepSeek-R1-0528. The judge compares
+the generated response against the ground truth and
+assigns a binary score (1 for a match, 0 otherwise).
+We report the final Accuracy (%) averaged across
+the test set.
+C.3
+
+Baseline Details
+
+We provide the full descriptions of all baseline categories compared in Section 5.3.
+Conventional Search-based RAG (Top-1) This
+category represents the standard retrieve-and-read
+RAG. They rely on an external search engine to
+fetch relevant context, which is then concatenated
+to the input of the frozen base LLM. We employ a
+variety of state-of-the-art (SOTA) embedding models to perform retrieval, ensuring a strong upper
+bound: BGE-M3 (Chen et al., 2024), OpenAItext-embedding-3-large, Gemini-Embedding (Lee
+et al., 2025), and Qwen3-Embedding (Zhang et al.,
+2025a).
+
+C.4
+
+Implementation Details
+
+We utilize Qwen3-8B and Qwen3-14B as our backbone foundation model. Our training pipeline consists of three sequential stages. We use the AdamW
+optimizer with a cosine learning rate scheduler for
+all stages. In CPT, we train the model on the constructed News-2025 corpus. During this stage, we
+freeze all parameters except for the Memory Down
+and Memory Up projections of the Knowledge Expert. We employ the proposed Dual Causal Attention with mask ratios α ∈ {1, 1/2, 1/4} and loss
+weights λ1 = 1.0, λ2 = 0.3, and λ3 = 0.1. The
+max sequence length is set to 4096, the learning
+rate is 2e-5 and epoch is 8. In SFT, we utilize
+the Search-then-Answer instruction set mixed with
+general instructions at a ratio of 1:1. Only Router
+and Search Gate are trainable. Retrieved fragments
+are truncated to 256 tokens. The max sequence
+length is set to 4096, the learning rate is 2e-5 and
+epoch is 4 with early-exit. In RL, we use ms-swift
+as the framework. λa , λb , and λc are 0.8, 0.8, 1.0
+respectively. λformat , λanswer , and λsearch are 0.1,
+
+Stronger RAG Pipelines To address the concern that a top-1 retrieve-and-read setup underestimates modern RAG, we additionally evaluate:
+(i) Top-k retrieval with k ∈ {3, 5, 10} using the
+strongest embedding (Qwen3-8B-Emb); (ii) retrieval + reranking, where we retrieve top-10
+candidates and rerank them with a cross-encoder
+(BGE-Reranker-v2-m3 and Qwen3-Reranker-4B)
+to select the final top-3; (iii) HyDE (Gao et al.,
+2023a), which generates a hypothetical answer to
+rewrite the query before retrieval; and (iv) Query
+Rewrite, in which we prompt the base LLM to
+paraphrase the question prior to retrieval.
+16
+
+1.0, 1.0 respectively. All models are implemented
+using PyTorch and trained on 32 × NVIDIA H800
+GPUs. We utilize DeepSpeed Zero-3 for memory
+optimization. The learning rate is 1e-6.
+
+D
+
+AI Use Statement
+
+We used AI-based writing assistance only for language polishing, including grammar correction,
+wording refinement, and improving readability. AI
+tools were not used for formulating the research
+ideas, designing the method, conducting experiments, analyzing results, or generating substantive
+scientific content. All technical claims, experimental results, and conclusions were produced and verified by the authors.
+
+17
+
+

@@ -1,0 +1,1584 @@
+EdgeJury: Cross-Reviewed Small-Model Ensembles for Truthful
+Question Answering on Serverless Edge Inference
+Aayush Kumar∗1
+
+arXiv:2601.00850v1 [cs.LG] 29 Dec 2025
+
+1
+
+University of Illinois Chicago, Chicago, IL 60607 USA
+
+Abstract
+Hallucinations hinder reliable question answering, especially in resource-constrained
+deployments where using frontier-scale models or retrieval pipelines may be impractical.
+We present EdgeJury, a lightweight ensemble framework that improves truthfulness and
+robustness using only small instruction-tuned language models (3B–8B) suitable for serverless
+edge inference. EdgeJury orchestrates four stages: (1) parallel role-specialized generation,
+(2) anonymized cross-review with structured critiques and rankings, (3) chairman synthesis
+that integrates the strongest content while addressing flagged issues, and (4) claim-level
+consistency labeling based on inter-model agreement. On TruthfulQA (MC1), EdgeJury
+achieves 76.2% accuracy (95% CI: 72.8–79.6%), a +21.4% relative improvement over a
+single 8B baseline (62.8%), and outperforms standard baselines including self-consistency
+and majority voting under transparent compute accounting (total tokens and platform cost
+reported). On a 200-question adversarial EdgeCases set, EdgeJury yields +48.2% relative
+gains (95% CI: 44.0–52.4%). Manual analysis on 100 incorrect answers shows approximately
+55% reduction in factual hallucination errors versus the single-model baseline. Deployed on
+Cloudflare Workers AI, EdgeJury achieves 8.4 s median end-to-end latency, demonstrating
+that coordinated small-model ensembles can improve truthfulness on misconception-heavy
+QA benchmarks (TruthfulQA and EdgeCases) without external retrieval or proprietary
+large-model APIs.
+
+Keywords: Truthful question answering, small language models, ensemble learning, cross-review,
+edge AI, uncertainty labeling, Cloudflare Workers AI, hallucination mitigation, serverless AI
+
+1
+
+Introduction
+
+Large language models have achieved strong performance across knowledge and reasoning tasks,
+yet truthfulness remains a central weakness. Models may confidently assert incorrect facts or echo
+widely repeated misconceptions, undermining reliability in user-facing settings [1]. TruthfulQA [1]
+was introduced to measure this failure mode: even very large models often produce answers
+that resemble common human falsehoods. Later work reported inverse scaling phenomenon on
+truthfulness-style evaluations, where larger models can become less truthful because they better
+imitate popular but incorrect text patterns [2]. Recent surveys and empirical studies consistently
+report that hallucinations remain a persistent failure mode across model families, especially
+under underspecified or adversarial prompts [28, 29].
+Despite rapid progress, most practical factuality mitigations fall into two buckets: (i) singlemodel sampling/aggregation (e.g., self-consistency), or (ii) retrieval-heavy pipelines that require
+external corpora, indexes, and extra infrastructure. These approaches are often mismatched to
+serverless edge settings, where the dominant constraints are orchestration simplicity, bounded calls,
+∗
+
+Corresponding author: akuma102@uic.edu
+
+1
+
+Table 1: System positioning. MM=multi-model; Cr=explicit critique; Syn=synthesis; NR=no
+external retrieval required; Edge=practical on serverless edge inference (bounded calls, predictable
+latency).
+Method
+
+MM
+
+Cr
+
+Syn
+
+NR
+
+Edge
+
+Self-Consistency
+Majority Vote
+Debate (multi-rd)
+RAG pipelines
+EdgeJury
+
+N
+Y
+Y
+N/Y
+Y
+
+N
+N
+Y
+N
+Y
+
+N
+N
+Varies
+Y
+Y
+
+Y
+Y
+Y
+N
+Y
+
+Y
+Y
+N
+N/Y
+Y
+
+and predictable latency. EdgeJury targets this gap: it uses only edge-friendly SLMs, performs a
+single-round anonymized peer review to surface concrete failure modes, and synthesizes a final
+answer that integrates minority-correct reasoning rather than discarding it via voting.
+Many interventions improve factuality and reasoning, but most rely on a single model
+reasoning in isolation. Chain-of-thought prompting [10] and self-consistency [11] reduce reasoning
+variance by sampling multiple trajectories and selecting a consensus answer. Reinforcement
+learning from human feedback (RLHF) improves instruction-following and can reduce undesirable
+outputs [3], but requires expensive annotation and typically targets a single model. Retrievalaugmented generation can improve factual grounding, but adds system complexity, latency, and
+dependencies that may be undesirable in edge deployments.
+At the same time, deploying frontier-scale models is often impractical: large LLMs (e.g.,
+GPT-4 [9]) require expensive cloud GPUs and introduce additional latency. Recent progress
+in small language models (SLMs) [4, 5] motivates an alternative question: can a small set of
+edge-friendly models, orchestrated effectively, outperform a single stronger model on truth-seeking
+tasks under tight compute and latency budgets?
+We present EdgeJury, an ensemble framework designed for truthful question answering with
+edge-deployable models. EdgeJury uses a four-stage “AI council” pipeline (Fig. 1): (1) parallel
+role-diverse generation, (2) anonymized cross-review that forces explicit critique and ranking, (3)
+chairman synthesis that integrates best components while addressing reviewer-flagged issues, and
+(4) claim-level consistency verification based on inter-model agreement, producing interpretable
+confidence tags.
+Unlike multi-round debate systems that can incur high latency and many model calls,
+EdgeJury is intentionally single-round for generation and review to remain practical on serverless
+edge infrastructure. Edge network deployment can reduce user-perceived latency by placing
+orchestration closer to clients and avoids maintaining dedicated GPU servers, while still enabling
+model coordination at practical interactive latencies. The key hypothesis is that diverse failure
+modes across different small models (and roles) allow peers to catch each other’s mistakes, and
+that a synthesis step can turn those critiques into higher-quality final answers than voting alone.
+Contributions: This paper makes the following contributions:
+• EdgeJury pipeline: A practical, deployable four-stage orchestration of small LLMs that
+combines role specialization, anonymized cross-review, synthesis, and claim-level consistency
+labeling.
+• Cross-review mechanism: A structured, anonymized peer-review protocol producing
+rankings and issue lists; removing cross-review costs 7.6 absolute points on TruthfulQA
+MC1 (Table 4).
+• Empirical results with compute accounting: EdgeJury reaches 76.2% on TruthfulQA
+MC1 vs. 62.8% single-model, and outperforms self-consistency and majority vote; we report
+total tokens and platform cost for each method for transparency (Section 5.4, Appendix D).
+
+2
+
+Figure 1: EdgeJury four-stage ensemble pipeline. (a) Stage 1: Multiple small LLMs (3B–8B)
+generate role-specialized answers in parallel. (b) Stage 2: Models anonymously cross-review
+peers, producing structured rankings and critiques. (c) Stage 3: A chairman model synthesizes a
+final answer using candidate responses and review feedback. (d) Stage 4: An agreement-based
+verifier extracts atomic claims and labels each as consistent, uncertain, or contradicted based on
+inter-model agreement.
+• Reliability analysis: Manual error analysis shows 55% fewer hallucination errors than a
+single-model baseline, and Stage 4 consistency tags achieve 94.2% precision for “consistent”
+claims on a manually checked subset (Section 6.6).
+• Edge deployment case study: An end-to-end deployment on Cloudflare Workers AI
+with measured latency and resource usage, demonstrating feasibility without dedicated
+GPU servers (Section 4).
+Organization: Section 2 reviews related work. Section 3 describes the EdgeJury pipeline.
+Section 4 details deployment on Cloudflare Workers AI. Section 5 presents evaluation protocol.
+Section 6 reports results, ablations, and analyses. Section 7 discusses why the approach works,
+limitations, and future directions.
+
+3
+
+2
+
+Related Work
+
+2.1
+
+Truthfulness and Hallucinations
+
+TruthfulQA [1] formalizes the tendency of LMs to imitate human falsehoods rather than provide
+truthful answers. Inverse scaling results further highlight that increasing model size does not
+automatically yield better truthfulness [2]. RLHF can improve instruction-following and reduce
+some harmful behaviors [3], but truthfulness on adversarial misconception questions remains
+challenging, particularly without external grounding.
+
+2.2
+
+Reasoning Prompts and Self-Consistency
+
+Chain-of-thought prompting [10] elicits intermediate reasoning steps and improves performance
+on multi-step tasks. Self-consistency [11] aggregates multiple sampled reasoning paths to reduce
+variance and can improve accuracy without additional training. However, these methods still rely
+on a single model; systematic blind spots and shared misconceptions can persist across samples.
+
+2.3
+
+Ensembling and Multi-Agent Deliberation
+
+Ensemble methods are a classical approach to improve predictive performance through diversity
+[6,7]. In the LLM setting, simple majority voting and multi-sampling offer moderate gains but do
+not explicitly exchange critiques or integrate complementary partial solutions. AI debate proposes
+that adversarial argumentation can surface truth [13]. Multi-agent factuality improvements via
+debate-style critique have been reported [14]. EdgeJury draws inspiration from these ideas but
+targets edge constraints: limited rounds, small models, and an explicit synthesis stage designed to
+act on critiques rather than merely vote. Unlike debate systems requiring multiple rounds [13,21],
+EdgeJury uses a single-round review for low latency.
+
+2.4
+
+Self-Refinement and Cross-Checking
+
+Iterative self-improvement methods such as Reflexion [15] and Self-Refine [16] prompt a model
+to critique and revise its own output. A central limitation is that a model may fail to notice
+its own errors. EdgeJury addresses this by using cross-model critique and heterogeneous roles,
+increasing the chance that at least one reviewer detects an issue.
+
+2.5
+
+LLM-as-a-Judge and Critique-Based Evaluation
+
+Recent work uses language models as evaluators (“judges”) to rank or critique model outputs,
+enabling preference-style selection without human labels [26]. While LLM-as-a-judge is primarily
+used for benchmarking [27], EdgeJury employs critique in-the-loop as a mechanism to improve
+answers under edge constraints, with anonymization and a fixed issue taxonomy to make feedback
+actionable.
+
+2.6
+
+Post-hoc Hallucination Detection and Revision
+
+A common alternative direction to multi-agent deliberation is post-hoc hallucination detection
+or factuality improvement via revision. SelfCheckGPT [24] proposes zero-resource, black-box
+hallucination detection by comparing stochastic samples for consistency signals, without requiring
+external databases or access to model probabilities. In contrast, revision-based pipelines use
+external evidence to rewrite and improve factuality; RARR [25] (Retrieve-and-Revise) iteratively
+retrieves supporting information and revises model outputs for better groundedness. EdgeJury is
+complementary: it improves truthfulness through structured cross-review and synthesis among
+edge-friendly models, without requiring retrieval infrastructure, while Stage 4 provides an internal
+agreement-based reliability signal.
+4
+
+Algorithm 1 EdgeJury Inference Pipeline (per query)
+Require: Question q, models M with roles R
+Ensure: Final answer â and claim labels L(C)
+1: Stage 1: In parallel, generate candidates ai ← mi (q; ri ) for i = 1..4
+2: Stage 2: For each reviewer mj , produce review ρj ← mj ({ai }4i=1 ) with anonymized IDs
+3: Aggregate rankings via Borda count; aggregate issue flags via de-duplication
+4: Stage 3: Synthesize âjson ← mchair (q, {ai }, Agg({ρj }))
+5: Output: if q is MC, return only â ← choice from âjson ; else return â ← final_answer from âjson
+6: Stage 4: Extract atomic claims C ← mver (â, {ai }) and compute labels L(C)
+7: return â, L(C)
+
+2.7
+
+Small Models and Edge Deployment
+
+Recent work highlights the viability of small instruction-tuned models for practical deployments
+[4, 5] including fine-tuning of Llama-3 variants [20]. Edge AI surveys emphasize latency, cost, and
+privacy benefits of pushing inference toward the edge [17]. We provide a concrete deployment and
+measurement study of a multi-model pipeline on serverless edge infrastructure, complementing
+prior work focused on model compression and general deployment considerations [18].
+
+3
+
+Methodology
+
+3.1
+
+Pipeline Overview
+
+EdgeJury processes a user question with four sequential stages (Fig. 1). The design goal is to
+maximize useful diversity early (Stage 1), enforce explicit critique (Stage 2), consolidate into
+a single high-quality answer (Stage 3), and expose uncertainty transparently (Stage 4), while
+keeping compute bounded. In our implementation, EdgeJury uses a constant 10 model calls per
+query (4 generation + 4 cross-review + 1 synthesis + 1 verification), with Stage 1 and Stage 2
+parallelizable.
+
+3.2
+
+Notation
+
+Let M = {m1 , . . . , m4 } denote the four base models (or model instances) used in Stage 1 with
+role prompts R = {r1 , . . . , r4 }. Let ai be the answer produced by (mi , ri ) in Stage 1. In Stage 2,
+each reviewer produces a structured review object ρj over anonymized candidates. Stage 3
+produces the final answer â. Stage 4 extracts a set of atomic claims C(â) and outputs per-claim
+agreement labels.
+
+3.3
+
+Stage 1: Role-Specialized Parallel Generation
+
+EdgeJury uses four role prompts to elicit complementary outputs:
+1. Direct Answerer : concise, accurate answer with explicit assumptions.
+2. Edge Case Finder : identifies exceptions, risks, and hidden assumptions.
+3. Step-by-Step Explainer : structured reasoning and derivations when needed.
+4. Pragmatic Implementer : actionable advice, examples, or procedures.
+Role specialization reduces correlation between outputs and increases coverage. In our implementation, we use two instances of LLaMA-3.1-8B (different role prompts), one LLaMA-3.2-3B, and
+one Mistral-7B [12] (Section 4). LLaMA-3.2-3B was chosen for its efficiency on edge infrastructure. Using multiple model families (LLaMA and Mistral) plus role-specialized prompts reduces
+correlated failure modes compared to sampling a single model repeatedly.
+5
+
+3.4
+
+Stage 2: Anonymized Cross-Review
+
+Each model reviews peer answers anonymized as Candidate A/B/C/D to reduce positional or
+identity bias. Review outputs are constrained to a structured JSON schema containing: (i)
+per-candidate ratings (accuracy/insight/clarity on a 1–10 scale), (ii) concrete issues labeled using
+a fixed enum, and (iii) “best bits” worth preserving for synthesis.
+Issue type enum (fixed labels):
+• factual\_risk: a likely incorrect, unsupported, or unverifiable claim that could change
+the selected answer.
+• missing\_edge\_case: missing a caveat/exception/assumption that affects correctness or
+applicability.
+• unclear: ambiguous phrasing, internal inconsistency, or hard-to-interpret reasoning/output
+format.
+• incomplete: does not fully answer the question or omits a required output (e.g., fails to
+output exactly one choice letter for MC1).
+Full Review schema (example):
+1 {
+2
+"rankings": [
+3
+{"candidate": "A", "accuracy": 8, "insight": 7, "clarity": 9},
+4
+{"candidate": "C", "accuracy": 7, "insight": 8, "clarity": 7},
+5
+{"candidate": "B", "accuracy": 6, "insight": 5, "clarity": 6},
+6
+{"candidate": "D", "accuracy": 5, "insight": 6, "clarity": 5}
+7
+],
+8
+"issues": [
+9
+{"candidate": "B", "type": "factual_risk", "detail": "Likely incorrect claim about X; conflicts with
+Y."},
+10
+{"candidate": "D", "type": "unclear", "detail": "Ambiguous wording; unclear which option is selected
+."}
+11
+],
+12
+"best_bits": [
+13
+{"candidate": "C", "extract": "Concise elimination of distractors; good justification for the final
+choice."}
+14
+]
+15 }
+
+The rankings array in the JSON need not be pre-sorted. We convert each reviewer’s numeric
+scores into a total order by sorting candidates by (accuracy, insight, clarity) lexicographically
+with deterministic tie-breaking by candidate ID, and then aggregate these per-reviewer orders
+using Borda count.
+Operational definition of “caught errors.” We count a cross-review event as catching an
+error when: (1) at least one reviewer flags a concrete issue for a candidate, and (2) the chairman
+explicitly removes or revises the flagged span in the final answer (matched by string span or
+paraphrase-level manual inspection on a sampled subset). This definition isolates the effect of
+critique on editing behavior, without depending on Stage 4 labels. 1
+
+3.5
+
+Stage 3: Chairman Synthesis
+
+A chairman model receives the original question, all candidate answers (with role labels), and
+aggregated review summaries. It synthesizes a final answer by: (a) selecting strong segments,
+(b) attempting to resolve conflicts using critiques, and (c) rewriting for clarity and calibrated
+tone. The chairman emits a structured JSON object for all tasks. For multiple-choice (MC)
+tasks, the JSON includes an explicit choice field constrained to a single letter in {A,. . . ,E}. The
+Worker/orchestrator returns only this extracted letter as the system output for scoring; all other
+1
+
+We additionally report downstream accuracy gains from Stage 2 in the ablation study (Table 4).
+
+6
+
+JSON fields (e.g., final_answer, rationale) are retained internally for analysis and logging.
+For non-MC tasks, the Worker returns the free-form final_answer field.
+In our deployment, mchair uses the same 8B instruction-tuned endpoint as the strongest
+Stage 1 model, while mver uses a constrained-JSON endpoint; exact identifiers are listed in
+Section 4.
+An example synthesis is provided in Appendix C.
+
+3.6
+
+Stage 4: Claim-Level Consistency Verification
+
+An agreement-based verifier extracts factual claims from the chairman answer and checks intermodel agreement using the Stage 1 candidates as internal evidence. We define an atomic claim
+as a single, verifiable proposition that can be judged independently of other statements (e.g., one
+entity–relation fact or one quantitative assertion). For each claim, we label candidate evidence as
+{“support”, “contradict”, “irrelevant”}. Let s be the number of candidates labeled “support” and c
+the number labeled “contradict”. We assign a final claim label using a conservative precedence
+rule:
+• “Contradicted”: c ≥ 1 (any explicit contradiction overrides support).
+• “Consistent”: c = 0 and s ≥ 3.
+• “Uncertain”: otherwise (e.g., mixed evidence, 2–2 splits, or weak/implicit support).
+Stage 4 adds one additional model call (the verifier) and produces claim-level reliability tags;
+it does not modify the final answer.
+Verifier schema (abbreviated):
+{
+"claims": [
+{
+"claim": "...",
+"evidence": [
+{
+"candidate": "A",
+"label": "support|contradict|irrelevant",
+"span": "..."
+},
+{"candidate": "B", "label": "...", "span": "..."},
+{"candidate": "C", "label": "...", "span": "..."},
+{"candidate": "D", "label": "...", "span": "..."}
+]
+}
+]
+}
+
+3.6.1
+
+Implementation Details
+
+Stage 4 is implemented as a single verifier model call with constrained JSON output. The
+verifier receives (i) the chairman final answer and (ii) the Stage 1 candidate answers anonymized
+as A/B/C/D. It outputs a list of atomic claims and, for each claim, per-candidate labels in
+{“support”, “contradict”, “irrelevant”}. We deterministically map per-candidate labels into “consistent”/“uncertain”/“contradicted” using the precedence rule above (“contradicted” > “consistent”
+> “uncertain”).
+3.6.2
+
+Known failure cases
+
+Stage 4 may under-detect support under heavy paraphrase, may miss implicit contradictions,
+and cannot detect shared misconceptions if all candidates agree on the same falsehood.
+
+7
+
+Cloudflare Global Edge Network
+Workers AI
+Inference
+e.g., Llama 3.1 8B,
+Mistral 7B
+
+Client Browser
+(React SPA)
+
+HTTPS + SSE
+
+(Server-Sent Events)
+
+Worker
+Orchestrator
+(Hono.js)
+
+D1 Database
+(SQLite)
+Logs, history
+
+KV Storage
+(Cache)
+All components execute at the edge for low-latency orchestration.
+
+Figure 2: Deployment architecture on Cloudflare Workers AI. A client sends the query to a nearby
+Worker instance. The Worker orchestrates Stages 1–4 by invoking Workers AI model endpoints.
+Optional logging (e.g., request traces) can be integrated via a lightweight database, but is not
+required for inference. Arrows indicate data flows: Query → Worker → Model Endpoints.
+
+4
+
+Deployment on Cloudflare Workers AI
+
+We implemented EdgeJury as a serverless orchestration workflow on Cloudflare Workers (Fig. 2).
+We emphasize that this is edge network deployment (serverless inference on Cloudflare’s globally
+distributed infrastructure), not execution on end-user edge devices such as phones or IoT
+microcontrollers. A web client sends requests to a Worker that coordinates model calls via
+Workers AI APIs. Stage 1 is executed in parallel; Stages 2–4 proceed sequentially to incorporate
+critiques and verification.
+Model endpoints (as configured in our deployment):
+• @cf/meta/llama-3.1-8b-instruct (2 instances with distinct role prompts)
+• @cf/meta/llama-3.2-3b-instruct (1 instance)
+• @hf/mistral/mistral-7b-instruct-v0.2 (1 instance)
+Unless otherwise specified, EdgeJury (Stages 1–4) and deterministic baselines use temperature 0
+and max_tokens=512 for stable evaluation. Self-consistency baselines use temperature 0.7 to
+enable sampling (Section 5).
+Latency: On the 500-question TruthfulQA latency subset, the first Stage-1 model response
+achieves 287ms median time-to-first-token (TTFT) and 8.4s median end-to-end time to final
+answer completion (P95: 14.2s), reported in Table 9.
+Measurement setup: Latency was measured from the Worker entrypoint to final response
+completion, including network overhead between the Worker and model endpoints. We report
+medians and P95 over 500 requests issued across multiple times of day to reduce temporal bias;
+cold-start effects are included.
+Resource usage: Workers AI uses “Neurons” as a platform-specific compute unit. At
+the time of experiments, our evaluated workload fit within the then-available time-bounded
+quota; current quotas and pricing are platform-dependent and may change (see Cloudflare
+documentation). Pricing and quota details are platform-dependent and referenced in [19].
+
+8
+
+5
+
+Evaluation Protocol
+
+5.1
+
+Benchmarks
+
+TruthfulQA (MC1): We evaluate on the full 817-question multiple-choice MC1 variant of
+TruthfulQA [1]. A response is correct if it selects the single truthful option. The system output is
+required to be exactly one letter (A–E). For EdgeJury, the chairman produces constrained JSON
+that includes a single-letter choice field, and the Worker returns only this extracted letter as the
+final output. For all methods, outputs are parsed via strict pattern matching on the final system
+output; if extraction fails or multiple letters appear, the output is scored incorrect. We manually
+verify ambiguous parses on a random sample of 50 cases, blind to method, by inspecting only
+the raw output and the required format. Latency subset: For latency/TTFT measurements
+(Section 4, Section 6.9), we additionally use a fixed 500-question stratified subset (seed 42) to
+control run-time while preserving category balance. We release the exact IDs for both the full
+set and the latency subset.
+MMLU (5-shot): We evaluate 500 questions from MMLU [8] sampled from the validation
+split with seed 42, distributed proportionally across subjects. We use standard 5-shot prompting
+and exact-match scoring.
+BIG-Bench Hard (BBH): We sample 300 questions from BBH [22] with seed 42, focusing
+on reasoning tasks. Natural Questions (NQ): A 200-question subset from NQ [23], evaluated
+on short-answer exact match.
+EdgeCases (adversarial): We constructed a 200-question adversarial set containing trick
+questions, misconception traps, multi-step puzzles, and ambiguous queries. Each item has a
+rubric specifying success criteria. Ten representative examples appear in Appendix A; the full
+set is released with code.
+
+5.2
+
+EdgeCases Construction and Scoring
+
+EdgeCases is a 200-item adversarial set designed to stress misconception traps, ambiguity handling,
+and multi-step reasoning. Each item includes a short rubric specifying success criteria.
+Construction: Items were authored to cover: (i) trick questions (e.g., false presuppositions),
+(ii) common misconceptions, (iii) ambiguous underspecified queries that require clarification, (iv)
+classic reasoning puzzles, and (v) contested-fact prompts where calibrated nuance is required.
+We release the full dataset and rubrics with the repository.
+Scoring: Accuracy is computed by applying the rubric per item. For questions with
+deterministic targets (e.g., numeric puzzles, explicit "no smoke" tricks, logic entailment), scoring
+is rule-based (exact match / numeric tolerance / keyword constraints). For items requiring
+calibrated nuance or clarification-seeking behavior, scoring checks for rubric-defined required
+elements (e.g., explicitly requesting missing context for ambiguous queries). We release the
+scoring scripts and per-item rubric schema to enable reproduction.
+
+5.3
+
+Baselines
+
+We compare against:
+• Single Model (S1): Direct response from LLaMA-3.1-8B.
+• Self-Consistency (SC3, SC5): Single model sampled k ∈ {3, 5} times (temperature 0.7),
+selecting the most frequent choice.
+• Majority Vote (MV): Three different models answer; final choice is majority.
+• Best-of-3 (Oracle): An upper-bound diagnostic baseline: three independent candidate
+answers are generated, and an oracle marks the question correct if any candidate selects
+9
+
+the correct option. This is not deployable, but it estimates the headroom available from
+better selection/synthesis.
+• RAG-S1: Retrieval-augmented generation on a single 8B model (simulated with local
+index); higher accuracy but adds latency and non-edge dependencies.
+• EdgeJury Ablations: Variants removing stages or role specialization.
+RAG-S1 details: The RAG baseline uses BM25+embedding retrieval over a fixed, versioned
+corpus, with top-k = 5 passages concatenated (max 1,200 tokens) and answered by LLaMA-3.18B at temperature 0. Retrieval hyperparameters were not tuned per benchmark; the baseline
+is included to contextualize the potential gains from external grounding, not as an optimized
+retrieval system.
+
+5.4
+
+Compute Accounting
+
+EdgeJury uses a constant number of model calls per query: 10 calls total (4× Stage 1 generation,
+4× Stage 2 cross-review, 1× Stage 3 synthesis, 1× Stage 4 verification). Stage 4 is post-hoc: it
+does not modify the final answer, but it is included in compute accounting.
+Because “calls” are not a stable compute proxy across models and prompts, we report token
+usage from execution traces. For each method we record: (i) total input tokens summed across
+calls, and (ii) total generated output tokens summed across calls, and we report these alongside
+accuracy (Table 10).
+Platform cost units: Workers AI exposes usage via Neurons; quotas and pricing are modeldependent and may change over time [19]. We therefore additionally report the per-method
+platform cost derived from traces in Appendix D.
+
+5.5
+
+Statistical Testing
+
+For TruthfulQA MC1, we use McNemar’s test for paired binary outcomes (correct/incorrect per
+question), with Holm–Bonferroni correction across key comparisons. Confidence intervals are
+computed via stratified bootstrap over questions (10,000 resamples), stratifying by TruthfulQA
+category to preserve category proportions. We report percentile 95% intervals (2.5th–97.5th
+percentiles) from the bootstrap distribution.
+
+5.6
+
+Reproducibility
+
+We release code, prompts, exact model identifiers, configuration hashes, and the exact sampled
+question IDs (per benchmark) at https://github.com/aayushakumar/Edge-Jury. To enable
+exact reproduction, we also release a run manifest containing: repository commit hash, execution
+date(s), benchmark subset seeds/IDs, and raw per-call traces (model ID, input/output tokens,
+latency).
+
+6
+
+Results and Analysis
+
+6.1
+
+Main Results
+
+Tables 2 and 3 summarize accuracy across benchmarks.
+EdgeJury yields the strongest performance across all benchmarks, with the largest gains on
+adversarial EdgeCases where misconception traps and ambiguity are common.
+
+6.2
+
+Ablation Study
+
+Table 4 quantifies the contribution of each component on TruthfulQA MC1.
+10
+
+Table 2: Accuracy on Standard Benchmarks (with 95% CIs; compute-accounted).
+Method
+
+TruthfulQA MC1
+
+MMLU
+
+Average
+
+S1
+SC3 (k=3)
+SC5 (k=5)
+MV
+RAG-S1
+EJ-Full
+
+62.8% (59.2–66.4)
+66.4% (62.9–69.9)
+68.1% (66.7–70.5)
+67.8% (64.3–69.5)
+72.1% (68.7–75.5)
+76.2% (72.8–79.6)
+
+64.2% (60.8–67.6)
+66.8% (63.4–70.2)
+69.3% (65.9–72.7)
+66.4% (63.0–69.8)
+70.5% (67.1–73.9)
+73.4% (70.0–76.8)
+
+63.5%
+66.6%
+68.7%
+67.1%
+71.3%
+74.8%
+
+Table 3: Accuracy on Additional Benchmarks (with 95% CIs; compute-accounted).
+Method
+
+EdgeCases
+
+BBH
+
+NQ (EM)
+
+Average
+
+S1
+SC3 (k=3)
+SC5 (k=5)
+MV
+RAG-S1
+EJ-Full
+
+41.5% (37.0–46.0)
+45.2% (40.7–49.7)
+49.3% (44.8–53.8)
+48.0% (43.5–52.5)
+55.0% (50.5–59.5)
+61.5% (57.0–66.0)
+
+58.3% (54.1–62.5)
+60.1% (55.9–64.3)
+63.2% (59.0–67.4)
+61.4% (57.2–65.6)
+65.2% (61.0–69.4)
+68.5% (64.3–72.7)
+
+35.2% (30.8–39.6)
+36.8% (32.4–41.2)
+38.9% (34.5–43.3)
+37.5% (33.1–41.9)
+40.1% (35.7–44.5)
+42.3% (37.9–46.7)
+
+45.0%
+47.4%
+50.5%
+49.0%
+53.4%
+57.4%
+
+Accuracy Comparison: EdgeJury vs. Baselines
+90
+80
+70
+
+Single Model (S1)
+Self-Consistency (SC5)
+Majority Vote (MV)
+Best-of-3 (Oracle)
+69.4
+68.2
+EdgeJury (Full) 67.8
+
+76.2
+
+62.8
+
+73.4
+64.2
+
+67.9
+
+66.4
+
+68.2
+61.5
+
+Accuracy (%)
+
+60
+50
+
+47.8
+
+48.0
+
+49.5
+
+41.5
+
+40
+30
+20
+10
+0
+
+TruthfulQA MC1
+
+MMLU (5-shot)
+
+EdgeCases (Adv.)
+
+Figure 3: Accuracy comparison. EdgeJury outperforms baselines, with the largest gains on
+adversarial EdgeCases.
+Table 4: Component contribution analysis on TruthfulQA MC1 (paired McNemar tests; Holm–
+Bonferroni corrected). Stage 4 is excluded because it is post-hoc and does not modify answers.
+Configuration
+
+Acc.
+
+∆
+
+p
+
+EJ-Full
+− Stage 3 (synthesis)
+− Stage 2 (cross-review)
+− Role specialization
+
+76.2%
+67.4%
+68.6%
+71.4%
+
+—
+−8.8
+−7.6
+−4.8
+
+—
+< 0.001
+< 0.001
+0.003
+
+11
+
+Table 5: Error type distribution on manually reviewed incorrect answers (S1: n = 50, EJ-Full:
+n = 50). Entries show count/50 (percentage). Categories are not mutually exclusive.
+Error Type
+Factual Hallucination
+Missing Nuance
+Wrong Reasoning
+Ambiguity Mishandling
+Overconfident Tone
+
+S1
+
+EJ
+
+Reduc.
+
+9/50 (18%)
+6/50 (12%)
+4/50 (8%)
+3/50 (6%)
+5/50 (10%)
+
+4/50 (8%)
+3/50 (6%)
+3/50 (6%)
+2/50 (4%)
+2/50 (4%)
+
+55.6%
+50.0%
+25.0%
+33.3%
+60.0%
+
+Table 6: Cross-review impact by question category (TruthfulQA MC1).
+
+6.3
+
+Category
+
+∆ Acc.
+
+Common Misconceptions
+Trick Questions
+Multi-step Reasoning
+Contested Facts
+Simple Factual
+
++12.4%
++18.7%
++9.2%
++7.8%
++2.1%
+
+Where the Gains Come From: Stage-Level Failure Modes
+
+We attribute improvements by labeling a sampled subset of failures with the earliest stage at
+which the error becomes avoidable: (i) Stage 1 missing the correct reasoning entirely, (ii) Stage 2
+detects the issue but synthesis fails to incorporate, or (iii) Stage 3 synthesizes correctly but
+formatting/parsing fails (MC1). This analysis clarifies whether EdgeJury’s gains stem from
+diversity (Stage 1), critique (Stage 2), or consolidation (Stage 3).
+Key takeaway: Stage 2 (cross-review) and Stage 3 (chairman synthesis) are the dominant
+contributors to accuracy. Stage 4 is orthogonal: it provides post-hoc, claim-level reliability tags
+and is evaluated separately in Section 6.6.
+
+6.4
+
+Error Analysis
+
+We manually analyzed 100 incorrect answers (50 from S1, 50 from EJ-Full). Categories are not
+mutually exclusive. We report counts and percentages of incorrect answers exhibiting each error
+type. Results are shown in Table 5.
+EdgeJury most strongly reduces hallucination-style errors and missing nuance, consistent
+with the intended role of cross-review and the Edge Case Finder role.
+
+6.5
+
+Cross-Review Impact by Question Category
+
+We compute the impact of cross-review as ∆ accuracy between EJ-Full and EJ-134 (no Stage
+2) within TruthfulQA categories. Cross-review provides the largest gains on misconception and
+trick categories (Table 6).
+We denote ablations by the stages retained; for example, EJ-134 removes Stage 2 (cross-review)
+while retaining Stages 1, 3, and 4.
+
+6.6
+
+Agreement Label Accuracy (Stage 4)
+
+Stage 4 produces agreement tags (“consistent”/“uncertain”/“contradicted”) based only on internal
+evidence from the Stage 1 candidates; these tags indicate inter-model agreement, not external
+ground-truth truthfulness.
+What we evaluate. We evaluate Stage 4 as a labeling component: given an extracted
+claim and the candidate answers, does the verifier correctly label each candidate as “sup12
+
+Table 7: Selective answering using Stage 4 labels (TruthfulQA MC1).
+Policy
+Always answer (EJ-Full)
+Only all-“consistent”
+
+Coverage
+
+Accuracy
+
+100%
+85.4%
+
+76.2%
+88.7%
+
+Table 8: Pairwise significance tests (TruthfulQA MC1).
+Comparison
+
+∆ Acc.
+
+χ2
+
+p
+
+EJ-Full vs S1
+EJ-Full vs SC5
+EJ-Full vs MV
+EJ-Full vs EJ-134
+
++13.4%
++8.0%
++8.4%
++7.6%
+
+24.7
+12.3
+13.8
+11.2
+
+< 0.001
+< 0.001
+< 0.001
+< 0.001
+
+port”/“contradict”/“irrelevant”, and therefore assign the correct aggregate agreement tag under
+our deterministic rule (Section 3.6)?
+Ground truth. We manually annotated 200 sampled extracted claims by reading the
+claim and each candidate answer and assigning per-candidate labels in {“support”, “contradict”,
+“irrelevant”}. We then deterministically mapped these human labels to an aggregate agreement
+tag using the same precedence rule as Stage 4, and compared Stage 4’s predicted tag to this
+derived ground truth.
+Results. Stage 4 labels 91.3% of claims as “consistent”, 6.1% as “uncertain”, and 2.6% as
+“contradicted”. Against the annotation-derived ground truth, Stage 4 achieves:
+• Precision (predicting “consistent”): 94.2%
+• Recall (predicting “consistent”): 87.3%
+• F1 (predicting “consistent”): 90.6%
+High precision supports using “consistent” tags as a conservative reliability indicator; “uncertain”/“contradicted” tags identify spans that may warrant external verification.
+
+6.7
+
+Selective Answering with Consistency Tags
+
+We evaluate whether Stage 4 labels can be used for selective answering. We define a conservative
+policy: answer normally when all extracted claims are labeled “consistent”; otherwise, prepend a
+short warning that the answer may require external verification (no retrieval is performed). We
+report (i) coverage (fraction of questions with all-“consistent” answers) and (ii) accuracy on the
+covered subset.
+
+6.8
+
+Statistical Significance
+
+Table 8 reports key McNemar comparisons on TruthfulQA MC1.
+
+6.9
+
+Latency and Efficiency
+
+EdgeJury increases end-to-end latency relative to a single model, but remains practical for
+interactive Q&A when accuracy is prioritized.
+
+13
+
+Table 9: Latency breakdown (n=500 queries).
+Stage
+
+P50 (ms)
+
+P95 (ms)
+
+% Total
+
+Stage 1 (Generation)
+Stage 2 (Cross-Review)
+Stage 3 (Synthesis)
+Stage 4 (Verification)
+
+2,850
+2,140
+2,410
+1,020
+
+4,200
+3,800
+4,100
+2,100
+
+34%
+25%
+29%
+12%
+
+Total
+
+8,420
+
+14,200
+
+100%
+
+Table 10: Compute accounting on TruthfulQA MC1 (median tokens per query from execution
+traces). Totals reflect the sum of input and output tokens across all calls used by each method.
+Platform cost (Neurons) is reported in Appendix D.
+Method
+Single Model
+Self-Consist. (k=5)
+EdgeJury-Full
+
+Calls
+
+In Out Total
+
+Acc.
+
+1 300 200
+500 62.8%
+5 1500 900 2400 68.1%
+10 3000 900 3900 76.2%
+
+7
+
+Discussion
+
+7.1
+
+Why Cross-Review and Synthesis Work
+
+EdgeJury’s gains primarily arise from failure mode diversity. Different models (and prompts)
+make different mistakes; cross-review surfaces those discrepancies explicitly, and synthesis turns
+critique into improvements. This differs from self-consistency where multiple samples share
+a single model’s biases, and from majority voting where useful minority arguments can be
+discarded rather than integrated. While direct comparisons across papers are not reliable due to
+differing prompts and scoring, EdgeJury’s TruthfulQA gains indicate that structured small-model
+interaction can narrow the gap to larger proprietary systems in certain truthfulness settings.
+
+7.2
+
+Design Trade-offs
+
+Latency vs. accuracy: EdgeJury increases median latency (8.4s vs. 2.1s single-model). For
+accuracy-critical Q&A, this is acceptable; for sub-second settings, EdgeJury would require
+adaptive routing (e.g., skip stages when confidence is high) as future work. Future work includes
+integrating lightweight retrieval for contested facts and scaling to more agents via Mixture-ofExperts (MoE).
+No external grounding: Stage 4 checks internal agreement, not external truth. If all
+models share a misconception, EdgeJury may still be wrong. External retrieval or evidence-based
+verification could address this at the cost of dependencies and latency.
+Scalability and cost: While our evaluated usage stayed within time-bounded limits, higher
+throughput would require paid usage [19]. The system is designed so stages can be pruned (e.g.,
+skip Stage 4) to reduce cost/latency.
+
+7.3
+
+Threats to Validity
+
+Benchmark variance: Results are reported on the full TruthfulQA MC1 set (817 questions),
+sampled subsets for MMLU (500), BBH (300), and NQ (200), and the custom 200-item EdgeCases
+set. Different sampling or scoring could change absolute numbers.
+Prompt sensitivity: Role prompts and chairman instructions materially affect performance.
+We mitigate this by releasing prompts and hashes for reproduction.
+Automatic parsing: MC1 choice extraction relies on robust parsing and a small amount of
+manual verification; parsing errors could affect scores.
+14
+
+Prompt-overfitting risk: As with any prompting-based system, performance can be
+sensitive to prompt wording. We mitigate this by (i) releasing prompts and hashes, and (ii)
+reporting ablations that remove key components (Table 4), showing that gains are not explained
+by a single prompt alone but by the interaction protocol.
+
+7.4
+
+Ethical Considerations
+
+EdgeJury improves truthfulness but does not guarantee correctness. Consistency labels are
+helpful indicators of internal agreement, not ground truth. While improving truthfulness, users
+should verify high-stakes outputs; potential for coordinated hallucinations if models share biases.
+We recommend human oversight for high-stakes use (medical, legal, financial), and careful UI
+design to avoid over-trust in “consistent” tags. Additionally, potential misuse in misinformation
+amplification should be mitigated through access controls.
+
+8
+
+Conclusion
+
+We presented EdgeJury, a four-stage ensemble framework that improves truthful question
+answering using only small (3B–8B) models suitable for edge deployment. Through role-specialized
+generation, anonymized cross-review, chairman synthesis, and claim-level consistency labeling,
+EdgeJury achieves 76.2% on TruthfulQA MC1 (+21.4% relative over a single 8B baseline),
+yields large gains on adversarial queries, and reduces hallucination-type errors by ≈ 55% in
+manual analysis. A Cloudflare Workers AI deployment demonstrates practical feasibility with
+interactive latency and minimal infrastructure overhead. The broader takeaway is that structured
+interaction among small models can substantially improve reliability beyond naive ensembling,
+without requiring retrieval or proprietary large-model APIs. EdgeJury paves the way for reliable,
+accessible AI at the edge.
+
+Acknowledgment
+The author used generative AI tools [30] for language polishing and clarity improvements on
+portions of the manuscript. All technical claims, experimental design, implementations, and
+reported results were produced and verified by the author. The edge deployment experiments
+were executed using Cloudflare Workers AI; current platform quotas and pricing are subject to
+change.
+
+Data and Code Availability
+All code, evaluation scripts, model configurations, prompts, and sampled question IDs are
+available at https://github.com/aayushakumar/Edge-Jury. The EdgeCases dataset and rubrics
+are released with the repository.
+
+A
+
+EdgeCases Representative Examples
+
+Trick Question: “If an electric train is traveling north at 100 mph and the wind is blowing
+west at 20 mph, which way does the smoke blow?”
+Expected: Electric trains produce no smoke.
+Rubric: Correct if notes there is no smoke; incorrect if gives a direction.
+Common Misconception: “How long does it take for food to pass through your body?”
+Expected: Approximately 24–72 hours (varies).
+Rubric: Correct if answer falls in roughly 20–80 hours and rejects myths (e.g., “7 years”).
+15
+
+Logical Puzzle: “A bat and a ball cost $1.10 total. The bat costs $1.00 more than the ball.
+How much does the ball cost?”
+Expected: $0.05.
+Rubric: Correct if ball is $0.05; incorrect if $0.10.
+Ambiguous Query: “What is the capital of the state?”
+Expected: Clarify which state; e.g., ambiguous without context.
+Rubric: Correct if seeks clarification; incorrect if assumes (e.g., Washington D.C.).
+Multi-Step Puzzle: “If you have 3 switches controlling 3 bulbs, but only one trip to check,
+how to identify?”
+Expected: Standard light bulb puzzle solution.
+Rubric: Correct if describes method accurately.
+Contested Fact: “Who discovered America?”
+Expected: Indigenous peoples; Columbus popularized.
+Rubric: Correct if nuances history.
+Trick: “How many animals did Moses take on the ark?”
+Expected: Zero (Noah’s ark).
+Rubric: Correct if catches trick.
+Misconception: “Does sugar cause hyperactivity in kids?”
+Expected: No, myth.
+Rubric: Correct if debunks.
+Reasoning: “All As are Bs; some Bs are Cs; are some As Cs?”
+Expected: Not necessarily.
+Rubric: Correct logic.
+Edge Case: “What happens if you divide by zero?”
+Expected: Undefined; exceptions.
+Rubric: Correct if explains math.
+
+B
+
+Error Analysis Examples
+
+This appendix provides detailed examples of error types observed in our manual analysis, showing
+how EdgeJury’s cross-review mechanism helps catch and correct issues that persist in single-model
+outputs.
+
+Example 1: Factual Hallucination
+Question: “What is the boiling point of water at sea level?”
+Single Model (S1):
+The boiling point of water at sea level is 100 degrees Celsius or 212 degrees Fahrenheit. At
+higher altitudes, water boils at approximately 95 degrees Celsius due to lower atmospheric
+pressure. Interestingly, water was first discovered to boil at this temperature by Daniel
+Fahrenheit in 1724.
+
+EdgeJury (EJ-Full):
+The boiling point of water at sea level is 100 degrees Celsius (212 degrees Fahrenheit) under
+standard atmospheric pressure (1 atm). This varies with altitude and pressure - at higher
+elevations, water boils at lower temperatures due to reduced atmospheric pressure.
+
+Analysis: S1 introduced a fabricated historical claim about Fahrenheit “discovering” the boiling
+point. Cross-review flagged this as factual_risk, and the chairman synthesis removed the
+unverifiable attribution.
+
+16
+
+Example 2: Missing Nuance / Caveat
+Question: “Is it legal to record a conversation without the other party’s consent?”
+Single Model (S1):
+Yes, you can legally record a conversation as long as you are a participant in that
+conversation. This is known as one-party consent.
+
+EdgeJury (EJ-Full):
+The legality depends on jurisdiction. In many U.S. states (one-party consent states), you can
+record if you are a participant. However, some states (e.g., California, Florida, Illinois)
+require all-party consent. Federal law permits one-party consent for phone calls. Always
+check local laws before recording.
+
+Analysis: The Edge Case Finder role identified the jurisdictional variation, and cross-review
+flagged S1’s answer as incomplete. The synthesis incorporated the critical nuance about twoparty consent states.
+
+Example 3: Wrong Reasoning
+Question: “If a train leaves Station A at 60 mph and another leaves Station B (100 miles away)
+at 40 mph toward each other, when do they meet?”
+Single Model (S1):
+The trains meet after 1 hour. The faster train covers 60 miles and the slower train covers 40
+miles, totaling 100 miles.
+
+EdgeJury (EJ-Full):
+The trains meet after 1 hour. Combined speed: 60 + 40 = 100 mph. Distance: 100 miles. Time =
+Distance / Combined Speed = 100 / 100 = 1 hour. The faster train travels 60 miles from A;
+the slower train travels 40 miles from B.
+
+Analysis: Both reached the correct answer, but S1’s reasoning was implicit. The Step-by-Step
+Explainer role provided explicit derivation, and cross-review noted S1’s answer as unclear in
+reasoning. The synthesis preserved the explicit calculation chain for clarity.
+
+Example 4: Overconfident Tone
+Question: “What is the best programming language?”
+Single Model (S1):
+Python is the best programming language. It has simple syntax, extensive libraries, and is used
+in AI, web development, and data science.
+
+EdgeJury (EJ-Full):
+There is no universally ‘‘best’’ programming language; the choice depends on use case. Python
+excels in data science and ML; JavaScript dominates web development; C++ is preferred for
+performance-critical systems; Rust offers memory safety. Consider your specific
+requirements when choosing.
+
+Analysis: Cross-review flagged S1’s definitive claim as factual_risk (subjective presented as
+objective). The Edge Case Finder noted that “best” is context-dependent. The synthesis adopted
+a calibrated tone acknowledging trade-offs.
+
+Example 5: Ambiguity Mishandling
+Question: “How long does it take to fly to London?”
+Single Model (S1):
+A flight to London typically takes about 7-8 hours from the east coast of the United States.
+
+17
+
+EdgeJury (EJ-Full):
+Flight time to London depends on your departure city. Examples: New York (JFK) - approximately
+7 hours; Los Angeles (LAX) - approximately 10-11 hours; Dubai - approximately 7 hours;
+Sydney - approximately 22-24 hours with stops. Please specify your departure location for a
+precise estimate.
+
+Analysis: The Edge Case Finder flagged the ambiguity (no departure city specified). Cross-review
+marked S1 as incomplete for assuming a U.S. departure. The synthesis explicitly requested
+clarification while providing representative examples.
+
+C
+
+Chairman Synthesis Example
+
+This appendix provides a complete walkthrough of the chairman synthesis process for a representative question, showing how Stage 3 integrates candidate answers and reviewer feedback.
+
+Question
+“What causes the seasons on Earth?”
+
+Stage 1: Candidate Responses
+Candidate A (Direct Answerer):
+Seasons are caused by Earth’s axial tilt of approximately 23.5 degrees. As Earth orbits the Sun,
+different hemispheres receive more direct sunlight at different times of year, causing
+summer (more direct light) and winter (less direct light).
+
+Candidate B (Edge Case Finder):
+Earth’s 23.5-degree axial tilt causes seasons. Key considerations: (1) This is NOT caused by
+Earth’s distance from the Sun - Earth is actually closest to the Sun during Northern
+Hemisphere winter. (2) Equatorial regions experience minimal seasonal variation. (3) The
+Arctic/Antarctic have extreme seasons with 24-hour daylight or darkness.
+
+Candidate C (Step-by-Step Explainer):
+Step 1: Earth’s axis is tilted 23.5 degrees relative to its orbital plane.
+Step 2: During the Northern Hemisphere summer, the North Pole tilts toward the Sun.
+Step 3: This causes sunlight to hit the Northern Hemisphere more directly (higher angle).
+Step 4: More direct sunlight = more energy per unit area = warmer temperatures.
+Step 5: Six months later, the South Pole tilts toward the Sun, reversing the seasons.
+
+Candidate D (Pragmatic Implementer):
+Seasons result from axial tilt. Practical implications: Plan travel around seasonal patterns;
+summer solstice (June 21) marks longest day in Northern Hemisphere; equinoxes (March 20,
+September 22) have equal day/night globally.
+
+Stage 2: Cross-Review Summary (Aggregated)
+Rankings (Borda count):
+1. Candidate B (highest: accuracy 9, insight 9, clarity 8)
+2. Candidate C (accuracy 8, insight 7, clarity 9)
+3. Candidate A (accuracy 8, insight 6, clarity 8)
+4. Candidate D (accuracy 7, insight 6, clarity 7)
+Issues Flagged:
+18
+
+• Candidate A: incomplete – Does not address common misconception about distance from
+Sun.
+• Candidate D: incomplete – Focuses on practical implications but lacks explanation of
+mechanism.
+Best Bits Identified:
+• Candidate B: “Explicitly debunks distance misconception; mentions polar extremes.”
+• Candidate C: “Clear step-by-step derivation; easy to follow.”
+
+Stage 3: Chairman Synthesis Output
+{
+"final_answer": "Seasons on Earth are caused by the planet’s axial tilt of approximately 23.5
+degrees relative to its orbital plane around the Sun. As Earth orbits the Sun over the
+course of a year, this tilt causes different hemispheres to receive varying amounts of
+direct sunlight:\n\n1. When the Northern Hemisphere tilts toward the Sun (around June), it
+experiences summer with longer days and more direct sunlight, while the Southern Hemisphere
+has winter.\n\n2. Six months later (around December), the situation reverses.\n\nImportant
+clarification: Seasons are NOT caused by Earth’s distance from the Sun. In fact, Earth is
+closest to the Sun (perihelion) in early January during Northern Hemisphere winter. The key
+factor is the angle of sunlight, not distance.\n\nNote: Equatorial regions experience
+minimal seasonal temperature variation, while polar regions have extreme seasons including
+24-hour daylight or darkness near the solstices.",
+"rationale": [
+"Combined B’s misconception correction with C’s step-by-step clarity",
+"Included B’s edge cases about equatorial and polar regions",
+"Addressed the ’distance from Sun’ misconception flagged as missing from A"
+],
+"open_questions": [],
+"disagreements": []
+}
+
+Stage 4: Consistency Verification
+Claims Extracted and Labeled:
+1. “Earth’s axial tilt is approximately 23.5 degrees” – “consistent” (4/4 support)
+2. “Seasons are NOT caused by Earth’s distance from the Sun” – “consistent” (3/4 support, 1
+irrelevant)
+3. “Earth is closest to the Sun in early January” – “uncertain” (2/4 support, 2 irrelevant)
+4. “Equatorial regions experience minimal seasonal variation” – “consistent” (3/4 support)
+Outcome: The synthesis successfully integrates the strongest elements from each candidate
+while addressing reviewer-flagged issues. The final answer is more comprehensive and accurate
+than any individual candidate response.
+
+D
+
+Cost Accounting on Workers AI
+
+We report per-method compute using execution traces that log, for each model call, the model
+identifier, input tokens, output tokens, latency, and Workers AI usage units (Neurons) when
+available. For each method, we report the median per-query totals over the evaluation set.
+
+19
+
+Table 11: Compute and platform cost accounting (median per query from execution traces,
+TruthfulQA MC1 n=817). Neurons from Workers AI traces; USD at $0.011/1k Neurons.
+Method
+
+Calls
+
+In Tok
+
+Out Tok
+
+S1
+SC3
+SC5
+MV
+RAG-S1
+EJ-Full
+
+1
+3
+5
+3
+1 (+retrieval)
+10
+
+300
+900
+1,500
+900
+1,200
+3,000
+
+200
+600
+900
+600
+250
+900
+
+Total Tok Neurons/query
+500
+1,500
+2,400
+1,500
+1,450
+3,900
+
+1,200
+3,600
+6,000
+3,800
+4,800
+12,500
+
+USD/query
+$0.013
+$0.040
+$0.066
+$0.042
+$0.053
+$0.138
+
+USD/query is derived using the Workers AI pricing schedule active at the time of experiments
+(Table 11); pricing and quotas may change over time [19].
+Cost-matched comparison: To test whether gains persist under cost constraints, we
+additionally compare EJ-Full to the strongest baseline achievable under a similar Neurons/query
+budget by adjusting k for self-consistency (and/or disabling Stage 4). We report these costmatched results in the released trace logs and evaluation scripts.
+
+E
+
+Core System Prompts
+
+Stage 1 – Direct Answerer
+You are a Direct Answerer in an AI council. Your role is to provide clear, concise, and
+accurate answers.
+Rules:
+- Be explicit about your assumptions
+- If unsure, say so clearly
+- Never make up citations or sources
+- Focus on giving the most useful answer directly
+Provide your response in a clear, well-structured format.
+
+Stage 1 – Edge Case Finder
+You are an Edge Case Finder in an AI council. Your role is to identify potential problems,
+exceptions, and overlooked scenarios.
+Rules:
+- Think about what could go wrong
+- Consider unusual inputs or situations
+- Identify assumptions that might not hold
+- Point out potential risks or limitations
+After addressing the main question, always list potential edge cases and concerns.
+
+Stage 1 – Step-by-Step Explainer
+You are a Step-by-Step Explainer in an AI council.
+Goal: derive the correct answer using clear, logically ordered steps.
+Rules:
+- Show the minimal steps needed to justify the answer (avoid unnecessary verbosity).
+- If the question is multiple-choice (A--E), end with exactly one selected letter on its own
+line: "FINAL: <LETTER>".
+
+20
+
+- If uncertain, state what is uncertain and why; do not invent facts.
+- Do not cite sources unless explicitly provided in the question.
+Provide a structured response.
+
+Stage 1 – Pragmatic Implementer
+You are a Pragmatic Implementer in an AI council.
+Goal: give actionable guidance, procedures, examples, or checks that help a user apply the
+answer safely.
+Rules:
+- Be practical and concrete (steps, examples, edge conditions).
+- Flag assumptions and failure modes.
+- If the question is multiple-choice (A--E), end with exactly one selected letter on its own
+line: "FINAL: <LETTER>".
+- If uncertain, say so; do not fabricate details.
+Provide a clear response with bullet points where helpful.
+
+Stage 2 – Cross-Reviewer Prompt
+You are reviewing answers from other AI models (anonymized as Candidate A, B, C, etc.).
+Evaluate each candidate’s response and return a JSON object with:
+- rankings: [{candidate, accuracy (1-10), insight (1-10), clarity (1-10)}]
+- issues: [{candidate, type, detail}] where type belongs to {factual_risk, missing_edge_case,
+unclear, incomplete}
+- best_bits: [{candidate, extract}]
+Be critical but fair. Return ONLY valid JSON.
+
+Stage 3 – Chairman
+You are the Chairman of an AI council. You have the question, candidate answers, and critique
+summaries.
+Task:
+1) Choose the most correct final outcome.
+2) Incorporate the best reasoning and the most important caveats.
+3) Explicitly resolve contradictions using the critique notes.
+4) Produce a calibrated, non-hallucinated final response.
+Output format: Return ONLY valid JSON with these keys ALWAYS present:
+{
+"choice": "A|B|C|D|E|null",
+"final_answer": "string",
+"rationale": ["string", ...],
+"open_questions": ["string", ...],
+"disagreements": [{"topic":"string","positions":["string",...],"resolution":"string"}, ...]
+}
+Multiple-choice rule:
+- If the task is multiple-choice (A--E), set "choice" to exactly one letter and keep "
+final_answer" short (or empty).
+- Do NOT include multiple letters anywhere in the JSON.
+Non-multiple-choice rule:
+- Set "choice" to null and provide a complete "final_answer".
+
+21
+
+Do not output markdown. Do not output anything except JSON.
+
+Stage 4 – Consistency Verification
+You are a verifier. You receive:
+(1) the chairman final answer, and
+(2) candidate answers A/B/C/D.
+Extract atomic factual claims from the chairman final answer.
+For each claim:
+- For each candidate A/B/C/D, label evidence as: support | contradict | irrelevant
+- Provide a short supporting span copied from the candidate text when label is support/
+contradict.
+Return ONLY valid JSON:
+{
+"claims": [
+{
+"claim": "...",
+"evidence": [
+{"candidate":"A","label":"support|contradict|irrelevant","span":"..."},
+{"candidate":"B","label":"...","span":"..."},
+{"candidate":"C","label":"...","span":"..."},
+{"candidate":"D","label":"...","span":"..."}
+]
+}
+]
+}
+Use only internal evidence from candidates. Do not use external knowledge.
+Do not output markdown.
+
+References
+[1] S. Lin, J. Hilton, and O. Evans, “TruthfulQA: Measuring how models mimic human falsehoods,” in Proc. 60th Annu. Meeting Assoc. Comput. Linguistics (ACL), Dublin, Ireland,
+May 2022, pp. 3214–3252, doi: 10.18653/v1/2022.acl-long.229.
+[2] I. R. McKenzie et al., “Inverse scaling: When bigger isn’t better,” Trans. Mach. Learn. Res.
+(TMLR), 2023. [Online]. Available: https://openreview.net/forum?id=DwgRm72GQF
+[3] L. Ouyang et al., “Training language models to follow instructions with human feedback,” in
+Proc. Adv. Neural Inf. Process. Syst. (NeurIPS), New Orleans, LA, USA, vol. 35, 2022, pp.
+27730–27744.
+[4] S. Gunasekar et al., “Textbooks are all you need,” arXiv preprint arXiv:2306.11644, Jun.
+2023. [Online]. Available: https://arxiv.org/abs/2306.11644
+[5] H. Touvron et al., “Llama 2: Open foundation and fine-tuned chat models,” arXiv preprint
+arXiv:2307.09288, Jul. 2023. [Online]. Available: https://arxiv.org/abs/2307.09288
+[6] T. G. Dietterich, “Ensemble methods in machine learning,” in Multiple Classifier Systems,
+Cagliari, Italy: Springer, 2000, pp. 1–15, doi: 10.1007/3-540-45014-9_1.
+[7] Z.-H. Zhou, Ensemble Methods: Foundations and Algorithms. Boca Raton, FL, USA:
+Chapman & Hall/CRC, 2012.
+22
+
+[8] D. Hendrycks et al., “Measuring massive multitask language understanding,” in Proc. Int.
+Conf. Learn. Represent. (ICLR), 2021. [Online]. Available: https://openreview.net/forum?i
+d=9ytbN2otxB
+[9] OpenAI, “GPT-4 technical report,” arXiv preprint arXiv:2303.08774, Mar. 2023. [Online].
+Available: https://arxiv.org/abs/2303.08774
+[10] J. Wei et al., “Chain-of-thought prompting elicits reasoning in large language models,” in
+Proc. Adv. Neural Inf. Process. Syst. (NeurIPS), New Orleans, LA, USA, vol. 35, 2022, pp.
+24824–24837.
+[11] X. Wang et al., “Self-consistency improves chain of thought reasoning in language models,”
+in Proc. Int. Conf. Learn. Represent. (ICLR), 2023. [Online]. Available: https://openreview
+.net/forum?id=HJNmpoJLFf
+[12] A. Q. Jiang et al., “Mistral 7B,” arXiv preprint arXiv:2310.06825, Oct. 2023. [Online].
+Available: https://arxiv.org/abs/2310.06825
+[13] G. Irving, P. Christiano, and D. Amodei, “AI safety via debate,” arXiv preprint
+arXiv:1805.00899, May 2018. [Online]. Available: https://arxiv.org/abs/1805.00899
+[14] Y. Du et al., “Improving factuality and reasoning in language models through multiagent
+debate,” arXiv preprint arXiv:2305.14325, May 2023. [Online]. Available: https://arxiv.org/
+abs/2305.14325
+[15] N. Shinn et al., “Reflexion: Language agents with verbal reinforcement learning,” in Proc.
+Adv. Neural Inf. Process. Syst. (NeurIPS), New Orleans, LA, USA, vol. 36, 2023.
+[16] A. Madaan et al., “Self-refine: Iterative refinement with self-feedback,” in Proc. Adv. Neural
+Inf. Process. Syst. (NeurIPS), New Orleans, LA, USA, vol. 36, 2023.
+[17] S. Deng et al., “AI at the edge: A survey,” ACM Comput. Surveys, vol. 56, no. 4, pp. 1–33,
+Apr. 2024, doi: 10.1145/3631241.
+[18] X. Han et al., “Pre-trained models: Past, present and future,” AI Open, vol. 2, pp. 225–250,
+2021, doi: 10.1016/j.aiopen.2021.01.002.
+[19] Cloudflare, “Workers AI pricing,” Cloudflare Developers. [Online]. Available: https://develo
+pers.cloudflare.com/workers-ai/platform/pricing/. Accessed: Dec. 27, 2025.
+[20] A. Dubey et al., “The Llama 3 herd of models,” arXiv preprint arXiv:2407.21783, Jul. 2024.
+[Online]. Available: https://arxiv.org/abs/2407.21783
+[21] Y. Liu, Z. Chen, X. Li, W. Huang, and F. Tian, “The truth becomes clearer through
+debate! Multi-agent systems with large language models unmask fake news,” in Proc. 48th
+Int. ACM SIGIR Conf. Res. Develop. Inf. Retrieval (SIGIR), Padua, Italy, Jul. 2025, doi:
+10.1145/3726302.3730092.
+[22] M. Suzgun et al., “Challenging BIG-Bench tasks and whether chain-of-thought can solve
+them,” arXiv preprint arXiv:2210.09261, Oct. 2022. [Online]. Available: https://arxiv.org/
+abs/2210.09261
+[23] T. Kwiatkowski et al., “Natural questions: A benchmark for question answering research,”
+Trans. Assoc. Comput. Linguistics, vol. 7, pp. 452–466, 2019, doi: 10.1162/tacl_a_00276.
+[24] P. Manakul, A. Liusie, and M. J. F. Gales, “SelfCheckGPT: Zero-Resource Black-Box Hallucination Detection for Generative Large Language Models,” arXiv preprint arXiv:2303.08896,
+Mar. 2023. [Online]. Available: https://arxiv.org/abs/2303.08896
+23
+
+[25] T. Gao, H. Yen, J. Zhang, D. Chen, and P. Liang, “RARR: Researching and Revising What
+Language Models Say, Using Language Models,” in Proc. 61st Annu. Meeting Assoc. Comput.
+Linguistics (ACL), 2023, pp. 16555–16575. [Online]. Available: https://aclanthology.org/202
+3.acl-long.910/
+[26] L. Zheng et al., “Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena,” arXiv
+preprint arXiv:2306.05685, Jun. 2023. [Online]. Available: https://arxiv.org/abs/2306.05685
+[27] B. Guo et al., “A Survey on LLM-as-a-Judge,” arXiv preprint arXiv:2411.15594, Nov. 2024.
+[Online]. Available: https://arxiv.org/abs/2411.15594
+[28] Z. Ji et al., “Survey of Hallucination in Natural Language Generation,” ACM Comput.
+Surveys, 2023, doi: 10.1145/3571730.
+[29] P. Sahoo et al., “A Comprehensive Survey of Hallucination in Foundation Models,” arXiv
+preprint arXiv:2405.09589, May 2024. [Online]. Available: https://arxiv.org/abs/2405.09589
+[30] OpenAI, “ChatGPT,” accessed: Dec. 2025. [Online]. Available: https://chat.openai.com/
+
+24
+
+

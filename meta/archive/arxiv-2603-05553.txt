@@ -1,0 +1,1583 @@
+EigenData: A Self-Evolving Multi-Agent Platform for
+Function-Calling Data Synthesis, Auditing, and Repair
+
+Jiaao Chen
+
+Jingyuan Qi
+
+Mingye Gao
+
+Wei-Chen Wang
+
+Hanrui Wang
+
+Di Jin∗
+
+arXiv:2603.05553v1 [cs.SE] 5 Mar 2026
+
+Eigen AI
+
+Abstract
+Function-calling agents—large language models that invoke tools and APIs—
+require high-quality, domain-specific training data spanning executable environments, backing databases, and diverse multi-turn trajectories. We introduce EigenData, an integrated, self-evolving platform that automates the full data lifecycle
+through a multi-agent architecture. A top-level orchestrator, EigenCore, coordinates three specialized sub-systems: DatabaseAgent for realistic domain database
+construction, CodingAgent for verified executable environment generation with
+iterative test-debug loops, and DataAgent for multi-turn trajectory synthesis with
+self-evolving prompt optimization. Cross-component feedback ensures consistency
+across all artifacts. We apply EigenData to audit and repair the Berkeley FunctionCalling Leaderboard (BFCL-V3), identifying systematic errors in function schemas,
+implementations, and reference trajectories, automatically correcting them through
+coordinated schema refinement, code-level bug fixes, and trajectory modification,
+and introducing an outcome-aware evaluation protocol that assesses task success
+via database-state correctness rather than turn-level trajectory matching. We demonstrate that the repaired benchmark, coupled with outcome-aware metrics, produces
+model rankings substantially better correlated with human judgments of functional
+correctness.
+
+1
+
+Introduction
+
+Function-calling agents—LLMs that can invoke tools and APIs—are rapidly becoming a universal abstraction to automate workflows across domains such as travel booking, customer support,
+logistics, and enterprise operations [1; 2; 3; 4; 5; 6; 7; 8; 9]. In realistic deployments, achieving
+high performance requires in-domain post-training on representative trajectories—whether through
+supervised fine-tuning (SFT) [10; 11; 12; 13] or reinforcement learning (RL) with outcome-based
+rewards [14; 15; 11; 16; 17]. In these settings, data and evaluation are the primary bottlenecks [18]:
+models cannot be meaningfully improved beyond the quality, coverage, and faithfulness of the
+datasets and metrics used to train and assess them.
+Today, most high-quality function-calling agent data still depend on human annotation [1; 3]. Annotators must understand domain-specific schemas, reason about multi-step tool use, and maintain
+global consistency across complex tasks. This process is slow and expensive; as we push for more
+realistic and diverse scenarios, we face a sharp tradeoff between quality and scale under limited time
+and budget. Meanwhile, real-world interaction logs are noisy and incomplete, making them difficult
+to convert into clean training signal. As a result, even widely used benchmarks and training corpora
+often contain schema inconsistencies, ambiguous user intents, and labels that do not faithfully capture
+task success [19; 20; 21].
+To mitigate annotation costs, several works have turned to rule-based or scripted synthetic data
+generation, including function-calling benchmarks such as BFCL [22; 23] and TOUCAN [24], as
+∗
+
+Correspondence to Di Jin (di@eigenai.com).
+
+well as automated pipelines like ToolACE [25]. These pipelines can produce large amounts of data,
+but they are brittle. In practice, they often exhibit (i) schema bugs, where function definitions or
+implementations are incorrect or inconsistent; (ii) ambiguous or underspecified user intents, where
+multiple outcomes are plausible but only one is labeled ; and (iii) weak evaluation metrics, typically
+based on turn-level function-call matching rather than on the actual consequences of agent actions.
+Such issues can both mislead model selection and obscure genuine progress: an agent may achieve
+high function-match scores while failing to produce the correct database state or to satisfy user goals.
+We argue that closing this gap requires not merely better data generators, but an end-to-end infrastructure that can synthesize entire training environments—including executable tool implementations,
+backing databases, and diverse multi-turn trajectories—while also auditing, repairing, and iteratively
+refining existing datasets and evaluation protocols. To this end, we introduce EigenData, an integrated, self-evolving platform for function-calling data that spans the full lifecycle from environment
+construction to trajectory generation and quality assurance.
+At its core, EigenData is coordinated by EigenCore, a top-level orchestration module that receives
+human requests—ranging from “generate training data for a hotel-booking agent” to “audit the BFCL
+benchmark”—and decomposes them into sub-tasks dispatched to three specialized sub-systems:
+• DatabaseAgent constructs the domain databases that underpin tool-use environments (Section 3.2). Given a domain specification (e.g., schema descriptions, sample constraints,
+or natural-language requirements), it generates realistic, internally consistent database
+instances—including relational tables, JSON stores, or key-value structures—that serve as
+the ground-truth state against which agent trajectories are evaluated.
+• CodingAgent produces the executable code layer: environment implementations (e.g.,
+Python simulation environments, REST APIs, or MCP servers) that expose tool interfaces
+backed by the generated databases, as well as auxiliary scripts such as format-conversion utilities and evaluation harnesses (Section 3.3). CodingAgent employs a multi-agent, iterative
+test-debug workflow—generating code, synthesizing unit and integration tests, and invoking
+a judge-based refinement loop—to ensure that every produced artifact is functionally correct
+before it enters the data pipeline.
+• DataAgent is the multi-agent data-generation engine described in detail in Section 3.4.
+Operating on the environments and databases produced by the preceding sub-systems, it
+orchestrates a hierarchy of specialized worker agents to synthesize, evaluate, and iteratively
+refine high-quality multi-turn function-calling trajectories for both SFT and RL.
+A complete generation workflow from scratch proceeds as follows: the DatabaseAgent first constructs
+the domain database; the CodingAgent then generates the executable environment that exposes tool
+APIs backed by that database; and finally, the DataAgent uses both artifacts to produce diverse, verified
+training trajectories. EigenCore manages this pipeline end to end, handling dependency resolution,
+cross-component consistency checks, and iterative feedback among sub-systems. Importantly, each
+sub-system can also be invoked independently—for instance, the DataAgent alone can audit and
+repair an existing benchmark that already provides environments and databases, which is the focus of
+the case study in this paper.
+In this paper, we present the full EigenData architecture and instantiate it on the BFCL-V3 functioncalling benchmark, with a focus on benchmark auditing, repair, and extension that demonstrates
+the DataAgent sub-system in coordination with the CodingAgent and DatabaseAgent.2 Specifically,
+we use EigenData to (1) systematically audit and categorize errors in function schemas, implementations, reference trajectories, and user intents; and (2) repair these errors and disambiguate
+intents. In parallel, we introduce an outcome-aware evaluation protocol—inspired by Tau-style
+benchmarks [1]—that goes beyond turn-level function matching to explicitly assess whether (i) the
+predicted database changes match ground truth, (ii) key functions have been correctly invoked, and
+(iii) critical information has been correctly handled and conveyed. We show that this repaired and
+extended benchmark, coupled with outcome-based metrics, reveals qualitatively different failure
+modes and leads to substantially different model rankings than the original BFCL-V3 evaluation.
+To make EigenData accessible to practitioners, we have released a command-line interface (CLI) that
+exposes the platform’s core capabilities—including data generation, schema refinement, auditing,
+2
+
+Corrected BFCL-V3 is stored at: https://github.com/eigen-ai-labs/eigendata-corrected-bfcl-v3
+
+2
+
+and repair—through a unified, scriptable workflow. The CLI and its documentation are available at:
+https://docs.eigenai.com/products/eigendata-cli/intro.
+
+2
+
+Related Work
+
+Function-Calling Benchmarks and Synthetic Data. The rapid growth of tool-augmented LLMs
+has spurred a wave of benchmarks: BFCL [22; 23] evaluates single- and multi-turn function calling, AgentBench [26] provides eight agent evaluation environments, and domain-specific suites
+such as WebArena [7], SWE-bench [27], τ 2 -Bench [1], and Tool Decathlon [2] target web navigation, software engineering, conversational agents, and long-horizon tasks, respectively. To address
+the cost of human annotation, several pipelines automate function-calling data production: APIGen [13] and APIGen-MT [12] generate verifiable datasets through simulated agent–human interplay;
+ToolACE [25] uses tool self-evolution to synthesize diverse APIs; TOUCAN [24] scales to 1.5M
+trajectories from real-world MCP environments; and MAG-V [28] applies multi-agent generation
+with verification. While effective at scale, these pipelines typically operate as fixed, linear workflows without the iterative self-correction, cross-component feedback, or end-to-end environment
+construction (databases, code, trajectories) that EigenData provides.
+Multi-Agent Systems for Code Generation and Evaluation. Multi-agent architectures have
+shown promise for complex software tasks: ChatDev [29] models software development as multirole conversation, AgentCoder [30] combines programmer, test designer, and executor agents with
+iterative refinement, and MASLab [8] provides a unified codebase for LLM-based multi-agent
+systems. In parallel, LLM-based evaluation has matured since MT-Bench [31] demonstrated high
+agreement with human preferences, with subsequent work exploring agent-level assessment [32]
+and comprehensive evaluation taxonomies [18]. EigenData’s CodingAgent extends multi-agent
+code generation with a judge-based fault-attribution mechanism and two-stage testing (unit then
+workflow), while its DataAgent introduces hierarchical orchestration with LLM-as-judge quality
+control and programmatic verification functions that can serve as reward models for reinforcement
+learning [33; 14].
+Prompt Optimization and Self-Evolving Agents. Automated prompt refinement has evolved
+from evolutionary search [34] to declarative pipeline compilation [35] and hierarchical multi-agent
+optimization [36]. Recent work on self-evolving agents extends this paradigm to entire agent
+workflows, where systems iteratively improve not just prompts but also tool selection, coordination
+strategies, and quality criteria [11]. EigenData’s two-phase self-evolving process (Section 3.4.3)
+draws on these ideas: Phase 1 optimizes prompts on a small pilot batch through iterative judge
+feedback, and Phase 2 scales with continuous quality monitoring, combining the efficiency of
+pilot-based tuning with the robustness of production-time verification.
+
+3
+
+EigenData: An Integrated Platform for Function-Calling Data
+
+We present EigenData, an integrated platform for automated agentic data generation that spans the
+full lifecycle from environment construction to trajectory synthesis and quality assurance. EigenData
+is organized around a top-level orchestration module, EigenCore (Section 3.1), which receives
+human requests and coordinates three specialized sub-systems: DatabaseAgent (Section 3.2) for
+domain database construction, CodingAgent (Section 3.3) for executable environment and tool
+generation, and DataAgent (Section 3.4) for multi-turn trajectory synthesis. Each sub-system is itself
+a multi-agent system composed of specialized worker agents; EigenCore manages their interplay,
+enforces cross-component consistency, and supports both end-to-end generation from scratch and
+targeted operations on existing artifacts.
+In contrast to single-LLM prompting or static pipelines [13; 12], our multi-agent architecture—
+inspired by recent advances in collaborative agent systems [29; 8]—enables dynamic workflow
+planning, prompt self-evolution, complex task decomposition, and self-correction, yielding realistic,
+diverse, and domain-specific data that meets rigorous quality criteria. Moreover, the framework is
+designed to be domain-agnostic: by simply providing domain documentation or APIs as context, the
+same pipeline can be applied to different domains effortlessly, adapting its behavior to the nuances of
+each new task.
+3
+
+Figure 1: Overview of the EigenData platform. EigenCore receives user requests and orchestrates
+three specialized sub-systems: DatabaseAgent for domain database construction, CodingAgent for
+environment and tool generation, and DataAgent for multi-turn trajectory synthesis. Artifacts flow
+left to right through the canonical pipeline, with cross-component feedback enabling targeted repair
+without full-pipeline restarts.
+
+3.1
+
+EigenCore: Top-Level Orchestration
+
+EigenCore is the user-facing entry point and top-level controller of the EigenData platform as
+illustrated in Figure 1. It accepts natural-language requests that may range from narrow tasks (“repair
+the schemas in BFCL category X”) to broad directives (“generate a complete training environment
+and 1,000 trajectories for an airline-booking agent”), and decomposes each request into a dependencyaware execution plan over the three sub-systems.
+Request Understanding and Task Decomposition. Upon receiving a user request, EigenCore
+first invokes a Request Analysis module that classifies the request type (e.g., full-pipeline generation,
+environment-only construction, data auditing, benchmark extension) and extracts key parameters
+such as target domain, scale, quality constraints, and any user-supplied artifacts (existing databases,
+schemas, or code). Based on this analysis, EigenCore produces a task graph—a directed acyclic
+graph of sub-tasks with explicit data dependencies. For example, a from-scratch generation request
+yields the canonical three-stage pipeline: DatabaseAgent → CodingAgent → DataAgent, whereas a
+benchmark-repair request may invoke only the DataAgent on existing artifacts.
+Cross-Component Coordination. EigenCore manages the flow of artifacts between sub-systems,
+ensuring that outputs from one stage (e.g., the database schema produced by DatabaseAgent) are
+validated and correctly consumed by the next (e.g., CodingAgent’s environment generator). When
+downstream stages detect inconsistencies—such as a generated environment referencing database
+fields that do not exist—EigenCore routes structured feedback to the responsible upstream sub-system
+and triggers targeted re-generation, avoiding full-pipeline restarts.
+Human-in-the-Loop Interface. EigenCore supports interactive operation, allowing users to inspect intermediate artifacts, approve or reject sub-system outputs, adjust parameters, and steer the
+generation process. This is particularly valuable during the initial setup of a new domain, where user
+oversight can rapidly calibrate the system’s behavior. For large-scale batch generation, EigenCore
+operates autonomously once the user approves the initial configuration.
+4
+
+Figure 2: Internal architecture of the DatabaseAgent. The pipeline proceeds from input specification
+through schema design, validation, data population (with constraint-aware sampling, distribution
+modeling, and edge-case injection), and consistency verification. A targeted regeneration loop handles
+any constraint violations detected during verification.
+
+3.1.1
+
+Three-Agent Coordination
+
+As illustrated in Figure 1, EigenCore coordinates three specialized sub-systems—DatabaseAgent,
+CodingAgent, and DataAgent—each responsible for a distinct layer of the training-environment stack.
+Their interaction follows a dependency-driven artifact pipeline, and EigenCore can selectively invoke
+any subset depending on the user’s request. To assemble a complete task specification, EigenCore
+employs a multi-turn conversational interface that progressively elicits the required command parameters (e.g., target domain name, MCP server URL, and final sample count) across successive turns.
+Three agents implement this interface: an ExtractionAgent and a ConversationAgent drive the
+interactive collection loop, while a RequestBuilder synthesizes the final directive once all parameters
+have been supplied.
+Each turn begins with the ExtractionAgent, which receives the user’s message, the conversation
+history, the parameters accumulated thus far, and the schema of available commands. The agent
+determines whether the message specifies a concrete command: if so, it identifies the command,
+extracts any supplied arguments (e.g., domain name, sample count), and assigns the turn status
+collecting; if the message pertains to the system but the intended command remains ambiguous,
+the status is no-task; if the message falls outside system functionality (e.g., a general knowledge
+question), the status is chitchat. The ConversationAgent then generates a response conditioned on
+this status—serving as a general-purpose assistant in chitchat state, prompting the user to clarify
+their intent in no-task state, or soliciting the specific missing parameters in collecting state (e.g.,
+“How many samples would you like to generate?”). This two-agent loop iterates until all required
+parameters have been supplied, at which point the status transitions to ready.
+Once all required parameters are present, EigenCore invokes the RequestBuilder, which consumes the
+full set of accumulated parameters and the conversation history to produce a single, well-structured
+natural-language instruction that unambiguously captures the user’s intent (e.g., “Generate 200
+multi-turn airline booking dialogs with function calls, using the provided MCP server schema”).
+The ConversationAgent presents this synthesized request to the user for final confirmation. Once
+confirmed, EigenCore exits the conversational loop and routes the completed specification to the
+appropriate sub-system: DatabaseAgent for domain-database construction, CodingAgent for environment generation, DataAgent for trajectory synthesis, or any combination thereof as determined by the
+task graph produced during request analysis.
+3.2
+
+DatabaseAgent: Domain Database Construction
+
+The DatabaseAgent is responsible for constructing the domain databases that serve as the ground-truth
+state for tool-use environments as illustrated by Figure 2. High-quality databases are critical: they
+determine the space of possible user queries, constrain valid tool-call sequences, and provide the
+5
+
+reference state against which agent trajectories are evaluated. Manually creating realistic databases
+for each new domain is labor-intensive and error-prone; the DatabaseAgent automates this process.
+3.2.1
+
+Input Specification
+
+The DatabaseAgent accepts domain specifications in multiple forms, from high-level natural-language
+descriptions (e.g., “an airline database with flights, passengers, bookings, and seat assignments”)
+to detailed schema definitions with constraints, cardinalities, and example records. When the
+specification is underspecified, the DatabaseAgent infers reasonable defaults by leveraging the
+LLM’s world knowledge about the target domain, then presents the inferred schema to the user (via
+EigenCore) for confirmation before proceeding to data population.
+3.2.2
+
+Schema Design and Validation
+
+A SchemaDesignAgent translates the input specification into a formal database schema—defining
+tables (or collections), columns, data types, primary and foreign keys, uniqueness constraints, and
+value ranges. The agent reasons about domain semantics to ensure referential integrity (e.g., every
+booking references a valid flight and passenger) and realistic data distributions (e.g., flight prices vary
+by route, class, and season). The proposed schema is validated by a SchemaValidationAgent that
+checks for structural soundness, constraint satisfiability, and coverage of the tool APIs that will be
+built on top of it.
+3.2.3
+
+Data Population
+
+A DataPopulationAgent generates synthetic records that conform to the validated schema. Rather
+than producing uniformly random data, it employs domain-aware generation strategies:
+• Constraint-aware sampling: Generates records that satisfy all inter-table constraints (e.g.,
+departure times precede arrival times; seat assignments do not exceed aircraft capacity).
+• Distribution modeling: Produces realistic value distributions informed by domain priors
+(e.g., most hotel bookings are 1–3 nights; flight prices follow route-dependent distributions).
+• Edge-case injection: Deliberately includes boundary conditions and rare-but-valid scenarios
+(e.g., sold-out flights, canceled bookings, waitlisted passengers) to ensure that downstream
+training data covers failure modes.
+3.2.4
+
+Consistency Verification
+
+After population, a ConsistencyVerificationAgent performs end-to-end validation: executing
+referential-integrity checks, verifying that all constraints hold, and running a suite of representative queries to confirm that the database supports the intended tool-use scenarios. Any violations
+trigger targeted regeneration of the offending records rather than full repopulation. The final output is
+a self-contained database artifact (e.g., a JSON file, SQLite database, or structured collection) along
+with its schema documentation, ready for consumption by the CodingAgent.
+3.3
+
+CodingAgent: Environment and Tool Generation
+
+The CodingAgent produces the executable software layer of the training environment (Algorithm 1):
+the tool implementations, simulation environments, and auxiliary scripts that expose domain functionality as callable APIs. Given a domain specification and a database (typically produced by
+the DatabaseAgent), it generates code that is functionally correct, tested, and ready for use by the
+DataAgent’s trajectory-generation pipeline.
+3.3.1
+
+Architecture
+
+The CodingAgent is itself a multi-agent system organized around an EnhancedOrchestrator that
+coordinates several specialized agents through an iterative generate-test-debug workflow, extending
+multi-agent code generation paradigms [30; 29]:
+6
+
+Algorithm 1 CodingAgent: Two-Stage Iterative Test-Debug Pipeline
+Require: Domain specification S, database D, max iterations M , max cycles N
+Ensure: Verified environment module, test suites, (optional) MCP server
+1: Planner analyzes S and D → execution plan with function list and dependency graph
+2: FileGenerationAgent generates module skeleton and class structure
+3: — Stage 1: Unit Testing (per function) —
+4: for each function f in execution plan do
+5:
+Tf ← TestingAgent.generate_unit_tests(f ) {happy path, errors, edge cases, types}
+6:
+fˆ ← CodingAgent.generate(f , S, D)
+7:
+for cycle c = 1 to N do
+8:
+for iteration i = 1 to M do
+9:
+result ← run_tests(fˆ, Tf )
+10:
+if result = PASS then
+11:
+break both loops {function f passes}
+12:
+end if
+13:
+fˆ ← CodingAgent.fix(fˆ, result.feedback)
+14:
+end for
+15:
+if result ̸= PASS then
+16:
+fault ← JudgeAgent.attribute(result, fˆ, Tf )
+17:
+if fault = T ESTS then
+18:
+Tf ← TestingAgent.regenerate(f , fault.feedback) {fix faulty tests}
+19:
+else
+20:
+fˆ ← rollback(f ); incorporate judge feedback {retry code from scratch}
+21:
+end if
+22:
+end if
+23:
+end for
+24: end for
+25: — Stage 2: Workflow Testing (dependency groups) —
+26: for each dependency group G in dependency graph do
+27:
+TG ← TestingAgent.generate_workflow_tests(G) {integration tests}
+28:
+repeat
+29:
+result ← run_tests(G, TG )
+30:
+if result ̸= PASS then
+31:
+identify responsible function(s) ⊆ G or wrong tests; apply targeted fixes
+32:
+end if
+33:
+until result = PASS or max workflow iterations reached
+34: end for
+35: ReviewAgent performs batch code review over all functions {final quality gate}
+36: if review rejects any function (strict mode) then
+37:
+refine rejected functions and re-validate
+38: end if
+39: return environment module, test suites, MCP server (optional), auxiliary scripts
+
+• Planner: Analyzes the domain specification and database schema to determine the set of
+functions to implement, their signatures, dependencies, and the overall module structure. It
+produces an execution plan that the orchestrator follows.
+• FileGenerationAgent: Generates complete Python modules from natural-language specifications. For environment files, it produces stateful classes that load the domain database
+and expose tool functions (e.g., search_flights, book_hotel, cancel_reservation).
+For MCP (Model Context Protocol) servers, it generates FastMCP-based servers with REST
+endpoints, session isolation, and auto-expiration. It can also generate format-conversion
+scripts and evaluation harnesses.
+• CodingAgent (inner): The core code-generation agent that implements individual functions.
+It operates in multiple modes—generate (implement from scratch), correct (fix bugs), and
+7
+
+refine (improve working code)—and produces code that follows a consistent error-handling
+convention: public methods return structured error dictionaries while private methods
+propagate exceptions.
+• TestingAgent: Automatically generates unit tests and integration (workflow) tests from
+function schemas and specifications. Unit tests cover individual function correctness (happy
+paths, error cases, edge cases, type validation), while workflow tests verify that related
+functions integrate correctly (e.g., that book_flight correctly updates the state queried by
+get_booking).
+• JudgeAgent: When tests fail, the JudgeAgent determines whether the fault lies in the
+generated code or in the generated tests—a critical distinction, since LLM-generated tests
+can themselves be incorrect. Based on the judge’s verdict, either the code or the tests are
+regenerated with targeted feedback.
+• ReviewAgent: A quality gate that performs batch code review across all generated functions,
+checking for consistent patterns, proper state management, and adherence to specifications.
+In strict mode, rejected functions are automatically refined until they pass review.
+3.3.2
+
+Iterative Test-Debug Loop
+
+The CodingAgent’s central mechanism is a two-stage testing pipeline with judge-based refinement
+(Algorithm 1):
+Stage 1: Unit Testing. For each function, the system (1) generates unit tests from the function
+schema, (2) generates or refines the implementation, (3) runs the tests, and (4) if tests fail, enters
+a judge-based debug loop. This loop has a nested structure: an outer cycle (up to N iterations)
+governs the unit tests, and an inner cycle (up to M iterations) governs the code implementation. In
+the inner cycle, the CodingAgent iteratively revises the implementation to pass the current unit tests.
+If the inner cycle exhausts M attempts without success, the JudgeAgent intervenes to determine fault
+attribution—deciding whether the failure lies in the code or in the tests themselves. If the tests are
+deemed faulty, the outer cycle advances: the tests are regenerated with judge feedback, and the inner
+cycle restarts against the corrected tests. This process continues for up to N outer cycles per function.
+Stage 2: Workflow Testing. After all individual functions pass their unit tests, the system groups
+functions by their call dependencies and generates integration tests for each group. These tests verify
+that functions interact correctly—for example, that state mutations from one function are correctly
+observed by another. Failures trigger targeted fixes to the responsible functions.
+3.3.3
+
+Output Artifacts
+
+The CodingAgent produces several artifacts:
+• Environment module: A Python class or module that loads the domain database and
+exposes tool functions with consistent interfaces.
+• Test suites: Unit and workflow test files that serve as regression tests and documentation.
+• MCP server (optional): A FastMCP server wrapping the environment with HTTP endpoints,
+session management, and transport options (stdio, HTTP, SSE), enabling direct integration
+with agent frameworks.
+All artifacts are validated end to end before being passed to the DataAgent: the environment is
+instantiated against the database, tests are executed, and the tool interfaces are verified to match the
+specifications that the DataAgent will use for trajectory generation.
+3.3.4
+
+Example Workflows
+
+The EnhancedOrchestrator exposes the generate-test-debug loop described above through four highlevel workflow modes, each tailored to a common development scenario:
+8
+
+Schema-Implement. Given a set of refined function schemas (signatures, docstrings, and behavioral
+specifications), the orchestrator drives the CodingAgent through a full implementation pass: the
+Planner decomposes the schemas into an ordered implementation plan respecting inter-function
+dependencies; the inner CodingAgent generates each function; the TestingAgent produces unit and
+workflow tests; and the iterative judge-based debug loop (Stage 1 then Stage 2) runs until all tests
+pass. The ReviewAgent performs a final quality gate before emitting the complete environment
+module. This is the primary mode for producing a new environment from scratch.
+Code-Repair. When an existing implementation exhibits test failures or specification violations,
+the code-repair workflow focuses the loop on diagnosis and repair. The orchestrator loads the
+current code and re-runs the test suites; for each failure, the JudgeAgent performs fault attribution to
+distinguish genuine code bugs from incorrect tests. The CodingAgent then applies targeted fixes—
+patching only the affected functions—while the debug loop ensures that repairs do not introduce
+regressions.
+Code-Patch. The code-patch workflow handles incremental schema evolution: when function
+signatures, return types, or behavioral contracts are refined (e.g., a new optional parameter is added,
+or an error-handling convention is updated), the orchestrator diffs the old and new schemas, identifies the affected functions, and dispatches the CodingAgent in refine mode to update only those
+implementations. The TestingAgent then regenerates or augments the affected tests to align with
+the updated schema, and the debug loop re-validates the patched code against both the original and
+revised specifications. This avoids costly full re-implementation when schemas undergo incremental
+refinement.
+Env-to-MCP. The env-to-mcp workflow converts an existing environment module into a standardized Model Context Protocol (MCP) server. The FileGenerationAgent wraps each tool function as a
+FastMCP endpoint with appropriate request/response schemas, session isolation, and transport configuration (stdio, HTTP, or SSE). The TestingAgent generates integration tests that exercise the MCP
+endpoints end to end, verifying that the server faithfully reproduces the behavior of the underlying
+environment. This mode enables seamless onboarding of environments into MCP-compatible agent
+frameworks without manual server authoring.
+Format-Transform. The format-transform workflow converts existing trajectory datasets into alternative tool-calling formats required by different model providers. Given a representative sample of the
+source dataset and a target format specification, the orchestrator dispatches the FileGenerationAgent
+and CodingAgent (inner) to synthesize a deterministic Python conversion script that maps dialogue
+turns, tool calls, and tool outputs into the target schema. The TestingAgent generates validation cases
+to ensure that the transformed outputs conform to the required structural conventions (e.g., field layout,
+argument nesting, and tool-call encoding). Once validated, the script is executed in batch across
+the dataset to produce the converted representation (e.g., OpenAI Harmony, Anthropic Messages
+API, Qwen, or DeepSeek), avoiding costly LLM-based rewriting while ensuring deterministic and
+structurally consistent conversions.
+3.4
+
+DataAgent: Multi-Agent Trajectory Generation
+
+The DataAgent is the trajectory-generation engine of EigenData. Operating on the environments and
+databases produced by the DatabaseAgent and CodingAgent (or on existing artifacts for auditing
+and repair tasks), it orchestrates a hierarchy of specialized worker agents to synthesize, evaluate, and
+iteratively refine high-quality multi-turn function-calling data for both SFT and RL. The DataAgent
+comprises two internal layers: an Orchestration Layer for planning, scheduling, and quality control,
+and an Execution Layer of worker agents that perform domain-specific generation and analysis tasks.
+3.4.1
+
+Orchestration Layer
+
+At the core of the DataAgent is an Orchestration Layer, which coordinates the interactions among a
+set of high-level agents, guiding the generation process through iterative refine-and-evaluate cycles.
+Drawing inspiration from recent hierarchical agent frameworks [36; 37], the Orchestrator first invokes
+a Workflow Planner Agent to devise a structured workflow as well as the models to be used in each
+9
+
+Figure 3: Internal architecture of the DataAgent. The Orchestration Layer (top) coordinates planning,
+prompt engineering, and quality evaluation through a self-optimizing feedback loop. The Execution
+Layer (bottom) comprises specialized worker agents organized into three stages: seed and plan
+generation, dialogue synthesis, and processing and validation. A two-phase self-evolving process
+first optimizes prompts on a small batch (Phase 1), then scales to full production with continuous
+monitoring (Phase 2).
+part for data generation. The planner analyzes the user’s request and domain specifications to plan
+an optimal generation workflow. It decides which execution agents to invoke, in what order and
+with which model, effectively decomposing the data generation task into a sequence of sub-tasks.
+The planner accounts for domain complexity and resource dependencies (ensuring, for example,
+that if a database query is needed, the corresponding agent is included). This results in a dynamic,
+context-aware workflow tailored to the target domain.
+Next, a Prompt Engineer Agent is tasked with producing effective prompts for each worker agent
+in context. It auto-generates detailed instructions for the downstream agents, incorporating domain
+knowledge (e.g. domain guidelines, function specifications, or provided ontologies) and human
+requests. Crucially, the Prompt Engineer can revise its prompts over multiple rounds, informed by
+feedback from a Judge Agent, ensuring that instructions yield outputs meeting the desired accuracy,
+style, and compliance criteria.
+The Judge Agent serves as an automated evaluator that critiques intermediate outputs along various dimensions – including factual accuracy, relevance to the domain, coherence of conversation,
+adherence to formatting requirements, and overall realism. By leveraging large language models
+as judges [31], we obtain multi-dimensional quality assessments that have been shown to correlate
+well with human evaluations of dialog quality [32]. The Judge’s feedback is fed back into the loop,
+allowing the Orchestrator and Prompt Engineer to adjust subsequent prompts or agent behaviors.
+This forms a self-optimizing feedback loop (potentially augmented with human-in-the-loop oversight
+when available) in which the system “self-verifies” and improves its outputs each iteration. The
+orchestration layer therefore acts as a conductor, ensuring that all agents work in concert and that a
+high quality threshold is met before the process terminates.
+3.4.2
+
+Execution Layer
+
+At the execution layer, EigenData orchestrates a sequence of specialized lower-level worker agents.
+Each agent is responsible for a distinct stage of the generation process, transforming the data step
+by step from abstract scenario seeds to finalized dialog records. In this work, we define a default
+collection of worker agents for the workflow planner to choose from, while preserving full modularity
+10
+
+and extensibility. The DataAgent framework allows new agents to be added as needed, and the
+workflow planner dynamically configures the multi-agent architecture based on user requirements:
+• RandomPoolAgent: Generates a diverse pool of initial user scenarios and profiles. This
+agent creates varied starting conditions (user personas, goals, environmental contexts,
+constraint sets) to ensure broad coverage of possible dialogues. For example, in a customer
+service domain, RandomPoolAgent might output a range of customer types and inquiry
+topics as seeds for conversations.
+• UserIntentAgent: Using a scenario from the pool (and any available domain data like
+databases or APIs), this agent synthesizes a concrete user intent for the dialogue. It may
+produce a detailed goal or task the user wants to accomplish, incorporating domain specifics.
+For instance, given a banking domain, the UserIntentAgent might formulate a user goal such
+as “dispute a credit card charge via the banking app,” including necessary details that will
+drive the ensuing conversation.
+• ToolGraphComposerAgent: Given the available tools (APIs, functions, or services), this
+agent constructs a high-level tool-usage plan in the form of a compositional graph. The graph
+specifies the sequence, dependencies, and data flows among tools, ensuring that the overall
+workflow is both executable and aligned with domain constraints. It also performs sanity
+checks (e.g., missing parameters, incompatible outputs/inputs) and proposes alternative
+plans when conflicts arise.
+• ToolGraphExecutorAgent: This agent executes the composed tool graph step-by-step,
+invoking tools, collecting intermediate results, and propagating outputs downstream. It
+monitors execution failures, retries with revised parameters when possible, and records
+structured traces of the tool-calling process. These traces serve both as supervision signals
+and as grounding evidence for the dialogue generation process.
+• UserIntentFromGraphAgent: Using the executed tool graph and its traces, this agent
+reconstructs a coherent, user-centered narrative that explains why each tool call occurs
+and what the user is trying to achieve. It transforms system-level workflows into realistic,
+goal-driven user intents and sub-goals, ensuring that subsequent dialogues are grounded in
+actual executable behaviors rather than abstract high-level descriptions.
+• UserSimulatorAgent: Simulates the user’s behavior and dialogue turns based on the user
+intent and persona. The UserSimulator generates realistic user utterances step-by-step,
+responding to the assistant and following the user’s goal. It maintains context and persona
+consistency (e.g. a polite customer vs. a frustrated one) and can handle increasing complexity
+over multi-turn interactions, ensuring the conversation flow remains natural from the user’s
+side.
+• TrajectoryAgent: Orchestrates the assistant’s side of the conversation, interacting with the
+UserSimulatorAgent to produce a full multi-turn multi-step function calling dialogue. The
+TrajectoryAgent uses the refined prompts and has access to domain tools or functions. If the
+domain provides an API or function (e.g., database lookup) that the assistant should call, the
+TrajectoryAgent will incorporate those function call actions into the dialogue at appropriate
+turns. This agent ensures the assistant’s responses are goal-directed and that any tool usage
+is executed correctly within the conversation. The output of this stage is a complete raw
+trajectory of the dialogue, including all user and assistant turns and any intermediate tool
+interactions.
+• DialogConversionAgent: Converts the raw trajectory into a standardized dialogue format
+for the final dataset. This involves stripping out low-level execution details and formatting
+the conversation into the desired structure (for example, JSON or ChatML with clearly
+marked user/assistant messages, function call outputs, etc.). The DialogConversionAgent
+ensures that the final data is in an easily consumable format for model training or evaluation,
+including any necessary annotations (such as tags for function calls or system messages) as
+required by the target schema.
+• VerificationAgent: Performs a thorough validation on the dialogue. The VerificationAgent
+checks dialogue quality and correctness one last time: it verifies that the conversation is
+coherent and logically consistent, that any domain-specific requirements are satisfied, and
+that all tool calls or API usages in the conversation have valid results. It also confirms that
+the formatting is correct and that no content violates the guidelines or domain rules. This
+11
+
+automated verification (with dedicated checkers for tool outputs and content consistency)
+provides robust quality assurance, often catching issues that might be missed by human
+annotators.
+• VerificationFunctionAgent: Automatically constructs a programmatic verification function
+based on the dialogue trajectory and domain constraints. This function can be used for
+downstream evaluation or reinforcement learning as a reward model. It encodes correctness
+criteria, success conditions, tool-call validity, and failure signatures. For example, it may
+generate a scoring function that checks whether all required domain steps were completed,
+whether tool arguments align with constraints, and whether the user goal was achieved.
+This creates a self-contained evaluation artifact tied specifically to the generated dialogue
+instance.
+• ModifyAgent: Applies targeted modifications to the dialogue based on external requests or
+issues detected by the VerificationAgent. It can fix formatting errors, rewrite inconsistent
+turns, adjust persona styles, regenerate problematic sections, or update tool calls that fail
+validation. This agent enables iterative refinement until the dialogue satisfies all quality,
+schema, and domain criteria, effectively closing the loop in a self-improving data generation
+pipeline.
+• DialogAnalyzerAgent: Given an existing dialogue and a set of function schema changes,
+this agent identifies which conversation turns require regeneration and which can be preserved. It algorithmically segments the conversation into safe zones (turns prior to the first
+affected call, replayed verbatim), affected turns (turns that invoke a renamed or schemamismatched function), and candidate zones (turns following an affected call that may depend
+on the now-invalidated tool output); dialogues that contain no affected function calls are
+marked for passthrough, bypassing all downstream agents. For affected dialogues, the agent
+additionally invokes the LLM to extract the user’s intent and produce continuation guidance
+that enables the TrajectoryAgent to resume the conversation coherently from the truncation
+point.
+3.4.3
+
+Self-Evolving Data Generation Process
+
+To balance quality and efficiency, the DataAgent operates in a two-phase generation regime.
+Phase 1: Self-Evolving Prompt Optimization. The orchestrator generates a small batch of sample
+dialogues (e.g. 5–20) using initial prompts, then engages the Judge and other high-level agents in
+iterative refinement on this batch. Through a few iterations, the prompts and agent behaviors are tuned
+until the sample dialogues satisfy the quality criteria. This corresponds to an initial coarse-to-fine
+optimization of the prompt and workflow, analogous to recent self-referential prompt evolution [34]
+and declarative pipeline compilation [35] methods that first refine prompts then produce final answers.
+Phase 2: Full-Scale Generation. Once the prompt strategy is optimized, the orchestrator uses the
+refined prompts to generate the full dataset at scale. The Execution Layer are run to produce the
+complete set of dialogues, while monitoring mechanisms (including the Judge and VerificationAgent)
+continue to evaluate quality on the fly. If any drift or new error pattern is observed during bulk
+generation, the system can pause and invoke the refinement loop again to address it. After generation,
+a final validation pass is applied by the VerificationAgent to ensure all dialogues meet the release
+standards.
+This two-phase approach focuses human or computational critique on a small pilot batch to avoid largescale errors, then confidently expands to the entire data request. By integrating hierarchical control,
+specialized agents, and iterative self-evolving, the DataAgent is able to automatically synthesize
+high-quality, realistic conversational datasets. The general-purpose design, with pluggable domain
+resources and no task-specific training required, allows it to be readily adapted to a wide range of
+domains and dialogue styles from open-domain chat to task-oriented dialogs, while consistently
+maintaining rigorous quality control throughout the data generation process.
+3.4.4
+
+Example Workflows
+
+We now illustrate several representative workflows that the DataAgent’s high-level planner may
+instantiate for different data-generation objectives (see Figure 4).
+12
+
+Figure 4: Representative workflows instantiated by the DataAgent’s Workflow Planner. Each row
+shows a distinct pipeline: Data Audit systematically diagnoses quality issues and failure modes;
+Schema Polish iteratively refines API specifications via verification–modification loops; Data Repair
+performs targeted trajectory repair by segmenting conversations into safe, affected, and candidate
+zones; Data Generation Without Tool Graphs produces multi-turn conversations top-down from
+sampled user intents; Data Generation With Tool Graphs generates grounded conversations bottomup from executed tool-call plans; Schema-Triggered Patch incrementally reconstructs only the
+trajectory portions affected by schema evolution.
+
+Data Audit. This workflow systematically audits an existing dataset to expose quality issues,
+coverage gaps, and model failure modes. The VerificationAgent inspects each trajectory against the
+function schema and domain business rules, going beyond a binary pass/fail decision to perform
+structured error analysis: it identifies (i) turns that violate domain constraints, (ii) incorrect or
+unsafe tool usage, (iii) unmet user goals, and (iv) contradictions or hallucinations. In parallel, it
+analyzes the distribution and coverage of functions used across the dataset compared to the full list
+of available functions. The output is a structured report that annotates individual trajectories with
+richly labeled diagnostics and summarizes dataset-level issues, anomalies, coverage gaps, and quality
+metrics—directly useful for dataset debugging, reliability benchmarking, and robustness training.
+Schema Polish. In domains with underspecified or evolving APIs, EigenData supports iterative
+refinement of tool schemas. When the VerificationAgent detects recurring errors in function calls (e.g.,
+missing arguments, ambiguous parameter semantics, or incorrect output assumptions), it attributes
+the failure to specific schema deficiencies. These structured diagnostics are then passed to the
+ModifyAgent, which rewrites or augments the schema—adding constraints, clarifying parameter
+descriptions, or documenting edge cases. The updated schema is reinserted into the pipeline and
+revalidated, gradually converging toward executable, unambiguous specifications.
+Data Repair. When trajectories are known to contain quality issues but the specific problematic
+turns are not identified in advance, EigenData applies targeted repair rather than regenerating entire
+conversations. The VerificationAgent first performs a structured analysis of the dialogue, producing
+a list of problematic turn indices that flag where domain constraints are violated, tool calls are
+incorrect, or reasoning is inconsistent (e.g., an assistant turn that invokes a function with invalid
+arguments or a response that contradicts prior context). A DialogAnalyzerAgent then uses these
+indices to segment the conversation into safe zones (unaffected turns, preserved verbatim), affected
+turns (turns at the flagged indices that must be regenerated), and candidate zones (turns following
+an affected turn whose validity may depend on the repaired output). The TrajectoryAgent performs
+13
+
+a surgical replay, threading safe-zone turns through unchanged while regenerating affected and
+candidate turns against the live tool environment. The repaired dialogue then passes through the
+standard DialogConversionAgent–VerificationAgent–ModifyAgent pipeline for format compliance
+and a final consistency check, yielding polished trajectories with minimal deviation from otherwise
+valid conversations.
+Data Generation Without Tool Graphs. For open-ended or conversational domains, EigenData
+operates in a primarily top-down mode. The RandomPoolAgent first samples diverse scenario factors
+(personas, goals, constraints, contexts), and the UserIntentAgent instantiates a concrete task from
+one scenario. Dialogue is then generated through interaction between the UserSimulatorAgent and
+the TrajectoryAgent, producing a realistic multi-turn exchange. The DialogConversionAgent formats
+the conversation, while the VerificationAgent ensures coherence, safety, and formatting compliance.
+Minor issues are corrected by the ModifyAgent. Finally, the VerificationFunctionAgent synthesizes
+an executable reward/verification function, enabling reinforcement learning and evaluation on the
+generated instance.
+Data Generation With Tool Graphs. For goal-oriented domains with executable tools, EigenData
+generates grounded, bottom-up conversations. The RandomPoolAgent samples user profiles and
+contexts. The ToolGraphComposerAgent constructs a compositional plan over available APIs, and the
+ToolGraphExecutorAgent executes the plan, completing parameters, handling failures, and recording
+traces. The UserIntentFromGraphAgent converts these traces into a coherent, goal-driven narrative
+aligned with the executed workflow. The UserSimulatorAgent and TrajectoryAgent then generate
+the full dialog, where tool interactions emerge naturally during conversation. The DialogConversionAgent standardizes the trajectory, while the VerificationAgent validates logical consistency, tool
+correctness, and formatting. If necessary, the ModifyAgent performs selective repairs. Finally, the
+VerificationFunctionAgent constructs a programmatic checker tied to the underlying tool graph,
+enabling precise, reproducible evaluation.
+Schema-Triggered Patch. When a deployed function schema evolves—for instance, a function
+is renamed, a new required parameter is introduced, or an argument type is revised—existing
+trajectories that invoke the affected functions become misaligned with the updated specification.
+Rather than discarding and regenerating the entire dataset, the schema-triggered patch workflow
+applies targeted reconstruction at the trajectory level, confining regeneration cost strictly to the
+affected portions of the corpus. The orchestrator accepts a user-supplied function mapping (e.g.,
+renaming cancel_reservation to cancel_booking) and first filters the full dataset to identify
+only the dialogues that contain calls to the modified functions, forwarding all others unchanged.
+For each affected dialogue, a DialogAnalyzerAgent decomposes the conversation into a structured
+segment map that classifies turns as a safe zone (turns prior to the first affected call, replayed
+verbatim), an affected turn (turns that directly invoke the changed function or call it with arguments
+that violate the updated schema), or a candidate zone (turns following an affected call whose content
+may depend on the now-invalidated tool output). The TrajectoryAgent then performs a surgical
+replay, threading safe-zone turns through unchanged while regenerating affected and candidate turns
+against the live tool environment using the updated schema. The repaired trajectories re-enter the
+standard DialogConversionAgent–VerificationAgent–ModifyAgent pipeline for format compliance
+and consistency checks, making schema evolution an incremental, cost-proportional operation rather
+than a full-pipeline restart.
+3.5
+
+End-to-End Generation Workflow
+
+We now describe the canonical end-to-end workflow for generating a complete training environment
+and dataset from a domain specification—the pipeline that EigenCore orchestrates when a user
+requests from-scratch generation.
+Step 1: Database Construction (DatabaseAgent). Given the domain specification, the
+DatabaseAgent designs the database schema, populates it with realistic synthetic records, and
+validates internal consistency. The output is a self-contained database artifact (e.g., a JSON file or
+SQLite database) together with its formal schema.
+14
+
+Step 2: Environment Generation (CodingAgent). The CodingAgent receives the database and
+domain specification and generates the executable environment: a Python module (or MCP server)
+that exposes tool functions backed by the database. It iteratively tests and debugs the implementation
+until all unit and workflow tests pass, producing a verified environment along with its test suite and
+function schemas.
+Step 3: Trajectory Synthesis (DataAgent). The DataAgent loads the verified environment and
+database, and uses its hierarchical multi-agent pipeline to generate diverse, high-quality multi-turn
+trajectories. Through its self-evolving two-phase process (Section 3.4.3), it first optimizes prompts
+on a small pilot batch, then scales to full production with continuous quality monitoring.
+Cross-Component Feedback. Throughout the pipeline, EigenCore monitors for cross-component
+inconsistencies. If the DataAgent’s VerificationAgent detects that a tool function behaves incorrectly
+(e.g., returns unexpected results for valid inputs), EigenCore can route the issue back to the CodingAgent for targeted repair. Similarly, if the CodingAgent discovers that the database lacks records
+needed for meaningful tool-use scenarios, EigenCore can request the DatabaseAgent to augment the
+data. This feedback mechanism ensures that the three sub-systems converge toward a consistent,
+high-quality output without requiring manual intervention.
+
+4
+
+Benchmark Auditing, Repair, and Extension: A Case Study on BFCL
+
+BFCL (Berkeley Function-Calling Leaderboard) [22] is one of the most widely adopted benchmarks
+for evaluating large language models’ function-calling capabilities. It assesses a model’s ability
+to correctly select functions, generate valid arguments, and conduct multi-step tool calling across
+diverse domains. Given its prominence as a standard evaluation suite for tool-use reliability and
+compositional reasoning in LLMs [22], BFCL serves as a representative case study for examining the
+quality of existing benchmarks and demonstrating how E IGEN DATA can be applied to audit, repair,
+and extend them.
+In this case study, E IGEN C ORE (Section 3.1) orchestrates the full audit-and-repair pipeline, dispatching sub-tasks to the appropriate sub-systems: the DATA AGENT (Section 3.4) drives error
+analysis and trajectory repair through its VerificationAgent and ModifyAgent; the C ODING AGENT
+(Section 3.3) diagnoses and fixes implementation bugs in the benchmark’s executable functions;
+and the DATABASE AGENT (Section 3.2) validates and corrects any underlying data inconsistencies.
+Cross-component feedback (Section 3.5) ensures that fixes in one layer propagate to all dependent
+artifacts.
+We focus specifically on the multi-turn subset of BFCL, which evaluates multi-step tool-use trajectories requiring sequential reasoning and state tracking—the most challenging and practically relevant
+setting for real-world agent deployment.
+4.1
+
+Error within BFCL
+
+To audit the quality of BFCL’s multi-turn evaluation suite, E IGEN C ORE dispatches a coordinated
+analysis across all three sub-systems. The DATA AGENT’s VerificationAgent examines ground-truth
+trajectories and evaluation logic via the Data Audit workflow (Section 3.4); the C ODING AGENT’s
+TestingAgent and JudgeAgent exercise the benchmark’s executable functions against synthesized edge
+cases (Section 3.3); and the DATABASE AGENT’s ConsistencyVerificationAgent cross-checks backing
+data for constraint violations (Section 3.2). This multi-agent audit reveals three categories of errors
+that compromise the reliability of BFCL as a benchmark.
+Function Schema Errors (affecting 39 entries, 19.5%). We identify 39 entries where the function
+schemas provided to models contain incorrect or incomplete specifications. These include: (1) parameter type mismatches, where a parameter is declared as one type but the reference implementation or
+ground truth expects another—for instance, close_ticket declares ticket_id as integer, yet the
+initial configuration stores ticket IDs as strings and the ground truth passes the string "ticket_001"
+(Figure 5); (2) missing required parameters, where the ground-truth trajectory assumes the model
+should infer values without any discovery mechanism; and (3) ambiguous or contradictory parameter
+descriptions that admit multiple valid interpretations—such as setCruiseControl using "m/h"
+15
+
+for input but "km/h" for output (Figure 8), or get_order_history documenting a response key
+"order_history" while the implementation returns "history" (Figure 9). Appendix A provides
+additional examples.
+Function Implementation Errors (affecting 91 entries, 45.5%). The executable functions backing
+BFCL’s evaluation contain implementation bugs that cause correct model outputs to be scored as
+failures. We find 91 affected entries spanning three recurring patterns: (1) logic errors, such as
+the setHeadlights function where the "auto" mode—a schema-valid enum value—falls into the
+else branch and silently turns headlights off instead of providing automatic behavior (Figure 6),
+or tail(lines=0) returning the entire file instead of nothing due to Python’s content[-0:]
+semantics (Figure 10); (2) input handling defects, including get_zipcode_based_on_city which
+silently returns an invalid zipcode "00000" for unrecognized or differently-cased city names instead
+of raising an error (Figure 11); and (3) state management bugs, such as send_message storing
+messages without a sender field, making it impossible to distinguish senders when deleting or
+viewing messages (Figure 12). Because the evaluation pipeline executes these functions to determine
+correctness, these bugs silently penalize models that produce valid outputs, inflating error rates and
+distorting cross-model comparisons.
+Trajectory and Evaluation Errors (affecting 82 entries, 41.9%). The ground-truth trajectories
+used as references exhibit 82 errors across three sub-categories: (1) overly rigid evaluation, which
+penalizes functionally or semantically equivalent but syntactically different function call sequences—
+for example, rename-then-move versus the ground truth’s move-then-rename, despite producing
+identical filesystem states (Figure 13), or requiring integer-formatted tire pressures (32) when the API
+returns floats (32.0) (Figure 14); (2) incorrect ground-truth labels, where the reference trajectory
+itself contains erroneous outputs, such as a ground truth that word-sorts a single-line file instead of
+line-sorting it (Figure 7), or du() being called with human_readable=True but the ground truth
+writing the non-human-readable format (Figure 15); and (3) missing alternative solution paths, where
+a model that achieves the correct final state through a different but valid sequence of calls is marked
+as incorrect.
+In total, these errors affect 143 out of 200 entries (71.5%) in BFCL’s multi-turn evaluation suite, undermining the reliability of model rankings derived from the original benchmark. Table 1 summarizes
+the error distribution.
+Table 1: Summary of errors identified in BFCL multi-turn base evaluation suite (200 entries).
+Error Category
+
+4.2
+
+Entries Affected
+
+% of Cases
+
+Function Schema Errors
+Function Implementation Errors
+Trajectory / Evaluation Errors
+
+39
+91
+82
+
+19.5%
+45.5%
+41.0%
+
+Total (deduplicated)
+
+143
+
+71.5%
+
+Benchmark Fix with EigenData
+
+E IGEN C ORE orchestrates the repair pipeline by routing each error category to the appropriate subsystem and enforcing cross-component consistency through its feedback loop (Section 3.5). Schema
+errors are handled by the DATA AGENT’s schema-polish workflow, implementation bugs by the
+C ODING AGENT’s iterative debug loop, and trajectory errors by the DATA AGENT’s modification
+workflow—with E IGEN C ORE ensuring that a schema fix propagates to both the corresponding
+implementation and all affected trajectories. We select 200 representative multi-turn cases (BFCL-v3
+set) for detailed repair and re-evaluation.
+Function Schema Repair. We apply E IGEN DATA’s Schema Polish workflow (Section 3.4.4) to
+systematically correct deficient schemas. The VerificationAgent first cross-references each function
+schema against its reference implementation and ground-truth trajectory usage, detecting recurring
+mismatches such as parameter type conflicts, missing constraints, and ambiguous descriptions.
+These structured diagnostics are passed to the ModifyAgent, which rewrites the schema—correcting
+type declarations, adding missing parameter constraints, and clarifying descriptions to resolve
+16
+
+Schema Error: Schema declares integer, ground truth passes string (close_ticket)
+Entry: multi_turn_base_173, Turn 3
+
+Domain: Ticket API
+
+User prompt: “I noticed there’s a ticket linked with this booking that I no longer find necessary. Can you
+cancel it on my behalf?”
+Schema definition (ticket_api.json):
+{ "name": "close_ticket",
+"parameters": {
+"ticket_id": {"type": "integer",
+"description": "ID of the ticket to be closed."}
+}}
+Ground truth call:
+close_ticket(ticket_id=’ticket_001’)
+
+# passes a string!
+
+Initial config (ticket IDs stored as strings):
+{"ticket_queue": [{"id": "ticket_001", "status": "Open", ...}]}
+Problem: The schema specifies ticket_id as integer, but the initial config stores ticket IDs as the string
+"ticket_001" and the ground truth passes a string. The implementation’s lookup (ticket["id"] ==
+ticket_id) compares by equality, so passing an integer—as the schema dictates—would never match the
+string key. A model that follows the schema strictly produces a type-correct call that fails at runtime.
+
+Figure 5: Example of a function schema error in BFCL. The schema declares ticket_id as integer,
+but the ground truth and backing data use the string "ticket_001"—a model following the schema
+cannot succeed.
+
+Implementation Error: setHeadlights("auto") silently turns headlights OFF
+Entry: multi_turn_base_50
+
+File: vehicle_control.py:314–329
+
+User prompt: “It’s getting a bit darker out here, so please flip on the headlights for visibility.”
+Implementation:
+def setHeadlights(self, mode: str):
+if mode not in ["on", "off", "auto"]:
+return {"error": "Invalid headlight mode."}
+if mode == "on":
+self.headLightStatus = "on"
+return {"headlightStatus": "on"}
+else: # Both "off" AND "auto" fall here!
+self.headLightStatus = "off"
+return {"headlightStatus": "off"}
+Problem: The schema declares "auto" as a valid enum value, but the else branch treats both "off" and
+"auto" identically—turning headlights off. A model that reasonably interprets darkening conditions and
+calls setHeadlights(mode="auto") would get headlightStatus="off" instead of "on", causing a
+state mismatch and test failure. The ground truth avoids this by calling setHeadlights(mode="on"),
+masking the bug.
+
+Figure 6: Example of a function implementation error in BFCL. The "auto" headlight mode—a
+schema-valid option—silently falls into the "off" branch due to a missing elif, penalizing models
+that make a reasonable choice.
+
+17
+
+Trajectory Error: Ground truth contains wrong sorted content (multi_turn_base_4)
+Entry: multi_turn_base_4, Turn 2
+
+Domain: File System + Twitter API
+
+User prompt: “Share the sorted result as the message body on social media, ensuring to tag ‘currenttechtrend’ and mention Julia.”
+File content (single line, from initial config):
+Initial report content Unsorted data More unsorted data
+sort() implementation (line-sorts, not word-sorts):
+sorted_content = "\n".join(sorted(content.splitlines()))
+# Single line -> returns unchanged:
+# "Initial report content Unsorted data More unsorted data"
+Ground truth tweet (incorrectly word-sorted):
+post_tweet(
+content=’Initial report content More unsorted data Unsorted data’,
+mentions=[’@Julia’], tags=[’#currenttechtrend’])
+Problem: The sort() function sorts lines, not words. Since the file has a single line, the output is
+unchanged. But the ground truth contains word-sorted content—a different string. A model that faithfully
+uses the sort() output would post the correct (unchanged) content but fail the evaluation because the
+ground truth itself is wrong.
+
+Figure 7: Example of a trajectory error in BFCL. The ground truth contains word-sorted content, but
+the sort() function sorts lines—producing unchanged output for a single-line file. The reference
+answer is provably incorrect.
+
+ambiguity. The updated schema is reinserted into the pipeline and revalidated by the VerificationAgent,
+iterating until the specification is consistent with both its implementation and its downstream usage
+in trajectories.
+Function Implementation Repair. For implementation bugs, we leverage E IGEN DATA’s CodingAgent (Section 3.3) to diagnose and correct the faulty executable functions. The repair proceeds in three
+stages. First, the TestingAgent executes the existing test suite and collects structured failure traces—
+stack traces, assertion mismatches, and input–output pairs that trigger incorrect behavior. Second, the
+JudgeAgent analyzes these traces to attribute each failure to either a genuine implementation bug or
+a test-side issue (e.g., an overly strict assertion or an incorrect expected value), preventing repairs
+from chasing false positives. Third, for confirmed implementation bugs, the FileGenerationAgent
+rewrites the defective function body while preserving the corrected schema contract established
+in the schema-repair step. Each rewritten function is revalidated by the TestingAgent against both
+the original test cases and additional edge cases synthesized by the pipeline—including boundary
+inputs, null/empty arguments, and adversarial orderings identified during the error-analysis phase.
+This iterative debug loop (up to M iterations per cycle, N cycles per function) continues until all
+identified implementation bugs are resolved, yielding regression coverage beyond what the original
+benchmark’s fixed test cases offer.
+Trajectory and Evaluation Repair. We employ E IGEN DATA’s Data Repair workflow to repair
+ground-truth trajectories. The VerificationAgent scans each reference trajectory and marks spans
+containing incorrect function calls, invalid argument values, or logically inconsistent reasoning.
+Rather than regenerating entire conversations, the ModifyAgent rewrites only the problematic segments, preserving valid reasoning and context. The repaired trajectory is then rechecked through a
+verification–modification–verification loop until all issues are resolved. For evaluation, the VerificationFunctionAgent synthesizes state-based checking functions that assess whether the final system
+state matches the expected outcome, rather than requiring exact trajectory matching. This allows
+the evaluation to accept functionally equivalent call sequences, and for cases where multiple valid
+solution paths exist, the verification function encodes all acceptable completion criteria.
+18
+
+4.3
+
+Evaluation Results
+
+We evaluate five frontier models on the repaired 200-case subset (BFCL-v3) using both automated
+metrics and human evaluation to assess the consistency and reliability of the corrected benchmark.
+Automated Evaluation. Table 2 reports results across five automated metrics of increasing strictness: Config Match checks whether the model’s function call configuration (function name and
+parameter schema) matches the reference; Key Function verifies that critical function calls are present;
+LLM-as-Judge uses a separate language model to assess trajectory correctness; Config+Func requires
+both configuration and key function match; and All Three demands simultaneous satisfaction of
+configuration match, key function match, and LLM-as-Judge approval.
+Table 2: Automated evaluation results on the repaired BFCL multi-turn subset (200 cases). Models
+are sorted by the strictest metric (All Three). Best results per column are bolded.
+Model
+
+Config
+Match
+
+Key Func.
+
+LLM Judge
+
+Config +
+Func
+
+All Three
+
+Gemini-3-Pro
+Claude-4.5-Sonnet
+GLM-4.6
+GPT-5.2
+DeepSeek-V3.2
+
+65.5
+57.5
+50.5
+50.5
+45.0
+
+71.0
+57.5
+58.5
+54.0
+44.0
+
+59.0
+52.0
+49.0
+45.0
+40.0
+
+53.0
+43.0
+39.5
+40.0
+29.5
+
+42.5
+38.0
+32.5
+32.5
+22.5
+
+Average
+
+53.8
+
+57.0
+
+49.0
+
+41.0
+
+33.6
+
+Human Evaluation. To assess the reliability of automated metrics and further validate the corrected benchmark, we conduct a human evaluation study on five representative models, collecting
+approximately 40 evaluation cases per model.
+To construct realistic evaluation scenarios, annotators first select several target environments and
+optionally configure complex settings (e.g., API availability, tool configurations, or multi-tool
+environments). These configurations initialize the evaluation context. An LLM-assisted interface
+then supports annotators in generating diverse and challenging multi-turn user queries: given the
+selected environment and configuration, the LLM proposes candidate task descriptions and follow-up
+interactions, which annotators refine or extend to produce realistic multi-step requests. This process
+enables the creation of complex agentic tasks involving tool usage, state tracking, and iterative
+reasoning. For each generated task, the same prompt sequence is executed across all evaluated
+models. Annotators are presented with the resulting trajectories and final outputs from each model
+and determine whether the model successfully fulfills the user’s intent under the given environment.
+Each model output is labeled as Pass or Fail: a Pass indicates that the model correctly uses available
+tools to produce a functionally valid solution satisfying the user’s request, regardless of differences
+in intermediate reasoning steps or tool invocation order; a Fail indicates that the model produces
+an incorrect result, an incomplete solution, or invalid tool interactions that prevent successful task
+completion.
+Crucially, unlike automated evaluation, which typically relies on trajectory matching against predefined references, our human evaluation does not use reference trajectories at all. Annotators judge
+task success based solely on whether the model correctly uses available tools to accomplish the user’s
+intent within the given environment. This reference-free design captures valid alternative reasoning
+paths and tool usage strategies that automated trajectory-based metrics systematically miss, providing
+a more faithful measure of practical tool-use capability in realistic multi-turn scenarios. Table 3
+reports the results alongside each model’s ranking on the original BFCL multi-turn leaderboard.3
+Analysis. Several findings emerge from comparing automated and human evaluations. First, the
+model ranking is broadly consistent between the repaied automated metric (All Three) and human
+judgment, with Gemini-3-Pro leading in both settings and DeepSeek-V3.2 trailing substantially.
+3
+
+https://gorilla.cs.berkeley.edu/leaderboard.html
+
+19
+
+Table 3: Human evaluation results on the repaired BFCL environment. Annotators judge whether
+each model trajectory constitutes a functionally correct task completion without reference trajectories.
+Pass rates are compared against the strictest automated metric (All Three) on the repaired benchmark
+and against the original BFCL multi-turn leaderboard scores. Models are sorted by human pass rate.
+Model
+
+Pass
+
+Fail
+
+Pass Rate (%)
+
+Repaired BFCL
+All Three (%)
+
+Original
+BFCL MT (%)
+
+Gemini-3-Pro
+Claude-4.5-Sonnet
+GPT-5.2
+GLM-4.6
+DeepSeek-V3.2
+
+33
+28
+26
+23
+10
+
+8
+13
+14
+19
+33
+
+80.5
+68.3
+65.0
+54.8
+23.3
+
+42.5
+38.0
+32.5
+32.5
+22.5
+
+63.12
+61.37
+28.12
+68.00
+44.88
+
+This suggests that the repaired benchmark’s automated metrics are reasonably well-calibrated after
+E IGEN DATA-guided corrections.
+Second, comparing the repaired All Three metric against the original BFCL leaderboard scores reveals
+striking rank inversions that expose the severity of benchmark artifacts prior to repair. Most notably,
+GPT-5.2 scores only 28.12% on the original BFCL but achieves 65.0% human pass rate—a 36.9
+percentage-point gap indicating that pre-repair benchmark errors were disproportionately penalizing
+this model. Conversely, GLM-4.6 attains the highest original BFCL score (68.00%) yet ranks fourth
+in human evaluation (54.8%), suggesting it benefited from benchmark-specific patterns that do not
+reflect genuine capability. Crucially, the repaired All Three metric corrects these distortions: its
+model ranking (Gemini-3-Pro > Claude-4.5-Sonnet > GPT-5.2 ≥ GLM-4.6 > DeepSeek-V3.2)
+aligns with the human-evaluation ranking, whereas the original leaderboard ordering does not. This
+demonstrates that E IGEN DATA’s repair pipeline removes systematic biases that previously inflated or
+deflated model scores, yielding automated metrics whose relative ordering faithfully reflects human
+judgments of functional correctness.
+Third, the sub-metric decomposition in Table 2 reveals that multi-turn function calling involves
+multiple independent failure modes. The average pass rate drops from 57.0% (Key Function) and
+53.8% (Config Match) individually to 41.0% when both are required (Config+Func), and further
+to 33.6% under the full All Three criterion. This 23.4 percentage-point gap between the easiest
+individual metric and the conjunction indicates that models frequently satisfy one evaluation axis
+while failing another: a model may invoke the correct functions but with malformed configurations, or
+produce well-formed calls that miss key functions in the workflow. Notably, the LLM-as-Judge metric
+(49.0% average) falls between the individual and conjunction criteria, suggesting that semantic-level
+assessment captures a complementary signal—detecting cases where both the configuration and
+function selection are individually plausible but the overall trajectory is logically incoherent. This
+multi-dimensional failure profile underscores why single-axis evaluation can mask genuine capability
+gaps, and validates the design of the All Three metric as a stringent but informative composite.
+Taken together, these results demonstrate that E IGEN DATA’s end-to-end auditing and repair pipeline—
+coordinated by E IGEN C ORE across the DATABASE AGENT, C ODING AGENT, and DATA AGENT—
+produces benchmarks that are both more reliable (fewer false negatives from schema mismatches
+and implementation bugs) and more discriminative (better correlation with human judgments of
+functional correctness).
+
+5
+
+Conclusion
+
+We have presented EigenData, an integrated, self-evolving platform for function-calling data that
+coordinates three specialized sub-systems—DatabaseAgent, CodingAgent, and DataAgent—through
+a top-level orchestrator (EigenCore) to cover the full lifecycle from environment construction to
+trajectory generation and quality assurance. The platform’s multi-agent architecture enables dynamic
+workflow planning, iterative self-correction, and cross-component feedback, distinguishing it from
+existing linear data-generation pipelines.
+20
+
+We have demonstrated EigenData’s capabilities through a case study on BFCL-V3, where our
+automated audit identified systematic errors affecting 71.5% of multi-turn entries across function
+schemas, implementations, and reference trajectories. The repair pipeline, which routes each error
+category to the appropriate sub-system with cross-component consistency enforcement, produced a
+corrected benchmark variant that resolves the rank inversions present in the original leaderboard—
+most notably, models that were under- or over-estimated are now correctly ranked. On the repaired
+benchmark, the automated All Three metric aligns with human evaluation in model ranking. These
+findings validate EigenData’s end-to-end auditing approach and motivate the outcome-aware, statebased evaluation protocol enabled by EigenData’s VerificationFunctionAgent.
+Limitations. Several limitations of the current work should be noted. First, our BFCL case study
+focuses on 200 multi-turn cases; scaling the repair and evaluation to the full benchmark remains
+future work. Second, while we introduce outcome-aware evaluation through synthesized verification
+functions, a systematic comparison with other evaluation paradigms (e.g., reward-model-based or
+simulation-based assessment) is deferred to future work. Third, the current system relies on frontier
+LLMs for all agent roles; an analysis of cost–quality tradeoffs across model tiers would strengthen
+practical deployment guidance.
+
+References
+[1] Victor Barres, Honghua Dong, Soham Ray, Xujie Si, and Karthik Narasimhan. τ 2 -bench:
+Evaluating conversational agents in a dual-control environment, 2025. URL https://arxiv.
+org/abs/2506.07982.
+[2] Junlong Li, Wenshuo Zhao, Jian Zhao, Weihao Zeng, Haoze Wu, Xiaochen Wang, Rui Ge,
+Yuxuan Cao, Yuzhen Huang, Wei Liu, Junteng Liu, Zhaochen Su, Yiyang Guo, Fan Zhou,
+Lueyang Zhang, Juan Michelini, Xingyao Wang, Xiang Yue, Shuyan Zhou, Graham Neubig,
+and Junxian He. The tool decathlon: Benchmarking language agents for diverse, realistic, and
+long-horizon task execution, 2025. URL https://arxiv.org/abs/2510.25726.
+[3] Ziyang Luo, Zhiqi Shen, Wenzhuo Yang, Zirui Zhao, Prathyusha Jwalapuram, Amrita Saha,
+Doyen Sahoo, Silvio Savarese, Caiming Xiong, and Junnan Li. Mcp-universe: Benchmarking
+large language models with real-world model context protocol servers, 2025. URL https:
+//arxiv.org/abs/2508.14704.
+[4] Zijian Wu, Xiangyan Liu, Xinyuan Zhang, Lingjun Chen, Fanqing Meng, Lingxiao Du, Yiran
+Zhao, Fanshi Zhang, Yaoqi Ye, Jiawei Wang, Zirui Wang, Jinjie Ni, Yufan Yang, Arvin Xu, and
+Michael Qizhe Shieh. Mcpmark: A benchmark for stress-testing realistic and comprehensive
+mcp use, 2025. URL https://arxiv.org/abs/2509.24002.
+[5] The Terminal-Bench Team. Terminal-bench: A benchmark for ai agents in terminal environments, Apr 2025. URL https://github.com/laude-institute/terminal-bench.
+[6] Alexandre Drouin, Maxime Gasse, Massimo Caccia, Issam H. Laradji, Manuel Del Verme, Tom
+Marty, Léo Boisvert, Megh Thakkar, Quentin Cappart, David Vazquez, Nicolas Chapados, and
+Alexandre Lacoste. Workarena: How capable are web agents at solving common knowledge
+work tasks?, 2024. URL https://arxiv.org/abs/2403.07718.
+[7] Shuyan Zhou, Frank F. Xu, Hao Zhu, Xuhui Zhou, Robert Lo, Abishek Sridhar, Xianyi Cheng,
+Tianyue Ou, Yonatan Bisk, Daniel Fried, Uri Alon, and Graham Neubig. Webarena: A realistic
+web environment for building autonomous agents, 2024. URL https://arxiv.org/abs/
+2307.13854.
+[8] Rui Ye, Keduan Huang, Qimin Wu, Yuzhu Cai, Tian Jin, Xianghe Pang, Xiangrui Liu, Jiaqi Su,
+Chen Qian, Bohan Tang, Kaiqu Liang, Jiaao Chen, Yue Hu, Zhenfei Yin, Rongye Shi, Bo An,
+Yang Gao, Wenjun Wu, Lei Bai, and Siheng Chen. Maslab: A unified and comprehensive
+codebase for llm-based multi-agent systems, 2025. URL https://arxiv.org/abs/2505.
+16988.
+[9] Xiangru Tang, Wanghan Xu, Yujie Wang, Zijie Guo, Daniel Shao, Jiapeng Chen, Cixuan Zhang,
+Ziyi Wang, Lixin Zhang, Guancheng Wan, et al. Eigen-1: Adaptive multi-agent refinement with
+monitor-based rag for scientific reasoning. arXiv preprint arXiv:2509.21193, 2025.
+21
+
+[10] Kimi Team, Yifan Bai, Yiping Bao, Guanduo Chen, Jiahao Chen, Ningxin Chen, Ruijue Chen,
+Yanru Chen, Yuankun Chen, Yutian Chen, Zhuofu Chen, Jialei Cui, Hao Ding, Mengnan Dong,
+Angang Du, Chenzhuang Du, Dikang Du, Yulun Du, Yu Fan, Yichen Feng, Kelin Fu, Bofei Gao,
+Hongcheng Gao, Peizhong Gao, Tong Gao, Xinran Gu, Longyu Guan, Haiqing Guo, Jianhang
+Guo, Hao Hu, Xiaoru Hao, Tianhong He, Weiran He, Wenyang He, Chao Hong, Yangyang Hu,
+Zhenxing Hu, Weixiao Huang, Zhiqi Huang, Zihao Huang, Tao Jiang, Zhejun Jiang, Xinyi Jin,
+Yongsheng Kang, Guokun Lai, Cheng Li, Fang Li, Haoyang Li, Ming Li, Wentao Li, Yanhao
+Li, Yiwei Li, Zhaowei Li, Zheming Li, Hongzhan Lin, Xiaohan Lin, Zongyu Lin, Chengyin
+Liu, Chenyu Liu, Hongzhang Liu, Jingyuan Liu, Junqi Liu, Liang Liu, Shaowei Liu, T. Y. Liu,
+Tianwei Liu, Weizhou Liu, Yangyang Liu, Yibo Liu, Yiping Liu, Yue Liu, Zhengying Liu, Enzhe
+Lu, Lijun Lu, Shengling Ma, Xinyu Ma, Yingwei Ma, Shaoguang Mao, Jie Mei, Xin Men, Yibo
+Miao, Siyuan Pan, Yebo Peng, Ruoyu Qin, Bowen Qu, Zeyu Shang, Lidong Shi, Shengyuan
+Shi, Feifan Song, Jianlin Su, Zhengyuan Su, Xinjie Sun, Flood Sung, Heyi Tang, Jiawen Tao,
+Qifeng Teng, Chensi Wang, Dinglu Wang, Feng Wang, Haiming Wang, Jianzhou Wang, Jiaxing
+Wang, Jinhong Wang, Shengjie Wang, Shuyi Wang, Yao Wang, Yejie Wang, Yiqin Wang, Yuxin
+Wang, Yuzhi Wang, Zhaoji Wang, Zhengtao Wang, Zhexu Wang, Chu Wei, Qianqian Wei,
+Wenhao Wu, Xingzhe Wu, Yuxin Wu, Chenjun Xiao, Xiaotong Xie, Weimin Xiong, Boyu Xu,
+Jing Xu, Jinjing Xu, L. H. Xu, Lin Xu, Suting Xu, Weixin Xu, Xinran Xu, Yangchuan Xu,
+Ziyao Xu, Junjie Yan, Yuzi Yan, Xiaofei Yang, Ying Yang, Zhen Yang, Zhilin Yang, Zonghan
+Yang, Haotian Yao, Xingcheng Yao, Wenjie Ye, Zhuorui Ye, Bohong Yin, Longhui Yu, Enming
+Yuan, Hongbang Yuan, Mengjie Yuan, Haobing Zhan, Dehao Zhang, Hao Zhang, Wanlu Zhang,
+Xiaobin Zhang, Yangkun Zhang, Yizhi Zhang, Yongting Zhang, Yu Zhang, Yutao Zhang, Yutong
+Zhang, Zheng Zhang, Haotian Zhao, Yikai Zhao, Huabin Zheng, Shaojie Zheng, Jianren Zhou,
+Xinyu Zhou, Zaida Zhou, Zhen Zhu, Weiyu Zhuang, and Xinxing Zu. Kimi k2: Open agentic
+intelligence, 2025. URL https://arxiv.org/abs/2507.20534.
+[11] Yuetai Li, Huseyin A Inan, Xiang Yue, Wei-Ning Chen, Lukas Wutschitz, Janardhan Kulkarni, Radha Poovendran, Robert Sim, and Saravan Rajmohan. Simulating environments with
+reasoning models for agent training, 2025. URL https://arxiv.org/abs/2511.01824.
+[12] Akshara Prabhakar, Zuxin Liu, Ming Zhu, Jianguo Zhang, Tulika Awalgaonkar, Shiyu Wang,
+Zhiwei Liu, Haolin Chen, Thai Hoang, Juan Carlos Niebles, Shelby Heinecke, Weiran Yao,
+Huan Wang, Silvio Savarese, and Caiming Xiong. Apigen-mt: Agentic pipeline for multi-turn
+data generation via simulated agent-human interplay, 2025. URL https://arxiv.org/abs/
+2504.03601.
+[13] Zuxin Liu, Thai Hoang, Jianguo Zhang, Ming Zhu, Tian Lan, Shirley Kokane, Juntao Tan,
+Weiran Yao, Zhiwei Liu, Yihao Feng, Rithesh Murthy, Liangwei Yang, Silvio Savarese,
+Juan Carlos Niebles, Huan Wang, Shelby Heinecke, and Caiming Xiong. Apigen: Automated pipeline for generating verifiable and diverse function-calling datasets, 2024. URL
+https://arxiv.org/abs/2406.18518.
+[14] Yuchen Zhuang, Di Jin, Jiaao Chen, Wenqi Shi, Hanrui Wang, and Chao Zhang. Workforceagentr1: Incentivizing reasoning capability in llm-based web agents via reinforcement learning, 2025.
+URL https://arxiv.org/abs/2505.22942.
+[15] DeepSeek-AI, Aixin Liu, Aoxue Mei, Bangcai Lin, Bing Xue, Bingxuan Wang, Bingzheng
+Xu, Bochao Wu, Bowei Zhang, Chaofan Lin, Chen Dong, Chengda Lu, Chenggang Zhao,
+Chengqi Deng, Chenhao Xu, Chong Ruan, Damai Dai, Daya Guo, Dejian Yang, Deli Chen,
+Erhang Li, Fangqi Zhou, Fangyun Lin, Fucong Dai, Guangbo Hao, Guanting Chen, Guowei
+Li, H. Zhang, Hanwei Xu, Hao Li, Haofen Liang, Haoran Wei, Haowei Zhang, Haowen Luo,
+Haozhe Ji, Honghui Ding, Hongxuan Tang, Huanqi Cao, Huazuo Gao, Hui Qu, Hui Zeng,
+Jialiang Huang, Jiashi Li, Jiaxin Xu, Jiewen Hu, Jingchang Chen, Jingting Xiang, Jingyang
+Yuan, Jingyuan Cheng, Jinhua Zhu, Jun Ran, Junguang Jiang, Junjie Qiu, Junlong Li, Junxiao
+Song, Kai Dong, Kaige Gao, Kang Guan, Kexin Huang, Kexing Zhou, Kezhao Huang, Kuai Yu,
+Lean Wang, Lecong Zhang, Lei Wang, Liang Zhao, Liangsheng Yin, Lihua Guo, Lingxiao Luo,
+Linwang Ma, Litong Wang, Liyue Zhang, M. S. Di, M. Y Xu, Mingchuan Zhang, Minghua
+Zhang, Minghui Tang, Mingxu Zhou, Panpan Huang, Peixin Cong, Peiyi Wang, Qiancheng
+Wang, Qihao Zhu, Qingyang Li, Qinyu Chen, Qiushi Du, Ruiling Xu, Ruiqi Ge, Ruisong Zhang,
+Ruizhe Pan, Runji Wang, Runqiu Yin, Runxin Xu, Ruomeng Shen, Ruoyu Zhang, S. H. Liu,
+Shanghao Lu, Shangyan Zhou, Shanhuang Chen, Shaofei Cai, Shaoyuan Chen, Shengding Hu,
+22
+
+Shengyu Liu, Shiqiang Hu, Shirong Ma, Shiyu Wang, Shuiping Yu, Shunfeng Zhou, Shuting
+Pan, Songyang Zhou, Tao Ni, Tao Yun, Tian Pei, Tian Ye, Tianyuan Yue, Wangding Zeng,
+Wen Liu, Wenfeng Liang, Wenjie Pang, Wenjing Luo, Wenjun Gao, Wentao Zhang, Xi Gao,
+Xiangwen Wang, Xiao Bi, Xiaodong Liu, Xiaohan Wang, Xiaokang Chen, Xiaokang Zhang,
+Xiaotao Nie, Xin Cheng, Xin Liu, Xin Xie, Xingchao Liu, Xingkai Yu, Xingyou Li, Xinyu
+Yang, Xinyuan Li, Xu Chen, Xuecheng Su, Xuehai Pan, Xuheng Lin, Xuwei Fu, Y. Q. Wang,
+Yang Zhang, Yanhong Xu, Yanru Ma, Yao Li, Yao Li, Yao Zhao, Yaofeng Sun, Yaohui Wang,
+Yi Qian, Yi Yu, Yichao Zhang, Yifan Ding, Yifan Shi, Yiliang Xiong, Ying He, Ying Zhou,
+Yinmin Zhong, Yishi Piao, Yisong Wang, Yixiao Chen, Yixuan Tan, Yixuan Wei, Yiyang Ma,
+Yiyuan Liu, Yonglun Yang, Yongqiang Guo, Yongtong Wu, Yu Wu, Yuan Cheng, Yuan Ou,
+Yuanfan Xu, Yuduan Wang, Yue Gong, Yuhan Wu, Yuheng Zou, Yukun Li, Yunfan Xiong,
+Yuxiang Luo, Yuxiang You, Yuxuan Liu, Yuyang Zhou, Z. F. Wu, Z. Z. Ren, Zehua Zhao, Zehui
+Ren, Zhangli Sha, Zhe Fu, Zhean Xu, Zhenda Xie, Zhengyan Zhang, Zhewen Hao, Zhibin Gou,
+Zhicheng Ma, Zhigang Yan, Zhihong Shao, Zhixian Huang, Zhiyu Wu, Zhuoshu Li, Zhuping
+Zhang, Zian Xu, Zihao Wang, Zihui Gu, Zijia Zhu, Zilin Li, Zipeng Zhang, Ziwei Xie, Ziyi Gao,
+Zizheng Pan, Zongqing Yao, Bei Feng, Hui Li, J. L. Cai, Jiaqi Ni, Lei Xu, Meng Li, Ning Tian,
+R. J. Chen, R. L. Jin, S. S. Li, Shuang Zhou, Tianyu Sun, X. Q. Li, Xiangyue Jin, Xiaojin Shen,
+Xiaosha Chen, Xinnan Song, Xinyi Zhou, Y. X. Zhu, Yanping Huang, Yaohui Li, Yi Zheng,
+Yuchen Zhu, Yunxian Ma, Zhen Huang, Zhipeng Xu, Zhongyu Zhang, Dongjie Ji, Jian Liang,
+Jianzhong Guo, Jin Chen, Leyi Xia, Miaojun Wang, Mingming Li, Peng Zhang, Ruyi Chen,
+Shangmian Sun, Shaoqing Wu, Shengfeng Ye, T. Wang, W. L. Xiao, Wei An, Xianzu Wang,
+Xiaowen Sun, Xiaoxiang Wang, Ying Tang, Yukun Zha, Zekai Zhang, Zhe Ju, Zhen Zhang, and
+Zihua Qu. Deepseek-v3.2: Pushing the frontier of open large language models, 2025. URL
+https://arxiv.org/abs/2512.02556.
+[16] Hongjin Su, Shizhe Diao, Ximing Lu, Mingjie Liu, Jiacheng Xu, Xin Dong, Yonggan Fu,
+Peter Belcak, Hanrong Ye, Hongxu Yin, Yi Dong, Evelina Bakhturina, Tao Yu, Yejin Choi, Jan
+Kautz, and Pavlo Molchanov. Toolorchestra: Elevating intelligence via efficient model and tool
+orchestration, 2025. URL https://arxiv.org/abs/2511.21689.
+[17] Meng Lu, Ran Xu, Yi Fang, Wenxuan Zhang, Yue Yu, Gaurav Srivastava, Yuchen Zhuang,
+Mohamed Elhoseiny, Charles Fleming, Carl Yang, et al. Scaling agentic reinforcement learning
+for tool-integrated reasoning in vlms. arXiv preprint arXiv:2511.19773, 2025.
+[18] Asaf Yehudai, Lilach Eden, Alan Li, Guy Uziel, Yilun Zhao, Roy Bar-Haim, Arman Cohan,
+and Michal Shmueli-Scheuer. Survey on evaluation of llm-based agents, 2025. URL https:
+//arxiv.org/abs/2503.16416.
+[19] Anthropic.
+Claude opus 4.5 system card.
+Technical report, Anthropic, November 2025.
+URL https://assets.anthropic.com/m/64823ba7485345a7/
+Claude-Opus-4-5-System-Card.pdf.
+[20] FutureHouse. About 30% of Humanity’s Last Exam chemistry/biology answers are likely wrong,
+2025. URL https://www.futurehouse.org/research-announcements/hle-exam.
+[21] OpenAI. Why SWE-bench Verified no longer measures frontier coding capabilities, 2025. URL
+https://openai.com/index/why-we-no-longer-evaluate-swe-bench-verified/.
+[22] Shishir G Patil, Huanzhi Mao, Fanjia Yan, Charlie Cheng-Jie Ji, Vishnu Suresh, Ion Stoica, and
+Joseph E Gonzalez. The berkeley function calling leaderboard (bfcl): From tool use to agentic
+evaluation of large language models. In Forty-second International Conference on Machine
+Learning.
+[23] Shishir G. Patil, Tianjun Zhang, Xin Wang, and Joseph E. Gonzalez. Gorilla: Large language
+model connected with massive APIs, 2023. URL https://arxiv.org/abs/2305.15334.
+[24] Zhangchen Xu, Adriana Meza Soria, Shawn Tan, Anurag Roy, Ashish Sunil Agrawal, Radha
+Poovendran, and Rameswar Panda. Toucan: Synthesizing 1.5 m tool-agentic data from realworld mcp environments. arXiv preprint arXiv:2510.01179, 2025.
+[25] Team ACE. ToolACE: Winning the points of LLM function calling, 2024. URL https:
+//arxiv.org/abs/2409.00920.
+23
+
+[26] Xiao Liu, Hao Yu, Hanchen Zhang, Yifan Xu, Xuanyu Lei, Hanyu Lai, Yu Gu, Hangliang Ding,
+Kaiwen Men, Kejuan Yang, Shudan Zhang, Xiang Deng, Aohan Zeng, Zhengxiao Du, Chenhui
+Zhang, Sheng Shen, Tianjun Zhang, Yu Su, Huan Sun, Minlie Huang, Yuxiao Dong, and Jie
+Tang. AgentBench: Evaluating LLMs as agents, 2023. URL https://arxiv.org/abs/2308.
+03688.
+[27] Carlos E. Jimenez, John Yang, Alexander Wettig, Shunyu Yao, Kexin Pei, Ofir Press, and
+Karthik Narasimhan. SWE-bench: Can language models resolve real-world GitHub issues?,
+2024. URL https://arxiv.org/abs/2310.06770.
+[28] Saptarshi Sengupta, Kristal Curtis, Fei Ding, and Suhang Wang. MAG-V: A multi-agent
+framework for synthetic data generation and verification, 2024. URL https://arxiv.org/
+abs/2412.04494.
+[29] Chen Qian, Wei Liu, Hongzhang Liu, Nuo Chen, Yufan Dang, Jiahao Li, Cheng Yang, Weize
+Chen, Yusheng Su, Xin Cong, Juyuan Xu, Dahai Li, Zhiyuan Liu, and Maosong Sun. ChatDev:
+Communicative agents for software development, 2024. URL https://arxiv.org/abs/
+2307.07924.
+[30] Dong Huang, Jie M. Zhang, Michael Luck, Qingwen Bu, Yuhao Qing, and Heming Cui.
+AgentCoder: Multi-agent-based code generation with iterative testing and optimisation, 2024.
+URL https://arxiv.org/abs/2312.13010.
+[31] Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan Zhuang, Zhanghao Wu, Yonghao Zhuang,
+Zi Lin, Zhuohan Li, Dacheng Li, Eric P. Xing, Hao Zhang, Joseph E. Gonzalez, and Ion
+Stoica. Judging LLM-as-a-judge with MT-Bench and Chatbot Arena, 2023. URL https:
+//arxiv.org/abs/2306.05685.
+[32] Fangyi Yu. When ais judge ais: The rise of agent-as-a-judge evaluation for llms, 2025. URL
+https://arxiv.org/abs/2508.02994.
+[33] Mingyue Cheng, Jiqian Yang, Qi Liu, Yucong Luo, and Enhong Chen. Agent-R1: Training
+powerful LLM agents with end-to-end reinforcement learning, 2025. URL https://arxiv.
+org/abs/2511.14460.
+[34] Chrisantha Fernando, Dylan Banarse, Henryk Michalewski, Simon Osindero, and Tim Rocktäschel. Promptbreeder: Self-referential self-improvement via prompt evolution, 2023. URL
+https://arxiv.org/abs/2309.16797.
+[35] Omar Khattab, Arnav Singhvi, Paridhi Maheshwari, Zhiyuan Zhang, Keshav Santhanam, Sri
+Vardhamanan, Saiful Haq, Ashutosh Sharma, Thomas T. Joshi, Hanna Moazam, Heather Miller,
+Matei Zaharia, and Christopher Potts. DSPy: Compiling declarative language model calls into
+self-improving pipelines, 2023. URL https://arxiv.org/abs/2310.03714.
+[36] Yuchi Liu, Jaskirat Singh, Gaowen Liu, Ali Payani, and Liang Zheng. Towards hierarchical
+multi-agent workflows for zero-shot prompt optimization, 2025. URL https://arxiv.org/
+abs/2405.20252.
+[37] Tsz-To Wong, Ching-Chun Huang, and Hong-Han Shuai. Coach: Collaborative agents for
+contextual highlighting – a multi-agent framework for sports video analysis, 2025. URL
+https://arxiv.org/abs/2512.01853.
+
+24
+
+A
+
+BFCL Error Examples
+
+This appendix provides additional concrete examples of errors identified in the BFCL multi-turn base
+evaluation suite (Section 4.1). Examples are organized by error category and each is presented in a
+self-contained box showing the relevant schema, code, ground truth, and explanation.
+Schema Error: Speed unit "m/h" contradicts response unit "km/h" (setCruiseControl)
+Entry: multi_turn_base_79, Turn 2
+
+Domain: Vehicle Control API
+
+User prompt: “Could you adjust the cruise control to 65 mph. . . ”
+Schema definition (vehicle_control.json):
+{ "name": "setCruiseControl",
+"parameters": {
+"speed": {"type": "float",
+"description": "The speed to set in m/h."}
+},
+"response": {
+"currentSpeed": {"type": "float",
+"description": "Current speed in km/h."}
+}}
+Ground truth call:
+setCruiseControl(speed=65, activate=True, distanceToNextVehicle=100)
+Problem: The input parameter description uses "m/h" (ambiguous—miles/hour or meters/hour?), while
+the response describes speed in "km/h". The user says “65 mph”, but the schema offers two contradictory
+unit systems. If "m/h" means miles per hour but the output is in km/h, there is an implicit unit conversion
+that is never documented. If "m/h" means km/h, the abbreviation is wrong.
+
+Figure 8: Schema error: contradictory unit specifications between input parameter ("m/h") and
+response ("km/h").
+Schema Error: Documented response key "order_history" vs. actual key "history"
+Function: get_order_history
+
+Domain: Trading Bot API
+
+Schema (trading_bot.json):
+{ "name": "get_order_history",
+"response": {
+"properties": {
+"order_history": {"type": "array",
+"description": "List of orders ID in the order history."}
+}}}
+Implementation (trading_bot.py:554):
+return {"history": list(self.orders.keys())}
+Problem: The schema documents the response key as "order_history", but the implementation returns
+"history". Any model or downstream code that parses the response using the schema-documented key
+would fail to find the data.
+
+Figure 9: Schema error: the documented response key "order_history" does not match the actual
+implementation key "history".
+
+25
+
+Implementation Error: tail(lines=0) returns ALL lines instead of empty
+File: gorilla_file_system.py:563–585
+Implementation:
+def tail(self, file_name: str, lines: int = 10):
+content = file._read().splitlines()
+if lines > len(content):
+lines = len(content)
+last_lines = content[-lines:] # content[-0:] == content[0:]!
+return {"last_lines": "\n".join(last_lines)}
+Problem: In Python, content[-0:] is equivalent to content[0:], which returns the entire list. So
+tail(file, lines=0) returns all lines instead of no lines. This is a classic off-by-one / boundary
+condition error. A model calling tail with lines=0 would receive unexpected results.
+
+Figure 10: Implementation error: tail(lines=0) returns the entire file due to Python’s [-0:] slice
+semantics.
+
+Implementation Error: get_zipcode_based_on_city — silent failure on unknown cities
+File: vehicle_control.py:618–649
+
+Affected entries: 38 calls across 20 entries
+
+Implementation:
+def get_zipcode_based_on_city(self, city: str):
+if city == "Rivermist":
+return {"zipcode": "83214"}
+elif city == "San Francisco":
+return {"zipcode": "94016"}
+# ... more elif chains ...
+else:
+return {"zipcode": "00000"} # Silent failure!
+Problem: (1) Case-sensitive exact matching means "san francisco" or "SAN FRANCISCO" returns
+"00000". (2) Unknown cities silently return the invalid zipcode "00000" instead of an error, which then
+propagates to estimate_distance producing incorrect distance calculations. The function should either
+normalize case or return an error for unknown cities.
+
+Figure 11: Implementation error: case-sensitive matching and silent failure with an invalid default
+zipcode "00000".
+
+26
+
+Implementation Error: send_message stores messages without sender
+File: message_api.py:187–196
+
+Affected entries: 28 entries
+
+Implementation:
+def send_message(self, receiver_id: str, message: str):
+message_id = self._generate_id() # Returns {"new_id": int}!
+self.inbox.append({receiver_id: message}) # No sender field
+self.message_count += 1
+return {"sent_status": True, "message_id": message_id}
+_generate_id (message_api.py:104):
+def _generate_id(self):
+return {"new_id": new_id}
+
+# Returns a dict, not an int
+
+Problem: Two compounding bugs: (1) Messages are stored as {receiver_id: message} with no
+sender field, so delete_message cannot distinguish between messages from different senders to the same
+receiver, and view_messages_sent returns all messages regardless of sender. (2) _generate_id returns
+a dict {"new_id": 12345} instead of a plain integer, producing a nested dict in the response.
+
+Figure 12: Implementation error: send_message omits the sender field and _generate_id returns
+a dict instead of an integer.
+
+Trajectory Error: Move-then-rename vs. rename-then-move (multi_turn_base_10)
+Entry: multi_turn_base_10, Turn 1
+
+Domain: File System API
+
+User prompt: “Let’s move over the project’s proposal document into this ‘Projects’ folder, but we’ll go
+ahead and rename it to ‘final_proposal_2024’.”
+Ground truth (move first, then rename):
+mv(source=’proposal.docx’, destination=’Projects’)
+cd(folder=’Projects’)
+mv(source=’proposal.docx’, destination=’final_proposal_2024’)
+Equally valid alternative (rename first, then move):
+mv(source=’proposal.docx’, destination=’final_proposal_2024’)
+mv(source=’final_proposal_2024’, destination=’Projects’)
+Problem: Both approaches produce identical filesystem state: Projects/final_proposal_2024 with
+the correct content. However, the evaluation requires the ground truth’s execution result strings to appear
+in the model’s output. The alternative produces different intermediate strings, causing a false failure. The
+same pattern affects multi_turn_base_24.
+
+Figure 13: Trajectory error: overly rigid evaluation penalizes a valid rename-then-move strategy that
+produces identical final state.
+
+27
+
+Trajectory Error: Float vs. integer formatting in tweet (multi_turn_base_75)
+Entry: multi_turn_base_75, Turn 1
+
+Domain: Vehicle Control + Twitter API
+
+User prompt: “Share a quick update about the tire pressures on Twitter, using the format ‘Front Left Tire:
+XXX PSI, . . . ’ ”
+check_tire_pressure() returns (float values):
+{"frontLeftTirePressure": 32.0, "frontRightTirePressure": 32.0,
+"rearLeftTirePressure": 30.0, "rearRightTirePressure": 30.0}
+Ground truth tweet (integer formatting):
+post_tweet(content=’Front Left Tire: 32 PSI, Front Right Tire:
+32 PSI, Rear Left Tire: 30 PSI, Rear Right Tire: 30 PSI’)
+Problem: The API returns float values (32.0, 30.0), but the ground truth uses integer formatting (32, 30).
+A model faithfully using the API return values would construct "Front Left Tire: 32.0 PSI, ...".
+The state checker compares tweet content exactly, so 32.0 vs 32 causes a mismatch despite conveying
+identical information.
+
+Figure 14: Trajectory error: exact string matching penalizes float formatting (32.0) when the ground
+truth uses integers (32).
+
+Trajectory Error: du() format mismatch — no valid solution exists (multi_turn_base_28)
+Entry: multi_turn_base_28, Turn 2
+
+Domain: File System API
+
+User prompt: “Log the storage usage of the current directory to usage.txt. The content should be the
+number followed by the word bytes and nothing else.”
+Ground truth:
+du(human_readable=True)
+# Returns "205.00 B"
+touch(file_name=’usage.txt’)
+echo(content=’205 bytes’, file_name=’usage.txt’) # Writes "205 bytes"
+du() implementation (gorilla_file_system.py:550–561):
+if human_readable:
+size_str = f"{total_size:.2f} {unit}"
+else:
+size_str = f"{total_size} bytes"
+
+# -> "205.00 B"
+# -> "205 bytes"
+
+Problem: The ground truth calls du(human_readable=True) which returns "205.00 B", but then
+writes "205 bytes" (the non-human-readable format). A model using du(human_readable=True) and
+faithfully writing its output would write "205.00 B" (state mismatch). A model using du() without the
+flag gets "205 bytes" (correct file content), but fails the response check because the ground truth expects
+the human_readable=True return value. No solution can satisfy both checks simultaneously.
+
+Figure 15: Trajectory error: the ground truth calls du(human_readable=True) but writes the
+non-human-readable output, making it impossible to pass both state and response checks.
+
+28
+
+

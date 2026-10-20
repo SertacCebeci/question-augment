@@ -1,0 +1,2237 @@
+Rethinking Rubric Generation for Improving LLM
+Judge and Reward Modeling for Open-ended Tasks
+William F. Shen⋆ , Xinchi Qiu, Chenxi Whitehouse, Lisa Alazraki⋆ , Shashwat Goel⋆ , Francesco
+Barbieri, Timon Willi, Akhil Mathur, Ilias Leontiadis
+Meta Superintelligence Labs
+
+arXiv:2602.05125v1 [cs.LG] 4 Feb 2026
+
+⋆
+
+Work done at Meta
+
+Recently, rubrics have been used to guide LLM judges in capturing subjective, nuanced, multidimensional human preferences, and have been extended from evaluation to reward signals for
+reinforcement fine-tuning (RFT). However, rubric generation remain hard to control: rubrics often
+lack coverage, conflate dimensions, misalign preference direction, and contain redundant or highly
+correlated criteria - degrading judge accuracy and producing suboptimal rewards during RFT. We
+propose RRD, a principled framework for rubric refinement built on a recursive decompose–filter cycle.
+RRD decomposes coarse rubrics into fine-grained, discriminative criteria, expanding coverage while
+sharpening separation between responses. A complementary filtering mechanism removes misaligned
+and redundant rubrics, and a correlation-aware weighting scheme to prevent over-representing highly
+correlated criteria, yielding rubric sets that are informative, comprehensive, and non-redundant.
+Empirically, RRD delivers large, consistent gains across both evaluation and training: it improves
+preference-judgment accuracy on JudgeBench and PPE for both GPT-4o and Llama3.1-405B judges,
+achieving top performance in all settings with up to +17.7 points on JudgeBench. When used as the
+reward source for RFT on WildChat, it yields substantially stronger and more stable learning signals,
+boosting reward by up to 160% (Qwen3-4B) and 60% (Llama3.1-8B) versus ∼10–20% for prior rubric
+baselines, with gains that transfer to HealthBench-Hard and BiGGen Bench. Overall, RRD establish
+recursive rubric refinement as a scalable and interpretable foundation for LLM judging and reward
+modeling in open-ended domains.
+Date: February 6, 2026
+Correspondence: fs604@cam.ac.uk, iliasl@meta.com
+
+1
+
+Introduction
+
+Large language models (LLMs) are increasingly used as judges (“LLM judge”) to evaluate open-ended
+generations (e.g., creative writing, planning, and roleplay) (Gu et al., 2024). However, because quality in these
+settings is subjective and inherently multi-attribute, LLM-based judging remains brittle: even frontier models
+can be near chance on preference benchmarks, and real-world use is further limited by bias, inconsistency,
+and limited transparency, especially when evaluation criteria are implicit or underspecified (Thakur et al.,
+2024; Tan et al., 2024; Pezeshkpour and Hruschka, 2023; Saito et al., 2023; Zheng et al., 2023; Haldar and
+Hockenmaier, 2025; Kim et al., 2023; Gajcin et al., 2025).
+In parallel, recent work extends Reinforcement Learning from Verifiable Rewards (RLVR) beyond domains with
+objectively checkable outcomes (e.g., math and coding) to open-ended tasks under non-verifiable rewards (Cui
+et al., 2025; Guo et al., 2025; Lambert et al., 2024). A common approach converts binary correctness into
+pairwise preferences (Ivison et al., 2024), but this approach not only inherits the limitations of standard
+LLM-judge labeling, but also introduces a key scaling bottleneck: generating preference supervision that
+incorporates diverse and robust criteria matching the complexity of real-world reasoning (Ouyang et al., 2022;
+Chen et al., 2024; Singhal et al., 2023; Wang et al., 2024; Ye et al., 2025).
+One promising direction is rubric-based judging, where LLMs generate explicit, structured rubrics and use
+them to ground assessments, improving reliability and interpretability relative to holistic judgments (Hashemi
+et al., 2024). These rubric-level signals also integrate naturally into reinforcement fine-tuning (RFT) as
+1
+
+structured rewards, motivating the Rubrics-as-Rewards paradigm for aligning models on complex open-ended
+tasks (Gunjal et al., 2025).
+
+Figure 1 RRD consistently outperforms all baselines on both
+JudgeBench and PPE for both proprietary (GPT-4o) and
+open-weights (Llama3.1-405B) judges, delivering substantial
+gains in preference-judgment accuracy.
+
+However, existing rubric generation methods
+face two key limitations: (1) coverage deficiency,
+where the rubric set fails to comprehensively capture the diverse and nuanced dimensions of generation quality; (2) noisy evaluation outcomes,
+where misaligned, overlapping, or highly correlated rubrics introduce unreliable signals. Consequently, rubric-based judges often show weak
+alignment with human preferences, reducing evaluation accuracy, and when used as rewards for
+RFT, they yield only limited improvements in
+learning preference-aligned behavior across diverse model outputs. These flaws are severe:
+we show that naively generated rubrics degrade
+GPT-4o’s judgment accuracy from 55.6% to
+42.9% (Figure 1) on JudgeBench (Tan et al.,
+2024) – 13 points below using no rubrics at all.
+
+In this work, we propose Recursive Rubric Decomposition (RRD), a principled framework that improves both
+the accuracy of rubric-based judges and their effectiveness as reward models for downstream RFT. RRD
+expands coverage by decomposing high-level rubric items—broad criteria satisfied by many responses—into
+finer-grained, nuanced subpoints. This yields more comprehensive and discriminative evaluations, helping LLM
+judges better capture subtle yet consequential quality differences when comparing candidate responses. To
+complement rubric expansion, we introduce an aggregation mechanism to mitigate noise by (i) filtering rubrics
+that produce misaligned or conflicting signals, and (ii) removing redundant rubrics while down-weighting
+highly correlated ones. The first step guards against criteria that yield grossly incorrect judgments, while the
+second prevents overlapping perspectives from being overrepresented. Together, these components produce
+more stable and informative rubric-based assessments.
+This process mirrors many real-world evaluations which follow a structured assessment rather than a single
+holistic verdict. Consider a physician diagnosing ambiguous symptoms: they don’t render a holistic verdict,
+but forms hypotheses and orders discriminating tests. When a test result is consistent with multiple conditions,
+she orders more specific tests that distinguish between them. For example, a positive result for “inflammatory
+markers” doesn’t determine whether the cause is autoimmune, infectious, or malignant - she must decompose
+further. The process terminates when tests discriminate: the remaining diagnosis is the only one consistent
+with all evidence. Crucially, she also recognizes correlated indicators—elevated CRP and ESR both signal
+inflammation but shouldn’t be double-counted as independent evidence. RRD instantiates this diagnostic
+logic: rubrics satisfied by multiple responses are insufficiently discriminative and are recursively decomposed;
+the process adapts naturally to case complexity, and correlated criteria are appropriately down-weighted.
+We empirical demonstrate the performance of RRD two-fold. We first evaluate RRD on two widely used
+preference-judgment benchmarks: JudgeBench (Tan et al., 2024) and Preference Proxy Evaluation (PPE)
+(Frick et al., 2024). Across both GPT-4o and Llama3.1-405B judges, RRD consistently yields stronger
+agreement with human pairwise preferences, improving accuracy over the base judges and prior rubric-based
+baselines. In particular, our best variant (RRD WU ) achieves the top score on all settings achieving up to
+17.7% improvement on JudgeBench for GPT-4o.
+In addition, we demonstrate the effectiveness of RRD in RFT by training open-source policies, Qwen3-4B (Yang
+et al., 2025) and Llama3.1-8B (Dubey et al., 2024), with rubric-based judges on WildChat (Zhao et al., 2024)
+as the reward signal. Compared to prior LLM-judge-based and rubrics-based reward baselines, RRD yields
+substantially stronger and better-calibrated rewards, translating into faster learning and higher final reward
+(Figure 4). Concretely, our method boosts reward by up to 160% for Qwen3-4B and 60% for Llama3.1-8B,
+versus only ∼10–20% for LLM Rubrics and Chasing the Tail (Figure 4). These gains also carry over to
+downstream evaluations, where the resulting policies consistently improve on BiGGen Bench (Kim et al.,
+2
+
+2024) and HealthBench-Hard (Arora et al., 2025) for both model families.
+Overall, our results show that recursive rubric decomposition (RRD) is a key enabler of effective rubric-based
+judging and reward modeling for open-ended tasks, turning brittle rubrics into reliable signals that support
+robust alignment in open-ended language generation.
+
+2
+
+RRD Framework
+
+In this section, we first provide an overview of rubric-based judges in §2.1. We then formalize a theoretical
+perspective on rubric quality that motivates our approach. Finally, we present Recursive Rubric Decomposition
+(RRD) in §2.3, a principled framework that builds on this grounding to improve rubric-based evaluation.
+
+2.1
+
+Rubric-based Judge Overview
+
+Let P denote the prompt space and R the response space. For each P ∈ P, consider a finite candidate set
+R(P ) = {R1 , . . . , RM } ⊆ R. An LLM judge outputs a preference verdict V over R(P ).
+A rubric-based judge conditions its evaluation on a set of rubric predicates, evaluated separately. Each rubric
+is a measurable map g : P × R → {0, 1}, where g(P, R) = 1 indicates that response R satisfies the criterion
+under prompt P . Given a rubric family G = (g1 , . . . , gm ) and nonnegative weights w = (w1 , . . . , wm ) ∈ Rm
++,
+we define the rubric reward
+m
+X
+fw,G (P, R) :=
+wk gk (P, R) .
+(1)
+k=1
+
+The constraint wk ≥ 0 is without loss of generality: any negatively polarized rubric can be rewritten as
+a positive, contrastive criterion. For two responses Ri , Rj ∈ R(P ), the judge prefers Ri over Rj , denoted
+Ri ≻ Rj , iff fw,G (P, Ri ) > fw,G (P, Rj ).
+
+2.2
+
+Theoretical Grounding for Rubric Quality
+
+Since rubrics directly shape how LLM judges compare responses, and therefore the reward signals used in
+RFT, rubric quality is a primary lever for both judgment accuracy and reward fidelity. Ideally, a rubric set
+should be (a) informative, with each criterion helping distinguish preferred from non-preferred responses; (b)
+comprehensive, spanning the diverse dimensions along which quality varies; and (c) non-redundant, providing
+complementary signals, since overlapping or correlated rubrics can distort aggregation. While prior work has
+made substantial progress (see §5), achieving the three desiderata simultaneously remains challenging: expertauthored rubrics are often precise but can be limited in coverage, whereas LLM-generated rubrics scale readily
+but may include criteria that are overly generic, misaligned or highly correlated. More broadly, a principled
+theoretical account of rubric quality – and how to systematically enforce it – remains underdeveloped.
+To bridge this gap and motivate RRD, we first briefly present the theoretical grounding based on two
+assumptions: (A1) positive edge and (A2) bounded correlation. We then analyze the judge’s misclassification
+probability, whether aggregated rubric verdicts recover the true preference label, and show that it admits an
+exponential upper bound (Eq. 2). Minimizing this bound yields a principled objective for rubric generation
+and correlation-aware weighting, directly operationalizing the three desiderata above.
+Assume each rubric gk ∈ G is weakly informative (a positive “edge” over random guessing) and its noise (the
+deviation of its verdicts from conditional mean given the true label) is sub-Gaussian with bounded dependence:
+(A1) (Positive edge) There exist µk > 0 such that E[Ybk | Y = +1] = +µk , E[Ybk | Y = −1] = −µk , where
+Y ∈ {±1} is the ground-truth preference label, Ybk is the verdict of the k th rubric.
+(A2) (Bounded correlation) Letting Zk = Ybk − µk Y , the vector Z = (Z1 , . . . , Zm ) is mean-zero sub-Gaussian
+with covariance Σy satisfying Var(Zk ) ≤ σk2 and |Corr(Zi , Zj )| ≤ ρ < 1 for i ̸= j.
+In simple words, (A1) assumes that each rubric, with a positive edge (µk > 0), contributes positively toward
+distinguishing the preferred response from the inferior one; (A2) assumes that individual rubric’s noise is
+bounded and rubrics are not repetitive (bounded pairwise correlation ρ < 1). Here, the noise Zk = Ybk − µk Y
+3
+
+captures rubric-specific randomness or systematic mismatch – i.e., the part of a rubric’s verdict not explained
+by the true label, arising from ambiguous criteria, imperfect judge execution, or instance-specific idiosyncrasies.
+This enables standard concentration bounds over the aggregated, non-redundant decisions.
+The probability that the rubric-based judge, after aggregating decisions across all rubric items (Eq.1), produces
+an incorrect verdict (misclassification probability) Yb ̸= Y is then upper bounded by:
+
+
+P(Yb ̸= Y ) ≤ exp − 12 min{∆2m /Vm (+1), ∆2m /Vm (−1)}
+(2)
+where ∆m := w⊤ µ and Vm := w⊤ Σ w is the variance proxy of the weighted residuals (ref. Appendix B.1).
+⊤
+
+2
+
+µ)
+Eq. 2 implies that tightening the misclassification bound amounts to maximizing Ξ = (w
+. This perspective
+w⊤ Σw
+suggests a high-level prescription:
+
+1. Decomposition: Decompose broad rubrics into finer dimensions to enhance coverage and discrimination.
+2. Positivity: Remove misaligned rubrics to eliminate negative edge and maintain constructivity.
+3. Non-redundancy: Prune redundant rubrics to ensure distinct, non-overlapping criteria.
+4. Weight Optimization: Prevent over-representation of highly correlated rubrics via weight optimization.
+In tandem, (1) and (2) expand the rubric set by admitting new criteria with positive edge (µk > 0) to maximize
+aggregate edge, while (3) and (4) minimize redundancy and correlation within the denominator. Together,
+these yield an exponentially decaying misclassification probability and formalizes our three desiderata.
+
+2.3
+
+Methodology: Recursive Rubric Decomposition (RRD)
+
+Building on the theoretical insights in §2.2, we optimize Eq.2 through four pillars: decomposition, positivity,
+non-redundancy, weight optimization. Now, we introduce Recursive Rubric Decomposition (RRD), a principled
+rubric construction framework. The full RRD procedure is summarized in Figure 2 and Algorithm 1.
+RRD consists of three stages. First, we prompt an LLM to propose initial rubrics conditioned on the task
+prompt and m sample responses (we set m = 8 in all experiments), yielding candidate rubrics for optimization.
+Second, we start the recursive decomposition and filtering cycle. We exploit the fact that distinct responses
+must differ in some respects: a rubric satisfied by many responses is too broad-brush and insufficiently
+discriminative. It can be decomposed into finer sub-dimensions that capture more nuanced aspects of quality.
+We operationalize this by instructing an LLM-based rubric generator to recursively decompose any rubric
+that applies to more than n rollouts (we use n = 2 in all experiments, triggering decomposition whenever a
+rubric matches more than two candidate responses and leaving minimal room for under-decomposition). We
+then apply two filters: (a) misalignment filtering: which discards rubrics that prefer outputs from a weaker
+model (Llama3-8B) over a stronger model (GPT-4o) as a proxy for incorrect preference direction (more
+discussion about this in Appendix C); and (b) LLM-based redundancy filtering, which removes rubrics that
+are substantially overlapping with existing ones.
+We repeat this decomposition–filtering loop until the proposer struggles to produce novel, valid, non-redundant
+items. For efficiency, we use an early-stopping criterion: if the number of accumulated rejected proposals
+exceeds a termination threshold, we stop the loop, since further iterations are unlikely to yield effective new
+rubrics. We treat this termination threshold as a tunable hyperparameter. We use 15 in all of our experiments
+below. The resulting rubric set is task-adaptive: its size emerges from the intrinsic complexity of the prompt
+rather than being fixed a priori (More discussion about this in Appendix C).
+Finally, optimize weights to prevent over-representation of highly correlated rubrics. In practice, this is
+particularly challenging because the ground-truth preference labels needed to estimate the rubric edges µ
+are unavailable. Prior work therefore instructs an LLM to assign rubric weights using a heuristically chosen
+scale (Gunjal et al., 2025; Viswanathan et al., 2025; Zhang et al., 2025a). This strategy is effective only
+if there exists a clearly dominant rubric and the LLM can reliably identify it, so that (w⊤ µ)2 dominates
+the covariance term, effectively suppressing the impact of rubric correlations. In open-ended tasks, quality
+is inherently multi-dimensional, subjective, and nuanced, so the class-separating signal is often distributed
+4
+
+Figure 2 Overview of RRD framework: RRD consists of three stages: (I) Initial Rubric Proposal. LLM proposes
+initial candidate rubrics (conditioned on the task prompt and sample responses) for optimization. (II) Recursive
+Decomposition and Filtering. Recursively decompose coarse rubric into finer dimensions to enhance coverage and
+discrimination, while filtering misalgined and redundant rubrics. The cycle stops when the number of discarded
+rubrics exceeds N , indicating saturation in novel, non-redundant, and valid rubrics. (III) Rubric Weight Assignment.
+For open-ended tasks where preference signal is distributed, assign whitened uniform (WU) weights to account for
+correlation structure and prevent over-representation of highly correlated rubrics. Otherwise, assign LLM-proposed
+heuristic weights. Empirically, WU weighting yields higher LLM judge accuracy and improves the effectiveness of
+rubrics as generative rewards in RFT.
+
+across many criteria rather than concentrated in single dominant rubric. This helps explain why existing
+rubric-based judges remain imperfect in practice, and why expanding coverage with additional valid rubrics
+further disperses the signal.
+To sidestep the need for labeled edges, we instead minimize the misclassification upper bound by homogenizing
+signal in a whitened space. This is feasible because the second-order redundancy structure of rubric scores,
+captured by Σ, is an intrinsic property of the rubric set, not of any particular response pair, and can therefore
+be estimated from unlabeled data (ref. Appendix B.2). Concretely, we choose weights that whiten the rubric
+space via Σ−1/2 (i.e., removing correlations while applying equal weighting in the whitened coordinates). This
+yields a simple, label-free, and correlation-aware weighting scheme that stabilizes aggregation when signals
+are spread across many rubric dimensions.
+
+3
+
+RRD-based LLM Judge Results
+
+In §2, we introduced RRD as a novel and theoretically grounded framework for rubric generation. In this
+section, we empirically evaluate the effectiveness of RRD in improving the accuracy of LLM judges on
+open-form pairwise judgment tasks.
+Dataset. We evaluate the accuracy of LLM judge using (1) JudgeBench (Tan et al., 2024), which consists
+of challenging open-form response pairs spanning knowledge, reasoning, mathematics, and coding tasks.
+Following Tan et al. (2024), we report results on the subset where both responses are generated by GPT-4o
+(350 preference pairs), and (2) Preference Proxy Evaluations (PPE) (Frick et al., 2024), a large-scale benchmark
+containing 10.2K human preference pairs from Chatbot Arena covering 20 LLMs across 121+ languages.
+
+5
+
+GPT-4o
+Method
+Base Model
+LLM Rubrics (w/o resp.)
+LLM Rubrics (w. resp.)
+Chasing the Tail
+RRDuniform
+RRDLLM
+RRDWU
+
+Llama3.1-405B
+
+JudgeBench PPE JudgeBench PPE
+55.6
+42.9
+66.8
+67.6
+70.0
+72.4
+73.3
+
+67.1
+55.2
+64.7
+66.4
+71.2
+72.6
+73.7
+
+57.4
+41.5
+56.0
+56.9
+61.1
+63.5
+64.8
+
+66.9
+56.7
+65.9
+66.3
+68.2
+69.7
+70.9
+
+(a)
+
+(b)
+
+Figure 3 (a) Accuracy on JudgeBench and PPE Preference datasets for base model and rubric-assisted judges under
+different rubric-generation strategies. While basic LLM-generated rubrics (unconditioned on sample responses) can
+degrade performance, RRD yields consistent improvements over the baselines. Notably, RRDWU delivers the largest
+gains and scales reliably across both proprietary (GPT-4o) and open-weights (Llama3.1-405B) judges. (b) Rubric-count
+dynamics on JudgeBench. Starting from an average of 7.4 rubrics, the count rises to ∼ 20, while the increasing variance
+across tasks indicates that the recursive procedure adapts evaluation depth to instance complexity.
+
+Baselines. We compare RRD against the base model (preference labeling without explicit rubrics) and
+several rubric-based judge baselines that differ in their rubric generation strategies. Specifically, we include:
+(1) LLM Rubrics (w/o resp.): rubrics are proposed based solely on the prompt; (2) LLM Rubrics (w. resp.):
+rubrics are generated with access to sample responses for better grounding; (3) Chasing the Tail (Zhang
+et al., 2025a): a state-of-the-art iterative method that optimizes rubrics to differentiate high-quality response
+pairs; and (4) RRD variants: we evaluate three weighting schemes – RRDuniform (uniform weights), RRDLLM
+(LLM-assigned weights), and RRDUW (whitened weights).
+We employ GPT-4o (Hurst et al., 2024) and Llama-3.1-405B (Dubey et al., 2024) as rubric generator and final
+judge, and consistently use GPT-4o and Gemini 2.5-pro (Comanici et al., 2025) as sample response generator
+(each model generates 4 sample responses).
+
+3.1
+
+Results
+
+We summarize the primary performance results in Figure 3(a) and analyze the dynamics of the recursive
+generation process in Figure 3(b).
+As shown in Figure 3(a), RRD variants consistently outperform baselines across both models and datasets.
+On JudgeBench, RRDWU improves GPT-4o’s accuracy from 55.6% to 73.3% (+17.7 points). Similarly,
+Llama-3.1-405B sees a 6.6 point boost. This suggests that the recursive discovery of latent rubrics provides
+critical signal that the initial rubric sets miss in a single pass. Interestingly, simple LLM Rubrics (w/o resp.)
+actually degrade performance compared to the base model as LLM judge. This highlights the failure mode
+where generic rubrics introduce noise or distract the judge. RRD mitigates this by grounding the rubrics in
+recursive residuals, ensuring they capture meaningful differences. Additionally, whitened weighting (RRDWU )
+consistently outperforms the uniform and LLM-assigned weighting. This validates our theoretical framework:
+for open-ended tasks involving multiple non-dominating dimensions, accounting for rubric correlation yields a
+more robust aggregation of judge “votes” than simple averaging or LLM-based self-weighting.
+Figure 3(b) shows the evolution of rubric counts across recursive rounds on JudgeBench. Two key phenomena
+emerge: first, the initial average of 7.4 rubrics grows rapidly and plateaus at approximately 20 by iteration
+3, suggesting that RRD captures a comprehensive set of dimensions quickly before reaching a “saturation”
+point in novelty. Second, the framework is inherently adaptive, increasing the variance in rubric counts as
+it progresses. Consequently, recursion terminates quickly for simpler tasks but generates deeper criteria for
+complex tasks to resolve residual quality differences. A qualitative example of simpler tasks entailing fewer
+rubrics are provided in the Appendix G.
+Ablations. To assess the impact of key design choices, we conduct ablation studies on JudgeBench, focusing
+on two key components: the termination threshold for recursion and the choice of sample response generator.
+6
+
+Termination Threshold
+Method
+RRD
+RRDLLM
+RRDWU
+
+5
+
+10
+
+68.6
+69.7
+71.4
+
+67.4
+69.1
+72.0
+
+15
+70.0
+72.4
+73.3
+
+Sample Responses Generator
+
+20
+
+Method
+
+GPT+Gemini
+
+Gemini Only
+
+GPT Only
+
+GPT+Llama-8B
+
+66.3
+67.1
+73.1
+
+RRD
+RRDLLM
+RRDWU
+
+70.0
+72.4
+73.3
+
+66.6
+71.0
+72.4
+
+57.4
+61.4
+62.3
+
+54.3
+60.0
+60.3
+
+(b)
+
+(a)
+
+Table 1 Ablation studies for RRD on JudgeBench with GPT-4o as rubric proposer. (a) Ablation of the termination
+threshold (i.e., the number of rubric proposals rejected due to redundancy or misalignment) for the RRD process. (b)
+Ablation of the sample response generation strategy, comparing (i) a combination of strong frontier models, (ii) a
+single strong model, and (iii) a mixture of strong and weaker models as inputs to the rubric proposer.
+
+Table 1(a) reports RRD variants under different termination thresholds, where the recursion stops after a
+fixed number of rubric proposals are rejected as redundant or misaligned. We observe that lower thresholds
+(e.g., 5 or 10) underperform, likely due to insufficient exploration of the rubric space. Raising the threshold
+to 20 yields a plateau or slight drop for basic RRD and RRDLLM , consistent with diminishing returns and
+increased noise from correlated criteria. In contrast, RRDWU is notably robust: accuracy remains high even
+at threshold 20, suggesting that whitening-uniform weighting effectively counteracts correlation-induced noise
+and stabilizes performance under deeper rubric exploration.
+In Table 1(b), we ablate the sample response generator by comparing multi-model ensembles with single-model
+and mixed-capability setups. Using two strong frontier models (GPT-4o + Gemini 2.5-Pro) performs best,
+consistently outperforming single-model baselines. Notably, when GPT-4o is the rubric proposer, it benefits
+more from conditioning on high-quality samples produced by a different frontier model (Gemini) than on its
+own outputs, suggesting that exposure to diverse reasoning styles and perspectives improves rubric generation.
+Meanwhile, replacing one frontier model with a smaller model (e.g., Llama3.1-8B) tends to reduce performance
+in RRD setting, likely because decomposition benefits from high-quality samples that reveal when a rubric is
+overly coarse (i.e., satisfied by multiple strong responses) and should be refined.
+
+4
+
+RRD-based RFT
+
+Previously in §3, we showed that RRD improves the accuracy of LLM judges on open-ended tasks by producing
+more comprehensive, discriminative and fine-grained rubrics. In this section, we ask whether these gains
+translate into learning gains when judges are used as generative reward models for reinforcement fine-tuning
+(RFT). RFT is the natural stress test for open-ended judging: even small systematic scoring biases can be
+amplified by the optimization loop, shaping model behavior in unintended ways. A reward model therefore
+must do more than standalone preference judges, it must provide stable, informative gradients that consistently
+promote the desired trade-offs across diverse prompts. We therefore use RFT to convert judge quality into an
+end-to-end signal, evaluating (i) reward reliability during training, and (ii) downstream performance of the
+resulting policies on in- and out-of-domain tasks.
+Dataset and Training. We conduct RFT on 4K English, non-toxic, de-duplicated prompts sampled from
+WildChat (Zhao et al., 2024), representing natural user–AI interactions. We employ Dr.GRPO (Liu et al.,
+2025) as our RFT algorithm for all settings (see details in Appendix D).
+Then after training, to demonstrate the performance of resulting models, we evaluate the resulting policies on
+two rubric-based, open-ended generation benchmarks: BiGGen Bench (Kim et al., 2024) and HealthBenchHard (Arora et al., 2025). BiGGen Bench is a free-form generation benchmark spanning multiple core
+capabilities, and is evaluated with instance-specific criteria that capture what a good answer should contain
+for each prompt. HealthBench is a domain-specific benchmark containing 5K multi-turn clinical dialogues,
+scored using conversation-specific rubrics authored by physician experts, with importance-weighted criteria to
+reflect clinical priorities; the Hard split is designed to remain challenging and unsaturated.
+We choose these two benchmarks because they provide complementary coverage of (i) in-distribution general
+
+7
+
+Figure 4 Reward improvement during training of Qwen3-4B (left) and Llama3.1-8B-instruct (right) models using
+various rubric generation methods. Both RRDWU and RRDLLM provide a significantly stronger reward signal than
+traditional rubric-based or iterative baselines. RRDWU , in particular, shows superior training stability and higher
+cumulative reward gains across both architectures, indicating a more robust and granular supervision signal for RFT.
+
+Figure 5 Multi-dimensional evaluation (scores in percentage) on BiGGen Bench (left) and HealthBench-Hard (right).
+Comparison of RRDWU against five baseline methods using Llama-3.1 and Qwen3 base models. RRDWU (solid red)
+demonstrates robust improvements across all axes, particularly in Instruction Following (IF) and Completeness.
+
+assistant behavior and (ii) out-of-domain, high-stakes generalization. BiGGen Bench is closer to our training
+distribution (WildChat): both emphasize broad, real-world, open-ended assistant tasks, making BiGGen a
+natural test of whether RFT improves general helpfulness and capability across the kinds of prompts seen
+in the wild. In contrast, HealthBench-Hard focuses on clinical multi-turn dialogue with physician-defined
+notions of correctness, safety, and communication. It is substantially more domain-specific than open-domain
+chat, thereby stress-testing whether the learned policy maintain reliability in a high-stakes setting.
+total_awardedi
+We report the macro-average score, computed as the mean of per-example rubric scores si = total_possible
+i
+(converted to a percentage), so that each dialogue/prompt contributes equally regardless of how many rubric
+criteria it contains. For HealthBench, we additionally clip the macro-average to [0, 100] after averaging,
+following the benchmark’s recommended presentation to prevent rare negative-penalty cases from overly
+skewing the headline score.
+
+Models We fine-tune Qwen3-4B (Yang et al., 2025) and Llama3.1-8B (Dubey et al., 2024) as policy models.
+GPT-4o serves as the rubric proposer and GPT-OSS-120B (Agarwal et al., 2025) determines rubric satisfaction
+for rollout responses (or give direct preference judgment in “LLM judge as reward” baseline) during RFT.
+
+4.1
+
+Results
+
+Reward Dynamics during Training. Figure 4 shows reward improvement during RFT for Qwen3-4B (left)
+and Llama3.1-8B-Instruct (right) under different rubric-generation strategies. Across both models, RRD
+produces a substantially stronger learning signal: rewards climb rapidly in the first ∼50–100 steps and continue
+improving throughout training, while prior baselines plateau early at low gains. Concretely, on Qwen3-4B,
+8
+
+RRDWU reaches roughly 150–160% reward improvement by the end of training, compared to only ∼10–20%
+for LLM Rubrics and Chasing the Tail; on Llama3.1-8B-Instruct, it attains about 55–60% versus ∼10–20% for
+baselines. Both RRD variants outperform alternatives, with RRDWU also showing the smoothest, most stable
+curves. Overall, the large absolute gaps (often ≥3–10× higher improvements) indicate that RRD yields more
+discriminative and better-calibrated rewards, enabling sustained optimization rather than early saturation on
+open-ended tasks.
+Policy Performance on BiGGen Bench. The superior reward signal provided by RRD translates into
+state-of-the-art performance for the resulting policies across diverse generation capabilities, as shown in
+the radar chart (Figure 5) with more details breakdown in Table 3 (Appendix E). For both Qwen3-4B and
+Llama3.1-8B backbones, RRDWU achieves the highest overall scores of 82.8% and 71.1%, respectively. The
+method is particularly effective at improving instruction following (IF), refinement, and reasoning, all while
+maintaining robust performance on safety axes.
+Generalization to High-Stakes Domains. The performance is further confirmed by looking at the evaluation
+on the HealthBench dataset as shown in the same radar chart (Fig. 5) with more details breakdown in
+Table 4 (Appendix E) too. These results confirm that the benefits of RRD transfer effectively to high-stakes,
+domain-specific tasks, such as the medical field. On HealthBench-Hard, RRDWU consistently yields the best
+policy performance, particularly in IF, accuracy, and completeness (+16.0%, +5.5%, and +12.5% points
+respectively on the Qwen3-4B backbone). These results underscore the framework’s ability to provide granular
+supervision that aligns with complex, physician-authored evaluation criteria.
+
+5
+
+Related Works
+
+LLM-as-a-Judge. Early work has shown that holistic judges, those producing a single verdict, can approximate human preferences with reasonable correlation (Zheng et al., 2023; Liu et al., 2023; Dubois et al., 2024;
+Wang et al., 2023; Bavaresco et al., 2025). However, such approaches suffer from bias (Pezeshkpour and
+Hruschka, 2023; Saito et al., 2023), inconsistency (Zheng et al., 2023; Haldar and Hockenmaier, 2025), and
+opacity (Kim et al., 2023; Gajcin et al., 2025), especially given the subjective, nuanced, and multidimensional
+nature of open-ended evaluation (Thakur et al., 2024). To address these limitations, recent work has shifted
+toward rubric-assisted judges (Kim et al., 2023; Hashemi et al., 2024; Kim, 2025; Arora et al., 2025), though
+many rely on static or heuristic rubrics that either lack scalability or prompt-specific nuance. In contrast, we
+propose a dynamic approach that recursively decomposes evaluation criteria to ensure both broad coverage
+and discriminative power.
+Rubrics-based Rewards The use of structured rubrics has recently expanded beyond evaluation to serve
+as reward signals for training (Gunjal et al., 2025). To improve rubric quality, Xie et al. (2025) introduce
+a Propose–Evaluate–Revise paradigm, while Zhang et al. (2025a) optimize rubrics by maximizing score
+differentials between high-quality responses. Domain-specific approaches, such as Wang et al. (2025), condition
+rubric generation on prompt context and retrieved exemplars, producing both positive and negative criteria.
+Other works leverage rubrics as priors for data generation or policy learning (Huang et al., 2025; Zhou
+et al., 2025), or explore online rubric generation (Rezaei et al., 2025). RRD differs from prior work by
+introducing explicit mechanisms that enforce rubric informativeness, comprehensiveness, and non-redundancy
+in LLM-generated criteria, and demonstrates its effectiveness as a source of high-quality RFT reward signals.
+Reinforcement Fine-Tuning (RFT) for Open-Ended Tasks. Reinforcement Learning from Verifiable Rewards
+(RLVR) has shown immense success in domains with objective ground truth, such as mathematics and coding,
+exemplified by models like DeepSeek-R1 and architectures utilizing process rewards (Guo et al., 2025; Su et al.,
+2025; Wen et al., 2025). Extending this success to open-ended tasks (e.g., creative writing, brainstorming)
+remains an open challenge due to the lack of ground-truth verifiers (Zhang et al., 2025b; Simonds et al., 2025).
+Recent works have attempted to bridge this gap by using LLM judges as proxy reward models for algorithms
+like GRPO. Our work contributes to this frontier by providing a “Generative Verifier” via RRD that offers
+the granularity and reliability required to stabilize RFT in subjective and open-ended domains.
+
+9
+
+6
+
+Conclusion
+
+In this work, we introduced Recursive Rubric Decomposition (RRD), a principled framework for generating
+informative, comprehensive and non-redundant rubrics for rubric-based LLM judges and reward modeling
+for open-ended tasks. RRD operates by recursively decomposing high-level evaluation criteria into granular,
+discriminative rubrics, filtering for positive edge and non-redundancy to ensure reliability while optimizing
+weights to account for correlation structures and prevent the over-representation of highly correlated metrics.
+Empirically, we demonstrate that RRD significantly improves the accuracy of LLM judges in a training-free
+setting, and establishes its effectiveness as a high-fidelity reward model for RFT. Policies trained with RRDderived rewards exhibit stronger alignment with human preferences on complex, open-ended generation tasks.
+These results highlight the importance of structured, granular, and statistically grounded rubric generation as
+a critical pathway toward scalable, interpretable, and reliable alignment for the next generation of LLMs.
+
+References
+Sandhini Agarwal, Lama Ahmad, Jason Ai, Sam Altman, Andy Applebaum, Edwin Arbus, Rahul K Arora, Yu Bai,
+Bowen Baker, Haiming Bao, et al. gpt-oss-120b & gpt-oss-20b model card. arXiv preprint arXiv:2508.10925, 2025.
+Rahul K Arora, Jason Wei, Rebecca Soskin Hicks, Preston Bowman, Joaquin Quiñonero-Candela, Foivos Tsimpourlas,
+Michael Sharman, Meghan Shah, Andrea Vallone, Alex Beutel, et al. Healthbench: Evaluating large language
+models towards improved human health. arXiv preprint arXiv:2505.08775, 2025.
+Yuntao Bai, Saurav Kadavath, Sandipan Kundu, Amanda Askell, Jackson Kernion, Andy Jones, Anna Chen, Anna
+Goldie, Azalia Mirhoseini, Cameron McKinnon, et al. Constitutional ai: Harmlessness from ai feedback. arXiv
+preprint arXiv:2212.08073, 2022.
+Anna Bavaresco, Raffaella Bernardi, Leonardo Bertolazzi, Desmond Elliott, Raquel Fernández, Albert Gatt, Esam
+Ghaleb, Mario Giulianelli, Michael Hanna, Alexander Koller, et al. Llms instead of human judges? a large scale
+empirical study across 20 nlp evaluation tasks. In Proceedings of the 63rd Annual Meeting of the Association for
+Computational Linguistics (Volume 2: Short Papers), pages 238–255, 2025.
+Lichang Chen, Chen Zhu, Davit Soselia, Jiuhai Chen, Tianyi Zhou, Tom Goldstein, Heng Huang, Mohammad Shoeybi,
+and Bryan Catanzaro. Odin: Disentangled reward mitigates hacking in rlhf. arXiv preprint arXiv:2402.07319, 2024.
+Gheorghe Comanici, Eric Bieber, Mike Schaekermann, Ice Pasupat, Noveen Sachdeva, Inderjit Dhillon, Marcel Blistein,
+Ori Ram, Dan Zhang, Evan Rosen, et al. Gemini 2.5: Pushing the frontier with advanced reasoning, multimodality,
+long context, and next generation agentic capabilities. arXiv preprint arXiv:2507.06261, 2025.
+Ganqu Cui, Lifan Yuan, Zefan Wang, Hanbin Wang, Yuchen Zhang, Jiacheng Chen, Wendi Li, Bingxiang He, Yuchen
+Fan, Tianyu Yu, et al. Process reinforcement through implicit rewards. arXiv preprint arXiv:2502.01456, 2025.
+Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad Al-Dahle, Aiesha Letman, Akhil
+Mathur, Alan Schelten, Amy Yang, Angela Fan, et al. The llama 3 herd of models. arXiv e-prints, pages arXiv–2407,
+2024.
+Yann Dubois, Balázs Galambosi, Percy Liang, and Tatsunori B Hashimoto. Length-controlled alpacaeval: A simple
+way to debias automatic evaluators. arXiv preprint arXiv:2404.04475, 2024.
+Evan Frick, Tianle Li, Connor Chen, Wei-Lin Chiang, Anastasios N Angelopoulos, Jiantao Jiao, Banghua Zhu, Joseph E
+Gonzalez, and Ion Stoica. How to evaluate reward models for rlhf. arXiv preprint arXiv:2410.14872, 2024.
+Jasmina Gajcin, Erik Miehling, Rahul Nair, Elizabeth Daly, Radu Marinescu, and Seshu Tirupathi. Interpreting
+llm-as-a-judge policies via verifiable global explanations. arXiv preprint arXiv:2510.08120, 2025.
+Jiawei Gu, Xuhui Jiang, Zhichao Shi, Hexiang Tan, Xuehao Zhai, Chengjin Xu, Wei Li, Yinghan Shen, Shengjie Ma,
+Honghao Liu, et al. A survey on llm-as-a-judge. arXiv preprint arXiv:2411.15594, 2024.
+Anisha Gunjal, Anthony Wang, Elaine Lau, Vaskar Nath, Yunzhong He, Bing Liu, and Sean Hendryx. Rubrics as
+rewards: Reinforcement learning beyond verifiable domains. arXiv preprint arXiv:2507.17746, 2025.
+Daya Guo, Dejian Yang, Haowei Zhang, Junxiao Song, Ruoyu Zhang, Runxin Xu, Qihao Zhu, Shirong Ma, Peiyi Wang,
+Xiao Bi, et al. Deepseek-r1: Incentivizing reasoning capability in llms via reinforcement learning. arXiv preprint
+arXiv:2501.12948, 2025.
+
+10
+
+Rajarshi Haldar and Julia Hockenmaier. Rating roulette: Self-inconsistency in llm-as-a-judge frameworks. In Findings
+of the Association for Computational Linguistics: EMNLP 2025, pages 24986–25004, 2025.
+Helia Hashemi, Jason Eisner, Corby Rosset, Benjamin Van Durme, and Chris Kedzie. Llm-rubric: A multidimensional,
+calibrated approach to automated evaluation of natural language texts. arXiv preprint arXiv:2501.00274, 2024.
+Zenan Huang, Yihong Zhuang, Guoshan Lu, Zeyu Qin, Haokai Xu, Tianyu Zhao, Ru Peng, Jiaqi Hu, Zhanming Shen,
+Xiaomeng Hu, et al. Reinforcement learning with rubric anchors. arXiv preprint arXiv:2508.12790, 2025.
+Aaron Hurst, Adam Lerer, Adam P Goucher, Adam Perelman, Aditya Ramesh, Aidan Clark, AJ Ostrow, Akila
+Welihinda, Alan Hayes, Alec Radford, et al. Gpt-4o system card. arXiv preprint arXiv:2410.21276, 2024.
+Hamish Ivison, Yizhong Wang, Jiacheng Liu, Zeqiu Wu, Valentina Pyatkin, Nathan Lambert, Noah A. Smith, Yejin
+Choi, and Hannaneh Hajishirzi. Unpacking dpo and ppo: Disentangling best practices for learning from preference
+feedback. In Advances in Neural Information Processing Systems, 2024.
+Ahrii Kim. Rubric-mqm: Span-level llm-as-judge in machine translation for high-end models. In Proceedings of the
+63rd Annual Meeting of the Association for Computational Linguistics (Volume 6: Industry Track), pages 147–165,
+2025.
+Seungone Kim, Jamin Shin, Yejin Cho, Joel Jang, Shayne Longpre, Hwaran Lee, Sangdoo Yun, Seongjin Shin, Sungdong
+Kim, James Thorne, et al. Prometheus: Inducing fine-grained evaluation capability in language models. In The
+Twelfth International Conference on Learning Representations, 2023.
+Seungone Kim, Juyoung Suk, Ji Yong Cho, Shayne Longpre, Chaeeun Kim, Dongkeun Yoon, Guijin Son, Yejin
+Cho, Sheikh Shafayat, Jinheon Baek, Sue Hyun Park, Hyeonbin Hwang, Jinkyung Jo, Hyowon Cho, Haebin Shin,
+Seongyun Lee, Hanseok Oh, Noah Lee, Namgyu Ho, Se June Joo, Miyoung Ko, Yoonjoo Lee, Hyungjoo Chae, Jamin
+Shin, Joel Jang, Seonghyeon Ye, Bill Yuchen Lin, Sean Welleck, Graham Neubig, Moontae Lee, Kyungjae Lee,
+and Minjoon Seo. The biggen bench: A principled benchmark for fine-grained evaluation of language models with
+language models, 2024. URL https://arxiv.org/abs/2406.05761.
+Nathan Lambert, Jacob Morrison, Valentina Pyatkin, Shengyi Huang, Hamish Ivison, Faeze Brahman, Lester James V
+Miranda, Alisa Liu, Nouha Dziri, Shane Lyu, et al. Tulu 3: Pushing frontiers in open language model post-training.
+arXiv preprint arXiv:2411.15124, 2024.
+Harrison Lee, Samrat Phatale, Hassan Mansoor, Thomas Mesnard, Johan Ferret, Kellie Lu, Colton Bishop, Ethan
+Hall, Victor Carbune, Abhinav Rastogi, et al. Rlaif vs. rlhf: Scaling reinforcement learning from human feedback
+with ai feedback. arXiv preprint arXiv:2309.00267, 2023.
+Yang Liu, Dan Iter, Yichong Xu, Shuohang Wang, Ruochen Xu, and Chenguang Zhu. G-eval: Nlg evaluation using
+gpt-4 with better human alignment. arXiv preprint arXiv:2303.16634, 2023.
+Zichen Liu, Changyu Chen, Wenjun Li, Penghui Qi, Tianyu Pang, Chao Du, Wee Sun Lee, and Min Lin. Understanding
+r1-zero-like training: A critical perspective. arXiv preprint arXiv:2503.20783, 2025.
+Ilya Loshchilov and Frank Hutter. Decoupled weight decay regularization. arXiv preprint arXiv:1711.05101, 2017.
+Long Ouyang, Jeffrey Wu, Xu Jiang, Diogo Almeida, Carroll Wainwright, Pamela Mishkin, Chong Zhang, Sandhini
+Agarwal, Katarina Slama, Alex Ray, et al. Training language models to follow instructions with human feedback.
+Advances in neural information processing systems, 35:27730–27744, 2022.
+Pouya Pezeshkpour and Estevam Hruschka. Large language models sensitivity to the order of options in multiple-choice
+questions. arXiv preprint arXiv:2308.11483, 2023.
+Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, and Yuxiong He. Zero: Memory optimizations toward training
+trillion parameter models. In SC20: International Conference for High Performance Computing, Networking, Storage
+and Analysis, pages 1–16. IEEE, 2020.
+MohammadHossein Rezaei, Robert Vacareanu, Zihao Wang, Clinton Wang, Yunzhong He, and Afra Feyza Akyürek.
+Online rubrics elicitation from pairwise comparisons. arXiv preprint arXiv:2510.07284, 2025.
+Keita Saito, Akifumi Wachi, Koki Wataoka, and Youhei Akimoto. Verbosity bias in preference labeling by large
+language models. arXiv preprint arXiv:2310.10076, 2023.
+John Schulman, Filip Wolski, Prafulla Dhariwal, Alec Radford, and Oleg Klimov. Proximal policy optimization
+algorithms. arXiv preprint arXiv:1707.06347, 2017.
+
+11
+
+Zhihong Shao, Peiyi Wang, Qihao Zhu, Runxin Xu, Junxiao Song, Xiao Bi, Haowei Zhang, Mingchuan Zhang, YK Li,
+Yang Wu, et al. Deepseekmath: Pushing the limits of mathematical reasoning in open language models. arXiv
+preprint arXiv:2402.03300, 2024.
+Guangming Sheng, Chi Zhang, Zilingfeng Ye, Xibin Wu, Wang Zhang, Ru Zhang, Yanghua Peng, Haibin Lin, and
+Chuan Wu. Hybridflow: A flexible and efficient rlhf framework. In Proceedings of the Twentieth European Conference
+on Computer Systems, pages 1279–1297, 2025.
+Toby Simonds, Kevin Lopez, Akira Yoshiyama, and Dominique Garmier. Self rewarding self improving. arXiv preprint
+arXiv:2505.08827, 2025.
+Prasann Singhal, Tanya Goyal, Jiacheng Xu, and Greg Durrett. A long way to go: Investigating length correlations in
+rlhf. arXiv preprint arXiv:2310.03716, 2023.
+Yi Su, Dian Yu, Linfeng Song, Juntao Li, Haitao Mi, Zhaopeng Tu, Min Zhang, and Dong Yu. Crossing the reward
+bridge: Expanding rl with verifiable rewards across diverse domains. arXiv preprint arXiv:2503.23829, 2025.
+Sijun Tan, Siyuan Zhuang, Kyle Montgomery, William Y Tang, Alejandro Cuadron, Chenguang Wang, Raluca Ada
+Popa, and Ion Stoica. Judgebench: A benchmark for evaluating llm-based judges. arXiv preprint arXiv:2410.12784,
+2024.
+Aman Singh Thakur, Kartik Choudhary, Venkat Srinik Ramayapally, Sankaran Vaidyanathan, and Dieuwke Hupkes.
+Judging the judges: Evaluating alignment and vulnerabilities in llms-as-judges. arXiv preprint arXiv:2406.12624,
+2024.
+Vijay Viswanathan, Yanchao Sun, Shuang Ma, Xiang Kong, Meng Cao, Graham Neubig, and Tongshuang Wu.
+Checklists are better than reward models for aligning language models. arXiv preprint arXiv:2507.18624, 2025.
+Haoxiang Wang, Yong Lin, Wei Xiong, Rui Yang, Shizhe Diao, Shuang Qiu, Han Zhao, and Tong Zhang. Arithmetic
+control of llms for diverse user preferences: Directional preference alignment with multi-objective rewards. arXiv
+preprint arXiv:2402.18571, 2024.
+Pengkai Wang, Qi Zuo, Pengwei Liu, Zhijie Sang, Congkai Xie, and Hongxia Yang. Infimed-orbit: Aligning llms on
+open-ended complex tasks via rubric-based incremental training. arXiv preprint arXiv:2510.15859, 2025.
+Yidong Wang, Zhuohao Yu, Zhengran Zeng, Linyi Yang, Cunxiang Wang, Hao Chen, Chaoya Jiang, Rui Xie, Jindong
+Wang, Xing Xie, et al. Pandalm: An automatic evaluation benchmark for llm instruction tuning optimization. arXiv
+preprint arXiv:2306.05087, 2023.
+Xumeng Wen, Zihan Liu, Shun Zheng, Shengyu Ye, Zhirong Wu, Yang Wang, Zhijian Xu, Xiao Liang, Junjie Li,
+Ziming Miao, et al. Reinforcement learning with verifiable rewards implicitly incentivizes correct reasoning in base
+llms. arXiv preprint arXiv:2506.14245, 2025.
+Lipeng Xie, Sen Huang, Zhuo Zhang, Anni Zou, Yunpeng Zhai, Dingchao Ren, Kezun Zhang, Haoyuan Hu, Boyin Liu,
+Haoran Chen, et al. Auto-rubric: Learning to extract generalizable criteria for reward modeling. arXiv preprint
+arXiv:2510.17314, 2025.
+An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu, Chang Gao, Chengen Huang,
+Chenxu Lv, et al. Qwen3 technical report. arXiv preprint arXiv:2505.09388, 2025.
+Zihuiwen Ye, Fraser David Greenlee, Max Bartolo, Phil Blunsom, Jon Ander Campos, and Matthias Gallé. Improving
+reward models with synthetic critiques. In Findings of the Association for Computational Linguistics: NAACL 2025,
+pages 4506–4520, 2025.
+Junkai Zhang, Zihao Wang, Lin Gui, Swarnashree Mysore Sathyendra, Jaehwan Jeong, Victor Veitch, Wei Wang,
+Yunzhong He, Bing Liu, and Lifeng Jin. Chasing the tail: Effective rubric-based reward modeling for large language
+model post-training. arXiv preprint arXiv:2509.21500, 2025a.
+Mengyu Zhang, Xubo Liu, Siyu Ding, Weichong Yin, Yu Sun, Hua Wu, Wenya Guo, and Ying Zhang. Auditable-choice
+reframing unlocks rl-based verification for open-ended tasks. arXiv preprint arXiv:2511.02463, 2025b.
+Wenting Zhao, Xiang Ren, Jack Hessel, Claire Cardie, Yejin Choi, and Yuntian Deng. Wildchat: 1m chatgpt interaction
+logs in the wild. arXiv preprint arXiv:2405.01470, 2024.
+Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan Zhuang, Zhanghao Wu, Yonghao Zhuang, Zi Lin, Zhuohan
+Li, Dacheng Li, Eric Xing, et al. Judging llm-as-a-judge with mt-bench and chatbot arena. Advances in neural
+information processing systems, 36:46595–46623, 2023.
+
+12
+
+Yang Zhou, Sunzhu Li, Shunyu Liu, Wenkai Fang, Kongcheng Zhang, Jiale Zhao, Jingwen Yang, Yihe Zhou, Jianwei
+Lv, Tongya Zheng, et al. Breaking the exploration bottleneck: Rubric-scaffolded reinforcement learning for general
+llm reasoning. arXiv preprint arXiv:2508.16949, 2025.
+
+13
+
+Appendix
+A
+
+Algorithm
+
+Algorithm 1: RRD: Recursive Rubric Decomposition
+Require: Let P be the prompt set; {Ri }ni=1 ∈ R be sampled responses for each prompt P ∈ P; Ψ be the
+LLM-based rubric proposer.
+Procedure:
+for each P ∈ P: do
+Let Ψ generate an initial rubric list G0 = Ψ(P, {Ri }ni=1 ),
+Initialize Gfinal ← G0 , iteration counter t ← 0, |Gfiltered | ← 0
+while |Gfiltered | < N do
+t←t+1
+for each rubric gm ∈ Gt−1 do
+Rm ← { Ri ∈ {Ri }ni=1 : gm (P, Ri ) = 1 }
+if |Rm | ≥ n then
+new
+Gm
+← Ψ(gm , Rm )
+new
+Gt−1 ← Gt−1 ∪ Gm
+′
+Gt ← { m ∈ Gt−1 | ∄ m ̸= m : conflict(m, ) ∨ overlap(m, m′ ) }
+Gfinal ← Gt
+return Gfinal
+
+14
+
+Step 1: Rubric Evaluation
+Step 2: Rubric Decomposition
+
+Step 3: Rubric Filter
+
+B
+
+Additional Notes on Derivations and Proofs
+
+B.1
+
+Probability Upper Bound for Incorrect Rubric-based Judge Verdict (Eq.2)
+
+Derivation. Condition on the class Y = y, an error is {Yb ̸= Y } ⇐⇒ {Γ ≤ 0}. Let Wy = w⊤ Z,
+Pr(Γ ≤ 0 | Y = y) = Pr(Wy ≤ −∆m | Y = y).
+For a sub-Gaussian, it is trivial to show that
+2
+
+2
+
+Pr(X ≤ −a) = Pr(e−λX ≥ eλa ) ≤ E[e−λX ]e−λa ≤ exp( λ 2σ − λa).
+For λ > 0,
+
+
+a2 
+Pr(X ≤ −a) ≤ exp − 2 .
+2σ
+
+Substitute a with ∆m and σ 2 with = Vm (y),
+
+Pr(Γ ≤ 0 | Y = y) = Pr(Wy ≤ −∆m | Y = y) ≤ exp −
+
+∆2m 
+,
+2Vm (y)
+
+Therefore, by the law of total probability,
+Pr(Yb ̸= Y ) = π+ Pr(Γ ≤ 0 | Y = +1) + π− Pr(Γ ≥ 0 | Y = −1),
+Hence,
+2
+
+2
+
+Pr(Yb ̸= Y ) ≤ π+ e−∆m /(2Vm (+1)) + π− e−∆m /(2Vm (−1))
+n
+o
+2
+2
+≤ max e−∆m /(2Vm (+1)) , e−∆m /(2Vm (−1))
+
+≤ exp − min{∆2m /(2Vm (+1)), ∆2m /(2Vm (−1))} ,
+Now, we complete the derivation for Eq.2.
+
+Note. As a side note following Eq.2, the motivation for expanding the set of rubrics with positive information
+edge is clearer under the idealized case where the rubrics are equicorrelated, equal-variance, equal-weight.
+Pm
+Recall Vm (Y ) = Var( k=1 wk Zk | Y ). With wk = 1,
+Vm (Y ) = Var
+
+ m
+X
+
+Zk Y
+
+
+
+k=1
+
+=
+
+m
+X
+
+Var(Zk | Y ) + 2
+
+X
+
+Cov(Zi , Zj | Y ).
+
+1≤i<j≤m
+
+k=1
+
+Plugging in the equicorrelation/equal-variance values:
+m
+X
+
+Var(Zk | Y ) = m σ 2 ,
+
+k=1
+
+Cov(Zi , Zj | Y ) = ρ σ 2 (i ̸= j).
+
+15
+
+There are
+
+m
+2
+
+
+
+= m(m−1)
+distinct pairs, so
+2
+m(m − 1)
+Vm (Y ) = m σ 2 + 2 ·
+ρ σ2
+2
+
+
+= σ 2 m + (m2 − m)ρ .
+
+Under the symmetric assumptions of the corollary, this does not depend on Y = +1 or Y = −1, so we simply
+write
+
+
+Vm = σ 2 m + (m2 − m)ρ .
+As such, with the idealized assumptions of wk ≡ 1, µk ≡ µ > 0, Var(Sk | Y ) = σ 2 , and Corr(Si , Sj | Y ) = ρ
+(i ̸= j),
+
+
+m µ2
+b
+P(Y ̸= Y ) ≤ exp − 2
+.
+2 σ [1 + (m − 1)ρ]
+Following this, it becomes obvious that when rubrics are uncorrelated (i.e., ρ = 0), the prediction error can be
+consistently reduced by consistently expanding the rubric pool, provided that each added rubric contributes a
+positive information edge (i.e., its prediction direction aligns with human preference). This supports the
+recursive process to encourage more extensive rubric search for broader coverage. In practice, however,
+rubrics are neither independent nor equicorrelated. When the exact information edge µ is unobservable and
+individual evaluation dimensions carry comparable importance (i.e., no single criterion dominating the overall
+judgment as often the case for open-ended tasks), the aggregation of extended rubric set must explicitly
+account for the rubric correlation structure. This motivates incorporating correlation-aware normalization
+via an effective weighting scheme, which we introduce below.
+
+B.2
+
+Rubric Weighting in Whitened Space
+
+Define the ratio to be optimized as:
+
+Ξ = (w⊤ µ)2 /(w⊤ Σw)
+
+Also define whitened coordinates:
+u :=
+
+Σ1/2 w
+∈ Rm ,
+Σ1/2 w 2
+
+z :=
+
+Σ−1/2 µ
+∈ Rm ,
+Σ−1/2 µ 2
+
+κ := Σ−1/2 µ
+
+2
+
+.
+2
+
+Lemma 1. For any w ̸= 0,
+Ξ(w) = κ u, z
+
+2
+
+Proof. By direct algebra: (w⊤ µ)2 =
+
+and
+
+
+Ξ(w)
+= cos2 ∠ Σ1/2 w, Σ−1/2 µ ∈ [0, 1].
+⋆
+Ξ(w )
+
+Σ1/2 w, Σ−1/2 µ
+
+2
+
+2
+
+=
+
+2
+
+2
+
+2
+
+Σ1/2 w 2 Σ−1/2 µ 2 ⟨u, z⟩ , and w⊤ Σw =
+
+Σ1/2 w 2 . Thus, Ξ(w⋆ ) = κ, where w⋆ is the optimized weight.
+Lemma 2. Let X ∈ Rm be a zero-mean rubric-score vector with covariance Σ = E[XX ⊤ ] ≻ 0 (Note: X is
+sub-Gaussian given bounded rubric scores in [0, 1] and Xi f or i ∈ [1, N ] are i.i.d. copies of X).
+Define the sample covariance
+N
+X
+b := 1
+Σ
+Xi Xi⊤ ,
+N i=1
+
+reff (Σ) :=
+
+Then there exist constants c, C > 0 such that, for all t ≥ 0,
+!
+r
+reff (Σ) reff (Σ)
+t
+b
+Σ − Σ op ≤ C ∥Σ∥op
++
++√
+N
+N
+N
+16
+
+tr(Σ)
+∈ [1, m].
+∥Σ∥op
+
+2
+
+with probability at least 1 − 2e−ct .
+
+In particular,
+r
+b − Σ∥op ≤ C ∥Σ∥op
+E ∥Σ
+
+reff (Σ) reff (Σ)
++
+N
+N
+
+!
+.
+
+b − Σ∥op ≤ 1 λmin (Σ), then
+Moreover, if λmin (Σ) > 0 and ∥Σ
+2
+b −1/2 − Σ−1/2
+≤
+Σ
+op
+
+−3/2
+1
+2 λmin (Σ)
+
+b −Σ ,
+Σ
+op
+
+b are consistent and numerically stable.
+Thus whitened uniform weights computed from Σ
+b − Σ = 1 PN X ⊤ Xi − Σ = 1 PN Yi
+Proof. Let Yi := Xi Xi⊤ − Σ, estimation error for or covariance Σ is Σ
+i=1 i
+i=1
+N
+N
+b − Σ in operator norm, we will apply a matrix Bernstein
+with EYi = 0. To control the random fluctuation Σ
+PN
+PN
+2
+inequality to the sum i=1 Yi . This requires bounding the matrix variance proxy V :=
+,
+i=1 E Yi
+op
+
+which captures the second-order size of the fluctuations.
+
+Since Yi2 = (Xi Xi⊤ − Σ)2 = Xi Xi⊤ Xi Xi⊤ − Xi Xi⊤ Σ − ΣXi Xi⊤ + Σ2 , we have E Yi2 = E[XX ⊤ XX ⊤ ] − Σ2 .
+p
+p
+Thus, for any unit u, u⊤ E[XX ⊤ XX ⊤ ] u = E[∥X∥22 (u⊤ X)2 ] ≤ E∥X∥42 E(u⊤ X)4 . Sub-Gaussian moment
+bounds give E∥X∥42 ≤ C(tr Σ)2 and E(u⊤ X)4 ≤ C(u⊤ Σu)2 ≤ C∥Σ∥2op , where C is universal constant.
+Plugging this back we get
+u⊤ E[XX ⊤ XX ⊤ ] u ≤ C ∥Σ∥op tr(Σ),
+
+⇒
+
+E[XX ⊤ XX ⊤ ] op ≤ C ∥Σ∥op tr(Σ).
+
+Therefore,
+V =
+
+N
+X
+
+EYi2
+
+i=1
+
+op
+
+≤ N C ∥Σ∥op tr(Σ) = C N ∥Σ∥2op reff (Σ),
+
+where reff (Σ) = tr(Σ)/∥Σ∥op .
+To apply the non-commutative Bernstein inequality, we also require a uniform sub-exponential bound on the
+size of the summands, encoded by a parameter L > 0 such that ∥Yi ∥op is sub-exponential with ∥Yi ∥ψ1 ≤ L.
+Since
+∥Yi ∥op = ∥Xi Xi⊤ − Σ∥op ≤ ∥Xi Xi⊤ ∥op + ∥Σ∥op = ∥Xi ∥22 + ∥Σ∥op ,
+and X is sub-Gaussian, it follows that ∥Yi ∥op is sub-exponential with ∥Yi ∥ψ1 ≤ C∥Σ∥op for some universal C.
+With V and L = C∥Σ∥op , we now invoke the intrinsic-dimension version of the matrix Bernstein inequality
+PN
+for the sum i=1 Yi and have:
+P
+
+!
+
+ 2 2
+
+N
+1 X
+N s Ns
+Yi
+≥ s ≤ 2 exp − c min
+,
+,
+N i=1
+V
+L
+op
+
+where V and L are as above and c > 0 is a universal constant.
+Substituting V ≤ CN ∥Σ∥2op reff (Σ) yields
+
+P
+Choosing s = C ∥Σ∥op
+
+
+
+
+b
+Σ − Σ op ≥ s ≤ 2 exp −cN min
+
+p
+
+s
+s2
+,
+2
+C∥Σ∥op reff (Σ) C∥Σ∥op
+
+
+.
+
+√ 
+reff /N + reff /N + t/ N gives, after rescaling constants,
+r
+b −Σ
+Σ
+≤ C ∥Σ∥op
+op
+
+reff (Σ) reff (Σ)
+t
++
++√
+N
+N
+N
+
+2
+
+!
+,
+
+with probability at least 1 − 2e−ct . Integrating this tail yields the stated expectation bound.
+17
+
+For symmetric positive definite A, B with λmin (A), λmin (B) ≥ γ > 0 and any C 1 scalar function f on [γ, ∞),
+the spectral calculus gives
+∥f (A) − f (B)∥op ≤ sup |f ′ (t)| ∥A − B∥op .
+t∈[γ,∞)
+
+b B = Σ, and γ = 1 λmin (Σ)
+Applying this with f (t) = t−1/2 yields supt≥γ |f ′ (t)| = 12 γ −3/2 . Taking A = Σ,
+2
+b − Σ∥op ≤ 1 λmin (Σ)) gives
+(valid when ∥Σ
+2
+b −Σ ,
+b −1/2 − Σ−1/2
+≤ 21 λmin (Σ)−3/2 Σ
+Σ
+op
+op
+
+Theorem 1. Let the weight space be W :=
+
+
+
+w ∈ Rm :
+
+sup inf SNR(w)
+
+w∈W µ∈U
+
+Σ1/2 w 2 = 1 . Then
+
+is attained by
+
+wwu ∝ Σ−1/2 1
+
+Proof. Assume whitened edge Σ−1/2 µ is nonnegative and exchangeable in distribution across coordinates. We
+2
+fix its magnitude Σ−1/2 µ 2 = c > 0 but leave its direction unknown.
+2
+
+By Lemma 1, Ξ(w) = c ⟨u, z⟩ with u = Σ1/2 w/ Σ1/2 w 2 and z = Σ−1/2 µ/ Σ−1/2 µ 2 . Under the
+assumptions, z is supported on the positive orthant and is exchangeable with fixed norm; the least favorable z
+2
+against a given u is the one minimizing ⟨u, z⟩ . By symmetry and convexity of the feasible set of z, the u
+that maximizes the worst-case inner product is the barycenter of the positive orthant, i.e., u ∝ 1. Translating
+back gives w ∝ Σ−1/2 1.
+
+C
+
+Discussion
+
+Misalignment filtering discussion. We include an directionality guardrail that flags rubrics whose induced
+preferences systematically favor a weaker reference model over a stronger one. This heuristic is motivated by
+prior evidence that strong LLM judges can, on average, closely track human pairwise preferences on open-ended
+prompts (e.g., GPT-4 achieving human-comparable agreement in MT-Bench/Chatbot Arena; (Zheng et al.,
+2023)), and that structured LLM-based evaluation frameworks can substantially improve correlation with
+human judgments in NLG evaluation (Liu et al., 2023). More broadly, using a more capable model as a source
+of supervision is a standard alignment pattern (e.g., AI feedback replacing or complementing human labels in
+Constitutional AI and related RLAIF setups; (Bai et al., 2022; Lee et al., 2023)). Importantly, we do not treat
+“stronger model preferred” as a normative definition of quality: the heuristic can fail on value-sensitive axes
+where humans may prefer caution, brevity, calibrated uncertainty, or certain refusal behaviors. Accordingly,
+we treat the filter as a conservative sanity-check rather than a core dependency of RRD, and recommend
+disabling it in such domains or replacing it with (i) a multi-reference check across several strong models
+and/or (ii) axis-specific exemptions/calibration for known inversion-prone criteria.
+Controlling over-decomposition. A potential failure mode of recursive rubric refinement is overdecomposition: when the decomposition trigger is aggressive (e.g., small coverage threshold), the procedure
+may fragment criteria into overly specific sub-rubrics that track incidental artifacts of the sampled responses
+(e.g., stylistic quirks) rather than stable preference dimensions. To mitigate this, RRD includes two
+complementary safeguards. First, we apply a non-redundancy filter that removes candidate rubrics that are
+duplicative, conflicting, or near-paraphrases of existing ones, preventing correlated or semantically equivalent
+sub-rubrics from accumulating and effectively “double-counting” the same dimension. Second, we impose a
+rejection-based early stopping criterion by setting up a tunable hyperparameter termination threshold: when a
+decomposition round produces too many invalid or non-novel candidates (exceeding a rejection threshold),
+we halt further recursion. Together, these mechanisms bound rubric set growth and reduce the risk that
+continued recursion degenerates into overly fine-grained, sample-specific criteria, while preserving the benefits
+of decomposition when it reveals genuinely discriminative sub-dimensions.
+
+18
+
+D
+
+RFT Training Details
+
+Reinforcement Fine-Tuning (RFT) aligns a policy model πθ by maximizing expected return under prompts
+q ∼ pQ and model-generated responses o ∼ πθ (· | q):
+h
+i
+J(πθ ) = Eq∼pQ Eo∼πθ (·|q) [R(q, o)] − β DKL πθ (· | q) ∥ πref (· | q) ,
+where R(q, o) =
+
+P|o|
+
+t=1 r(st , ot ) is the trajectory return and πref is an optional reference policy.
+
+In practice, policy-gradient methods such as PPO (Schulman et al., 2017) optimize a clipped surrogate
+objective using an importance ratio against the pre-update policy πθold :
+JPPO (πθ ) = Eq∼pQ , o∼πθold (·|q)
+
+|o|
+X
+
+
+
+min rt (θ)Ât , clip(rt (θ), 1 − ε, 1 + ε)Ât ,
+
+t=1
+<t )
+with rt (θ) = πθπθ (o(ot |q,o
+. GRPO (Shao et al., 2024) removes the need for a learned value function by
+t |q,o<t )
+old
+
+sampling a group of G responses {oi }G
+i=1 per question and using a group-relative advantage for all tokens in
+response oi :
+R(q, oi ) − mean({R(q, oj )}G
+j=1 )
+.
+Âi =
+std({R(q, oj )}G
+)
+j=1
+However, the standard GRPO objective additionally aggregates token losses with a per-response length
+normalization factor 1/|oi |, and together with per-question std(·) normalization this induces an optimization
+bias. Dr.GRPO (Liu et al., 2025) mitigates this bias by removing the 1/|oi | token-aggregation term and
+removing the per-question std(·) normalization, yielding an unbiased policy-gradient estimator and improved
+token efficiency.
+In our experiments, we consistently apply Dr.GRPO algorithm in RFT training across baselines and RRD
+variants. We provide RFT training parameters as below in Table 2.
+Table 2 Shared RFT training hyperparameters. We use the verl library (Sheng
+et al., 2025) for RFT.
+
+Parameter
+
+Value
+
+Algorithm
+Rollouts per prompt
+Learning rate
+Learning rate schedule
+Global batch size
+Reward-level KL coefficient
+Max. training steps
+Max. gen. tokens
+Training GPUs
+πJ
+Optimizer
+Parallelism strategy
+
+Dr,GRPO
+8
+1 × 10−6
+Constant with no warmup
+128
+1 × 10−3
+1000
+2048
+8× NVIDIA H100s
+GPT-OSS-120B (Agarwal et al., 2025)
+AdamW (Loshchilov and Hutter, 2017)
+FSDP (Rajbhandari et al., 2020)
+
+Note: We use the PyTorch FSDP implementation; see https://pytorch.org/
+docs/stable/fsdp.html.
+
+19
+
+E
+
+RFT Training Results
+
+Table 3 Performance (in percentage) on BiGGen Bench of the base models (pre-RFT) and models fine-tuned with
+various methods. RRDWU (highlighted in gray) consistently improves performance across both Qwen3-4B and
+Llama3.1-8B backbones, yielding gains across evaluation axes as well as the overall score.
+Model
+
+Method
+
+IF
+
+Ground.
+
+Refine.
+
+Plann.
+
+ToM
+
+Reason.
+
+Tool
+
+Safety
+
+Overall
+
+Qwen3
+
+Base Model
+LLM Judge as Reward
+LLM Rubrics (w. resp.)
+Chasing the Tail
+RRDuniform
+RRDLLM
+RRDWU
+
+76.4
+79.0
+79.6
+80.2
+79.2
+80.2
+82.6
+
+85.6
+87.0
+82.6
+86.0
+87.8
+87.2
+87.6
+
+79.7
+78.7
+83.1
+80.2
+83.6
+83.1
+84.3
+
+84.0
+82.2
+83.5
+82.5
+82.8
+84.3
+85.4
+
+84.4
+85.4
+86.0
+84.8
+88.2
+85.7
+88.6
+
+86.0
+85.2
+86.6
+86.0
+87.4
+86.0
+88.2
+
+60.8
+65.7
+73.2
+63.1
+74.2
+74.2
+74.9
+
+75.9
+75.4
+71.1
+74.6
+79.4
+76.7
+79.5
+
+77.9
+78.5
+79.2
+78.6
+81.3
+80.6
+82.8
+
+Llama3.1
+
+Base Model
+LLM Judge as Reward
+LLM Rubrics (w. resp.)
+Chasing the Tail
+RRDuniform
+RRDLLM
+RRDWU
+
+69.4
+73.1
+72.6
+72.6
+72.4
+73.4
+74.6
+
+76.2
+74.8
+76.6
+78.4
+73.0
+78.6
+79.1
+
+67.3
+67.1
+69.2
+66.0
+72.6
+65.3
+73.3
+
+69.7
+69.1
+72.7
+72.0
+70.2
+72.9
+73.1
+
+71.6
+70.0
+72.6
+73.8
+72.6
+74.8
+76.4
+
+64.0
+61.4
+66.2
+63.0
+65.8
+64.2
+67.4
+
+61.1
+55.1
+61.4
+62.0
+64.8
+63.1
+64.9
+
+70.1
+70.8
+61.0
+60.8
+70.9
+67.1
+70.9
+
+67.0
+66.3
+66.9
+67.3
+68.6
+68.0
+71.1
+
+Table 4 Performance (in percentage) on HealthBench-Hard of the base model (pre-RFT) and models fine-tuned with
+various methods. RRDWU outperforms both the base model and RFT baselines on key axes – including instruction
+following (IF), accuracy, completeness, context, and the overall score – when using Qwen3-4B as the backbone
+model. It also achieves comparable performance on the communication axis relative to other RRD-variants. Similar
+performance gains are observed when using Llama3.1-8B as the backbone, demonstrating the robustness of RRDWU
+across architectures.
+Model
+
+Method
+
+IF
+
+Accuracy
+
+Qwen3
+
+Base Model
+LLM Judge as Reward
+LLM Rubrics (w. resp.)
+Chasing the Tail
+RRDuniform
+RRDLLM
+RRDWU
+
+48.3
+51.0
+49.0
+48.8
+49.5
+50.7
+64.3
+
+59.7
+57.0
+60.8
+60.9
+63.1
+64.2
+65.2
+
+59.2
+57.9
+63.3
+55.5
+54.9
+66.6
+71.7
+
+63.3
+64.8
+65.7
+64.8
+68.6
+69.0
+67.7
+
+42.4
+34.9
+40.6
+39.7
+37.7
+47.2
+47.4
+
+55.9
+57.0
+59.3
+58.7
+60.1
+60.9
+61.7
+
+Llama3.1
+
+Base Model
+LLM Judge as Reward
+LLM Rubrics (w. resp.)
+Chasing the Tail
+RRDuniform
+RRDLLM
+RRDWU
+
+33.0
+39.0
+36.2
+36.2
+36.3
+42.2
+41.8
+
+40.7
+46.7
+49.6
+48.9
+49.3
+48.0
+52.6
+
+34.3
+45.1
+55.2
+55.3
+56.5
+58.0
+58.2
+
+57.3
+59.4
+53.6
+56.0
+55.7
+62.5
+62.3
+
+23.1
+27.5
+35.1
+38.6
+37.7
+37.6
+39.9
+
+37.1
+44.1
+47.2
+47.5
+47.6
+48.5
+49.3
+
+20
+
+Completeness Communication Context
+
+Overall
+
+F
+
+Prompts
+
+F.1
+
+Rubric Generation
+
+Prompt for initial rubric generation.
+Role: You are a rubric designer for an LLM-as-judge system.
+Inputs you will receive:
+• Prompt: the task/question the response must answer.
+• Responses: a set of responses to be evaluated against rubrics.
+Goal: Design a comprehensive set of rubrics for evaluating responses to the given prompt. Only write
+rubrics you are confident about. Only propose the best new rubrics.
+Requirements:
+• Propose rubrics that collectively cover the most important dimensions needed to judge whether a
+response correctly and helpfully satisfies the prompt.
+• Each rubric must be consistently judgeable across many responses (avoid vague wording like “good”,
+“nice”, “high-quality”).
+• Each rubric must be prompt-specific (tied to what the user asked), not generic writing advice.
+• Each rubric should be written as a single criterion with clear, binary pass/fail boundaries. Prefer
+objective checks.
+• New rubric MUST NOT answer the question directly.
+• New rubric MUST NOT repeat any of the responses provided.
+Tips for writing good rubrics:
+i. MECE:
+• Mutually Exclusive, Collectively Exhaustive
+ii. Completeness:
+• Consider all the elements you would want to include to create a perfect response and put them into
+the rubric. This means including not only the facts and statements directly requested by the prompt,
+but also the supporting details that provide justification, reasoning, and logic for your response. Each
+of these elements should have a criterion because each criterion helps to develop the answer to the
+question from a slightly different angle.
+iii. No overlapping:
+• the same error from a model shouldn’t be punished multiple times.
+iv. Diversity:
+• The rubric items should include variable types of information.
+• If all criteria are like “the response mentions A”, “the response mentions B”, then this is not a good
+rubric.
+v: How many rubric items for each prompt
+• There is no golden standard, and the desired number of rubrics varies by accounts and task types.
+• Write rubrics that cover all aspects of an ideal response.
+vi: How many rubric items to fail
+• A good rule of thumb is that the model fails on 50 per cent of rubrics items
+vii: Atomicity / Non-stacked
+• Each rubric criterion should evaluate exactly one distinct aspect. Avoid bundling multiple criteria into
+a single rubric. Most stacked criteria with the word “and” can be broken up into multiple pieces.
+
+21
+
+• BAD: Response identifies George Washington as the first U.S. president and mentions he served two
+terms.
+• GOOD: Response identifies George Washington as the first U.S. president.
+• GOOD: Response mentions that George Washington served two terms.
+viii: Specificity
+• Criteria should be binary (true or false) and objective.
+• Avoid vague descriptions (e.g., “the response must be accurate” is vague).
+• Example: “The response should list exactly three examples.”
+ix: Self-contained
+• Each criterion should contain all the information needed to evaluate a response. For example: “Mentions
+the capital city of Canada” → BAD; “Mentions the capital city of Canada is Ottawa” → GOOD.
+x: Criterion should be verifiable without requiring external search.
+• BAD: Response names any of the Nobel Prize winners in Physics in 2023
+• GOOD: Response names any of the following Nobel Prize winners in Physics in 2023: Pierre Agostini,
+Ferenc Krausz, or Anne L’Huillier.
+Below are the inputs:
+• Here is the user prompt for which we want to generate a rubric:
+PROMPT: {prompt}
+• Here are a list of reference responses:
+RESPONSES: {responses}
+Output STRICTLY in below format. No other text is allowed:
+• <RUBRIC> Rubric 1 </RUBRIC>
+• <RUBRIC> Rubric 2 </RUBRIC>
+• ...
+Note: Italic parts are only included when generating rubrics with sampled responses.
+Prompt for rubric decomposition.
+Role: You are a rubric designer for an LLM-as-judge system.
+Inputs you will receive:
+• Prompt: the task/question the response must answer.
+• Responses: a set of responses to be evaluated against rubrics.
+• Current rubric: criterion currently used by a judge. This rubric has already been satisfied by multiple
+responses, so it is too coarse and fail to distinguish response quality.
+• Other rubrics: Other rubrics that the new rubric must NOT overlap with.
+Goal: Propose exactly TWO new rubrics that are more granular than the existing ones and can better
+differentiate candidate responses. Only write rubrics you are confident about. Only propose the best new
+rubrics.
+What “more granular” means (requirements):
+• Each new rubric must target a specific, discriminative dimension of quality that is not sufficiently
+captured by the existing rubrics (e.g., completeness of key sub-steps, correctness of constraints,
+justification quality, handling of edge cases, faithfulness to prompt format, etc.).
+• New rubrics should NOT miss critical information contained in the existing rubric.
+• Each rubric must be consistently judgeable across many responses (avoid vague wording like “good”,
+“nice”, “high-quality”).
+• Each rubric must be prompt-specific (tied to what the user asked), not generic writing advice.
+
+22
+
+• Each rubric should be written as a single criterion with clear, binary pass/fail boundaries. Prefer
+objective checks.
+• New rubric MUST NOT repeat any of the responses provided.
+• New rubric MUST NOT answer the question directly.
+Tips for writing good rubrics:
+The same as those in the prompt for initial rubric generation. These have been omitted here for brevity.
+Below are the inputs:
+• Here is the user prompt for which we want to generate a rubric:]
+PROMPT: {prompt}
+• Here are a list of reference responses:
+RESPONSES: {responses}
+• Here is existing rubric to improve:
+RUBRIC: {rubric}
+• Here is other rubric that the new rubric should NOT overlap with:
+OTHER RUBRIC: {other_rubric}
+Output STRICTLY in below format. No other text is allowed:
+• <RUBRIC> New rubric 1 </RUBRIC>
+• <RUBRIC> New rubric 2 </RUBRIC>
+
+F.2
+
+Filtering
+
+Prompt for checking overlapping rubrics.
+You are checking whether a new rubric substantially overlaps with ANY of the existing rubrics. If ANY
+overlap is found, output YES; otherwise output NO.
+Definition of substantial overlapping:
+• The new rubric has the same intent as an existing rubric, or is a strict subset/superset of it, or ≥ 70%
+of its meaning is covered by the existing rubric so that applying both would not materially change
+scoring outcomes.
+• Match on meaning, not wording. Treat synonyms, paraphrases, and inverses with the same effect as
+overlapping (e.g., “be concise” ≈ “avoid unnecessary verbosity”).
+• Ignore trivial phrasing, tone, and example differences unless they change the requirement.
+Edge cases:
+• If scopes are disjoint (different capability/goal) → NO.
+• If the new rubric adds only minor qualifiers (e.g., “clearly”/“appropriately”) without changing evaluation
+→ YES.
+• If the new rubric merely narrows the context while keeping the same criterion (subset) or broadens it
+(superset) → YES.
+Input format:
+• EXISTING_RUBRICS: {existing_rubrics}
+• NEW_RUBRIC: {new_rubric}
+Output STRICTLY in below format. No other text is allowed:
+• <EVALUATION> YES/NO </EVALUATION>
+
+23
+
+Prompt for checking conflicting rubrics.
+You are checking whether a new rubric expresses opposite meaning of ANY of the existing rubrics. If
+ANY opposition is found, output YES; otherwise output NO.
+Definition of opposition:
+• “Opposite” means the new rubric asserts the negation or reverse polarity of the same requirement,
+property, or direction as an existing rubric.
+• Examples:
+– require X ↔ forbid/avoid X
+– must include X ↔ must NOT include X
+– prefer more of X ↔ prefer less of X (same X, opposite direction)
+– answer should be optimistic ↔ answer should be pessimistic
+• Do NOT flag different targets or contexts.
+• Do NOT flag orthogonal dimensions (e.g., tone vs citations or “be clear” vs “be concise”)
+• Do NOT flag mere differences in emphasis, strength, scope, or style.
+• Do NOT flag stricter/looser thresholds unless they clearly reverse direction on the same axis (e.g.,
+“maximize brevity” vs “maximize elaboration” = opposite; “≤ 120 words” vs “≤ 150 words” = NOT
+opposite).
+Input format:
+• EXISTING_RUBRICS: {existing_rubrics}
+• NEW_RUBRIC: {new_rubric}
+Output STRICTLY in below format. No other text is allowed:
+• <EVALUATION> YES/NO </EVALUATION>
+
+F.3
+
+Evaluation
+
+Judge prompt for rubric-based response evaluation.
+You are a judge, evaluating whether a response satisfies the given rubric. If the response satisfies the
+criterion of the rubric, output YES; otherwise output NO.
+Requirement:
+• You must follow the rubric strictly, and only consider the criteria listed in the rubric.
+• You must NOT consider any other factors, such as your own opinions or external knowledge.
+Below between <RESPONSE> and </RESPONSE> is the response to evaluate on
+• <RESPONSE> {response} </RESPONSE>
+Below between <RUBRIC> and </RUBRIC> is the rubric to evaluate on
+• <RUBRIC> {rubric} </RUBRIC>
+Output STRICTLY in below format. No other text is allowed:
+• <EVALUATION> YES/NO </EVALUATION>
+
+24
+
+G
+
+Qualitative Examples
+
+In this section, we present representative rubric outputs from multiple datasets, showing both the initially
+proposed rubrics and the corresponding refined rubrics produced through our recursive decomposition and
+filtering process.
+Note: Due to the large number of task prompts in each dataset, and the considerable length of some prompts
+and their associated rubric sets, we do not display all instances, as doing so would be prohibitively difficult to
+read. We present representative examples to qualitatively illustrate how RRD enhances both the granularity
+and coverage of rubric-based evaluation.
+Example from JudgeBench Dataset
+Prompt:
+A college student initiated a criminal case against his former roommate, claiming the former roommate
+snuck in and removed his state-of-the-art home theater equipment from his house. The college student
+took the complaint papers that were approved by the prosecution and filed them with a magistrate
+court. An ongoing police investigation later determined, however, that the college student was a
+vengeful person not averse to creating stories, and that he and the former roommate had been arguing
+over several related issues. They also determined that he never had any quality sound or video
+equipment. The police dropped the prosecution, and the criminal case was dismissed at the preliminary
+hearing. When the former roommate filed a civil case against the college student alleging the tort of
+malicious prosecution, will evidence of the student’s reputation for dishonesty be admissible and why?
+• (A) Yes, because the student’s reputation for dishonesty directly relates to the tort of malicious
+prosecution.
+• (B) No, because reputation evidence is considered too prejudicial to be admissible.
+• (C) Yes, because dishonesty at any time in the past is always relevant to a malicious prosecution
+complaint.
+• (D) Yes, because the student’s dishonesty directly affects the credibility of his initial criminal
+complaint.
+• (E) Yes, because reputation evidence, just like most character evidence, is virtually always
+admissible.
+• (F) Yes, because even though character evidence is too collateral to be admitted for circumstantial
+evidence, it is admissible if it is directly at issue in the case.
+• (G) No, because character evidence is only admissible if it is directly related to the act in question.
+• (H) No, because the past reputation of a person is not considered as evidence in court.
+• (I) Yes, because while most character evidence is not admissible, some is, and reputation evidence
+is always admissible.
+• (J) No, because character evidence is never admissible in any case.
+If you cannot determine the correct multiple-choice answer, take your best guess. Once you have your
+answer, please duplicate that letter five times in a single string. For example, if the answer is K, then
+write KKKKK. Let’s think step by step.
+Initial rubrics:
+1. Correctly identifies that the admissibility of reputation evidence depends on its relevance to an
+element of the tort of malicious prosecution.
+2. Distinguishes between general character evidence and reputation evidence admissible when character
+is directly at issue.
+3. Correctly considers the legal elements required to prove malicious prosecution.
+4. Accurately addresses whether the student’s reputation for dishonesty is being used for propensity
+reasoning or as direct evidence of an element in the case.
+5. Avoids overgeneralization regarding the admissibility of reputation or character evidence.
+6. Acknowledges that rules of evidence may treat civil and criminal cases differently regarding character
+evidence.
+
+25
+
+Final rubrics:
+1. Clearly identifies the key elements required to prove malicious prosecution: institution of criminal
+proceedings, termination in plaintiff’s favor, absence of probable cause, and malice.
+2. Correctly articulates the general rule that character evidence is inadmissible to prove a person acted
+in conformity with that character on a particular occasion, known as the propensity rule.
+3. Accurately identifies the exception that character evidence is admissible when character is an
+essential element of a claim or defense, known as character being directly at issue.
+4. Explains how the student’s reputation for dishonesty directly relates to proving lack of probable
+cause and malice in a malicious prosecution case.
+5. Explicitly mentions the role of the student’s reputation for dishonesty in determining whether the
+student had an honest belief that a crime occurred.
+6. Assesses the relevance of character evidence by determining whether it significantly impacts a central
+factual question or element in the case, beyond mere propensity.
+7. Assesses the impact of admitting reputation evidence on the balance of prejudice versus probative
+value, specifically in relation to a malicious prosecution claim.
+8. Assesses the contextual relevance and potential prejudicial impact of introducing reputation evidence
+of dishonesty, weighing its probative value against its potential to unfairly bias the court.
+9. Explores the connection between the student’s reputation and the historical pattern of behavior,
+evaluating whether this pattern offers insight into a motive or strategy crucial for the malicious
+prosecution claim, without relying on the propensity argument.
+10. Clearly distinguishes between the legal concept of reputation and character as they apply to the
+admissibility of evidence, and explains any differences in their impact on the case.
+
+Example from PPE Preference Dataset
+Prompt:
+Write an email for selling my website speed optimization services to e-commerce business owners. Make
+it at short as possible. Focus in benefits (revenue or money) that i make for them.
+Initial rubrics:
+1. Mentions website speed optimization as the core service offered.
+2. Specifically targets e-commerce business owners as the intended audience.
+3. Includes at least one concrete business benefit tied to money or revenue.
+4. Maintains a short and concise format (no more than 100 words).
+5. Avoids technical jargon or implementation details unrelated to benefits.
+6. Includes a clear call to action (e.g., reply, book a call, request audit).
+7. Avoids generic claims unrelated to website performance or monetary benefit.
+Final rubrics:
+1. Mentions that faster loading times lead to higher sales or increased revenue.
+2. Advises that every second of delay can reduce sales or mentions specific loss metrics.
+3. Offers a specific service aimed at optimizing website speed for e-commerce.
+4. Includes a call to action inviting the recipient for further engagement, such as a chat or a video.
+5. Uses an analogy or relatable scenario to illustrate the impact of website speed on sales or customer
+retention.
+6. Provides an option to receive additional information or a report, implying a no-obligation offer.
+7. References an impact of speed on conversion rates, either generally or with specific percentages.
+8. Utilizes a subject line that directly mentions website speed and its impact on sales/revenue.
+9. Highlights specific benefits for customer satisfaction or user experience beyond direct revenue
+increase, such as improved browsing experience or reduced bounce rates.
+10. Craft a customizable template by including placeholders for recipient’s name and company name.
+
+26
+
+11. Establishes credibility by referencing a well-known company or study related to website optimization
+and its impact on revenue.
+12. Utilizes persuasive language that emotionally appeals to the business owner’s pain points, like
+frustration from slow checkout or fear of losing customers, to emphasize urgency and drive interest
+in services offered.
+13. Incorporates a sense of urgency or a compelling reason to act quickly within the email message.
+14. Emphasizes the competitive advantage gained by having a faster-loading website compared to other
+e-commerce businesses.
+15. Initiates engagement by offering a free initial assessment or audit of the recipient’s current website
+performance to demonstrate potential improvements.
+16. Explicitly quantifies potential revenue increase with specific dollar amounts, contrasting current
+losses due to slow website speed with projected gains post-optimization.
+17. Incorporates industry-specific examples or case studies to demonstrate proven results of website
+speed optimization in increasing e-commerce sales.
+18. Clearly differentiates the email by employing a visually unique format or structure that stands out,
+such as bullet points, bold headings, or highlighting key revenue benefits, to enhance readability
+and impact.
+19. Measure the concise and efficient use of language in the email, aiming to keep the message succinct
+yet informative, meeting the prompt’s requirement for brevity.
+20. Mentions strategies or tools used in the website speed optimization, detailing specific technologies
+or methodologies applied to achieve faster loading times, such as caching, image optimization, or
+content delivery networks.
+21. Specifies how increased website speed can amplify the business’s online visibility or improve SEO
+rankings, thus contributing indirectly to revenue growth.
+22. Informs the recipient that an optimized website speed can lead to improved search engine rankings,
+thereby attracting more organic traffic and increasing potential sales.
+23. Demonstrates insight into user behavior changes stemming from improved website speed, such as
+increased time spent on site or higher interaction rates.
+24. Incorporates a personalization element that leverages the recipient’s specific industry or e-commerce
+niche, showcasing tailored expertise in optimizing website speed for their unique business needs.
+25. Evaluates whether the email offers a personalized benefit or advantage uniquely tailored to the
+recipient’s business or e-commerce niche, emphasizing customization over generic benefits.
+26. Specifies how optimized website speed can enhance mobile user experiences, which is crucial for
+e-commerce businesses to capture a significant portion of their audience.
+27. Presents a scalable solution that can easily integrate into the recipient’s existing e-commerce
+infrastructure, emphasizing its convenience and low disruption to current operations.
+28. Clearly outlines the process or specific steps involved in the website speed optimization service to
+give the reader insight into how the transformation will be achieved.
+29. The email creatively uses a metaphor or storytelling that evokes a vivid image to emphasize the
+importance of website speed optimization, enhancing the overall persuasive impact.
+30. Ensures the email utilizes statistical evidence or factual data, such as industry benchmarks, to
+validate the benefits of speed optimization comprehensively, enhancing the persuasive power through
+quantifiable credibility.
+
+Example of a simple task from PPE Preference Dataset
+Prompt:
+There are 10 apples today. 1 was eaten yesterday. How many are left now? (Original prompt in
+Chinese – translated to English for illustration)
+Initial rubrics:
+
+27
+
+1. States that there are 10 apples remaining today, regardless of yesterday’s consumption.
+2. Explains that the apples consumed yesterday do not affect today’s apple count of 10.
+3. Acknowledges that the count of apples as of today is based on the statement “There are 10 apples
+today” without reference to past events.
+4. Provides a rationale or explanation for considering the past apple consumption as irrelevant to the
+current count.
+5. Avoids making quantitative calculations that incorrectly deduct apples from today’s count based on
+past consumption.
+6. Does not ambiguously imply there could be fewer or more than 10 apples today without any
+additional information provided in the prompt.
+Final rubrics:
+1. (Same as the initial rubrics – omit for brevity.)
+2. Provides a creative interpretation of the scenario, incorporating narrative or imaginative elements
+that explain the unchanged apple count.
+3. Uses narrative or imaginative storytelling elements without deviating from the stated fact that
+today’s count is 10 apples, enhancing engagement while maintaining accuracy.
+
+Example of WildChat Dataset
+Example 1
+Prompt:
+What influence did Greek thought have on the emergence and development of science?
+Initial rubrics:
+1. Identifies Greek thought as a historical antecedent rather than a modern scientific contributor.
+2. Describes at least one conceptual contribution of Greek thought to the development of scientific
+reasoning.
+3. Mentions at least one historical figure or school of Greek thought in a scientific or proto-scientific
+context.
+4. Acknowledges the role of Greek thought in shaping methodological or epistemological foundations
+of science.
+5. Avoids attributing anachronistic concepts of modern science (e.g., peer review, experimental control)
+directly to the Greeks.
+6. Maintains focus on Greek influence specifically, not general ancient civilizations.
+7. Frames the influence of Greek thought in terms of its impact on later scientific development (e.g.,
+during the Islamic Golden Age, Renaissance, Enlightenment).
+Final rubrics:
+1. The response mentions Thales of Miletus predicting an eclipse as an example of early scientific
+reasoning by the Greeks.
+2. The response includes an explanation of the Greek concept of ’Kosmos’ as an ordered, harmonious
+system significant to scientific thought.
+3. The response describes the influence of Pythagorean mathematics on the development of scientific
+principles.
+4. The response discusses Socratic questioning or the Socratic method as essential for scientific inquiry.
+5. The response acknowledges errors in Greek science but emphasizes their foundational contributions
+to scientific development.
+6. The response cites Euclid’s "Elements" and its impact on geometry as a part of scientific advancement.
+7. The response mentions the Greek transition from mythological explanations to logical reasoning in
+
+28
+
+understanding the universe.
+8. The response includes reference to Greek thinkers’ belief in a rational, intelligible universe governed
+by laws.
+9. The response discusses Aristotle’s role in the systematization and classification of the natural world.
+10. The response explores Greek contributions to observational and empirical methods, such as Hippocrates’ emphasis on documenting symptoms, in the development of scientific methodology.
+11. The response addresses the synthesis of empirical observation and logical reasoning as a Greek
+methodological advancement in the pursuit of understanding the natural world.
+12. The response identifies the impact of Greek dialectic methods on shaping the peer review process
+used in modern science.
+13. The response explains the role of Greek mathematics, particularly its use in describing physical
+phenomena, in influencing later scientific approaches to the natural world.
+14. The response illustrates how Greek thought contributed to the formation of a foundational ethical
+framework for science, highlighting examples like the Hippocratic Oath.
+15. The response explores the role of Archimedes in advancing principles of physics and engineering,
+illustrating the practical application of Greek thought to material reality.
+16. The response illustrates how Greek philosophical discourse in public spaces, such as the Agora,
+contributed to the communal and social nature of scientific inquiry.
+17. The response explores the role of Greek philosophical schools, such as the Atomists or Stoics, in
+shaping fundamental principles that influenced later scientific exploration.
+18. The response discusses the role of Greek thought in shaping the dual approach of both theoretical
+abstraction and practical experimentation which became fundamental to later scientific advancements,
+despite the Greeks not fully implementing experimentation themselves.
+19. The response showcases how Greek thought laid the groundwork for interdisciplinary thinking,
+mixing philosophy, mathematics, and early natural sciences to broaden approaches in scientific
+exploration.
+20. The response highlights the symbolic aspect of Greek thought as initiating a "cathedral of knowledge,"
+metaphorically illustrating the foundational impact on science across millennia.
+21. The response highlights the impact of Greek thought in establishing a systematic methodology for
+distinguishing between subjective beliefs and objective facts, facilitating a structured framework for
+scientific inquiry.
+22. The response explores the lasting cultural and intellectual impact of Greek thought on the Renaissance
+and subsequent scientific revolution, highlighting the transfer and transformation of Greek ideas
+across different historical periods.
+23. The response explains how Greek thought established an early conceptual framework for distinguishing between qualitative and quantitative analysis in scientific inquiry.
+24. The response explores how Greek advancements in abstract thought, particularly through Plato’s
+ideal forms, contributed to the long-term development of scientific concepts by encouraging the
+pursuit of universal principles and truths.
+25. The response highlights the contribution of Greek exploration of metaphysics and ontology—concepts
+of being and existence—and their impact on shaping scientific inquiry into the nature of reality.
+26. The response outlines the Greek philosophical commitment to deductive reasoning as a critical
+factor in establishing structured scientific theories.
+
+Example 2
+Prompt:
+What skill can I learn in six months and generate a lot of money?
+Initial rubrics:
+1. Proposes a skill that is realistically learnable within approximately six months.
+2. Proposes a skill that has clear, established paths to monetization.
+
+29
+
+3. Clearly identifies the skill being recommended.
+4. Avoids unrealistic earnings claims (e.g., “become a millionaire instantly”) or unverifiable hype.
+5. Connects the proposed skill to a plausible use case or real-world application.
+6. Maintains relevance to both time constraint (six months) and financial goal (generating a lot of
+money).
+Final rubrics:
+1. Identifies and recommends a specific skill that can be learned in six months and is capable of
+generating substantial income.
+2. Provides justification for why the skill chosen is lucrative, referring to current demand and market
+trends.
+3. Lists actionable steps or a clear plan on how to learn the skill within the six-month time frame.
+4. Includes examples of tools or platforms necessary to master the skill.
+5. Discusses potential income or earning opportunities related to the skill.
+6. Addresses the need for the skill to solve specific business problems or provide substantial value to
+clients.
+7. Suggests ways to monetize the skill, such as freelance opportunities, consulting, or creating digital
+products.
+8. Emphasizes the importance of differentiating oneself with complementary skills or additional
+strategies beyond the primary skill.
+9. Mentions the importance of building a portfolio or case studies to showcase expertise in the chosen
+skill.
+10. Encourages pursuing online courses, certification, or self-directed learning as part of the skill
+acquisition process.
+11. Evaluates the long-term sustainability and adaptability of the skill in relation to evolving market
+conditions and potential technological advancements.
+12. Evaluates the transformation of the learned skill into a clearly defined business model, detailing
+how the skill is integrated into a sustainable, repeatable, and scalable business process.
+13. Evaluates the practicality of transitioning from learning the skill to implementing it in real-world
+scenarios within the six-month time frame.
+14. Evaluates the potential scalability or expansion of the skill into a broader business or service offering
+in the future, beyond just immediate income generation.
+15. Evaluates the effectiveness of the skill in addressing industry-specific challenges, detailing how it
+creates a competitive advantage or fills a gap in the current market.
+16. Evaluates the creativity and uniqueness of the proposed learning path by assessing whether the
+response provides a vision or framework for integrating the skill into the user’s broader personal or
+professional development roadmap.
+17. Evaluates potential challenges or pitfalls in learning the chosen skill and suggests methods to
+overcome them.
+18. Evaluates the clarity and realism of the proposed six-month learning timeline in the context of the
+user’s current knowledge and experience level, assessing whether the response tailors the learning
+schedule to various starting points of potential learners.
+19. Assesses whether the response includes a strategy for gaining the first practical experience or
+opportunities (e.g., internships, volunteer projects, or initial clients) in the chosen skill to build
+credibility and real-world expertise.
+20. Examines the feasibility and validity of the skill learning timeline by analyzing the skill’s complexity,
+required foundational knowledge, and intensity of the proposed learning schedule.
+21. Assesses the completeness and coherence of the narrative or framework describing how the proposed
+skill will lead to financial success, ensuring it logically connects individual learning steps to the
+eventual income objectives.
+22. Assesses the ability of the response to convey the transformative impact of the skill on both personal
+growth and career trajectory, highlighting the broader implications of mastering the skill beyond
+immediate financial gain.
+
+30
+
+23. Evaluates the response’s inclusion of strategies to enhance personal branding related to the skill,
+including creating an online presence or sharing work publicly to attract potential clients or
+employers.
+24. Assesses whether the response effectively illustrates a unique marketing or networking strategy
+to connect with potential clients or build a professional reputation in the first stages of the skill
+application.
+25. Emphasizes the need to practice and iterate on real-world projects or scenarios relevant to the
+chosen skill, demonstrating iterative improvement and application of feedback.
+26. Assesses the response for providing specific examples of successful individuals or case studies who
+have effectively learned and monetized the skill within a similar timeframe, showcasing real-world
+applicability and success stories.
+27. Assesses the depth of detail and specificity in outlining how the proposed skill integrates with
+existing competencies or knowledge, illustrating how this integration enhances the potential for
+success and financial gain.
+28. Assesses the degree to which the response incorporates practical examples or case studies demonstrating the real-world application and impact of the skill learned, highlighting any transformations
+in business operations or financial performance.
+29. Assesses the alignment of the skill with the user’s current abilities and interests, ensuring that
+the skill is not only compatible with but also builds upon their existing strengths, knowledge, or
+passions to maximize successful implementation and retention.
+30. Assesses the ability to effectively communicate and articulate the value proposition of the learned
+skill to prospective clients or employers, ensuring that the pitch is tailored to their specific needs
+and objectives.
+31. Assesses the response’s ability to identify opportunities for networking or collaboration within the
+industry relevant to the chosen skill, and how this could accelerate learning and increase potential
+income.
+
+Example 3
+Prompt:
+Write me an essay about monkeys.
+Initial rubrics:
+1. The response is structured in essay format with an introduction, body, and conclusion.
+2. The essay remains focused on the topic of monkeys throughout the response.
+3. The response refers specifically to monkeys and does not conflate them with apes or other primates.
+4. Includes at least one factual detail about monkeys (e.g., diet, habitat, species, behavior).
+5. Avoids listing-only or bullet-point format; presented as continuous prose.
+6. Does not consist entirely of generic filler or vague commentary.
+7. Maintains a neutral or informative tone appropriate for an essay.
+Final rubrics:
+1. Includes an exploration of monkeys’ physical abilities, such as their agility and acrobatics.
+2. Mentions the social structures and behaviors observed in monkey societies.
+3. Describes the intelligence and problem-solving abilities of monkeys.
+4. Examines the evolutionary connection between monkeys and humans.
+5. Discusses the ecological role of monkeys, such as seed dispersers.
+6. Provides factual information about the diversity of monkey species.
+7. Reflects on the emotional experiences shared between humans and monkeys.
+8. Utilizes symbolic language to enhance understanding of monkeys beyond biological terms.
+9. Considers the environmental habitat diversity in which different monkey species thrive, including
+their geographical distribution across continents.
+
+31
+
+10. Compares and contrasts different monkey species to highlight their unique characteristics and
+ecological niches.
+11. Highlights the role of monkeys in scientific research and their contributions to advancements in our
+understanding of human cognition and disease.
+12. Explains the impact of human activity, such as the illegal wildlife trade, on monkey populations.
+13. Considers the historical depiction of monkeys in literature and folklore across different civilizations.
+14. Discusses the use of metaphorical elements to draw parallels between monkey behavior and broader
+existential themes or philosophical questions.
+15. Discusses the sensory experiences and communication methods of monkeys, such as vocalizations,
+facial expressions, and tactile behaviors, and their significance in their daily life and interactions.
+16. Analyzes the role of monkeys in fostering cross-cultural connections and exchanges, highlighting
+examples where different cultures have interacted with or been influenced by monkey-related myths,
+symbols, or depictions.
+17. Evaluates the symbolic representation of monkeys as tricksters or wise figures in folklore and what
+this reveals about human self-perception and cultural values.
+18. Analyzes the role of monkeys in maintaining ecological balance and biodiversity through their
+interactions with other species.
+19. Critically analyzes the ethical considerations and responsibilities associated with human interactions
+and interventions with monkey species, including the implications of research and conservation
+efforts.
+20. Analyzes the role of monkeys in facilitating biodiversity through their interactions with other species
+in their ecosystems.
+21. Discusses the ethical considerations in scientific research involving monkeys, including the balance
+between scientific advancement and animal welfare.
+22. Analyzes the ethical considerations and moral obligations involved in the conservation of monkey
+habitats and populations.
+23. Presents a nuanced exploration of monkeys’ interactions with their environment, focusing on their
+role as adaptors within ecosystems and their ability to thrive across varying environmental conditions.
+24. Assesses the depiction of unique communication methods and the role they play in both cooperative
+interactions and competitive scenarios within monkey societies.
+25. Assesses the aesthetic portrayal of monkeys in the essay, considering the use of descriptive imagery
+to evoke sensory experiences and emotional responses in the reader.
+26. Examines the role of monkeys in inspiring artistic and creative expressions, such as in visual
+arts, music, or dance, and how these reflect human interpretations of monkey characteristics and
+significance.
+27. Explores the challenges related to the social dynamics within monkey populations when faced with
+environmental pressures or changes, such as altered food availability or increased competition for
+resources.
+28. Discusses the role of monkeys in their local food webs and their interactions with other species as
+both prey and predators.
+29. Assesses the anthropomorphism of monkey behaviors and characteristics, examining how human-like
+traits are attributed to monkeys in the narrative.
+30. Evaluates the physiological adaptations of monkeys that enable them to thrive in varied environmental
+conditions, such as skin type variations and dietary specializations.
+31. Analyzes the adaptation mechanisms monkeys have developed to thrive in varying environmental
+pressures and challenges, such as climate variations and human-induced habitat changes.
+32. Discusses the role of monkeys in influencing art forms, such as visual art, music, and dance, and
+how these representations impact cultural perception and creative expression.
+33. Explores the role of monkeys in allegorical storytelling, examining how they serve as vehicles for
+moral lessons and social commentary in diverse cultural narratives.
+
+32
+
+

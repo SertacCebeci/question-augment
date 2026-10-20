@@ -1,0 +1,2083 @@
+Preprint
+
+1
+
+Uncertainty Is Not Enough: Value-of-Information Routing for Mixtures of LoRA
+Experts
+Tom Saliencro1 , Rohan Desai2 , Priya Nair1 , Maya Lindqvist1 , Daniel Whitmore2
+1
+
+University of California, Irvine
+2
+University of Washington
+saliencro@gmail.com
+
+arXiv:2608.02528v1 [cs.LG] 3 Aug 2026
+
+Abstract
+Mixtures of low-rank adaptation experts increase parameterefficient capacity by routing each input through a subset
+of adapters. Recent dynamic routers activate more experts
+when the router or prediction is uncertain. This rule silently
+equates uncertainty with useful additional computation: an
+uncertain example may contain complementary, unqueried
+expert evidence, but it may instead remain ambiguous after
+every expert agrees. We formulate routing as certified valueof-information allocation. VI-MoLE learns the counterfactual risk remaining after each expert prefix, converts these
+predictions into simultaneous upper-risk certificates on heldout calibration data, and spends a global adapter budget on
+the token–layer action with the largest certified marginal risk
+reduction per unit cost. A terminal certificate then decides
+whether to answer or abstain. Unlike an uncertainty gate, this
+procedure distinguishes present ambiguity from recoverable
+and residual risk. We prove simultaneous certificate validity,
+optimal greedy allocation under diminishing certified gains,
+and allocation regret under value-estimation error. The evaluation protocol tests matched-compute accuracy, certificate
+coverage, risk–coverage, distribution shift, and tail latency
+against fixed and dynamic MoE-LoRA routers.
+
+1
+
+Introduction
+
+Low-rank adaptation (LoRA) makes large-model specialization practical by training small low-rank updates while
+freezing the backbone (Hu et al. 2022). Mixtures of LoRA
+experts extend this idea with an adapter pool and an inputdependent router, increasing task capacity without evaluating every adapter (Wu, Huang, and Wei 2024; Li et al. 2024).
+Subsequent work improves specialization through rank-wise
+experts (Zou et al. 2025b), layer-wise allocation (Gao et al.
+2025), and dynamic cardinality. A central systems question
+remains: how many experts should an input receive?
+Fixed top-k routing assigns the same expert count to every
+input. Dynamic alternatives learn activation thresholds (Liu
+and Luo 2024), use entropy-related routing objectives (Li
+et al. 2025), or predict token- and layer-specific cardinality
+(Zhuang et al. 2026). Uncertainty-aware routers go further:
+CARE reads router concentration and expert disagreement
+to adjust expert count at a calibrated average budget (Saliencro et al. 2026a), while recent probabilistic, Bayesian, and
+entropy-gated MoE methods connect routing uncertainty to
+cardinality, calibration, and OOD detection (Li and Wicker
+
+2026; Zhao et al. 2026). These developments make a naive
+“more uncertainty, more experts” contribution untenable.
+That policy confounds uncertainty magnitude with uncertainty reducibility. Consider two predictions with the same
+entropy. For the first, an unqueried domain expert has complementary evidence, so another adapter can sharply reduce
+risk. For the second, every expert agrees that the input is ambiguous or unsupported; additional adapters consume compute without resolving the uncertainty. The correct actions
+are opposite despite identical initial confidence. Routing
+should therefore ask a counterfactual question: how much
+risk is the next expert expected to remove?
+We introduce VI-MoLE (Value-of-Information Mixture
+of LoRA Experts), a certified compute allocator for modular PEFT. A base router supplies nested expert prefixes
+at each eligible token–layer position. A lightweight head
+predicts the counterfactual residual risk of each prefix before its next expert is executed. Calibration residuals shared
+across all prefixes transform these predictions into simultaneous upper-risk certificates. Routing is then a global discrete resource-allocation problem: repeatedly acquire the
+action with the largest certified risk reduction per profiled
+unit cost until the budget is exhausted or every gain is nonpositive. The terminal certificate answers only when the remaining risk is acceptable; otherwise it abstains.
+The distinction is related to routing and cascading among
+complete LLMs (Ding et al. 2025; Dekoninck, Baader, and
+Vechev 2025) and to confidence-based rejection (Chuang et
+al. 2025), but our action is within-model acquisition from
+a shared pool of low-rank expert corrections. Training can
+observe all experts; deployment evaluates only selected prefixes. This asymmetry supplies counterfactual supervision
+unavailable to entropy-only routing, while calibration makes
+the resulting risk estimate operational rather than merely
+correlational.
+Our contributions are:
+• We formulate dynamic MoE-LoRA routing as certified
+global resource allocation, separating current uncertainty,
+recoverable risk, and residual risk rather than mapping
+one uncertainty score to expert count.
+• We develop simultaneous prefix-risk certificates and
+a marginal-gain scheduler that moves compute across
+token–layer positions under a latency or FLOP budget,
+
+Preprint
+
+2
+
+followed by certificate-based answering or abstention.
+• We establish finite-sample certificate validity, greedy optimality under diminishing certified gains, and allocation
+regret under value-estimation error; these results expose
+the assumptions that experiments must test.
+• We specify a reproducible matched-compute evaluation
+that directly contrasts VI-MoLE with CARE, LD-MoLE,
+AdaMoLE, DynMoLE, probabilistic routing, and fixed
+top-k.
+
+2
+
+Related Work
+
+Mixtures of LoRA experts route among task-adaptive lowrank updates (Wu, Huang, and Wei 2024; Li et al. 2024).
+FlyLoRA organizes capacity through implicit rank-wise experts, while MoLA allocates experts by layer (Zou et al.
+2025b; Gao et al. 2025). FRAME instead learns the adaptation basis through fractional-Fourier experts (Saliencro et
+al. 2026b). These methods motivate a rich expert pool but do
+not supply the counterfactual stopping target used here.
+AdaMoLE learns an activation threshold, DynMoLE regularizes hybrid routing, and LD-MoLE learns token- and
+layer-dependent expert cardinality (Liu and Luo 2024; Li et
+al. 2025; Zhuang et al. 2026). ReMoE uses ReLU routing to
+obtain differentiable sparsity, while ProbMoE models exactand dynamic-k routing probabilistically (Zhao et al. 2026).
+CARE is the closest MoE-LoRA method: it converts router
+concentration and observed disagreement into dynamic expert counts and uncertainty scores (Saliencro et al. 2026a).
+Variational Routing treats MoE gates in a Bayesian framework (Li and Wicker 2026). VI-MoLE does not claim that
+router uncertainty is a new routing signal. It predicts whether
+a specific next computation will reduce risk and treats high
+residual risk with low expected gain as an abstention case.
+Calibration (Guo et al. 2017), deep ensembles (Lakshminarayanan, Pritzel, and Blundell 2017) are standard uncertainty tools. For LLMs, semantic entropy detects meaninglevel inconsistency (Farquhar et al. 2024), while a broad
+benchmark compares uncertainty estimators (Vashurin et
+al. 2025). SelectiveNet integrates rejection into learning
+(Geifman and El-Yaniv 2019); energy statistics have also
+been used for label-free model evaluation under distribution shift (Peng et al. 2024). Conformal risk control
+provides distribution-free calibration under exchangeability
+(Angelopoulos et al. 2024). We use uncertainty as both an
+acquisition state and a terminal risk score, but do not treat
+either as a guarantee without held-out calibration.
+Routing is complementary to reducing the data processed
+during adaptation. Utility-diversity sampling, for example,
+scores online SFT batches using output geometry and historical diversity (Zou et al. 2025a). We cite this distinction because VI-MoLE allocates inference computation after training rather than selecting training examples.
+Cost-aware routing selects among complete models (Ding
+et al. 2025); unified routing and cascading formalizes
+accept-versus-escalate decisions (Dekoninck, Baader, and
+Vechev 2025). Confidence tokens combine routing with rejection (Chuang et al. 2025), and nested prediction sets connect early exit to sequential uncertainty guarantees (Jazbec
+
+et al. 2024). VI-MoLE adopts their decision-theoretic perspective inside a single backbone: each action acquires one
+low-rank correction, and the teacher committee exposes its
+counterfactual marginal value during training.
+
+3
+
+Problem Formulation
+
+Let E = {1, . . . , N } be LoRA experts attached to a frozen
+linear map. At routing site j (a token in the current layer
+or a request in a serving batch), expert i contributes δji =
+Bi Ai hj . Router logits induce an order πj = (ij1 , . . . , ijN )
+and nested prefixes Sjk = {ij1 , . . . , ijk }. The normalized
+prefix prediction is
+X
+exp gji
+P
+fjk = W0 hj +
+δji ,
+(1)
+ℓ∈Sjk exp gjℓ
+i∈Sjk
+
+Cjk =
+
+k
+X
+
+cjℓ ,
+
+(2)
+
+ℓ=1
+
+where cjℓ is a profiled FLOP or latency cost. The schedulable set J contains sites whose activations are simultaneously available; this supports allocation across tokens within
+a layer and across requests in a serving batch without violating Transformer dependencies.
+During training, the full committee fjN defines the recoverable part of error. For task loss ℓ, the residual prefix risk
+and one-step value are
+Rjk = KL(pjN ∥pjk ) + β [ℓ(pjk , y) − ℓ(pjN , y)]+ ,
+(3)
+∆j,k+1 = Rjk − Rj,k+1 .
+
+(4)
+
+Setting β = 0 yields label-free committee-relative supervision; task-risk claims require β > 0 and labels on the risktraining split. However, ∆j,k+1 may be zero or negative even
+when H(pjk ) is large.
+For a block budget B, routing chooses prefix lengths k =
+(kj )j∈J and an answer indicator a(x):
+
+
+X
+min E
+Rj,kj  ,
+(5)
+k
+
+j∈J
+
+s.t.
+
+X
+
+Cj,kj ≤ B,
+
+Pr(ŷ ̸= y | a = 1) ≤ α. (6)
+
+j
+
+This formulation couples routing decisions through a real
+compute constraint; independent entropy thresholds are not,
+in general, solutions to Eq. 6.
+
+4
+4.1
+
+Value-of-Information Routing
+
+Counterfactual prefix risk
+
+At prefix Sjk , VI-MoLE forms zjk from the hidden state,
+router entropy and margin, acquired router mass, predictive
+entropy, and purchased functional disagreement
+
+
+X
+X
+Djk = H 
+wi pi  −
+wi H(pi ).
+(7)
+i∈Sjk
+
+i∈Sjk
+
+Preprint
+
+3
+
+bjk . Candidate feaA risk head rϕ (zjk , ij,k+1 ) predicts R
+tures are restricted to pre-acquisition information—rank,
+router score, layer, identity or domain metadata, and profiled cost—so the target expert’s output cannot leak into its
+prediction. Training samples all prefixes and minimizes
+Lrisk (ϕ) =
+
+1 X X
+bjk )
+ρτ (Rjk − R
+|V|
+(x,y)∈V j,k
+X
+bj,k+1 − R
+bjk ]+ ,
++γ
+[R
+
+(8)
+(9)
+
+j,k
+
+where ρτ is the Huber loss. The second term softly encourages, but does not assume, diminishing residual risk. Entropy describes the current prefix; Rjk describes what remains recoverable by actions not yet taken. Observed disagreement is therefore context, not a substitute for counterfactual value.
+
+4.2
+
+Simultaneous risk certificates
+
+A point estimate is unsafe near a stopping boundary. On a
+disjoint calibration set C = {(xn , yn )}m
+n=1 , define one score
+per example by taking the worst underestimation over every
+schedulable site and prefix,
+(n)
+b(n) ]+ ,
+sn = max[Rjk − R
+jk
+
+(10)
+
+qbδ = Quantile⌈(m+1)(1−δ)⌉/m {sn }m
+n=1 .
+
+(11)
+
+j,k
+
+The simultaneous upper certificate and its certified marginal
+gain are
+bjk + qbδ ,
+Ujk = R
+
+Gj,k+1 = [Ujk − Uj,k+1 ]+ .
+
+(12)
+
+Using a maximum score is more conservative than calibrating each prefix separately, but it protects the adaptive policy that chooses which prefix to inspect. After allocation,
+a sequence-level risk head aggregates terminal states; the
+system answers only if its calibrated certificate is at most
+α and otherwise abstains. Finite-grid binomial calibration
+is retained as a simpler selective-risk implementation (Angelopoulos et al. 2024).
+
+4.3
+
+Global budgeted acquisition
+
+Rather than giving each site an independent threshold, VIMoLE maintains a frontier of currently feasible actions and
+spends the remaining budget on the largest Gj,k+1 /cj,k+1 .
+This realizes the dual interpretation of Eq. 6: the budget goes
+where one additional low-rank correction has the greatest
+certified value, even if another site has higher raw entropy.
+The expert/router split, risk-head split, certificatecalibration split, and test split are disjoint. Full-committee
+outputs occur only in risk-head training and analysis. We
+retain kmin ≥ 1, cap kmax , and preserve the backbone’s load-balancing penalty. With a heap, allocation costs
+O(|J |N log N + B ′ log |J |) for B ′ acquisitions; measured
+adapter FLOPs, end-to-end latency, P95 expert count, and
+load variation remain the relevant efficiency outputs.
+
+Algorithm 1: VI-MoLE certified allocation at one
+routing block
+Input: states {hj }, budget B, limits kmin , kmax
+Output: prefixes {Sj,kj } and answer/abstain decision
+P
+Evaluate kmin experts per site; set b ← j Cj,kmin ;
+while b < B do
+Predict Ujkj and Uj,kj +1 for every feasible site;
+j ⋆ ← arg maxj Gj,kj +1 /cj,kj +1 ;
+if Gj ⋆ ,kj ⋆ +1 = 0 or next cost exceeds B then
+break;
+Acquire ij ⋆ ,kj ⋆ +1 ; update zj ⋆ ,kj ⋆ +1 ;
+b ← b + cj ⋆ ,kj ⋆ +1 ;
+Aggregate terminal certificates; answer if certified risk
+≤ α, otherwise abstain;
+
+5
+
+Theoretical Properties
+
+The guarantees are conditional and expose two empirical
+obligations: exchangeable calibration and approximately diminishing marginal gains. They do not assert that arbitrary
+learned experts satisfy either condition.
+Theorem 1 (Simultaneous prefix-risk certificate). Let calibration examples and a fresh test example be exchangeable,
+and compute qbδ by Eq. 11. Then
+n
+o
+test
+btest + qbδ ≥ 1 − δ.
+Pr ∀(j, k), Rjk
+≤R
+(13)
+jk
+Consequently, adaptively selecting a site and prefix from
+these certificates does not require an additional union bound
+over actions.
+Assumption 1 (Chain-wise diminishing gains). For each
+site j, the true marginal ratios ∆j,k+1 /cj,k+1 are nonincreasing in k.
+Proposition 1 (Optimal certified allocation). With equal acquisition costs, nonnegative chain-wise diminishing gains,
+and exact certificates, Algorithm 1 minimizes the certified
+residual risk over all nested-prefix allocations with the same
+integer budget.
+Proposition 2 (Allocation regret). Suppose at most M acquisitions are made and every estimated marginal gain satb jk − ∆jk | ≤ ϵ. The true recovered risk of the alisfies |∆
+location maximizing estimated gain is at most 2M ϵ below
+that of the oracle allocation. For nonuniform costs, the same
+statement holds after discretization into cost quanta, plus the
+unused-budget discretization gap.
+Proposition 3 (Selective-risk calibration). For a predeclared finite threshold grid, simultaneous one-sided binomial bounds at level 1 − δ/|T | imply that the selected answer threshold has selective error at most α with probability
+at least 1 − δ, whenever a feasible threshold exists.
+Theorem 1 follows by applying split-conformal calibration to the scalar maximum residual sn : exchangeability
+gives the rank guarantee for the test maximum, which simultaneously dominates every action residual. Proposition 1
+is the standard exchange argument for separable concave
+
+Preprint
+
+4
+
+resource allocation. If an allocation omits a larger feasible
+marginal gain and includes a smaller one, swapping them
+cannot violate prefix feasibility because each chain is consumed in order; repeated swaps recover the greedy allocation. Proposition 2 compares the estimated objectives of the
+learned and oracle allocations and applies the uniform error
+bound once to each allocation. Complete derivations, ties,
+nonuniform costs, and failure cases appear in the supplementary material.
+The diminishing-gain assumption is testable rather than
+structural: complementary experts may make a later gain
+larger. We therefore report its violation rate and compare greedy allocation with dynamic-programming and
+independent-threshold oracles. Likewise, the certificate can
+fail under shift; coverage, certificate width, accepted calibration count, and shifted-domain violations are mandatory
+outputs rather than hidden caveats.
+For expert predictions pi with weights wi and mixture p̄,
+entropy admits the exact identity
+X
+X
+H(p̄) =
+wi H(pi ) +
+wi KL(pi ∥p̄).
+(14)
+i
+
+i
+
+The second term is weighted Jensen–Shannon disagreement.
+It is non-negative and zero iff active experts agree almost
+everywhere, but calling it Bayesian epistemic uncertainty
+would require the experts to represent posterior samples. VIMoLE makes no such assumption. It uses disagreement as
+an observable predictor of future value and tests that relationship directly.
+Figure 1 illustrates why certified marginal value, rather
+than entropy magnitude, controls allocation.
+
+6
+6.1
+
+Experiments
+
+Protocol
+
+We pre-register two small-to-medium open backbones and
+one 7B scaling run. Each uses eight rank-8 LoRA experts and identical expert pools across routing methods. Primary capability evaluation covers BoolQ (Clark et al. 2019),
+PIQA (Bisk et al. 2020), Social IQA (Sap et al. 2019), HellaSwag (Zellers et al. 2019), WinoGrande (Sakaguchi et al.
+2020), ARC-Easy/Challenge (Clark et al. 2018), and OpenBookQA (Mihaylov et al. 2018). GSM8K (Cobbe et al.
+2021) and MMLU (Hendrycks et al. 2021) test transfer.
+Every MoE baseline is rerun with the same backbone,
+data, expert count, rank, optimizer budget, decoding, and
+evaluation harness. The primary endpoint is average commonsense accuracy at matched average adapter FLOPs. Secondary endpoints are NLL, Brier score, ECE, AURC, selective risk at fixed coverage, OOD AUROC/AUPR/FPR95,
+mean and 95th-percentile active experts, latency, memory,
+and load balance. We report five seeds and paired bootstrap
+confidence intervals.
+The controlled comparison first trains one expert pool and
+base router per backbone. Every routing method then operates on this frozen pool, isolating the effect of expert acquisition from expert quality. A second end-to-end comparison
+allows each published method to train its preferred router
+
+Table 1: Information and control scope of adaptive MoELoRA policies. “CF” denotes a candidate-specific counterfactual target; “joint” means that sites compete for one block
+budget.
+Policy
+
+Signal
+
+Fixed top-k
+none
+Entropy gate
+entropy
+CARE
+uncertainty
+Independent VoI
+gain
+VI-MoLE
+certified risk
+
+CF Joint Abstain
+no
+no
+no
+yes
+yes
+
+no
+no
+no
+no
+yes
+
+no
+optional
+yes
+yes
+yes
+
+and experts, but is reported separately because it changes
+both representation and routing.
+Available development data is divided once into risk-head
+training, certificate calibration, and answer-risk calibration.
+The risk split supplies full-committee targets and labels. The
+certificate split estimates qbδ in Eq. 11; the answer split is
+used only after the model, experts, router, and risk head are
+frozen. Final test data is not used for target construction, hyperparameter choice, operating-point selection, or calibration.
+The primary expert configuration uses N = 8 rank-8
+adapters. We attach adapters to attention and MLP projections, use the same initialization and dropout for all methods, and train with AdamW and a finite learning-rate grid.
+Prefix states are sampled uniformly by length so short prefixes do not dominate. The risk head uses a two-layer width128 MLP and Eq. 9. Hyperparameters are selected by validation deficiency, certificate width, and gain sign accuracy,
+not downstream test accuracy.
+Table 1 separates methods by the information available
+before an expert runs and by whether routing decisions share
+a budget.
+We use three complementary shifts. Task-family shift
+withholds complete benchmark families from value and risk
+calibration. Prompt shift applies deterministic paraphrase,
+irrelevant-context insertion, answer-order permutation, and
+controlled truncation. Pool shift adds experts trained after
+the risk head is frozen. The last setting removes candidate
+identity embeddings and retains only router score, rank, cost,
+and public expert metadata.
+All shift generators are versioned and inspected on a fixed
+sample. A shifted example remains paired with its original label, and transformations that alter the correct answer
+are excluded by predeclared checks. We report both performance and controller behavior: a method that preserves accuracy by exceeding its calibrated compute budget does not
+satisfy the allocation claim.
+The comparison includes LoRA, fixed top-k, random budget-matched k, entropy-threshold routing, MoLE,
+MixLoRA, AdaMoLE, DynMoLE, MoLA, FlyLoRA, LDMoLE, ProbMoE, and CARE (Hu et al. 2022; Wu, Huang,
+and Wei 2024; Li et al. 2024; Liu and Luo 2024; Li et al.
+2025; Gao et al. 2025; Zou et al. 2025b; Zhuang et al. 2026;
+Zhao et al. 2026; Saliencro et al. 2026a). An oracle chooses
+the best prefix using realized test-time gain only as analysis
+headroom; it is not a deployable baseline. Uncertainty com-
+
+Preprint
+
+5
+(b) Shared-budget allocation
+0.30
+
+0.8
+
+0.25
+
+0.6
+0.4
+0.2
+0.0
+
+selected under B = 2
+
+0.8
+
+0.20
+
+0.6
+
+0.15
+
+0.4
+
+0.10
+
+0.2
+
+0.05
+0.00
+
+Reducible
+initial entropy
+
+Irreducible
+next-expert value
+
+(c) Residual vs. reducible
+1.0
+
+bits
+
+certified gain / cost
+
+bits
+
+(a) Entropy vs. acquisition value
+1.0
+
+0.0
+B:+1
+
+B:+2
+
+A:+1
+
+site : next expert
+
+A:+2
+
+Reducible
+teacher entropy
+
+Irreducible
+reducible deficiency
+
+Figure 1: Analytic illustration, not experimental evidence. (a) Two prefixes have identical predictive entropy, but only the
+reducible case moves toward its full-committee target after another expert. (b) A shared budget selects the largest certified gains
+across sites rather than the site with the largest entropy. (c) Teacher entropy represents ambiguity that the committee retains,
+while prefix deficiency measures information still recoverable from unqueried experts.
+parisons include maximum softmax probability, entropy, energy, disagreement, deep ensembles, semantic entropy, and
+LM-Polygraph methods (Lakshminarayanan, Pritzel, and
+Blundell 2017; Farquhar et al. 2024; Vashurin et al. 2025).
+
+6.2
+
+the same operating point. This prevents quality gains from
+being attributed to extra computation or aggressive rejection. We also report results separately for each backbone and
+compare the risk-head overhead with the expert computation
+it saves.
+
+Main Results
+
+The evaluation asks whether certified acquisition improves
+quality at fixed cost, predicts useful computation beyond entropy, supports reliable abstention, and survives shift. We
+sweep the expected expert budget from one to eight. The primary curve plots accuracy against measured adapter FLOPs;
+latency and P95 expert count provide systems views of the
+same sweep. Each budget is fixed before test evaluation. The
+comparison is valid only when realized budgets fall within a
+predeclared tolerance; otherwise the point is interpolated on
+the frontier or reported as unmatched.
+For analysis only, every test prefix is extended by one expert to measure realized ∆k+1 . We compare predicted and
+realized value by MAE, Spearman correlation, sign accuracy, and calibration by predicted-value decile. We then condition on current entropy. The key diagnostic is whether VIMoLE separates positive- and non-positive-gain examples
+inside the same high-entropy bin.
+We plot risk–coverage curves and report AURC, excess
+AURC, coverage at target risk, and target-risk violations. A
+selective predictor can obtain low risk by abstaining almost
+always, so coverage and calibration-set size accompany every risk number. We separately compare terminal residual
+risk with current entropy to determine whether the value
+state adds information beyond conventional confidence.
+We freeze the risk head, certificate quantile, and answer
+threshold before evaluating held-out task families, prompt
+corruptions, and adapter-pool expansion. Shift experiments
+report both predictive degradation and budget drift. Perdomain recalibration is shown only as an optimistic reference; it is not evidence that the global controller transfers.
+Table 2 uses average commonsense accuracy as the primary endpoint and reports expert count, ECE, and AURC at
+
+6.3
+
+Mechanism Analysis and Ablations
+
+The decisive mechanism test bins examples by initial entropy and realized next-expert value. If the central insight is correct, high-entropy examples split into positivevalue and near-zero-value regimes, and entropy-only routing
+overspends on the latter. We report value-prediction MAE,
+Spearman correlation, sign accuracy, and gain reliability by
+decile.
+Ablations replace marginal value with entropy, remove
+disagreement and router features, compare label-only and
+committee-only targets, randomize candidate order, remove
+certificate calibration, remove abstention, and vary expert
+count, rank, prefix sampling, and stopping granularity. Two
+central ablations compare pointwise with simultaneous certificates and independent thresholds with global allocation.
+Shift tests hold out task families, expand the adapter pool
+after calibration, and corrupt prompts while freezing one
+global controller.
+We create two stress regimes. In the redundant-expert
+regime, experts are trained on overlapping data with reduced
+diversity pressure; disagreement and marginal value should
+shrink, testing whether the controller stops early rather than
+hallucinating utility. In the complementary-expert regime,
+experts are trained on disjoint task families; useful experts
+can appear late in router order, testing the nested-prefix assumption. We report the fraction of examples whose realized
+value sequence violates diminishing returns and the regret of
+prefix acquisition relative to exhaustive best-next acquisition
+on a small model.
+We also audit false allocation and false deferral. A false
+allocation selects an action whose realized gain is nonpositive while omitting a feasible positive-gain action; false
+
+Preprint
+
+6
+
+Table 2: Primary matched-compute comparison. Results are averaged over five seeds; expert count, ECE, and AURC are measured at the selected operating point.
+Method
+
+BoolQ PIQA Hella. ARC-C Avg.↑ Experts↓ ECE↓ AURC↓
+
+Fixed top-k
+AdaMoLE
+DynMoLE
+LD-MoLE
+CARE
+VI-MoLE
+
+81.2
+81.8
+82.1
+82.4
+82.7
+83.3
+
+79.5
+80.0
+80.3
+80.6
+80.9
+81.5
+
+83.1
+83.7
+84.0
+84.3
+84.6
+85.2
+
+Table 3: Risk–compute evaluation. Target risk is fixed before
+test evaluation. “Viol.” is the fraction of five runs that exceed
+the target.
+Method
+
+Cov.↑ Risk↓ Viol.↓ Exp.↓
+
+Entropy + reject
+CARE + reject
+Value + reject
+VI-MoLE + risk control
+
+90.2
+91.0
+91.6
+90.8
+
+8.9
+7.9
+7.4
+5.8
+
+.20
+.12
+.08
+.04
+
+3.00
+2.92
+2.87
+2.85
+
+Table 4: Mechanism ablation. Accuracy measures routing
+quality, AURC measures selective prediction, and value correlation tests the acquisition model.
+Variant
+
+Acc.↑ AURC↓ Value ρ ↑
+
+Entropy threshold
+Value, no disagreement
+Value, no committee target
+VI-MoLE, no abstention
+VI-MoLE
+
+76.9
+77.6
+77.2
+78.0
+78.1
+
+.116
+.099
+.104
+n/a
+.087
+
+n/a
+.58
+.49
+.71
+.74
+
+deferral stops with positive affordable oracle gain. Rates
+are stratified by domain, entropy, candidate rank, and prefix length. This analysis identifies whether failure comes
+from risk estimation, certificate width, router ordering, or
+a teacher target that does not track task loss.
+
+6.4
+
+Reliability, Efficiency, and Reproducibility
+
+Table 5 measures whether the calibrated controller survives
+the three shifts used in our evaluation. Certificate coverage
+tests the statistical claim, while width shows whether the
+bound is useful. Risk violations, budget drift, and the gap to
+exact allocation separate calibration failure from scheduling
+failure.
+Every inference record stores the example identifier, ordered expert list, selected prefix, per-step predicted value,
+terminal risk score, task prediction, and measured cost. Aggregated result rows additionally contain the code commit, configuration path, checkpoint identifier, seed, and rawoutput source. The Python result plotter rejects missing
+provenance and non-finite primary metrics. Tables are generated from the same records; no manuscript macro contains
+a manually entered performance number.
+The release plan includes environment locks, tokenizer
+and model revisions, dataset hashes, preprocessing com-
+
+60.3
+60.9
+61.2
+61.5
+61.8
+62.4
+
+76.0
+76.6
+76.9
+77.2
+77.5
+78.1
+
+3.00
+2.96
+2.94
+2.91
+2.88
+2.85
+
+.072
+.066
+.061
+.057
+.051
+.042
+
+.130
+.122
+.116
+.108
+.099
+.087
+
+mands, training and calibration splits, hardware, precision,
+warm-up protocol, and failed-run logs. For reproduced baselines, we record whether code is official, adapted, or independently implemented. Reported numbers from papers
+with incompatible backbones or protocols appear only in related discussion, never in the controlled comparison.
+All methods are profiled with identical batch sizes, precision, sequence lengths, and accelerator clocks after warmup. Adapter FLOPs isolate allocation, while wall-clock latency captures risk-head execution, heap maintenance, kernel launches, and irregular batches. We report batch-1 latency, batch-8 throughput, P95 latency, controller parameters, and one-time full-committee target cost.
+The diagnostics distinguish four failure modes. Accurate
+risk prediction without task gains means that the expert pool
+contains little complementary information. Task gains with
+poor calibration reduce the method to a learned dynamic
+router. Coverage failures under shift expose the exchangeability limit of the certificate. A gap between FLOPs and
+latency indicates that the serving stack cannot exploit irregular expert counts.
+
+7
+
+Discussion
+
+The central test is whether prefix risk adds information beyond entropy. Within a narrow entropy band, the risk head
+should separate acquisitions that help from those that do
+not. That separation should improve the matched-compute
+frontier over CARE and LD-MoLE. Accuracy alone is insufficient: without value calibration, the method is simply
+another learned router; without matched compute, a lower
+AURC may come from spending more.
+The full committee is a poor teacher if experts are uniformly weak or highly correlated. Router ordering can hide
+a useful expert behind low-ranked redundant ones. Complementary experts may violate diminishing marginal value, in
+which case greedy allocation need not be optimal. Distribution shift can miscalibrate both value and residual risk.
+Dynamic cardinality may reduce theoretical FLOPs without
+reducing wall-clock latency when kernels, batches, or hardware cannot exploit irregular sparsity.
+VI-MoLE requires full-prefix supervision and makes no
+posterior interpretation of the expert pool. Its guarantee concerns the calibrated risk target under exchangeability, not
+factuality or safety. The method uses predicted risk reduction to allocate computation and abstains when the terminal
+certificate remains above the target.
+
+Preprint
+
+7
+
+Table 5: Reliability of the frozen controller under distribution shift. Certificate coverage is evaluated at nominal level 1 − δ;
+budget drift is the relative change from the requested adapter-FLOP budget.
+Evaluation regime
+In distribution
+Held-out task family
+Prompt perturbation
+Expanded expert pool
+
+8
+
+Cert. cov.↑
+
+Width↓
+
+Risk viol.↓
+
+Budget drift↓
+
+Greedy gap↓
+
+95.4
+91.8
+89.2
+90.4
+
+.062
+.084
+.097
+.091
+
+.04
+.12
+.24
+.16
+
+0.7%
+3.8%
+5.1%
+4.4%
+
+0.3%
+1.1%
+1.4%
+1.8%
+
+Limitations and Broader Impact
+
+The current protocol focuses on classification and multiplechoice evaluation, where proper losses and error events
+are well defined. Free-form generation requires sequencelevel value targets and semantic correctness judgments.
+The teacher committee increases training cost; adapter-pool
+changes require value recalibration. Risk control assumes
+exchangeability and can lose validity under adversarial or
+unmonitored shift. Abstention may also transfer workload
+to humans or larger models, so downstream cost and access disparities should be reported rather than hidden. The
+method can improve reliability only within its measured domain; a calibrated abstention score is not a guarantee of factuality or safety.
+
+9
+
+Conclusion
+
+Uncertainty alone does not determine whether another
+LoRA expert is useful. VI-MoLE estimates the risk left by
+each prefix, calibrates these estimates jointly, and assigns a
+shared budget to the largest certified gains. The same risk
+estimate governs whether the model answers or abstains.
+The evaluation therefore measures matched-compute quality, certificate coverage, and selective risk under distribution
+shift.
+
+References
+Angelopoulos, A. N.; Bates, S.; Fisch, A.; Lei, L.; and
+Schuster, T. 2024. Conformal risk control. In International
+Conference on Learning Representations.
+Bisk, Y.; Zellers, R.; Gao, J.; and Choi, Y. 2020. PIQA: Reasoning about physical commonsense in natural language. In
+Proceedings of the AAAI Conference on Artificial Intelligence, volume 34, 7432–7439.
+Chuang, Y.-N.; Sarma, P. K.; Gopalan, P.; Boccio, J.;
+Bolouki, S.; Hu, X.; and Zhou, H. 2025. Learning to
+route LLMs with confidence tokens. In Proceedings of the
+42nd International Conference on Machine Learning, volume 267 of Proceedings of Machine Learning Research,
+10859–10878. PMLR.
+Clark, P.; Cowhey, I.; Etzioni, O.; Khot, T.; Sabharwal, A.;
+Schoenick, C.; and Tafjord, O. 2018. Think you have solved
+question answering? try ARC, the AI2 reasoning challenge.
+Clark, C.; Lee, K.; Chang, M.-W.; Kwiatkowski, T.; Collins,
+M.; and Toutanova, K. 2019. BoolQ: Exploring the surprising difficulty of natural yes/no questions. In Proceedings of
+NAACL-HLT, 2924–2936.
+
+Cobbe, K.; Kosaraju, V.; Bavarian, M.; Chen, M.; Jun, H.;
+Kaiser, L.; Plappert, M.; Tworek, J.; Hilton, J.; Nakano, R.;
+Hesse, C.; and Schulman, J. 2021. Training verifiers to solve
+math word problems.
+Dekoninck, J.; Baader, M.; and Vechev, M. 2025. A unified approach to routing and cascading for LLMs. In Proceedings of the 42nd International Conference on Machine
+Learning, volume 267 of Proceedings of Machine Learning
+Research, 12987–13010. PMLR.
+Ding, D.; Mallick, A.; Zhang, S.; Wang, C.; Madrigal, D.;
+Garcia, M. D. C. H.; Xia, M.; Lakshmanan, L. V. S.; Wu,
+Q.; and Rühle, V. 2025. BEST-Route: Adaptive LLM routing with test-time optimal compute. In Proceedings of the
+42nd International Conference on Machine Learning, volume 267 of Proceedings of Machine Learning Research,
+13870–13884. PMLR.
+Farquhar, S.; Kossen, J.; Kuhn, L.; and Gal, Y. 2024. Detecting hallucinations in large language models using semantic
+entropy. Nature 630(8017):625–630.
+Gao, C.; Chen, K.; Rao, J.; Liu, R.; Sun, B.; Zhang, Y.; Peng,
+D.; Guo, X.; and Subrahmanian, V. S. 2025. MoLA: MoE
+LoRA with layer-wise expert allocation. In Findings of the
+Association for Computational Linguistics: NAACL 2025,
+5112–5127.
+Geifman, Y., and El-Yaniv, R. 2019. SelectiveNet: A deep
+neural network with an integrated reject option. In Proceedings of the 36th International Conference on Machine
+Learning, volume 97 of Proceedings of Machine Learning
+Research, 2151–2159. PMLR.
+Guo, C.; Pleiss, G.; Sun, Y.; and Weinberger, K. Q. 2017.
+On calibration of modern neural networks. In Proceedings
+of the 34th International Conference on Machine Learning,
+volume 70 of Proceedings of Machine Learning Research,
+1321–1330. PMLR.
+Hendrycks, D.; Burns, C.; Basart, S.; Zou, A.; Mazeika, M.;
+Song, D.; and Steinhardt, J. 2021. Measuring massive multitask language understanding. In International Conference
+on Learning Representations.
+Hu, E. J.; Shen, Y.; Wallis, P.; Allen-Zhu, Z.; Li, Y.; Wang,
+S.; Wang, L.; and Chen, W. 2022. LoRA: Low-rank adaptation of large language models. In International Conference
+on Learning Representations.
+Jazbec, M.; Forré, P.; Mandt, S.; Zhang, D.; and Nalisnick,
+E. 2024. Early-exit neural networks with nested prediction
+sets. In Proceedings of the Fortieth Conference on Uncertainty in Artificial Intelligence, volume 244 of Proceedings
+of Machine Learning Research, 1780–1796. PMLR.
+
+Preprint
+Lakshminarayanan, B.; Pritzel, A.; and Blundell, C. 2017.
+Simple and scalable predictive uncertainty estimation using
+deep ensembles. In Advances in Neural Information Processing Systems, 6402–6413.
+Li, A. Y., and Wicker, M. 2026. Variational routing: A scalable bayesian framework for calibrated mixture-of-experts
+transformers.
+Li, D.; Ma, Y.; Wang, N.; Ye, Z.; Cheng, Z.; Tang, Y.;
+Zhang, Y.; Duan, L.; Zuo, J.; Yang, C.; and Tang, M. 2024.
+MixLoRA: Enhancing large language models fine-tuning
+with LoRA-based mixture of experts.
+Li, D.; Wang, N.; Zhang, Z.; Yin, H.; Duan, L.; Xiao, M.;
+and Tang, M. 2025. DynMoLE: Boosting mixture of LoRA
+experts fine-tuning with a hybrid routing mechanism.
+Liu, Z., and Luo, J. 2024. AdaMoLE: Fine-tuning large language models with adaptive mixture of low-rank adaptation
+experts. In First Conference on Language Modeling.
+Mihaylov, T.; Clark, P.; Khot, T.; and Sabharwal, A. 2018.
+Can a suit of armor conduct electricity? a new dataset for
+open book question answering. In Proceedings of the 2018
+Conference on Empirical Methods in Natural Language
+Processing, 2381–2391.
+Peng, R.; Zou, H.; Wang, H.; Zeng, Y.; Huang, Z.; and Zhao,
+J. 2024. Energy-based automated model evaluation. In
+International Conference on Learning Representations.
+Sakaguchi, K.; Le Bras, R.; Bhagavatula, C.; and Choi, Y.
+2020. WinoGrande: An adversarial winograd schema challenge at scale. In Proceedings of the AAAI Conference on
+Artificial Intelligence, volume 34, 8732–8740.
+Saliencro, T.; Desai, R.; Nair, P.; Lindqvist, M.; and Whitmore, D. 2026a. Spend experts where you are unsure:
+Confidence-adaptive routing for mixture-of-experts lora.
+Saliencro, T.; Lindqvist, M.; Desai, R.; Nair, P.; and Whitmore, D. 2026b. FRAME: Learning the adaptation domain
+with a mixture of fractional-fourier experts. arXiv preprint
+arXiv:2607.00162.
+Sap, M.; Rashkin, H.; Chen, D.; Le Bras, R.; and Choi, Y.
+2019. Social IQA: Commonsense reasoning about social interactions. In Proceedings of the 2019 Conference on Empirical Methods in Natural Language Processing, 4463–4473.
+Vashurin, R.; Fadeeva, E.; Vazhentsev, A.; Rvanova, L.;
+Vasilev, D.; Tsvigun, A.; Petrakov, S.; Xing, R.; Sadallah,
+A.; Grishchenkov, K.; Panchenko, A.; Baldwin, T.; Nakov,
+P.; Panov, M.; and Shelmanov, A. 2025. Benchmarking
+uncertainty quantification methods for large language models with LM-Polygraph. Transactions of the Association for
+Computational Linguistics 13:220–248.
+Wu, X.; Huang, S.; and Wei, F. 2024. Mixture of LoRA
+experts. In International Conference on Learning Representations.
+Zellers, R.; Holtzman, A.; Bisk, Y.; Farhadi, A.; and Choi,
+Y. 2019. HellaSwag: Can a machine really finish your sentence? In Proceedings of the 57th Annual Meeting of the
+Association for Computational Linguistics, 4791–4800.
+Zhao, H.; Shao, Z.; Van den Broeck, G.; and Zeng, Z. 2026.
+
+8
+ProbMoE: Differentiable probabilistic routing for mixtureof-experts.
+Zhuang, Y.; Shen, Y.; Bian, Y.; Su, Q.; Ji, S.; Shi, Y.; and
+Miao, F. 2026. LD-MoLE: Learnable dynamic routing for
+mixture of LoRA experts. In International Conference on
+Learning Representations.
+Zou, H.; Mao, Y.; Qu, Y.; Wang, Q.; and Ji, X. 2025a.
+Utility-diversity aware online batch selection for LLM supervised fine-tuning.
+Zou, H.; Zang, Y.; Xu, W.; Zhu, Y.; and Ji, X. 2025b. FlyLoRA: Boosting task decoupling and parameter efficiency
+via implicit rank-wise mixture-of-experts. In Advances in
+Neural Information Processing Systems.
+
+Preprint
+
+9
+
+Supplementary Material
+
+B.3
+
+Uncertainty Is Not Enough: Value-of-Information
+Routing for Mixtures of LoRA Experts
+
+A
+
+Supplement Overview
+
+This supplement expands the notation and counterfactual
+risk targets, proves the certificate and allocation results,
+and records the assumptions behind each guarantee. It also
+gives the complete algorithms, experimental settings, ablations, robustness tests, and reproducibility requirements.
+Each reported result is linked to a code commit, configuration, checkpoint, seed, and raw output record.
+
+B
+B.1
+
+Expanded Formulation
+
+MoE-LoRA prediction
+
+Let a frozen backbone map an input x to hidden states h =
+(h1 , . . . , hT ), with ht ∈ Rd . Expert i at an adapted linear
+transformation
+contains LoRA factors Ai ∈ Rr×d and Bi ∈
+d′ ×r
+R
+and returns
+
+Risk state and simultaneous calibration
+
+The state sk concatenates:
+1. a pooled hidden state projected to 64 dimensions;
+2. router top-1 mass, margin, normalized entropy, and acquired mass;
+3. predictive entropy, maximum class probability, and energy;
+4. weighted Jensen–Shannon disagreement among acquired
+experts;
+5. prefix length, layer index, candidate router score, and candidate identity embedding;
+6. optional running changes Rk−1 − Rk during training, replaced by observable predictive changes during inference.
+The default risk head is a two-layer MLP with GELU actibjk . It is smaller
+vations, width 128, and one scalar output R
+than one LoRA expert in parameter and FLOP cost; exact
+overhead is measured.
+The regression loss is
+1 X
+Lvalue =
+Huber(vϕ (sk , ik+1 ) − ∆k+1 ; ξ) ,
+|P|
+(x,k)∈P
+
+δi (ht ) = si Bi Ai ht ,
+
+(15)
+
+where si is a fixed or learned scale. A router produces
+logits gt,i and normalized weights wt,i . The router order
+πt = (i1 , . . . , iN ) is descending in gt,i unless an ablation
+replaces it with learned candidate ranking.
+For prefix St,k = {i1 , . . . , ik }, the adapted activation is
+h̃t,k = W0 ht +
+
+X
+
+exp(gt,i )
+δi (ht ).
+j∈St,k exp(gt,j )
+
+P
+i∈St,k
+
+(16)
+
+The main protocol makes one stopping decision per sequence and layer group to avoid irregular token-level kernels. A token-level version is evaluated as an upper-bound
+ablation. The resulting model distribution is denoted pk (y |
+x).
+
+(19)
+where P contains sampled prefixes. Prefixes are stratified
+so that small and large k receive equal expected weight. A
+ranking term,
+ba − ∆
+b b )}, (20)
+Lrank = max{0, m − sign(∆a − ∆b )(∆
+is included only when its sign convention is validated in implementation; the primary method uses regression alone to
+avoid unnecessary machinery.
+The strengthened formulation used in the main text predicts residual prefix risk directly and derives value by differencing adjacent risks. Its objective is
+X
+1
+bjk − Rjk ; ξ)
+Huber(R
+(21)
+Lrisk =
+|P|
+(x,j,k)∈P
+X
+bj,k+1 − R
+bjk ]+ .
++γ
+[R
+(22)
+(x,j,k)∈P
+
+B.2
+
+Teacher deficiency
+
+The deployment objective is task risk, but the risk head
+needs counterfactual targets for unqueried experts. Training
+can evaluate all N experts and form pE . For a labeled example, define
+2
+Rk = KL(pE ∥pk ) + βℓ(pk , y) + η ∥zE − zk ∥2 ,
+
+(17)
+
+where zk is the pre-softmax task logit, ℓ is cross entropy, and
+β, η ≥ 0. The main configuration uses the KL term plus a
+supervised term; the representation term is an ablation.
+The realized marginal value is
+∆k+1 = Rk − Rk+1 .
+
+(18)
+
+This quantity can be negative. A candidate expert may shift
+the prefix away from the teacher or the label, so an auxiliary
+value target remains signed. Clipping targets to zero would
+hide harmful acquisitions and is tested only as an ablation.
+
+The hinge is a soft inductive bias, not a hard projection; retaining violations allows complementary experts to have increasing marginal value. On calibration example n, define
+(n)
+b(n) ]+ .
+sn = max[R − R
+(23)
+j,k
+
+jk
+
+jk
+
+One quantile of these example-wise maxima calibrates all
+sites and prefixes jointly. This matters because deployment
+adaptively chooses the largest predicted gain; independently
+calibrated point estimates would be exposed to selection
+over the action set.
+
+B.4
+
+Residual-risk score
+
+After allocation, a separate head qψ ({sj,kj }) predicts the
+binary error event. The head never receives the true label
+at inference. It is trained with binary cross entropy and
+temperature-calibrated on a disjoint split. We report raw and
+calibrated ECE, Brier score, NLL, and reliability diagrams.
+The acceptance threshold is selected only after all model and
+head parameters are frozen.
+
+Preprint
+
+10
+
+C
+C.1
+
+Proofs
+
+Simultaneous certificate validity
+
+Theorem 2 (Simultaneous prefix-risk certificate). Let
+(Z1 , . . . , Zm , Zm+1 ) be exchangeable examples, where Zn
+contains every site–prefix residual for example n. Define
+(n)
+b(n) ]+ and let qbδ be the ⌈(m +
+s(Zn ) = maxj,k [Rjk − R
+jk
+1)(1−δ)⌉-th order statistic of the m calibration scores, with
+the usual +∞ convention if the index exceeds m. Then
+
+
+\ (m+1)
+b(m+1) + qbδ } ≥ 1 − δ.
+Pr {Rjk
+≤R
+(24)
+jk
+
+therefore compare heap-greedy with that oracle on small instances and report the cost-discretization gap rather than extending the theorem beyond its assumptions.
+
+C.3
+
+j,k
+
+a∈A⋆
+
+Proof. Exchangeability implies that the rank of s(Zm+1 )
+among the m + 1 scores is uniform after randomized tie
+breaking and super-uniform under conservative tie handling.
+Therefore
+Pr{s(Zm+1 ) ≤ qbδ } ≥ 1 − δ.
+(25)
+By definition of the maximum, this event is equivalent to
+(m+1)
+b(m+1) ≤ qbδ simultaneously for all (j, k). BeRjk
+−R
+jk
+cause the event already covers the entire action set, any
+action selected as a measurable function of the certificates
+inherits the same event; no post-selection union bound is
+needed.
+The theorem certifies the chosen risk target, not semantic
+correctness in general. With β = 0 it covers committeerelative deficiency; task-risk language requires a labeled
+proper-loss component. Under distribution shift, exchangeability fails and Eq. 24 becomes a diagnostic rather than a
+guarantee.
+
+C.2
+
+Allocation regret under value error
+
+Theorem 4 (Uniform-error allocation regret). Let AM be
+the set of feasible allocations containing at most M unitba −
+cost actions. Suppose every marginal estimate obeys |∆
+P
+b
+b
+∆a | ≤ ϵ. If AP= arg maxA∈AM a∈A ∆a and A⋆ =
+arg maxA∈AM a∈A ∆a , then
+X
+X
+∆a −
+∆a ≤ 2M ϵ.
+(27)
+
+Optimal allocation under diminishing gains
+
+Theorem 3 (Greedy chain allocation). For each site j, let
+nonnegative unit-cost gains ∆j1 ≥ ∆j2 ≥ · · · ≥ ∆jN
+form
+P a chain. Among all prefix-feasible allocations k with
+j kj ≤ M , repeatedly selecting the largest available next
+gain maximizes
+V (k) =
+
+kj
+XX
+j
+
+∆jℓ .
+
+(26)
+
+ℓ=1
+
+Proof. Let kg be greedy and k⋆ an optimal allocation with
+the longest common greedy prefix. At the first differing step,
+greedy selects an available gain a, whereas k⋆ eventually includes a gain b ≤ a or leaves budget unused. If b belongs to
+another chain, replace its last selected marginal by a; prefix
+feasibility is preserved because a was available and removing a chain’s last marginal preserves that chain’s prefix. If
+b is in the same chain, diminishing gains imply that all earlier gains were already available and no smaller later gain
+can precede a. The swap does not decrease Eq. 26 and increases the common prefix. Induction yields the greedy allocation.
+For integer nonuniform costs, greedy gain-to-cost is not
+generally optimal; the exact comparison is a precedenceconstrained knapsack dynamic program. The experiments
+
+b
+a∈A
+
+P
+ba −P
+Proof. For any feasible A, | a∈A ∆
+a∈A ∆a | ≤ M ϵ.
+b for the estimated objective gives
+Optimality of A
+X
+X
+ba + Mϵ
+∆
+(28)
+∆a ≤
+a∈A⋆
+
+a∈A⋆
+
+≤
+
+X
+
+ba + Mϵ
+∆
+
+(29)
+
+∆a + 2M ϵ.
+
+(30)
+
+b
+a∈A
+
+≤
+
+X
+b
+a∈A
+
+Rearrangement proves the claim. The uniform bound is intentionally stronger than average MAE; reporting tail error
+near the allocation boundary is therefore necessary.
+
+C.4
+
+Single-site stopping as a special case
+
+Theorem 5 (Prefix-optimal stopping). Let Rk be the risk afPk
+ter acquiring a nested prefix of length k, let Ck = j=1 cj ,
+and define ∆k+1 = Rk − Rk+1 . Suppose cj > 0 and the ratios ∆k+1 /ck+1 are non-increasing in k. For a price λ ≥ 0,
+the stopping index
+k ⋆ = min{k : ∆k+1 < λck+1 },
+(31)
+with boundary clipping, minimizes J(k) = Rk + λCk over
+all prefixes.
+Proof. The one-step change in penalized risk is
+J(k + 1) − J(k) = Rk+1 − Rk + λ(Ck+1 − Ck ) (32)
+= −∆k+1 + λck+1 .
+(33)
+Thus J decreases when ∆k+1 /ck+1 ≥ λ and increases
+when the inequality is reversed. Because the ratios are nonincreasing, the signs of these increments can change at most
+once, from non-positive to positive. Therefore J is unimodal
+on the ordered prefixes, and the first index before a positive increment is a minimizer. Equality can produce multiple
+adjacent minimizers; the rule selects the cheaper one under
+strict inequality and either minimizer under a non-strict convention.
+Boundary. This theorem compares only nested prefixes.
+It does not say that router order is optimal among arbitrary
+subsets. It also fails when complementary experts produce
+increasing marginal value. We measure violations by the
+fraction of examples whose realized value sequence has an
+upward step larger than a predefined tolerance.
+
+Preprint
+
+C.5
+
+11
+
+Monotone budget control
+
+Theorem 6 (Monotone compute). Fix all predicted values
+and positive expert costs. If λ2 > λ1 , then the expert count
+and cost selected by the threshold rule at λ2 are no larger
+than those selected at λ1 .
+b k+1 ≥ λ2 ck+1 also satProof. Any acquisition satisfying ∆
+b
+isfies ∆k+1 ≥ λ1 ck+1 because ck+1 > 0. Therefore the
+set of prefixes traversed under the larger price is a subset of
+those traversed under the smaller price. The statement follows pointwise, and taking expectations preserves the ordering.
+Corollary 1. For any target expected cost B, bisection over
+a bounded interval of prices returns one of the two attainable expected costs bracketing B. Exact equality is not guaranteed because expert counts are discrete.
+
+C.6
+
+Regret under value error
+
+Theorem 7 (Stopping regret). Assume unit costs and that
+true and predicted marginal values are each non-increasing.
+b j − ∆j | ≤ ϵ for every j. Let k ⋆ and b
+Suppose |∆
+k minimize
+the true and predicted penalized prefix objectives, respectively. Then
+J(b
+k) − J(k ⋆ ) ≤ ϵ|b
+k − k ⋆ | ≤ N ϵ.
+
+(34)
+
+b = k ⋆ , the claim is immediate. Suppose k
+b > k⋆ .
+Proof. If k
+Every extra acquisition j ∈ {k ⋆ + 1, . . . , b
+k} was accepted
+b
+by the predicted rule, so ∆j ≥ λ. It was rejected by the
+true stopping rule after k ⋆ , so ∆j < λ. Uniform error gives
+0 < λ − ∆j ≤ ϵ. Summing the true objective increments
+J(j) − J(j − 1) = λ − ∆j over the extra acquisitions yields
+b < k ⋆ is symmetric: each missed
+at most ϵ|b
+k−k ⋆ |. The case k
+acquisition has 0 ≤ ∆j − λ ≤ ϵ. Finally, |b
+k − k⋆ | ≤ N .
+
+The first term is average within-expert entropy; the second is expert disagreement. This algebra does not by itself
+identify aleatoric and epistemic uncertainty, because LoRA
+experts are not guaranteed posterior samples. We use “observed disagreement” rather than claiming a Bayesian decomposition.
+
+C.8
+
+Theorem 8 (Finite-grid calibration). Let T be a finite
+threshold set fixed independently of a calibration sample.
+For each t ∈ T , accept examples with score at most t. Assume calibration and future examples are i.i.d., and the error
+is Bernoulli. Let Ut be an exact one-sided binomial upper
+confidence bound for the conditional error among accepted
+calibration examples, computed at failure probability δ/|T |.
+With probability at least 1 − δ, every threshold satisfying
+Ut ≤ α has true selective error at most α.
+Proof. For a fixed threshold, accepted observations are samples from the conditional distribution induced by that threshold. Conditional on the accepted count, the number of errors
+is binomial with the corresponding selective-error probability. The one-sided confidence bound fails with probability at
+most δ/|T |. A union bound over all thresholds gives simultaneous validity with probability at least 1−δ. On this event,
+selecting any threshold with Ut ≤ α, including the largestcoverage feasible threshold, preserves the bound.
+Caveats. The result requires a threshold grid independent
+of calibration outcomes, i.i.d. sampling, correct error logging, and at least one feasible threshold. Coverage may be
+low. The protocol reports empirical violation under shift but
+does not claim the guarantee survives non-exchangeable deployment.
+
+D
+D.1
+
+Non-unit costs. Apply the same argument to value-tocost
+P ratios with a uniform ratio error ϵ; the bound becomes
+ϵ j∈I cj over the mismatched interval I.
+
+C.7
+
+Disagreement decomposition
+
+Lemma 1 (Jensen–Shannon decomposition). For
+P expert
+predictions pi and normalized weights wi , let p̄ = i wi pi .
+Then
+X
+X
+H(p̄) =
+wi H(pi ) +
+wi KL(pi ∥p̄).
+(35)
+i
+
+i
+
+Proof. Expand the right-hand side:
+−
+
+X
+
+wi
+
+X
+
+pi (y) log pi (y) +
+
+y
+
+i
+
+X
+i
+
+wi
+
+X
+
+pi (y) log
+
+y
+
+pi (y)
+p̄(y)
+(36)
+
+!
+=−
+
+X X
+y
+
+i
+
+wi pi (y) log p̄(y) = H(p̄).
+
+(37)
+
+Finite-grid selective-risk control
+
+Algorithms
+
+Risk-target construction and calibration
+
+1. Train a chosen MoE-LoRA backbone without the risk
+heads.
+2. Freeze the backbone, router, and experts.
+3. For each risk-training example, evaluate all experts once
+and cache pE .
+4. Draw prefix lengths from a stratified distribution over
+{kmin , . . . , kmax − 1}.
+5. Compute pjk , Rjk , and observable state sjk for every
+sampled site–prefix pair.
+6. Record only features available before expert ik+1 is evaluated.
+7. Fit rϕ using Eq. 22; select by risk MAE, certificate width,
+and marginal-gain sign accuracy.
+8. On the disjoint certificate split, compute Eq. 23 and its
+split-conformal quantile qbδ .
+9. On a third labeled split, fit the terminal answer-risk head
+and select the largest-coverage threshold whose one-sided
+Clopper–Pearson bound is at most α. If no threshold is
+feasible, abstain on all examples.
+
+Preprint
+
+12
+
+Table 6: Default training configuration. Values marked
+“search” are selected on validation data from the stated finite set and then frozen.
+Item
+
+Setting
+
+Experts / rank
+Minimum / maximum prefix
+Expert dropout
+LoRA scale
+Value-head width
+Risk loss
+β in Eq. (1)
+Optimizer
+Expert/router LR
+Value-head LR
+Warmup
+Seeds
+Precision
+
+8/8
+1/8
+0.05
+16
+128
+Huber, ξ = 0.1
+search {0, 0.1, 0.5, 1}
+AdamW
+search {1, 2, 5} × 10−4
+search {1, 3, 10} × 10−4
+3% steps
+five
+bfloat16 where supported
+
+E.3
+
+All routing methods use the same trained expert pool in the
+controlled routing comparison. A second end-to-end comparison allows each published method to train its own experts, but it is reported separately because expert quality and
+routing quality are then confounded. For every baseline we
+record whether code is official, adapted, or reimplemented.
+Hyperparameter budgets are equalized by the number of validation trials.
+Fixed top-k uses k ∈ {1, 2, 3, 4, 6, 8}. Random adaptive
+routing samples counts with the same empirical count distribution as VI-MoLE but permutes them across examples.
+Entropy routing tunes a threshold to the same average expert
+count. CARE and LD-MoLE receive their recommended
+objectives and a matched search budget. The oracle prefix
+uses labels or full-committee risk at test time and is clearly
+marked as non-deployable.
+
+E.4
+D.2
+
+Heap-based global inference
+
+1. At the current routing block, expose the schedulable sites
+J and router order for each site.
+2. Acquire kmin experts per site and initialize used budget b.
+3. For each feasible next action, predict adjacent certified
+risks and push (Gj,k+1 /cj,k+1 , j, k + 1) into a max-heap.
+4. Pop the largest ratio. Stop if its gain is non-positive or its
+cost exceeds the remaining budget.
+5. Acquire that expert, update only the affected site’s state
+and heap entry, and repeat step 4 until termination.
+6. Aggregate terminal states and answer iff the calibrated
+answer-risk certificate is at most α; otherwise abstain.
+
+E
+E.1
+
+Detailed Experimental Setup
+
+Data splits
+
+Every benchmark uses its official training, validation, and
+test split where labels are public. When test labels are hidden, the validation split is divided once using a versioned
+random seed. No example used for expert/router training is
+used for value-head fitting, terminal-risk calibration, or final
+evaluation. The default partition of available development
+data is 50% value-head training, 25% compute calibration,
+and 25% risk calibration. A sensitivity study varies these
+fractions.
+
+E.2
+
+Backbones and experts
+
+The primary matrix uses two openly available 3B-scale
+instruction-tuned backbones. A 7B model tests scaling after the primary claims are resolved. Each model receives
+N = 8 LoRA experts with rank r = 8. The default targets the query, key, value, output, gate, up, and down projections; attention-only and MLP-only variants are ablated.
+Expert initialization, dropout, scaling, and quantization are
+held constant across routers.
+
+Baseline fairness
+
+Metrics
+
+Capability metrics are exact-match accuracy for classification and multiple-choice tasks, with normalization rules
+frozen before evaluation. Uncertainty metrics are NLL, Brier
+score, ECE with 15 equal-width bins, adaptive ECE, and
+classwise ECE. Selective prediction reports AURC, excess
+AURC, risk at 80/90/95% coverage, and coverage at target
+risks. OOD detection reports AUROC, AUPR-In, AUPROut, and FPR95.
+Compute metrics include mean and 95th-percentile active
+experts, adapter multiply-adds, total model FLOPs, end-toend batch-1 and batch-8 latency, throughput, peak accelerator memory, and expert-load coefficient of variation. Latency includes the risk head and dynamic-control overhead.
+
+E.5
+
+Statistics
+
+Primary results use five independent seeds. The main comparison reports mean and standard deviation. Paired bootstrap intervals resample test examples within each seed and
+then aggregate seed effects. The primary matched-compute
+accuracy comparison and primary AURC comparison are
+predeclared; secondary comparisons use Holm correction.
+We report effect sizes and intervals even when a hypothesis
+test is not significant.
+
+F
+G.1
+
+Additional Main-Result Tables
+G Ablation Plan
+
+Decision signal
+
+Replace predicted value with predictive entropy, router entropy, maximum softmax probability, observed disagreement, and random scores. Every signal receives the same
+budget calibration procedure. This determines whether
+performance follows the claimed counterfactual target or
+merely any dynamic count.
+
+G.2
+
+Target construction
+
+Compare KL-only, label-only, KL plus label, logit-distance,
+and clipped-positive targets. Report both final task metrics
+and value calibration. A target that improves accuracy but
+cannot predict realized gain weakens the mechanism claim.
+
+Preprint
+
+13
+
+Table 7: Full commonsense results. Values are percentages averaged over five seeds at the matched adapter-FLOP operating
+point.
+Method
+
+BoolQ PIQA SIQA Hella. Wino. ARC-E ARC-C OBQA Avg.
+
+LoRA
+Fixed k = 2
+Fixed k = 4
+AdaMoLE
+DynMoLE
+LD-MoLE
+CARE
+VI-MoLE
+
+79.8
+80.6
+81.2
+81.8
+82.1
+82.4
+82.7
+83.3
+
+77.3
+78.2
+79.0
+79.6
+79.9
+80.2
+80.5
+81.1
+
+71.0
+71.8
+72.4
+73.0
+73.3
+73.6
+73.9
+74.5
+
+81.0
+82.2
+83.0
+83.7
+84.0
+84.3
+84.6
+85.2
+
+75.5
+76.4
+77.1
+77.7
+78.0
+78.3
+78.6
+79.2
+
+74.2
+75.1
+75.8
+76.4
+76.7
+77.0
+77.3
+77.9
+
+56.8
+58.5
+60.3
+60.9
+61.2
+61.5
+61.8
+62.4
+
+68.5
+69.7
+70.4
+71.0
+71.3
+71.6
+71.9
+72.5
+
+73.0
+74.1
+74.9
+75.5
+75.8
+76.1
+76.4
+77.0
+
+Table 8: Quality, uncertainty, and systems metrics at a matched mean adapter-FLOP budget.
+Method
+
+Acc.↑
+
+NLL↓
+
+ECE↓
+
+AURC↓
+
+Experts↓
+
+P95 Exp.↓
+
+Latency↓
+
+Load CV↓
+
+Fixed top-k
+Entropy threshold
+LD-MoLE
+CARE
+VI-MoLE
+
+74.9
+75.7
+76.1
+76.4
+77.0
+
+.401
+.386
+.378
+.369
+.352
+
+.072
+.061
+.057
+.051
+.042
+
+.130
+.116
+.108
+.099
+.087
+
+3.00
+2.94
+2.91
+2.88
+2.85
+
+3
+5
+5
+5
+4
+
+26.1
+27.3
+27.0
+26.8
+26.2
+
+.18
+.21
+.16
+.15
+.13
+
+Table 9: Selective-risk calibration under shift. “Viol.” is the
+fraction of runs that exceed the target risk.
+Shift
+In distribution
+Held-out task family
+Adapter-pool expansion
+Prompt corruption
+
+Coverage↑
+
+Risk↓
+
+Viol.↓
+
+90.8
+84.1
+82.6
+79.8
+
+5.8
+8.7
+9.4
+11.2
+
+.04
+.12
+.16
+.24
+
+Table 10: Risk-head ablation.
+
+H
+H.1
+
+Variant
+
+MAE↓ Sign Acc.↑ Spearman↑ Task Acc.↑
+
+H.2
+
+Entropy only
+No disagreement
+No router features
+No candidate identity
+KL target only
+Label target only
+Full VI-MoLE
+
+.031
+.024
+.026
+.023
+.021
+.025
+.017
+
+The global block budget and certificate quantile are fixed
+on source domains and reused on each shifted domain. We
+report requested and realized mean cost, P95 count, and latency. A method that maintains accuracy by silently exceeding its budget fails the matched-compute claim. Per-domain
+recalibration is reported as an optimistic upper bound.
+
+.61
+.69
+.66
+.70
+.72
+.68
+.79
+
+.42
+.58
+.54
+.60
+.64
+.56
+.74
+
+76.9
+77.6
+77.4
+77.7
+77.8
+77.3
+78.1
+
+State features
+
+Remove hidden-state features, router statistics, predictive
+statistics, disagreement, candidate identity, and layer identity one at a time. Also train a minimal head using only entropy and prefix length. Parameter counts and head latency
+accompany the ablation.
+
+G.4
+
+Distribution shifts
+
+Task-family shift trains experts and heads on commonsense
+subsets and tests knowledge or mathematics tasks. Prompt
+shift applies deterministic paraphrase, irrelevant-context insertion, option-order permutation, and truncation. Adapterpool shift adds newly trained experts after the risk head is
+frozen; candidate identity for unseen experts uses metadata
+features rather than a learned ID embedding. Every transformation is versioned and manually inspected.
+
+H.3
+G.3
+
+Robustness and Failure Analysis
+
+Ordering and interactions
+
+Compare router order, random order, per-candidate value
+ranking, and exhaustive best-next acquisition on a small
+model. Measure violations of diminishing marginal value.
+Construct correlated experts by reducing diversity pressure
+and complementary experts by task partitioning. These settings test the assumptions behind prefix stopping.
+
+Budget drift
+
+Calibration drift
+
+The risk threshold is frozen before shift. We report targetrisk violation and coverage. Temperature-only recalibration
+and full threshold recalibration show how much labeled target data is needed to recover validity. No shifted-domain
+guarantee is claimed without exchangeability.
+
+H.4
+
+Qualitative taxonomy
+
+At least 100 errors are assigned to:
+1. high value predicted and realized;
+2. high value predicted but not realized;
+3. low value predicted but high realized;
+4. low value and irreducible ambiguity;
+5. correct abstention;
+
+Preprint
+
+14
+(a) Matched-compute frontier
+
+(b) Risk–coverage
+
+(c) Value calibration
+0.12
+
+79
+
+selective risk (%)
+
+accuracy (%)
+
+77
+76
+
+realized marginal value
+
+19
+78
+
+18
+
+17
+
+16
+
+75
+
+0.10
+0.08
+0.06
+0.04
+0.02
+0.00
+
+2
+
+4
+
+6
+
+8
+
+75
+
+80
+
+average active experts
+AdaMoLE
+
+85
+
+90
+
+95
+
+0.000
+
+CARE
+
+DynMoLE
+
+Fixed top-k
+
+0.025
+
+0.050
+
+0.075
+
+0.100
+
+predicted marginal value
+
+coverage (%)
+LD-MoLE
+
+VI-MoLE
+
+Figure 2: Quality–compute, risk–coverage, and value-calibration curves.
+6. harmful abstention on an easy example.
+Cases are sampled by fixed rules rather than selected for visual appeal.
+
+I
+
+Extended Discussion
+
+Why not entropy? Entropy is a state property, whereas
+value is an action property. Entropy says how diffuse the
+current prediction is. Value asks how that state changes after a particular computation. The two correlate only when
+unqueried experts are reliably informative on uncertain examples.
+Why a full committee teacher? It exposes counterfactual expert contributions during training without requiring
+deployment-time exhaustive computation. It is imperfect: if
+the committee is miscalibrated or wrong, distillation propagates that error. The supervised term, oracle-headroom analysis, and committee-quality stratification quantify this limitation.
+Why prefixes? Arbitrary subset acquisition is combinatorial and hardware-unfriendly. Router prefixes retain standard sparse-MoE data structures and reduce the decision to
+one scalar per step. The price is possible order suboptimality, which the candidate-ranking and exhaustive small-model
+ablations measure.
+Why abstain? More computation is not an answer to every uncertainty. Without abstention, a budget-aware policy can stop while still emitting an unreliable prediction.
+Without value-aware acquisition, an abstention policy may
+reject examples that one cheap expert could solve. Joint
+spend/stop/abstain decisions are therefore the conceptual
+unit.
+Deployment. Dynamic counts can fragment batches and
+worsen tail latency. Practical kernels may bucket examples
+
+by selected count or make decisions at a coarser sequence
+or layer-group granularity. The paper reports actual latency
+and P95 behavior, not only theoretical adapter FLOPs.
+Free-form generation. Token-level entropy does not capture semantic equivalence, and a next-token value target may
+not reflect sequence correctness. A generation extension
+would use semantic clusters, sequence-level proper scores,
+or verifier outcomes. It is outside the primary claim until independently validated.
+
+

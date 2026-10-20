@@ -1,0 +1,795 @@
+CureAgent: A Training-Free Executor-Analyst
+Framework for Clinical Reasoning
+
+arXiv:2512.05576v1 [cs.AI] 5 Dec 2025
+
+Tingting Xie∗and Yixin Zhang†
+Team: CureAgent, prize-winning solution of CURE-Bench@NeurIPS 2025
+
+Abstract
+Current clinical agent built on small LLMs, such as TxAgent suffer from a Context
+Utilization Failure, where models successfully retrieve biomedical evidence due to
+supervised finetuning but fail to ground their diagnosis in that information. In this
+work, we propose the Executor-Analyst Framework, a modular architecture that
+decouples the syntactic precision of tool execution from the semantic robustness
+of clinical reasoning. By orchestrating specialized TxAgents (Executors) with
+long-context foundation models (Analysts), we mitigate the reasoning deficits
+observed in monolithic models. Beyond simple modularity, we demonstrate that a
+Stratified Ensemble strategy significantly outperforms global pooling by preserving
+evidentiary diversity, effectively addressing the information bottleneck. Furthermore, our stress tests reveal critical scaling insights: (1) a Context-Performance
+Paradox, where extending reasoning contexts beyond 12k tokens introduces noise
+that degrades accuracy; and (2) the Curse of Dimensionality in action spaces,
+where expanding toolsets necessitates hierarchical retrieval strategies. Crucially,
+our approach underscores the potential of training-free architectural engineering,
+achieving state-of-the-art performance on CURE-Bench without the need for expensive end-to-end finetuning. This provides a scalable, agile foundation for the
+next generation of trustworthy AI-driven therapeutics. Code will be released on
+https://github.com/June01/CureAgent.
+
+1
+
+Introduction
+
+The advent of large language models (LLMs) such as Med-PaLM [1] and GPT-4 [2] has heightened
+anticipation for transformative advances in clinical decision support, given their capacity for broad
+knowledge and fluent reasoning. However, real-world medical reasoning requires more than just internal knowledge; it demands the ability to actively retrieve and synthesize information from constantly
+updating biomedical sources (e.g., FDA labels [3], OpenTarget database [4] and Human Phenotype
+Ontology [5]). The CURE-Bench competition [6] addresses this critical gap by benchmarking agents
+not merely on static knowledge, but on their ability to utilize a vast ToolUniverse [7] to perform
+structured, multi-step reasoning for clinically grounded tasks.
+Specialized tool-augmented models like TxAgent [8] (the competition baseline) serve as a strong
+starting point. Fine-tuned specifically for this domain and curated for precise therapeutics, TxAgent
+demonstrates significant utility in executing complex API calls and multi-turn conversation to access
+biomedical knowledge and reasoning. However, a notable gap remains in achieving truly precise
+decision-making. Our analysis of failure cases with ground truth in the validation set (Figure 1(d))
+reveals four primary error categories, with Reasoning & Retrieval Failure constituting the dominant
+∗
+Project Lead and Corresponding Author: helloxietingting@gmail.com. Orchestrated project resources;
+conceived the methodology; designed the Multi-Agent architecture; led the implementation and writing.
+†
+zyxcambridge@gmail.com. Contributed computational resources (GPUs); assisted with the initial deployment of the txagent environment; participated in experimental analysis on Gemini models.
+
+Preprint.
+
+(a) Output Parsing Error
+
+(b) Instruction Failure
+User:
+
+User:
+
+The following is a multiple choice question about
+medicine... Convert the agent's answer to the
+final answer format using the corresponding option
+label, e.g., 'A', 'B', 'C', 'D', 'E' or 'None'.
+
+...Convert the agent's answer to the final answer
+format using the corresponding option label, e.g.,
+'A', 'B', 'C', 'D', 'E' or 'None'.
+
+...Question: What is the appropriate action if a
+patient experiences a severe infusion reaction
+during Ogivri administration?
+
+Question: At what oral dose did albuterol sulfate
+demonstrate no evidence of impaired fertility in
+rats?
+
+A: Decrease the rate of infusion
+B: Interrupt the infusion temporarily
+C: Discontinue Ogivri permanently
+D: Administer a higher dose to counteract the
+reaction
+
+Question: What should you do if the dose indicator
+on Stiolto Respimat reaches 0?
+
+A: 2 mg/kg
+B: 50 mg/kg
+C: 500 mg/kg
+D: 100 mg/kg
+
+Assistant:
+
+{role: tool, content: ...Permanent discontinuation
+should be strongly considered in all patients with
+severe infusion reactions..., call_id: E8FcHArX6}
+
+Assistant:
+
+To answer the question, I need to find information
+about the oral dose at which albuterol sulfate
+demonstrated no evidence of impaired fertility in
+rats. Since the agent's answer is already
+provided, I can use this information directly.
+
+Assistant (Hallucination):
+
+Post-Processing Result:
+Extracted: 'A' (Expected: B)
+
+Regex Error
+
+Post-Processing Result:
+Extracted: '' (Expected: B)
+
+Miscellaneous
+12.3%
+
+Retrieved Context:
+
+Format
+Violation
+
+B: Interrupt the infusion temporarily. During
+severe infusion reactions, it is crucial to
+interrupt the infusion temporarily to manage the
+patient's symptoms and prevent further
+complications.
+
+Ground Truth:
+
+Instruction Adherence Failure
+
+2.7%
+
+A: Continue using the inhaler until the cartridge
+is empty.
+B: Prepare and use a new Stiolto Respimat inhaler.
+C: Turn the clear base to reset the dose
+indicator.
+D: Clean the mouthpiece and continue using the
+inhaler.
+
+The agent's answer indicates that the correct
+action when the dose indicator on Stiolto Respimat
+reaches 0 is to prepare and use a new inhaler.
+This matches option B.
+
+(d) Distribution and types of failure cases
+
+(c) Reasoning & Retrieval Failure
+
+User:
+
+19.2%
+
+Reasoning & Retrieval Failure
+
+Output Parsing Error
+
+65.8%
+
+Failed to prioritize 'Permanent'
+
+C: Discontinue Ogivri permanently
+
+Figure 1: Analysis of TxAgent failed cases on the validation set. (a)(b)(c) Examples of failed cases
+highlighting different error modes in TxAgent. (d) Distribution and types of failure modes (n = 73
+out of 413 multi-choice questions) observed in TxAgent, providing insights into common pitfalls and
+areas for improvement.
+share (65.8%), while an example is shown in Figure 1(c). While this category includes instances
+of intrinsic model incapability or failures to invoke the correct tools, the vast majority represent a
+critical Context Utilization Failure: the agent successfully gathers sufficient evidence but fails to
+ground its final diagnosis in this information, leading to hallucination. We observed that this issue
+becomes even more pronounced in the test set, likely due to a distribution shift toward more complex
+cases requiring a higher average number of tool calls and longer context.
+Beyond reasoning deficits, Output Parsing Errors (19.2%) stem from the model’s failure to produce
+structured final answers (Figure 1(a)), a technical issue addressable via robust post-processing.
+Furthermore, Instruction Adherence Failures (12.3%) occur when the agent disregards formatting
+constraints (e.g., providing free-form text instead of selecting specific options, as in Figure 1(b)).
+We attribute the prevalence of both reasoning hallucinations and instruction failures primarily to
+the inherent limitations of TxAgent’s compact architecture (base model Llama-3.1-8B [9] with 8B
+parameters), which struggles to maintain coherence and strict logic over long-horizon inference
+tasks. Recent research has examined the extent and timing of knowledge forgetting that occurs
+when large language models are fine-tuned on downstream tasks, revealing that domain-knowledge
+benchmarks such as MMLU can experience considerable performance drops after continual training
+on task-specific data [10; 11; 12]. This raises a pivotal question: Can this performance gap be bridged
+simply by substituting the backbone with a more powerful foundation model? To investigate this,
+we conducted extensive benchmarking across a wide range of current mainstream open-source and
+closed-source models, as shown in Table 1 and Table 2.
+Table 1: Open-source Model Performance Comparison
+model name
+phase13 phase2
+TxAgent [8]
+65.214
+69.325
+Llama-3.1-8B [9]
+27.912
+29.715
+Llama3-Med42-8B [13]
+46.125
+50.407
+Qwen3-8B [14]
+28.134
+36.264
+Qwen-3-32B-Medical-Reasoning [15] 36.513
+40.791
+Baichuan-M2 [16]
+29.944
+30.071
+medgemma-4b-it [17]
+50.331
+54.366
+gpt-oss-20b [18]
+45.425
+47.644
+gpt-oss-120b [18]
+45.377
+39.896
+Table 1 reveals a stark contrast in performance between TxAgent and other open-source models.
+Despite the general capabilities of leading open-source foundation models like Llama-3.1-8B [9]
+and Qwen3-8B [14], their zero-shot performance on CURE-Bench is significantly lower than that of
+TxAgent, with scores often falling below 30%. Even specialized medical models such as Llama3Med42 [13] and MedGemma [17], while outperforming general-purpose counterparts, still lag behind
+TxAgent by a substantial margin (approximately 15-20 points). This discrepancy underscores a
+3
+
+phase1 refers to testset_phase1 (public leaderboard) and phase2 refers to testset_phase2 (private
+leaderboard). For details, see: https://www.kaggle.com/competitions/cure-bench/data
+
+2
+
+critical insight: general-purpose reasoning or even broad medical knowledge is insufficient for
+tasks that require dynamic, real-time information access. Without fine-tuning on the specific syntax
+and semantics of the CURE-Bench toolset, standard open-source models struggle to effectively
+navigate the retrieval process, making them unable to access the ground-truth evidence required for
+accurate clinical decisions. This observation echoes the findings of ReAct [19; 20; 21], where models
+significantly improve their tool-use capabilities through targeted training compared to their original,
+untrained versions.
+Table 2: Closed-source Model Performance Comparison
+model name
+with tools phase2
+gemini-2.5-flash
+×
+63.104
+gemini-2.5-flash
+search
+69.627
+gemini-2.5-pro
+×
+67.753
+gemini-2.5-pro
+search
+74.806
+gemini-3-pro-preview
+×
+70.985
+gemini-3-pro-preview
+search
+81.283
+Conversely, our evaluation of state-of-the-art closed-source models, presented in Table 2, highlights a different limitation. Models with superior reasoning capabilities, such as the Gemini 2.5
+series [22], achieve respectable scores (60-75 range), particularly when augmented with generic
+search capabilities.4
+A closer examination of the results shows that dynamic information retrieval plays a pivotal role in
+clinical reasoning tasks. With generic search enabled, both Gemini 2.5 Pro (74.8%) and Gemini 2.5
+Flash (69.6%) exhibit clear performance gains, significantly surpassing their own baselines without
+search and matching or exceeding the performance of the task-specific TxAgent (69.3%). For instance,
+Gemini 2.5 Pro without search (67.8%) falls short of TxAgent despite its stronger reasoning abilities,
+but the addition of search alone yields a performance boost of nearly 7 points. This highlights that
+access to real-time, dynamic knowledge is essential even for large-scale foundation models.
+However, there remains an open question: can a task-specialized agent like TxAgent, with its
+fine-grained tool-calling capabilities, further enhance information retrieval efficiency beyond what
+general-purpose search provides? In particular, as the reasoning capabilities of foundation models
+continue to advance rapidly, designing more precise, context-aware tool invocation mechanisms may
+be key to unlocking even greater downstream reasoning efficiency. Integrating the complementary
+strengths of dynamic search (for breadth and recency) and structured, task-specific tool execution (for
+precision) is likely to close the gap and maximize the utilization of available biomedical knowledge.
+Consequently, we propose a collaborative multi-agent framework that decouples these competencies.
+Our approach bridges the context utilization failure gap by assigning TxAgent as a specialized
+Executor for accurate information retrieval and Gemini 2.5 as a clinical Analyst for evidence synthesis
+and diagnosis. Through the integration of search for fact-checking and supplementing tool-missing
+information, we enable robust, high-fidelity clinical decision-making without requiring costly domainspecific pre-training as illustrated in Figure 2.
+
+2
+
+Methods
+
+In this section, we propose the Executor-Analyst Collaborative Framework, a modular architecture
+that decouples the distinct competencies of precise tool execution (“the hand”) and high-level clinical
+reasoning (“the brain”) (Figure 2).
+The framework decomposes the therapeutic reasoning process into multi-agent workflow, while a
+specialized agent responsible for navigating the ToolUNiverse to retrieve raw, unstructured evidence
+and a long-context foundation model that synthesizes noisy evidence into coherent clinical rationales.
+4
+We also benchmarked the newly released Gemini 3 Pro (available post-competition) in Table 2 to gauge the
+trajectory of foundation models. Its impressive score of 81.283% with search highlights the rapid advancement
+of reasoning engines. However, as this model was unavailable during the development phase, our architectural
+design and primary ablation studies focus on Gemini 2.5 era. It is promising to get much better result using
+Gemini 3 pro model.
+
+3
+
+Figure 2: Overview of the Executor-Analyst Collaborative Framework. We address the context
+utilization failure by decoupling clinical reasoning into three specialized phases: (1) The Executor:
+This agent focuses solely on precise information retrieval, utilizing a self-consistency mechanism to
+aggregate top-k evidence and reasoning trace from the ToolUniverse. (2) The Analyst: Freed from
+tool-use syntax, this long-context foundation model acts as a reasoner, performing fact verification
+and supplementing tool-missing information via search and synthesis on the noisy evidence stream.
+Note that while this figure depicts a linear flow, we further enhance performance via a Stratified
+Ensemble topology (detailed in Section 2.3). (3) Post-processing Module: A deterministic layer
+ensuring format compliance and deduplication.
+
+Then a deterministic layer ensuring deduplication and output format compliance. By separating these
+roles, we leverage the syntactic precision of fine-tuned smaller models for tool interactions while
+harnessing the robust reasoning capabilities of large-scale foundation models for evidence synthesis.
+2.1
+
+The Executor: Specialized Tool Retrieval Agent
+
+The Executor serves as the system’s interface with external biomedical knowledge. For this role, we
+utilize TxAgent, a Llama-3.1-8B model fine-tuned specifically for therapeutic reasoning. Unlike
+general-purpose models, the Executor is optimized to interact with ToolUniverse, a comprehensive
+library of over 200 validated biomedical tools (including FDA labels, Open Targets, and Human
+Phenotype Ontology).
+The Executor does not generate the final clinical answer. Instead, its objective is context Aggregation.
+It parses the input clinical scenario, decomposes it into sub-queries, and orchestrates multi-step tool
+invocations and reasoning. To mitigate the stochasticity of single-shot retrieval, we implement a
+self-consisteny mechanism [23] by instantiating multiple parallel Executor agents (n1 ) for a single
+query. Rather than relying on a single reasoning path, we aggregate the tool outputs from these
+parallel executions, retaining the top-k most frequently selected tool calls and the most frequent
+choice reasoning trace. This ensures that the downstream Analyst receives a comprehensive and
+robust set of evidence, minimizing the risk of missing critical contraindications or drug interactions
+due to retrieval errors.
+2.2
+
+The Analyst: Long-Context Clinical Reasoner
+
+To address the reasoning deficit inherent in smaller, tool optimized models, the Analyst employs
+Gemini 2.5 variant as a dedicated reasoning backbone. Ingesting the Aggregated Context, a noisy,
+unstructured stream of raw observations from the Executor, this agent is relieved of the syntactic
+burden of tool invocation and multi-turn dialogue. Instead, it concentrates exclusively on high-level
+clinical processing: cross-referencing retrieved tool outputs and performing supplementary internet
+searches against the patient’s specific comorbidities.
+4
+
+Leveraging its vast context window and superior “System 2” capabilities, the Analyst synthesizes this
+verified information into a coherent chain-of-thought rationale. It effectively filters irrelevant noise,
+actively searches the internet when tool-retrieved evidence is insufficient, and resolves conflicting
+data points without hallucinating non-existent medical facts. This rigorous process culminates in
+Clinical Synthesis, producing a preliminary draft that firmly grounds the diagnosis and supporting
+arguments in verified evidence.
+2.3
+
+Architecture Topology: Global Pooling vs. Stratified Ensemble
+
+A critical factor in multi-agent orchestration is balancing consensus against diversity. We investigate
+two distinct topological configurations to optimize the collaboration between Executors and Analysts
+using a fixed computational budget (Figure 3).
+Configuration A: Global Pooling (Early Fusion). In this baseline configuration (Figure 3(a)), we
+maximize the retrieval sample size by pooling all Executor instances (Ntotal ) into a single aggregation
+step. Then the generated context will be processed by n2 independent Analyst agents and perform
+another self consistency.
+While this approach effectively filters out retrieval noise, it introduces a severe information bottleneck:
+by forcing a consensus too early in the pipeline, minority yet critical evidence is often discarded
+before reaching the reasoning stage.
+Configuration B: Stratified Ensemble (Late Fusion). To address the bottleneck, we propose
+a Stratified Ensemble strategy (Figure 3(b)) that preserves information diversity. Instead of a
+monolithic pool, we partition the Executor budget into n2 parallel subgroups, each subgroup is with
+n1 = Ntotal /n2 Executor instances.
+1. Parallel Pipelines: Each subgroup independently aggregates its retrieval results, forming
+distinct context streams tailored to different retrieval paths.
+2. Independent Reasoning: Each unique context is ingested by a dedicated Analyst, creating
+fully independent end-to-end reasoning chains.
+3. Late Fusion: The final decision is reached via self-consisteny mechanism on the Analyst’s
+final answers, rather than the intermediate evidence.
+This ensures that diverse retrieval paths are maintained throughout the reasoning process, significantly
+reducing collective hallucination and improving robustness on complex, ambiguous cases.
+2.4
+
+Post-processing Module: Deterministic Output Calibration
+
+The final stage addresses output parsing errors and stochastic inconsistencies. The post-processing
+module is a lightweight, deterministic component that accepts the Analyst’s draft. It performs two
+key functions: 1) Format Calibration, which employs regular expressions (Regex) to map natural
+language conclusions into the strict output schema required by the benchmark; and 2) Response
+Deduplication, which enforces internal consistency across identical queries. By standardizing outputs
+for recurrent inputs, this layer mitigates the inherent generation variance of LLMs, ensuring the
+system exhibits the deterministic behavior critical for reliable clinical decision support.
+
+3
+
+Experiments and Ablation studies
+
+Dataset. Due to the late release of the phase2 set (phase2 testset), we prioritize phase2 for multiagent structure selection and final model comparisons, while retaining phase1 for ablation studies
+where resource constraints prevented re-evaluation. 5
+3.1
+
+Executor Calibration
+
+We first investigate the impact of generation diversity on the Executor’s retrieval capabilities. We
+conducted a sweep of the temperature parameter on the TxAgent on phase1 in Table 3, while
+performance peaks at a temperature of 0.8, achieving a score of 65.214, indicating that a moderate
+5
+
+Implementation details, such as temperature could be found in https://github.com/June01/CureAgent.
+
+5
+
+(a) Config A: Global Pooling (Early Fusion)
+
+(b) Config B: Stratified Ensemble (Late Fusion)
+
+Figure 3: Comparison of Topological Configurations. (a) Global Pooling aggregates all evidence
+into a single context. While reducing noise, it risks filtering out rare but valid cues. (b) Stratified
+Ensemble (Ours) partitions agents into parallel subgroups. Late Fusion approach preserves diverse
+reasoning paths until the final stage, mitigating the information bottleneck.
+increase in generation randomness helps TxAgent discover better tool call strategies. However,
+setting the temperature too high (0.9) leads to performance degradation, likely due to excessive output
+variability. These findings suggest careful calibration of the temperature hyperparameter is crucial for
+balancing exploration and reliability in clinical tool-using agents. Consequently, we fix T = 0.8 for
+subsequent experiments.
+Table 3: Performance of TxAgent with Different Temperature Settings on phase1.
+model temperature phase1
+txagent
+0.6
+58.950
+txagent
+0.7
+59.248
+txagent
+0.8
+65.214
+txagent
+0.9
+56.747
+3.2
+
+Self-consistency Mechanism
+
+We evaluate the Self-Consistency (SC) mechanism [23] for enhancing the Executor’s retrieval
+performance on phase2. As shown in Figure 4, increasing the number of sampled reasoning paths
+(n) and aggregating their outputs via majority voting leads to notable accuracy improvements over
+standard greedy decoding (orange line), which remains fixed at 69.3%. The SC method (blue line)
+achieves rapid gains in the low-sample regime (n < 15), with accuracy climbing to about 73.3%.
+Beyond n > 20, the improvement gradually plateaus, reaching approximately 74.2% at n = 60.
+3.3
+
+Collaborative Architecture Effectiveness
+
+We proceed to comprehensively evaluate the full Executor-Analyst Framework, in which SelfConsistency (SC) mechanisms are incorporated into both the retrieval and reasoning components.
+This assessment examines the progression from traditional single-agent baselines to our advanced
+6
+
+76
+
+Self-consistency
+greedy-decode
+
+75
+
+Accuracy (%)
+
+74
+73
+72
+71
+70
+69
+680
+
+10
+
+20
+
+30
+
+40
+
+50
+
+#Sampled Reasoning Paths
+
+60
+
+70
+
+Figure 4: Performance of TxAgent with Self-consistency Mechanisms on phase2.
+
+Table 4: Main results on phase2. Comparison of Single-Agent vs. Collaborative Architectures. n1 :
+Number of Executors. n2 : Number of Analysts. Config A: Global Pooling. Config B: Stratified
+Ensemble.
+Agent1
+n1
+Agent2
+n2 phase2
+Baselines
+gemini-2.5-flash
+1
+63.104
+TxAgent
+1
+69.325
+Single Agent with Self-Consistency
+gemini-2.5-flash
+3
+65.678
+TxAgent
+10
+72.673
+TxAgent
+30
+73.508
+Collaborative
+TxAgent (Config A) 1
+gemini-2.5-flash
+1
+74.701
+TxAgent (Config A) 10
+gemini-2.5-flash
+1
+78.527
+TxAgent (Config A) 30
+gemini-2.5-flash
+1
+79.311
+TxAgent (Config A) 30
+gemini-2.5-flash
+3
+80.510
+TxAgent (Config B) 10
+gemini-2.5-flash
+3
+81.367
+TxAgent (Config B) 10 gemini-2.5-flash (with search) 3
+83.803
+
+Stratified Ensemble architecture. As demonstrated in Table 4, the results robustly support the validity
+of our design principles:
+1) Decoupling Gains: The most significant jump occurs when combining a single Executor with a
+single Analyst (74.701%), suppressing the isolated TxAgent baseline (69.325%) and the standalone
+Gemini baseline (63.104%). This confirms that decoupling precise tool execution from high-level
+reasoning is the primary driver of performance.
+2) Topology Matters (Early vs. Late Fusion): While scaling the Executor pool to Ntotal = 10 × 3,
+i.e., n1 = 30 and n2 = 3 in Config A yields strong results (80.51%), it still faces an information
+bottleneck. By switching to Config B, which employs a Stratified Ensemble, a late fusion strategy
+with parallel pipelines (Ntotal = 10 × 3), i.e., n1 = 10 and n2 = 3 , we achieve the state-of-theart performance of 81.367%. This verifies that preserving diverse retrieval contexts prevents the
+premature filtering of critical evidence, effectively reducing collective hallucination.
+Note that the previous results are using Gemini 2.5 Flash without search; when equipped with search
+capabilities, Gemini 2.5 Flash achieves 83.803% accuracy, which is the configuration we used for the
+leaderboard results.
+7
+
+4
+
+Open Challenges and Conclusion
+
+Our investigation into the Executor-Analyst framework has validated the efficacy of decoupling tool
+execution from clinical reasoning. However, we also found several critical challenges emerge, thus
+we outline the roadmap for the next generation of clinical agents.
+4.1
+
+Scalability in Massive Action Spaces
+
+A primary limitation of current tool-use agents is the degradation of retrieval accuracy as the tool
+library expands. To quantify this, we conducted a preliminary stress test by upgrading ToolUniverse
+from v1.0 (200+ tools) to v2.0 (600+ distinct tools) [7]. As shown in Table 5, despite the increased
+domain coverage, the model’s accuracy decreased from 92.0% to 87.5%.
+Table 5: Performance of TxAgent on the Validation Set with Different ToolUniverse Versions.
+model
+ToolUniverse 1.0 (200+ tools) ToolUniverse 2.0 (600+ tools)
+TxAgent
+92.0%
+87.5%
+This performance drop highlights the Curse of Dimensionality in tool retrieval. Future work must
+address this by moving beyond flat retrieval spaces. We plan to investigate: 1) Hierarchical Tool
+Indexing: Grouping tools into clinical taxonomies to allow coarse-to-fine retrieval. 2) Trainingfree Adaptation: Exploring methods to teach models to navigate massive toolsets (> 1000) via
+In-Context Learning (ICL) or RAG-based documentation retrieval, eliminating the cost of fine-tuning
+for every new API update. 3) Curriculum Learning: Progressively exposing the Executor to larger
+tool subsets during training to improve robustness against distractors.
+4.2
+
+The Context-Performance Paradox and Token Efficiency
+
+1.0
+
+94.5% 95.8%
+(n=127) (n=119)
+
+90.4%
+(n=52)
+
+96.0%
+(n=25)
+
+94.1%
+(n=17)
+
+8K
+-10
+
+Correct
+Incorrect
+
+0.00020
+
+6K
+-8K
+
+Besides, our analysis reveals a counter-intuitive Context-Performance Paradox: extending the TxAgent’s context window does not linearly correlate with better reasoning. As visualized in Figure 5,
+we observe a sharp performance decline (from 94% to 87.93%) when reasoning contexts exceed
+12,000 tokens. The long-tail distribution of incorrect samples suggests that excessive raw evidence
+introduces noise that overwhelms the model’s attention mechanism, echoing recent findings by Du et
+al. [24].
+93.3%
+(n=15)
+
+87.9%
+(n=58)
+
+0.8
+
+Accuracy
+
+Density
+
+0.00015
+
+0.00010
+
+0.6
+0.4
+0.2
+
+0.00005
+
+Reasoning Token Count
+
+50000
+
+60000
+
+(a) Reasoning token distribution for samples.
+
+K+
+
+K
+
+K
+
+Token Range
+
+12
+
+40000
+
+K-1
+2
+
+30000
+
+10
+
+20000
+
+4K
+-6K
+
+10000
+
+2K
+-4K
+
+0
+
+0-2
+
+K
+
+0.0
+0.00000
+
+(b) Accuracy across different reasoning token ranges.
+
+Figure 5: Analysis of performance vs context length.
+To mitigate this, future iterations will focus on information compression and early rejection. Instead
+of feeding all aggregated evidence to the agent, we aim to implement confidence-based filtering
+strategies similar to DeepConf [25]. By estimating the semantic redundancy of tool outputs and
+rejecting irrelevant evidence before it consumes the context window, we can improve the signal-tonoise ratio and significantly reduce inference costs.
+8
+
+4.3
+
+Evolving the Reasoning Engine
+
+The landscape of foundation models is evolving rapidly. While our current framework relies on
+Gemini 2.5 variants, the emergence of next-generation models (e.g., Gemini 3 Pro) offers new
+possibilities for the Analyst role. Our preliminary zero-shot benchmarks (Table 2) indicate that
+Gemini 3 Pro already achieves superior performance. Future work will explore shifting the boundary
+between the Executor and Analyst. As foundation models become more capable of zero-shot tool
+use, the specialized Executor might evolve from a fine-tuned model into a lightweight promptengineered module. However, the core principle of our architecture—decoupling execution from
+reasoning—remains vital. This modularity allows our framework to seamlessly integrate stronger
+backbones without the need for expensive end-to-end retraining, ensuring adaptability in a fast-paced
+ecosystem.
+
+5
+
+Conclusion
+
+We address the limitations of monolithic medical agents by introducing the Executor-Analyst collaborative framework, which decouples tool manipulation (the hand) from clinical synthesis (the
+brain) to resolve the conflict between syntactic precision and semantic reasoning. Ablation studies
+on CURE-Bench reveal that reliable decision-making requires not just tool access but a topological
+structure preserving information diversity—our Stratified Ensemble (Late Fusion) mitigates early
+information bottlenecks and handles diverse retrieval paths. Beyond immediate gains, training-free
+architectural engineering enables rapid adaptation: future models can upgrade Analyst or expand
+the Executor’s ToolUniverse without retraining. Remaining open questions include the ContextPerformance Paradox (noise from longer contexts) and the Curse of Dimensionality in large action
+spaces. By emphasizing interaction design (e.g., early rejection, hierarchical orchestration) over
+parameter updates, our work provides a robust and future-proof preview toward scalable, trustworthy
+clinical AI.
+
+Acknowledgments
+All experiments ran on one AMD MI300X GPU, thanks to AMD for hardware support. Thanks also
+to Google AI Developer Programs team and GDE Healthcare Circle for Google Cloud and Gemini
+credits. We also gratefully acknowledge Synapnote.ai for the support.
+
+References
+[1] Karan Singhal et al. Towards expert-level medical question answering with large language
+models. arXiv preprint arXiv:2305.09617, 2023.
+[2] Harsha Nori et al. Capabilities of gpt-4 on medical challenge problems. arXiv preprint
+arXiv:2303.13375, 2023.
+[3] Taha A Kass-Hout, Zhiheng Xu, Matthew Mohebbi, Hans Nelsen, Adam Baker, Jonathan
+Levine, Elaine Johanson, and Roselie A Bright. Openfda: an innovative platform providing
+access to a wealth of fda’s publicly available data. Journal of the American Medical Informatics
+Association, 23(3):596–600, 2016.
+[4] David Ochoa, Andrew Hercules, Miguel Carmona, Daniel Suveges, Jarrod Baker, Cinzia
+Malangone, Irene Lopez, Alfredo Miranda, Carlos Cruz-Castillo, Luca Fumis, et al. The
+next-generation open targets platform: reimagined, redesigned, rebuilt. Nucleic acids research,
+51(D1):D1353–D1359, 2023.
+[5] P Talapova, MA Gargano, N Matentzoglu, B Coleman, EB Addo-Lartey, AV Anagnostopoulos,
+J Anderton, and P Avillach. The human phenotype ontology in 2024: phenotypes around the
+world. 2023.
+[6] CURE-Bench Organizers. CURE-Bench @ NeurIPS 2025: Benchmarking ai reasoning for
+therapeutic decision-making at scale, 2025. URL https://curebench.ai/. NeurIPS 2025
+Competition.
+
+9
+
+[7] Shanghua Gao, Richard Zhu, Pengwei Sui, Zhenglun Kong, Sufian Aldogom, Yepeng Huang,
+Ayush Noori, Reza Shamji, Krishna Parvataneni, Theodoros Tsiligkaridis, et al. Democratizing
+ai scientists using tooluniverse. arXiv preprint arXiv:2509.23426, 2025.
+[8] Shanghua Gao, Richard Zhu, Zhenglun Kong, Ayush Noori, Xiaorui Su, Curtis Ginder,
+Theodoros Tsiligkaridis, and Marinka Zitnik. Txagent: An ai agent for therapeutic reasoning
+across a universe of tools, 2025. URL https://arxiv.org/abs/2503.10970.
+[9] Meta AI. Introducing llama 3.1: Our most capable models to date. https://ai.meta.com/
+blog/meta-llama-3-1/, 2024. Accessed July 23, 2024.
+[10] Sanyuan Chen, Yutai Hou, Yiming Cui, Wanxiang Che, Ting Liu, and Xiangzhan Yu. Recall
+and learn: Fine-tuning deep pretrained language models with less forgetting. arXiv preprint
+arXiv:2004.12651, 2020.
+[11] Suhas Kotha, Jacob Mitchell Springer, and Aditi Raghunathan. Understanding catastrophic
+forgetting in language models via implicit inference. arXiv preprint arXiv:2309.10105, 2023.
+[12] Damjan Kalajdzievski. Scaling laws for forgetting when fine-tuning large language models.
+arXiv preprint arXiv:2401.05605, 2024.
+[13] Clément Christophe, Praveen K Kanithi, Tathagata Raha, Shadab Khan, and Marco AF Pimentel.
+Med42-v2: A suite of clinical llms, 2024. URL https://arxiv.org/abs/2408.06142.
+[14] Qwen Team. Qwen3 technical report, 2025. URL https://arxiv.org/abs/2505.09388.
+[15] nicoboss & kingabzpro. Fine-tuning qwen3-32b in 4-bit quantization for medical reasoning.
+https://huggingface.co/nicoboss/Qwen-3-32B-Medical-Reasoning, 2025.
+[16] M2 Team, Chengfeng Dou, Chong Liu, Fan Yang, Fei Li, Jiyuan Jia, Mingyang Chen, Qiang Ju,
+Shuai Wang, Shunya Dang, Tianpeng Li, Xiangrong Zeng, and et al. Yijie Zhou. Baichuan-m2:
+Scaling medical capability with large verifier system, 2025. URL https://arxiv.org/abs/
+2509.02208.
+[17] Google Health AI Developer Foundations. Medgemma. https://developers.google.com/
+health-ai-developer-foundations/medgemma, 2025.
+[18] OpenAI. gpt-oss-120b & gpt-oss-20b model card, 2025. URL https://arxiv.org/abs/
+2508.10925.
+[19] Shunyu Yao et al. React: Synergizing reasoning and acting in language models. arXiv preprint
+arXiv:2210.03629, 2022.
+[20] Timo Schick et al. Toolformer: Language models can teach themselves to use tools. arXiv
+preprint arXiv:2302.04761, 2023.
+[21] Cheng Qian, Emre Can Acikgoz, Qi He, Hongru Wang, Xiusi Chen, Dilek Hakkani-Tür, Gokhan
+Tur, and Heng Ji. Toolrl: Reward is all tool learning needs. arXiv preprint arXiv:2504.13958,
+2025.
+[22] Google Cloud.
+Gemini 2.5 pro.
+https://docs.cloud.google.com/vertex-ai/
+generative-ai/docs/models/gemini/2-5-pro, 2025.
+[23] Xuezhi Wang, Jason Wei, Dale Schuurmans, Maarten Bosma, Fei Xia, Ed Chi, Quoc Le, and
+Denny Zhou. Self-consistency improves chain of thought reasoning in language models. arXiv
+preprint arXiv:2203.11171, 2022.
+[24] Yufeng Du, Minyang Tian, Srikanth Ronanki, Subendhu Rongali, Sravan Bodapati, Aram
+Galstyan, Azton Wells, Roy Schwartz, Eliu A Huerta, and Hao Peng. Context length alone hurts
+llm performance despite perfect retrieval. arXiv preprint arXiv:2510.05381, 2025.
+[25] Yichao Fu, Xuewei Wang, Yuandong Tian, and Jiawei Zhao. Deep think with confidence. arXiv
+preprint arXiv:2508.15260, 2025.
+
+10
+
+

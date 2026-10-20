@@ -1,0 +1,3120 @@
+Zero-Shot Active Feature Acquisition via
+LLM-Elicitation.
+
+arXiv:2606.18933v2 [cs.LG] 18 Jun 2026
+
+Binyamin Perets*
+Faculty of EE, Technion.
+Faculty of Medicine, Technion.
+
+Natalie Mendelson*
+Faculty of EE, Technion.
+Faculty of Medicine, Technion.
+
+Shiran Vainberg
+CytoReason
+
+Yehuda Chowers
+CytoReason
+
+Shai S. Shen-Orr
+Faculty of Medicine, Technion.
+
+Shie Mannor
+Faculty of EE, Technion.
+NVIDIA
+
+Abstract
+Active feature acquisition (AFA) sequentially selects which features to observe
+to reach a classification or ranking decision. Its central limitation is reliance on
+large amount of labeled data to fit probabilistic models guiding acquisition. Large
+language models (LLMs) supply unsupervised domain knowledge, but are poor
+sequential planners. Asking one to both know and decide conflates capabilities
+best kept separate. Here, we develop a framework for zero-shot AFA through
+disciplined elicitation: asking the LLM only for what it can be trusted to return,
+the unary deviations and pairwise co-variations that are the sufficient statistics of
+a Markov random field (MRF). We apply our framework to two settings: binary
+classification and top-k identification. In practice, the LLM reliably returns only
+discriminative statistics, what distinguishes the classes rather than each class in
+isolation, which precludes classical AFA. We apply a maximum-entropy closure
+that resolves this gauge ambiguity. We evaluate on a cohort of Inflammatory
+Bowel Disease (IBD) patients, an active clinical setting where diagnostic ambiguity
+and patient heterogeneity obstruct stable treatment strategies. Our framework
+outperforms the LLM both on real labels and on its own extracted beliefs. Where
+it matters most, on the hardest patients, our top-k acquisition policy markedly
+outperforms all existing methods.
+
+1
+
+Introduction
+
+Many real-world decisions require sequential, adaptive measurement under a limited budget, sharing
+the same structure: observe, update, choose what to observe next. And in each, measurement
+cost and the combinatorial space of orderings render exhaustive strategies infeasible. This defines
+Active Feature Acquisition (AFA): a sequential decision task in which the ordering of observations
+matters, and optimal ordering requires a model of how features relate to hypotheses. AFA relies
+on constructing a probabilistic model that encodes which measurements are informative for which
+hypotheses, used downstream to guide the acquisition process. Typically, this model is learned
+from large labeled datasets in which both features and ground-truth labels are known [23, 32, 30].
+This requirement is the fundamental bottleneck: labeled datasets are expensive to collect, highly
+domain-specific, and in multi-label settings, where multiple hypotheses may be simultaneously active,
+extraordinarily difficult to obtain at scale [13, 8]. This scarcity is sharpest in precisely the regimes
+Preprint.
+
+where AFA is most valuable: rare or newly-characterized diseases for which training data is limited
+or unavailable, and atypical patients whose classification requires many features rather than a few
+discriminative ones. Zero-shot AFA, operating with no task-specific labeled data, is therefore both
+necessary and largely unsolved; a recent survey of AFA methods [28] confirms that every existing
+approach requires labeled data, RL episodes, or a meta-training distribution.
+Large language models (LLMs) are a natural candidate to break this bottleneck. Trained on the
+entirety of the scientific and medical corpus, SOTA models have shown strong potential to generalize
+to unseen domains and labels [4, 39, 5, 20], precisely the regime where labeled data is unavailable.
+Crucially, SOTA proprietary models substantially outperform open alternatives in knowledge quality,
+calibration, and structured-output reliability [27, 1, 43], making them the natural knowledge source
+for zero-shot model construction. This promise, however, collides with two fundamental obstacles.
+First, AFA requires sequential optimization over an exponential space of future observations, a
+task at which LLMs are demonstrably poor. They pattern-match heuristically, preferring features
+that sound important over features that are discriminatively optimal, and fail to reason about the
+cascading, non-local implications of feature correlations in a graphical model [37, 17, 33]. Second,
+AFA planning requires a white-box model one can condition, marginalize, and optimize over, but
+LLMs are poorly calibrated as formal probabilistic objects [16, 42]. Combined with the label scarcity
+above, this leaves human expert interrogation as the de facto fallback in exactly the settings where
+automated AFA is most needed. As we also show empirically, even when the LLM is given its own
+extracted model in context and asked to plan over it, it fails significantly, following the results of
+recent benchmarks [12]. In this work we aim to bridge this gap, allowing for a principled route to
+zero-shot AFA grounded in LLM knowledge. Our path is through a strict separation of roles: the
+LLM populates a formal probabilistic model offline; a classical algorithm plans over it online. Under
+this separation, we extract from the LLM only quantities that are well-posed for it: the unary marginal
+(“under hypothesis H, does feature F deviate from baseline, and if so in which direction?”), and the
+pairwise relations (“under hypothesis H, to what extent do features F and G co-vary?”). These are
+exactly the sufficient statistics of an MRF.
+A central design choice in our work, and a departure from standard AFA pipelines, is to avoid ever
+explicitly representing the two class-conditional distributions p(x | H) and p(x | ¬H). While one
+could in principle elicit two MRFs, one asking “what defines a sample under H” and another asking
+“what defines a sample not under H,” and difference them post hoc, we argue this is the wrong
+primitive for two reasons. First, the structure of the world’s knowledge, particularly in medicine,
+is discriminative rather than generative: the literature on a disease tells us how an inflamed colon’s
+expression profile differs from a healthy colon’s, not the absolute distribution of either. Second,
+eliciting distributions in absolute terms forces the LLM to commit to questions with no useful answer.
+We therefore extract from the LLM only discriminative information: how a feature deviates and
+co-varies under one hypothesis relative to another. This creates an identification problem: a log-ratio
+does not determine the two class-conditionals, since any pair inducing it is equally consistent, so the
+acquisition criteria of classical AFA, which depend on the per-class distributions (e.g., conditional
+mutual information), cannot be computed from the ratio alone. We resolve this with a maximumentropy closure: the unique class-conditional pair consistent with the elicited log-ratio that introduces
+no information beyond it. This work addresses two settings: the classical binary classification,
+which is the common case in AFA literature, and the surprisingly understudied problem of top-k
+identification: selecting the k most supported hypotheses from a large candidate set, underlying many
+hallmark problems (e.g differential diagnosis). For binary classification, the standard criterion [23, 8]
+is not trivially applied due to the discrimination of elicited information. This identification problem is
+the core methodological obstacle for the binary case and we show that under the MaxEnt gauge we
+can resolve it. As an alternative that sidesteps the gauge, we compare it to a Wald-like accumulator.
+Extending to top-k, we introduce a novel policy inspired by the dueling-bandit framework. Although
+our problem is not a classical bandit setting, we draw inspiration from the dueling-bandit literature
+for reasons rooted in MRF tractability. MRFs are hard to track exactly and admit only approximate
+inference, so reasoning over a difference between two MRFs is structurally easier than reasoning over
+either one in isolation. Dueling also provides a clean notation for ordering. Concretely, we instantiate
+the framework as a preference score that orders any two entities given the current observations, paired
+with a pairwise allocation rule that decides which duel to advance next.
+Beyond the application, the framework enables a controlled measurement of the knowledge–planning
+gap in LLMs. We compare our algorithm, which uses the LLM-derived MRF for formal planning,
+
+2
+
+against an in-context LLM baseline given the same MRF and the same task. Knowledge is identical
+across both arms; only the planner differs. In this maximally generous setting, the formal algorithm
+reaches the same accuracy with much fewer observations, a gap attributable entirely to planning.
+The remainder of the paper is organized as follows: §2 reviews related works and positions ours.
+§1.1 formalizes the binary classification and top-k identification settings. §3 develops the solution:
+the MaxEnt closure [15] that resolves the gauge ambiguity in the binary case (§3.1), the allocation
+policy (§3.2–§3.3), and a novel priority-weighted allocation rule for top-k (§3.4). §4 evaluates the
+framework on a real IBD cohort, isolating the contribution of each component and quantifying the
+LLM knowledge–planning gap. §5 and §6 close with implications and open problems.
+1.1
+
+Problem Setup
+
+We study active feature acquisition in two settings: binary classification and top-k identification. In
+both settings, an entity v admits two latent states y ∈ {0, 1} (baseline and condition), each inducing
+a class-conditional distribution over M features x = (x1 , . . . , xM ), xj ∈ {−1, 0, +1}, modeled as
+an MRF with unary and pairwise potentials:
+ M
+
+X (v,y)
+X (v,y)
+1
+P (x | y) = (y) exp
+αj xj +
+ψjl xj xl .
+(1)
+Z
+j=1
+(j,l)∈E
+
+(v,y)
+
+(v,y)
+
+Here αj
+∈ R is the unary potential of feature j under state y for entity v, ψjl
+∈ R is the
+(y)
+pairwise potential coupling features j and l, and Z is the
+ normalizing partition function. An MRF
+]
+relies on the Markov property: for edge set E ⊆ [M
+⊥ xl | x\{j,l} whenever (j, l) ∈
+/ E.
+2 , xj ⊥
+The use of MRFs relies on two observations: (1) Unlike similar models, the graph is symmetric
+and undirected, matching the symmetric form of LLM elicitation. (2) Unlike general factor graphs,
+interactions are restricted to pairs.
+As described before, throughout the paper we address the case where the two class-conditionals
+in (1) are a conceptual model only, that is, we never have access to each separately. Instead, LLM
+elicitation yields the contrast between hypotheses: the deviation of feature j under y = 1 relative to
+y = 0, and their differential covariation. We formalize these as the parameters of the discriminative
+(v)
+(v,1)
+(v,0)
+(v)
+(v,1)
+(v,0)
+MRF, with unaries ∆αj = αj
+− αj
+and pairwise couplings ∆ψjl = ψjl − ψjl .
+Assuming equal priors, the discriminative score computes the log-ratio directly:
+Sv (x) =
+
+M
+X
+
+(v)
+
+∆αj xj +
+
+j=1
+
+X
+
+(v)
+
+∆ψjl xj xl .
+
+(2)
+
+(j,l)∈E
+
+The discriminative MRF parameterized by these contrasts—not the per-class MRFs of (1)—is the
+model on which we operate.
+The acquisition protocol follows: features are observed sequentially,that is, at round t the feature set
+is partitioned into observed xB (t) and unobserved xA(t) , with B (0) = ∅. The algorithm selects which
+feature to observe next, receives its value (deterministic), and updates. For binary classification, a
+single entity v is given and the task is to determine the true hypothesis using the fewest observations.
+For top-k identification, N entities {v1 , . . . , vN } are given, and the task is to identify the k entities
+for which y = 1 is most supported, again using the fewest observations.
+
+2
+
+Related Work
+
+Active feature acquisition. AFA originates in cost-sensitive classification [24, 31]: a classifier
+P (Y | xobs ) over partially observed instances is maintained, and each candidate feature is scored
+by an acquisition criterion, typically the expected reduction in posterior entropy or the conditional
+mutual information (CMI) with the target. Evaluating any such criterion requires a predictive model
+P (xj | xobs ), either learned explicitly or approximated through the classifier. AFA methods vary
+along two axes. Myopicity: greedy policies select the feature with highest immediate expected utility,
+while non-myopic policies account for the downstream value of future observations. Model type:
+generative methods learn p(xi | xobs ) and plug it into the criterion, while discriminative methods
+3
+
+parameterize the acquisition value directly. Myopic generative methods, such as EDDI [23] and
+ACFlow [21], estimate the conditional density and greedily maximize CMI. Myopic discriminative
+methods [8, 10, 11] estimate CMI directly over arbitrary observed subsets, recovering the Bayesoptimal greedy policy at convergence. Non-myopic methods target the value of future observations
+via RL [32, 41] or oracle lookahead (AACO [35]). Meta-learning approaches [19] amortize policies
+across task distributions. Our framework departs along three dimensions. First, every existing
+AFA method requires labeled data, RL episodes, or a meta-training distribution; ours requires none,
+parameterizing the MRF entirely from LLM queries. Second, existing models are opaque with
+respect to unobserved features, precluding deterministic bounding. Third, existing methods are binary,
+whereas we additionally rank N entities sharing the same feature space.
+Sequential decision making. The formal study of sequential decision making originates with Wald’s
+sequential probability ratio test (SPRT) [38], developed for industrial quality control under costly
+inspection: at each round, the running log-likelihood ratio between two hypotheses is computed from
+the observations seen so far, and the test continues until the ratio crosses a decision threshold. SPRT
+is an optimal stopping rule over a fixed observation stream; it decides only when to halt and which
+hypothesis to accept, with no notion of which observation to take next. Chernoff [6] introduced
+the active sequential version with a heuristic randomized policy: the next observation is chosen to
+maximize the KL divergence between the two hypothesis distributions, the procedure AFA inherits.
+We adopt the Wald–Chernoff combination into our framework.
+LLMs and planning. A growing body of work shows that LLMs struggle with sequential planning
+even given complete problem specifications. [37] found GPT-4 achieves below 35% on Blocksworld
+with full PDDL in context; PlanBench [36] extended this across domains. [17] synthesized these
+into the LLM-Modulo framework, arguing LLMs are best viewed as approximate knowledge sources
+paired with external verifiers. Thought of Search [18] showed that extracting search components
+symbolically and performing search without LLM involvement achieves 100% accuracy where LLM
+planners fail. In scientific domains, [12] found LLM-based Bayesian optimization agents insensitive
+to experimental feedback, and hybrid approaches (LLAMBO [22], BORA [7]) confirm that LLMs
+are most effective contributing knowledge to formal optimization frameworks.
+LLMs for probabilistic model construction. Recent work uses LLMs to parameterize graphical
+models: [26] showed LLM-derived CPTs for Bayesian networks outperform uninformative baselines
+in low-data regimes, and [9] proposed generating formal probabilistic programs from LLMs for
+standard Bayesian inference. We share the principle of LLM-populated formal models but target
+active sequential acquisition on MRFs rather than static inference on Bayesian networks.
+
+3
+
+The Zero-Shot AFA Framework
+
+The discriminative scaffold of §1.1 reduces both settings to the same per-step primitive: score
+candidate features, select one, observe its value, update the diff-MRF state (App. A.1), recompute
+the running answer for the decision target. The two settings differ in what that answer is: binary
+classification asks for the sign of one discriminative score Sv , and top-k asks for a partial ordering
+over N entities, intuitively, the entities for which the positive-label hypothesis dominates the negative
+through the log-odds of the discriminative MRF. Because top-k is an ordering problem, the natural
+primitive is the duel: a pairwise comparison Dab = Sa − Sb , itself a discriminative MRF on the
+shared graph. While each duel inherits the structure of the binary case, the top-k setting have decisive
+advantage: while in the binary setting we have a single Sv and no per-class densities, so gauge
+ambiguity is real and must be resolved (§3.1), in top-k each duel is built from two separately elicited
+per-entity MRFs, so pa and pb are directly available. Hence, classical AFA tools apply per duel
+without a closure step. §3.1 gives the landscape, mode by mode; §3.2–§3.3 develop the shared
+machinery; §3.4 handles the top-k-specific allocation problem.
+Conditioning a unary/ternary MRF on observed features yields again a unary/ternary MRF on the
+remaining unobserved set. We maintain this conditioned diff-MRF incrementally, one feature per
+round, at a cost local to the observed feature’s neighborhood (App. A.1). This conditioning is exact,
+what is not exact is selection: scoring a candidate feature in a non-myopic setup requires marginals
+of the conditioned MRF, which are intractable, so we approximate them by mean-field and select
+greedily. The framework is therefore exact in its state update and myopic only in its acquisition
+criterion, isolating the single approximation that everything downstream inherits.
+4
+
+Table 1: Setup: Both = binary and top-k. Track (scores): D decides by sign EQ [Dab ], F by
+EQ [sign Dab ]. Inference: observed-only methods sum the energy of observed features and decide by
+its sign: gauge-invariant (the score depends only on the difference potentials), no closure needed,
+but blind to unobserved features; this is the deterministic baseline. Mean-field methods integrate
+over unobserved features through the per-class predictives P (xj | xobs , E=e), which require p0 , p1
+individually: elicited directly in top-k, and in binary supplied by the MaxEnt closure (§3.1). The
+closure is what makes the mean-field methods available in binary; the gauge-free wald route requires
+no closure, and §4.1 compares the two.
+
+3.1
+
+Method
+
+Setup
+
+Target
+
+Inference
+
+Construction
+MaxEnt closure
+
+Binary
+
+–
+
+supplies p0 , p1
+
+Preference score
+wald (Λ)
+linearity
+two_elbo
+kl sign-vote
+stack-A saddle
+
+Both
+Top-k
+Binary
+Top-k
+Both
+
+mean
+mean
+mean
+sign
+sign
+
+observed-only
+mean-field
+mean-field
+observed-only
+mean-field
+
+Selection gain
+CMI
+F -target (novel)
+Wald-magnitude (ablation)
+
+Both
+Both
+Top-k
+
+–
+–
+–
+
+mean-field
+mean-field
+observed-only
+
+Solution Landscape
+
+Binary case: gauge ambiguity and the MaxEnt anchor. The LLM provides the diff-MRF Sv ,
+which fixes log(p1 /p0 ) = Sv but leaves the gauge free: any positive g(x) induces an equivalent
+pair (p0 g, p1 g) with the same ratio, so any criterion in §3.2–§3.3 that reads a class-conditional is
+undefined, in particular the per-class predictive p(xj | xobs , E=e) scored by the information-theoretic
+gain. This admits two routes to the binary decision, which we evaluate against each other (§4.1).
+Gauge-free: the Wald accumulator (§3.2) sums the closed energy of observed features, a quantity
+depending only on the difference potentials and hence invariant to the gauge. It needs no closure and
+is exact at full observation, but ignores unobserved features. Gauge-restoring: the classical AFA
+criteria of §3.2–§3.3 read a class-conditional, which we resolve under the MaxEnt principle [14]:
+among all (p0 , p1 ) satisfying log(p1 /p0 ) = Sv , the MaxEnt closure (maximizing
+ H(p0 ) + H(p1 )
+subject to the ratio constraint, App. C.1) yields pe (x) ∝ exp (−1)e−1 Sv (x)/2 , e ∈ {0, 1}. Both
+class-conditionals are MRFs on the graph of Sv with halved, sign-flipped potentials. MaxEnt is a
+principled default, not a ground truth: if the true elicitation gauge is known and asymmetric (e.g.,
+uniform p0 , sparse p1 ), the explicit gauge wins. The top-k setting presents a natural way to test
+the gauge directly: a duel Dab = Sa − Sb is a difference of two diff-MRFs whose components
+Sa , Sb are individually known, so we can reconstruct the two sides from the difference alone and
+compare against holding them directly. As App. E.5 presents on real phenotype pairs: the two give
+different scalar scores at intermediate budgets, coincide at full observation, but most importantly- the
+gauge-reconstructed decision is no worse throughout.
+The top-k problem is usually harder than binary classification: rather than resolving the sign of a
+single discriminative score, we must recover a ranking among N entities under a shared budget, with
+ranking as the central object. The ranking is built from pairwise tests: Each pair (a, b) asks the binary
+question “is a ≻ b?”, the same question the binary case answers for a single entity, so the preference
+scores of §3.2 lift directly to per-pair scalars Vab . While the natural framework for such mechanism
+is the dueling bandits [40, 3], it is important to note we are working under the expert setting where all
+arms are observed at each turn. We aggregate pairwise outcomes via Copeland scoring: each entity v
+is scored by its number of wins C(v) = |{u : v ≻ u}|, and the top-k entities by C(v) are returned.
+Crucially, Dab is supported only on the features where a and b disagree which is typically a small
+subset, observations contribute to a pair’s resolution only when they fall in supp(Dab ).
+5
+
+3.2
+
+Preference Scores
+
+The acquisition process needs two criteria: a decision target (declaring the winner between two
+hypotheses) and a selection criterion (scoring which feature to acquire next). For both we maintain
+a dueling score Fab (xobs ) with the rule Fab > 0 ⇒ a ≻ b. The criteria below sit in the sequential
+Wald–Chernoff lineage §2 and differ in how they treat features not yet observed. The three lineage
+criteria apply to both settings, only the computation differs: the top-k case has direct access to
+per-entity MRFs pa , pb and computes mixture moments via per-entity mean-field marginals (§A.1),
+while the binary case uses the half-potential MRFs reconstructed via MaxEnt (§3.1) as pa , pb .
+(1) Wald: Fab = Λab . The classical Wald log-ratio reads only the closed energy of observed features,
+maintained incrementally by the conditioning update rule (§A.1). Unobserved features contribute
+nothing to the running score. This is the deterministic baseline: no inference, no variational bias,
+exact at full observation.
+The natural extension that exploits unobserved features marginalizes the discriminative score under
+the agnostic mixture Q := 12 (pa + pb ), the equal-posterior belief between the two hypotheses.
+(2) Chernoff–Wald via mixture KL: This is exactly Chernoff’s 
+expected-information-gain criterion
+under uniform prior: EQ [Dab ] = 12 KL(pa ∥ pb ) − KL(pb ∥ pa ) ; conditioning on xobs specializes
+it to the partial-observation state (App. B.1):
+
+
+ (1)
+
+(1)
+Fab (xobs ) := EQ Dab | xobs ,
+Decision: a ≻ b ⇐⇒ sign Fab (xobs ) .
+(3)
+(3) Dueling-bandit sign-vote: F (1) inherits the magnitude scale of the LLM-elicited parameters, so
+a few outlier couplings can dominate the score. We therefore also evaluate the sign-vote variant from
+the dueling-bandit literature, stack-A (App. B.1):
+
+
+(2)
+Fab (xobs ) := EQ sign(Dab ) | xobs ∈ [−1, +1],
+(4)
+which discards magnitude information by construction: each configuration contributes a single sign
+vote rather than its full log-ratio, so the score is bounded and robust to magnitude outliers. By
+Jensen’s inequality on the sign function, sign(EQ [Dab ]) ̸= EQ [sign(Dab )] in general, so the two
+tracks can rank the same data differently. We treat the choice as empirical based and report both in
+§4. A fourth score, the kl sign-vote (top-k only, App. D.2), replaces the mixture expectation with a
+per-feature KL sign tally; we include it in the top-k comparison for completeness. We compute F (1)
+from mean-field marginals. Mean-field is not an alternative to the ELBO but the fixed-point iteration
+that maximizes it (App. A.1); both estimators below share the same per-entity solve. In top-k, the
+instance linearity evaluates EQ [Dab ] directly from the per-entity marginals. In the binary case,
+the instance two_elbo estimates the same expected score as a difference of the two half-potential
+ELBOs, L1 − L0 , obtained as a byproduct of the CMI solve. The latter is a magnitude-calibrated
+readout at intermediate budgets, not a separate decision rule: at full observation it agrees in sign with
+wald. The contraction condition βL2X < 1 (App. A.1) is checkable from the elicited parameters
+before any acquisition. When it holds, mean-field converges to a unique fixed point; when it fails,
+as on most IBD pairs (βL2X ∈ [6, 20]), the marginals are biased and the mean-field scores degrade,
+which is one reason we retain the gauge-free Wald route alongside them.
+3.3
+
+Discriminative Feature Gain
+
+The discriminative gain quantifies the expected improvement in the pairwise separation between
+two hypotheses upon acquiring feature f . In the binary case the hypotheses are “case” (y = 1) and
+“control” (y = 0); in the top-k case we consider the duel between two entities y ∈ {a, b}.
+The classical assessment for this task is conditional mutual information (CMI), an informationtheoretic feature selection criterion established in the AFA literature [23, 8]:
+
+
+f ∗ = arg max I(y; xf | xobs ) = H(y | xobs ) − Exf |xobs H(y | xobs , xf ) ,
+(5)
+f
+
+where the posterior P (y | xobs ) is obtained from per-entity mean-field in the top-k case and from the
+MaxEnt half-potentials (§3.1) in the binary case. CMI is gauge-equivariant: the MaxEnt anchor is
+what makes it computable in the binary setting, where direct access to p0 , p1 is unavailable.
+6
+
+Beyond myopic CMI, we also evaluate whether matching the gain to the active F -target (§3.2)
+improves selection:
+h
+i
+(i)
+(i)
+f ∗ = arg max Exf |xobs Fab (xobs ∪ {xf }) − Fab (xobs ) .
+(6)
+f
+
+For ablation we also evaluate Wald magnitude, f ∗ = arg maxf |δfeff | , which requires no inference
+and selects the feature with the largest immediate contribution to the running constant.
+3.4
+
+Priority-Weighted Allocation for Top-k (Ours)
+
+With the per-pair preference score fixed (§3.2), the remaining top-k question is allocation: which duel
+to advance next under a shared budget. Our rule weights each pair’s feature gain by its influence on
+the top-k frontier, so the budget is spent on the comparisons that can still move the ranking. Table 2
+summarizes it against the baselines.
+Table 2: Top-k (only). Each row is an allocation rule: ours is the proposed rule and the others serve
+as baselines. The two clustered rules, ours and Cluster-LUCB, restrict attention to a registry R
+of candidate pairs formed by clustering entities in MRF-parameter space (§3.4), and prune R with
+two filters: cluster elimination discards whole clusters provably outside the top-k before acquisition
+begins, and bracket resolution drops a pair the moment its winner is certain. random and LUCB use
+neither clustering nor filters.
+Allocation rule
+
+Filters
+
+Mechanism
+
+ours (priority, §3.4)
+random
+LUCB
+Cluster-LUCB
+
+cluster elim. + bracket
+none
+none
+cluster elim. + bracket
+
+feature gain summed over R, weighted by boundary proximity
+uniform feature choice
+pick the single most-contested boundary pair
+LUCB over per-cluster champions
+
+
+Evaluating V (i) across all N2 pairs per round is intractable for large N , and two structural facts make
+it unnecessary. First, the dueling score is Lipschitz-continuous in MRF parameter space, so entities
+whose parameters lie close together induce distributions that respond similarly to any new observation;
+evaluating them independently is redundant. Second, the clustering uses the elicited base potentials,
+set offline; conditioning updates only the effective unaries of an observed feature’s neighbors, a cheap
+local update, so the cluster structure is refreshed incrementally rather than recomputed from scratch.
+We therefore cluster entities by ℓ1 distance in MRF parameter space (App. D.4) and reduce the active
+pair set to one pair per cluster. Within each cluster, the ordering is induced by the pairwise duel
+outcomes accumulated so far, and rk+ , rk− are the max- and min-entities of cluster k at the current
+round, reshuffled as newly observed features tighten the variational bounds. The active pair registry
+R = {(rk+ , rk− )}K
+(7)
+k=1
+
+N
+reduces
+the pair count from 2 to K ≪ N . Candidate features are correspondingly restricted to
+S
+(a,b)∈R supp(Dab ), since features outside this union have zero gain by construction.
+To select the next feature, the algorithm evaluates a globally aggregated criterion over the registry:
+X
+f ∗ = arg max
+gab (f )
+·
+wab
+(8)
+|{z}
+| {z }
+f
+(a,b)∈R discriminative gain
+
+pair influence
+
+The discriminative gain gab (f ) (§3.3) quantifies the expected improvement in the pairwise separation
+between entities a and b upon acquiring f . The pair influence wab weights the gain by the rankinglevel importance of the pair: with R already reduced by clustering and pre-filtering, the remaining
+pairs are still not equally important. A pair whose resolution would not change the top-k frontier need
+not be aggressively resolved. We use boundary-distance variant and bracket-margin signals directly:
+1
+1
+impl
+wab
+=
+·
+,
+(9)
+1 + dbdry (a, b) 1 + 0.1 |Vab |
+where dbdry (a, b) is the smaller of the two entities’ rank distances to the top-k frontier. This deprioritizes pairs far from the boundary or already widely separated. Vab - pair score (§3.1). Pairs
+whose ordering is already resolved with certainty are excluded from the summation in any variant,
+since their resolution cannot perturb the ranking (App. E.7).
+7
+
+4
+
+Evaluations
+
+We validate the framework on a real-world clinical task: an IBD cohort of 167 colon biopsies drawn
+from an ongoing clinical trial, each carrying 216 gene-expression measurements (encoded ternary as
+in App. E.2) and 25 multi-label clinical phenotypes (GI symptoms, disease activity scores, biomarkers,
+and extra-intestinal manifestations). Phenotype labels are evidence-based, assigned by expert clinical
+adjudication, and serve as our held-out clinical ground truth. The MRF parameters are elicited in a
+separate effort, blind to this cohort and its labels, so the model guiding acquisition never sees the
+data on which it is evaluated. As detailed below, we place special focus on a subset of 47 chaotic
+cases: patients who genuinely require many features to classify correctly, in an order that is hard to
+predict in advance. Alongside this evidence ground truth, each evaluation also scores against the
+full-observation label (the likelihood target defined below): the decision the model itself reaches
+once all features are observed, regardless of the clinical diagnosis. This complementary target serves
+as an ablation isolating acquisition quality from elicitation fidelity, and we report full-observation
+performance against the evidence labels as well, which marks the elicitation ceiling.
+The evaluation isolates the contribution of each component and quantifies the gap between what the
+LLM knows and what it can plan with. The subsections order follow: (i) The MaxEnt closure supplies
+the per-class predictives the mean-field scores require but the diff-MRF alone cannot, and we verify it
+against the true gauge: the two differ in scalar score at intermediate budgets yet agree on the decision
+throughout, confirming the closure is a principled default rather than a ground-truth assumption
+(App. E.5). (ii) On clinical labels, the resulting planner outperforms the LLM baselines given the
+same elicited information (§4.1). (iii) The dueling sign primitive recovers the full-observation winner
+as evidence accumulates under random ordering, removing the effect of the acquisition strategy
+(§4.2.1), and on the chaotic stratum the inference-anchored mean-field score resolves the ranking
+notably better (§4.2.1, App. E.9). (iv) Priority-weighted allocation improves top-k ranking accuracy
+over every non-priority rule (random, greedy, clustered) (§4.2.2, App. E.8).
+The evaluation proceeds in two tasks. We begin with binary classification and then turn to top-k
+identification, organized as a single thread that tightens one axis at a time: we first fix a random
+acquisition order to isolate score quality, showing that the preference scores resolve each pairwise
+duel in the right direction (with the gap widening on the order-sensitive “chaotic” patients), then we
+vary the acquisition order, showing that informed allocation resolves those same duels faster. We then
+escalate from the per-pair primitive to the end task, evaluating the aggregated top-5 ranking against
+both ground truths and the LLM baselines, and close by quantifying how much of the pair set the
+pruning machinery eliminates for free.
+4.1
+
+Binary Classification
+
+This experiment is the head-to-head between the two binary routes of §3.1: the gauge-free wald
+accumulator against the MaxEnt-enabled mean-field scores two_elbo and stack-A. We evaluate
+Mode 1 binary classification (sick/healthy on disease pairs) against the two benchmarks described
+above, clinical and full-observation likelihood, the latter calculated by conditioning the MRF on
+all observations, Sd∗ = α(d)⊤ x∗ + 12 x∗⊤ W (d) x∗ . Table 3 reports three planning methods over t ∈
+{10, 50, 100, 150, 216}, wald (App. B.1), two_elbo (the half-potential ELBO difference L1 − L0 ,
+App. B.1), and stack-A (App. B.1), alongside two LLM baselines given the same elicited information:
+MRF-LLM, which receives the elicited MRF parameters as context and is asked to classify directly, and
+RAG-LLM, which instead receives retrieved PubMed passages alongside its prior knowledge (prompts
+in App. E.10).
+Against the likelihood target all three planning methods reach 1.000 at full observation and are already
+strong earlier: wald climbs from 0.53 at t=10 to 0.89 at t=150, while two_elbo and stack-A open
+near 0.70 and reach 0.84–0.86. The lift from informed acquisition order over random is largest early
+and decays as the budget fills (wald, CMI gain: +30.6pp at t=10, +10.1pp at t=150). Against
+clinical labels every method converges to a common ceiling, with wald leading at intermediate
+budgets (0.69–0.73) but at a flat-to-negative lift over random. The LLM baselines trail the planner at
+every intermediate checkpoint (RAG-LLM 0.34–0.46, MRF-LLM 0.24–0.38).
+The results decompose two errors. Elicitation error: at full observation the LLM baselines reach
+only RAG-LLM 0.800 and MRF-LLM 0.700, short of the planner’s 1.000 against the likelihood label.
+Biological error: the 0.629 clinical ceiling reflects ∼37% irreducible mismatch between the elicited
+8
+
+MRF and clinical diagnoses, which no acquisition order can close. The planner saturates both; further
+gains require better elicitation, not better planning.
+Table 3: Binary Classification: Each planning cell reports accuracy under random acquisition
+ordering, followed in parentheses by the gain from F-target-driven ordering (Eq. 6) and from CMIdriven ordering (Eq. 5), both in percentage points over the random-ordering accuracy. Here random
+denotes a uniformly random acquisition order, averaged over seeds. Against the clinical labels (bold),
+wald leads from the smallest budgets because it accumulates only observed evidence and assumes no
+structure over unobserved features, whereas the integrating scores carry a data-independent inductive
+bias: by the maximum-entropy principle a smaller, less-coupled difference-MRF has higher entropy,
+and entropy-driven non-myopic criteria favor it before any observation, so already at t=0 two_elbo
+and stack-A lean on the elicited model’s structure rather than the clinical signal.
+t=10
+
+Method
+
+t=50
+
+t=100
+
+t=150
+
+t=216
+
+Likelihood
+wald
+0.53 (+29.7 / +30.6) 0.71 (+21.0 / +22.5) 0.81 (+14.9 / +15.8) 0.89 (+8.9 / +10.1)
+two_elbo 0.69 (+9.6 / +9.7) 0.74 (+15.5 / +16.1) 0.79 (+15.3 / +16.0) 0.86 (+10.6 / +11.5)
+stack-A
+0.70 (+5.4 / +4.6) 0.73 (+13.6 / +12.7) 0.77 (+14.6 / +15.2) 0.84 (+11.6 / +11.8)
+
+1.00
+1.00
+1.00
+
+Clinical
+wald
+two_elbo
+stack-A
+
+0.70 (-0.5 / -0.5)
+0.50 (+4.1 / +4.6)
+0.46 (+3.4 / +3.9)
+
+0.73 (-6.8 / -7.1)
+0.53 (+6.1 / +5.2)
+0.48 (+8.9 / +7.1)
+
+0.71 (-4.9 / -5.0)
+0.58 (+4.6 / +4.3)
+0.53 (+8.3 / +8.1)
+
+0.69 (-3.2 / -3.8)
+0.64 (+0.0 / +0.5)
+0.60 (+3.0 / +2.3)
+
+0.65
+0.65
+0.65
+
+LLM
+RAG-LLM
+MRF-LLM
+
+0.34
+0.24
+
+0.42
+0.34
+
+0.46
+0.38
+
+0.44
+0.28
+
+0.80
+0.70
+
+4.2
+
+Top-k Identification
+
+We evaluate top-k in three steps: we first isolate preference-score quality from the acquisition
+strategy by predicting each pair “direction” under random ordering (§4.2.1), then introduce informed
+allocation and measure its effect on the same per-pair sign decision (§4.2.2), and finally escalate to
+the aggregated top-5 ranking (§4.2.3).
+4.2.1
+
+Sign convergence at random ordering
+
+All four scores from §3.2 (defined in App. D.2) run on identical observation streams: 167 patients ×
+3 random feature orderings × 300 phenotype pairs, with each (patient, seed)’s permutation shared
+across methods. Each method’s pairwise score is reduced to its sign (a “vote” for a or b), and we report
+the fraction of (pair, patient, seed) tuples where that sign matches the full-observation MRF-likelihood
+winner. The two inference-based scores linearity and stack-A produce indistinguishable sign
+predictions across the trajectory (Table 4); we therefore proceed with linearity as the default
+preference score for the allocation experiments. Mean-field is non-contractive on most IBD pairs
+(App. E.4), so its prediction over unobserved features is biased which hurts the variational tracks.
+However, in §4.2.1, we show that in difficult, unpredictable scenarios, wald’s running sum never
+stabilizes, and the biased-but-anchored MF prediction outperforms it decisively. For kl we show
+in App. E.6 why full observation is not reached. KL’s 0.945 ceiling at t = M (Table 4) is not a
+convergence issue but a structural property of the per-feature sign-vote formula on ternary data; see
+App. E.6.
+Table 4: Sign accuracy — ranking using the dueling approach resolves order.
+Method
+
+t=10
+
+t=50
+
+t=100
+
+t=150
+
+t=216
+
+linearity
+wald
+kl
+stack-A
+
+0.666
+0.584
+0.583
+0.666
+
+0.683
+0.700
+0.693
+0.683
+
+0.708
+0.787
+0.774
+0.708
+
+0.765
+0.859
+0.836
+0.765
+
+1.000
+1.000
+0.945
+1.000
+
+9
+
+Chaotic patients: where the framework earns its keep. We call a patient chaotic if their decision
+trajectories sign-flip frequently in early observations (top-quartile mean sign-flip count) and their final
+magnitude |V (M ) | is above median; the second condition rules out genuinely ambiguous patients
+(small final signal regardless of order) from chaotic-but-decisive ones (large final signal, unstable
+trajectory).
+Two of the four preference scores, wald and linearity, occupy the same EQ [D]-track but treat the
+unobserved subgraph differently: wald ignores it entirely (deterministic running sum of observed
+evidence); linearity integrates over it via per-entity mean-field. Table 5 shows how their relative
+accuracy evolves over a fine early grid t ∈ {2, 5, 10, 20, 25, 30, 50} for the chaotic case.
+Across all patients, linearity dominates wald by 12.1pp at t=2, narrowing to −0.7pp at t=50
+(Table 5). Beyond this checkpoint wald progressively widens its lead through full observation. The
+two methods are not flat winners but complementary: linearity’s mean-field prediction is anchored
+to MRF structure and barely changes with observation count, while wald’s evidence accumulator is
+noisy at low t and converges as the budget fills.
+Table 5: Sign-accuracy gap acc(linearity) − acc(wald) in percentage points upon chaotic cases
+t
+
+All patients
+
+Chaotic (n=47)
+
+Non-chaotic (n=153)
+
+2
+5
+10
+20
+25
+30
+50
+
++12.1
++10.4
++8.4
++5.2
++4.1
++2.9
+−0.7
+
++34.1
++31.0
++27.6
++23.1
++21.6
++19.3
++15.1
+
++5.4
++4.1
++2.5
+−0.3
+−1.3
+−2.1
+−5.5
+
+On chaotic patients the gap is dramatically larger: the unobserved subgraph shrinks slowly enough
+that the mean-field structural prediction stabilizes early, while wald’s running sum wanders precisely
+because observed evidence is locally inconsistent with the latent label. Chaotic patients are the regime
+where inference-based scoring is decisive, exactly where it is most needed.
+4.2.2
+
+Allocation: priority weighting
+
+With the preference score fixed at linearity (§4.2.1), we compare allocation rules, pairing the
+priority rule ours (Eq. 8) with two gain functions, wald-mag (Eq. 3.3) and cmi (Eq. 5). As shown
+in Table 15, the priority-weighted ours rule lifts sign accuracy at t=150 to 0.864 with wald-mag
+gain, 4.7pp over greedy and 10.5pp over random. The lift holds across both gains, isolating the
+allocation rule rather than any specific gain as the source. The F-target gain (Eq. 6) under clustered
+allocation is substantially more expensive to evaluate than wald-mag or cmi, and running it across
+the full cohort at the bandit-grid scale was infeasible under our compute budget; it was validated on
+the 10-patient pilot reported next (§4.2.3).
+Table 6: Sign accuracy at t=150 on the bandit grid (50 patients × 300 pairs). ours (§3.4) lifts
+accuracy by 4–5pp over the strongest non-priority allocation, robustly across both gain functions
+tested at this scale. The F-target gain was validated on a 10-patient pilot due to time constraints.
+Allocation
+
+wald-mag gain
+
+cmi gain
+
+0.759
+0.817
+0.817
+0.864
+
+0.759
+0.787
+0.787
+0.833
+
+random
+greedy
+clustered
+ours (priority-weighted)
+
+4.2.3
+
+Decision quality
+
+We now turn from the per-pair sign primitive to the end task, the aggregated top-5 ranking. Table 7
+reports P@5 against both ground truths; the LLM baselines (RAG-LLM, MRF-LLM) expose the elicitation
+10
+
+gap on the same elicited parameters. On clinical labels the planner saturates close to the irreducible
+0.552 ceiling, set by MRF–clinical mismatch, compressing its visible contribution. This is a 10patient pilot, too small to separate ours from random with confidence on every checkpoint, but the
+direction is consistent with the 50-patient sign-accuracy result of §4.2.2; closing this gap by scaling
+the runs to the full cohort is left for future work.
+Table 7: Top-5 ranking accuracy on Mode 2 via allocation policy. Each method row is a (gain,
+allocation) pair; ours is the priority-weighted rule of §3.4.
+Gain
+
+4.2.4
+
+Allocation
+
+t=10 t=50 t=100 t=150 t=216
+
+P@5 likelihood
+wald_mag ours
+0.460 0.472 0.560
+cmi
+ours
+0.480 0.492 0.536
+F-target clustered 0.460 0.544 0.580
+
+0.764
+0.644
+0.680
+
+1.000
+1.000
+1.000
+
+P@5 clinical
+wald_mag ours
+0.412 0.456 0.468
+cmi
+ours
+0.416 0.424 0.452
+F-target clustered 0.416 0.420 0.484
+
+0.528
+0.472
+0.476
+
+0.552
+0.552
+0.552
+
+P@5 LLM baselines
+MRF-LLM
+RAG-LLM
+
+0.232
+0.183
+
+0.264
+0.197
+
+0.187 0.203 0.233
+0.198 0.207 0.197
+
+Pruning
+
+The framework carries two registry-pruning mechanisms that reduce the active pair set before and
+during acquisition (App. E.7). Layer 0 certifies entire clusters as dominated before any feature is
+observed; on IBD its “blob plus outliers” parameter geometry yields zero eliminations across cluster
+counts C ∈ {5, 8, 10, 12, 15, 20} (Table 13), so it contributes nothing to the headline numbers and is
+retained as an opt-in component for problems whose separability condition holds. Layer 1 resolves
+an individual pair the moment its confidence bracket clears zero. Under random ordering it is nearly
+inactive (one-sided rate ≤ 4% at t=100 across methods), but under the priority ordering of §4.2.2 the
+high-|δ eff | features acquired first both move the running estimate most and shrink the unobserved
+residual fastest, so the same brackets clear on a far steeper trajectory and Layer 1 becomes a primary
+budget-saving mechanism (Table 14). About 16% of pairs never reach a one-sided bracket even under
+favourable ordering; these are structural ties (D(x∗ ) ≈ 0) that give a quantitative lower bound on the
+irreducible difficulty of the task.
+
+5
+
+Discussion
+
+To the best of our knowledge, we present the first framework for fully zero-shot active feature
+acquisition, scaling from binary classification to complex top-k identification without requiring
+any task-specific labeled data. This approach forces us to reconsider the role of large language
+models in sequential decision-making: by strictly delegating knowledge elicitation to the LLM
+while reserving sequential planning for formal algorithms via a MaxEnt closure, we establish a
+mathematically rigorous foundation. This separation of capabilities proved critical in our clinical IBD
+evaluation. For the top-k problem, our priority-weighted allocation policy successfully navigated the
+massive combinatorial acquisition space, significantly outperforming standard heuristic baselines.
+Moreover, the framework demonstrated robust adaptability to patient heterogeneity; by exploiting
+the regime crossover between predictive marginals and deterministic Wald scores, the dual-track
+system gracefully managed "chaotic" patients who defied standard biological expectations. Crucially,
+our empirical results demonstrate that the fundamental bottleneck in zero-shot AFA has shifted: our
+formal planner easily saturates the available biological signal, revealing that the true ceiling is now
+the fidelity of the LLM’s elicited knowledge. Future work must focus on refining these elicitation
+techniques to bridge the remaining gap between extracted knowledge and biological ground truth.
+11
+
+6
+
+Limitations
+
+Our framework’s reliance on zero-shot LLM elicitation inherently introduces both biological and
+statistical errors. LLMs may hallucinate or fail to capture the full mechanistic complexity of IBD
+transcriptomics, leading to systematically biased MRF parameters. These elicitation errors have
+downstream algorithmic consequences. In regimes with highly biased parameters, Mean-Field (MF)
+approximations frequently fail to converge (i.e., the contraction condition βLX < 1 is violated).
+When this occurs, methods relying on predictive marginals degrade. The current framework discretises
+observations into ternary {−1, 0, +1}, discarding magnitude information that is clinically critical.
+The choice is constrained by the elicitation channel: current LLMs return directional contrasts reliably
+but cannot be queried for calibrated continuous magnitudes, so an MRF on continuous observations
+would presently outrun what the knowledge source can populate.
+
+References
+[1] Anthropic.
+The Claude 3 model family:
+Opus, Sonnet, Haiku.
+Anthropic Technical Report, 2024.
+URL https://www-cdn.anthropic.com/
+de8ba9b01c9ab7cbabf5c33b80b7bbc618857627/Model_Card_Claude_3.pdf.
+[2] Carmen Argmann, Mayte Suárez-Fariñas, Ruiqi Hou, and Haritz Irizar. Biopsy expression
+profiling of an adult inflammatory bowel disease cohort. https://www.ncbi.nlm.nih.gov/
+geo/query/acc.cgi?acc=GSE193677, 2022. GEO Accession GSE193677.
+[3] Viktor Bengs, Róbert Busa-Fekete, Adil El Mesaoudi-Paul, and Eyke Hüllermeier. Preferencebased online learning with dueling bandits: A survey. Journal of Machine Learning Research,
+22(7):1–108, 2021. URL http://jmlr.org/papers/v22/18-546.html.
+[4] Tom B. Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared Kaplan, Prafulla
+Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, Sandhini
+Agarwal, Ariel Herbert-Voss, Gretchen Krueger, Tom Henighan, Rewon Child, Aditya
+Ramesh, Daniel M. Ziegler, Jeffrey Wu, Clemens Winter, Christopher Hesse, Mark Chen,
+Eric Sigler, Mateusz Litwin, Scott Gray, Benjamin Chess, Jack Clark, Christopher Berner,
+Sam McCandlish, Alec Radford, Ilya Sutskever, and Dario Amodei. Language models are few-shot learners. In Advances in Neural Information Processing Systems 33
+(NeurIPS 2020), 2020. URL https://proceedings.neurips.cc/paper/2020/hash/
+1457c0d6bfcb4967418bfb8ac142f64a-Abstract.html.
+[5] Sébastien Bubeck, Varun Chandrasekaran, Ronen Eldan, Johannes Gehrke, Eric Horvitz, Ece
+Kamar, Peter Lee, Yin Tat Lee, Yuanzhi Li, Scott Lundberg, Harsha Nori, Hamid Palangi,
+Marco Tulio Ribeiro, and Yi Zhang. Sparks of artificial general intelligence: Early experiments
+with GPT-4, 2023.
+[6] Herman Chernoff. Sequential design of experiments. The Annals of Mathematical Statistics, 30
+(3):755–770, 1959. doi: 10.1214/aoms/1177706205.
+[7] Abdoulatif Cissé, Xenophon Evangelopoulos, Vladimir V. Gusev, and Andrew I. Cooper.
+Language-based bayesian optimization research assistant (BORA). In Proceedings of the ThirtyFourth International Joint Conference on Artificial Intelligence, pages 4967–4975. International
+Joint Conferences on Artificial Intelligence Organization, 2025. doi: 10.24963/ijcai.2025/553.
+[8] Ian Connick Covert, Wei Qiu, Mingyu Lu, Nayoon Kim, Nathan J. White, and Su-In Lee.
+Learning to maximize mutual information for dynamic feature selection. In International
+Conference on Machine Learning (ICML 2023), volume 202 of Proceedings of Machine
+Learning Research, pages 6424–6447. PMLR, 2023. URL https://proceedings.mlr.
+press/v202/covert23a.html.
+[9] Justin Domke. Large language bayes, 2025.
+[10] Soham Gadgil, Ian Connick Covert, and Su-In Lee. Estimating conditional mutual information
+for dynamic feature selection. In The Twelfth International Conference on Learning Representations (ICLR 2024). OpenReview.net, 2024. URL https://openreview.net/forum?id=
+Oju2Qu9jvn.
+12
+
+[11] Aritra Ghosh and Andrew Lan. Difa: Differentiable feature acquisition. Proceedings of the AAAI
+Conference on Artificial Intelligence, 37(6):7705–7713, 2023. doi: 10.1609/aaai.v37i6.25934.
+[12] Rushil Gupta, Jason Hartford, and Bang Liu. LLMs for bayesian optimization in scientific
+domains: Are we there yet? In Findings of the Association for Computational Linguistics:
+EMNLP 2025, pages 15482–15510. Association for Computational Linguistics, 2025. doi:
+10.18653/v1/2025.findings-emnlp.838.
+[13] Jaromír Janisch, Tomáš Pevný, and Viliam Lisý. Classification with costly features using deep
+reinforcement learning. Proceedings of the AAAI Conference on Artificial Intelligence, 33(01):
+3959–3966, 2019. doi: 10.1609/aaai.v33i01.33013959.
+[14] E. T. Jaynes. Information theory and statistical mechanics. Phys. Rev., 106:620–630, May 1957.
+doi: 10.1103/PhysRev.106.620. URL https://link.aps.org/doi/10.1103/PhysRev.
+106.620.
+[15] Edwin T. Jaynes. Information theory and statistical mechanics. Physical Review, 106(4):
+620–630, 1957.
+[16] Saurav Kadavath, Tom Conerly, Amanda Askell, Tom Henighan, Dawn Drain, Ethan Perez,
+Nicholas Schiefer, Zac Hatfield-Dodds, Nova DasSarma, Eli Tran-Johnson, Scott Johnston,
+Sheer El-Showk, Andy Jones, Nelson Elhage, Tristan Hume, Anna Chen, Yuntao Bai, Sam
+Bowman, Stanislav Fort, Deep Ganguli, Danny Hernandez, Josh Jacobson, Jackson Kernion,
+Shauna Kravec, Liane Lovitt, Kamal Ndousse, Catherine Olsson, Sam Ringer, Dario Amodei,
+Tom Brown, Jack Clark, Nicholas Joseph, Ben Mann, Sam McCandlish, Chris Olah, and Jared
+Kaplan. Language models (mostly) know what they know, 2022. URL https://doi.org/10.
+48550/arXiv.2207.05221.
+[17] Subbarao Kambhampati, Karthik Valmeekam, Lin Guan, Mudit Verma, Kaya Stechly, Siddhant
+Bhambri, Lucas Paul Saldyt, and Anil B Murthy. Position: LLMs can’t plan, but can help
+planning in LLM-modulo frameworks. In Proceedings of the 41st International Conference on
+Machine Learning, volume 235 of Proceedings of Machine Learning Research, pages 22895–
+22907. PMLR, 2024. URL https://proceedings.mlr.press/v235/kambhampati24a.
+html.
+[18] Michael Katz, Harsha Kokel, Kavitha Srinivas, and Shirin Sohrabi. Thought of search: Planning
+with language models through the lens of efficiency. In The Thirty-eighth Annual Conference
+on Neural Information Processing Systems, 2024. URL https://openreview.net/forum?
+id=lNCsyA5uS1.
+[19] Yuta Kobayashi, Zilin Jing, Jiayu Yao, Hongseok Namkoong, and Shalmali Joshi. Learning-tomeasure: In-context active feature acquisition. arXiv preprint arXiv:2510.12624, 2025.
+[20] Takeshi Kojima, Shixiang Shane Gu, Machel Reid, Yutaka Matsuo, and Yusuke Iwasawa.
+Large language models are zero-shot reasoners. In Advances in Neural Information Processing
+Systems 35 (NeurIPS 2022), 2022. URL http://papers.nips.cc/paper_files/paper/
+2022/hash/8bb0d291acd4acf06ef112099c16f326-Abstract-Conference.html.
+[21] Yang Li and Junier Oliva. Active feature acquisition with generative surrogate models.
+In Proceedings of the 38th International Conference on Machine Learning, volume 139
+of Proceedings of Machine Learning Research, pages 6450–6459. PMLR, 2021. URL
+https://proceedings.mlr.press/v139/li21p.html.
+[22] Tennison Liu, Nicolás Astorga, Nabeel Seedat, and Mihaela van der Schaar. Large language
+models to enhance bayesian optimization. In The Twelfth International Conference on Learning
+Representations (ICLR 2024). OpenReview.net, 2024. URL https://openreview.net/
+forum?id=OOxotBmGol.
+[23] Chao Ma, Sebastian Tschiatschek, Konstantina Palla, José Miguel Hernández-Lobato, Sebastian
+Nowozin, and Cheng Zhang. EDDI: efficient dynamic discovery of high-value information with
+partial VAE. In Proceedings of the 36th International Conference on Machine Learning (ICML
+2019), volume 97 of Proceedings of Machine Learning Research, pages 4234–4243. PMLR,
+2019. URL http://proceedings.mlr.press/v97/ma19c.html.
+13
+
+[24] P. Melville, M. Saar-Tsechansky, F. Provost, and R. Mooney. Active feature-value acquisition
+for classifier induction. In Fourth IEEE International Conference on Data Mining (ICDM’04),
+pages 483–486. IEEE, 2004. doi: 10.1109/ICDM.2004.10075.
+[25] Joris M. Mooij and Hilbert J. Kappen. Sufficient conditions for convergence of the sum–
+product algorithm. IEEE Transactions on Information Theory, 53(12):4422–4437, 2007. doi:
+10.1109/TIT.2007.909166.
+[26] Aliakbar Nafar, Kristen Brent Venable, Zijun Cui, and Parisa Kordjamshidi. Extracting probabilistic knowledge from large language models for Bayesian network parameterization, 2025.
+[27] OpenAI. GPT-4 technical report, 2023.
+[28] Arman Rahbar, Linus Aronsson, and Morteza Haghir Chehreghani. A survey on active feature
+acquisition strategies. arXiv preprint arXiv:2502.11067, 2025.
+[29] Mark Rudelson and Roman Vershynin. Hanson-wright inequality and sub-gaussian concentration. Electronic Communications in Probability, 18, 2013. doi: 10.1214/ECP.v18-2865.
+[30] Maytal Saar-Tsechansky, Prem Melville, and Foster Provost. Active feature-value acquisition.
+Management Science, 55(4):664–684, 2009. doi: 10.1287/mnsc.1080.0952.
+[31] Valter Schütz, Han Wu, Reza Rezvan, Linus Aronsson, and Morteza Haghir Chehreghani.
+AFABench: A generic framework for benchmarking active feature acquisition, 2025. URL
+https://doi.org/10.48550/arXiv.2508.14734.
+[32] Hajin Shim, Sung Ju Hwang, and Eunho Yang. Joint active feature acquisition and classification
+with variable-size set encoding. In Advances in Neural Information Processing Systems, volume 31. Curran Associates, Inc., 2018. URL https://proceedings.neurips.cc/paper_
+files/paper/2018/file/e5841df2166dd424a57127423d276bbe-Paper.pdf.
+[33] Kaya Stechly, Karthik Valmeekam, and Subbarao Kambhampati. On the self-verification limitations of large language models on reasoning and planning tasks, 2024. URL https://doi.
+org/10.48550/arXiv.2402.08115. arXiv admin note: text overlap with arXiv:2310.12397.
+[34] Sekhar Tatikonda and Michael I. Jordan. Loopy belief propagation and gibbs measures. In UAI
+’02, Proceedings of the 18th Conference in Uncertainty in Artificial Intelligence, pages 493–500.
+Morgan Kaufmann, 2002.
+[35] Michael Valancius, Maxwell Lennon, and Junier Oliva. Acquisition conditioned oracle for
+nongreedy active feature acquisition. In Proceedings of the 41st International Conference on Machine Learning, volume 235 of Proceedings of Machine Learning Research, pages 48957–48975.
+PMLR, 2024. URL https://proceedings.mlr.press/v235/valancius24a.html.
+[36] Karthik Valmeekam, Matthew Marquez, Alberto Olmo, Sarath Sreedharan, and Subbarao
+Kambhampati. Planbench: An extensible benchmark for evaluating large language models on
+planning and reasoning about change. In Thirty-seventh Conference on Neural Information
+Processing Systems Datasets and Benchmarks Track, 2023. URL https://openreview.net/
+forum?id=YXogl4uQUO.
+[37] Karthik Valmeekam, Matthew Marquez, Sarath Sreedharan, and Subbarao Kambhampati. On
+the planning abilities of large language models – a critical investigation. In Thirty-seventh
+Conference on Neural Information Processing Systems, 2023. URL https://openreview.
+net/forum?id=X6dEqXIsEW.
+[38] Abraham Wald. Sequential tests of statistical hypotheses. The Annals of Mathematical Statistics,
+16(2):117–186, 1945. doi: 10.1214/aoms/1177731118.
+[39] Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten Bosma, Brian Ichter, Fei Xia,
+Ed H. Chi, Quoc V. Le, and Denny Zhou. Chain-of-thought prompting elicits reasoning in large language models. In Advances in Neural Information Processing Systems 35
+(NeurIPS 2022), 2022. URL http://papers.nips.cc/paper_files/paper/2022/hash/
+9d5609613524ecf4f15af0f7b31abca4-Abstract-Conference.html.
+14
+
+[40] Yisong Yue, Josef Broder, Robert Kleinberg, and Thorsten Joachims. The k-armed dueling
+bandits problem. Journal of Computer and System Sciences, 78(5):1538–1556, 2012. doi:
+10.1016/j.jcss.2011.12.028.
+[41] Sara Zannone, José Miguel Hernández-Lobato, Cheng Zhang, and Konstantina Palla. ODIN:
+Optimal discovery of high-value INformation using model-based deep reinforcement learning.
+In Real-world Sequential Decision Making Workshop at ICML, 2019.
+[42] Zihao Zhao, Eric Wallace, Shi Feng, Dan Klein, and Sameer Singh. Calibrate before use:
+Improving few-shot performance of language models. In Proceedings of the 38th International Conference on Machine Learning, volume 139 of Proceedings of Machine Learning
+Research, pages 12697–12706. PMLR, 2021. URL https://proceedings.mlr.press/
+v139/zhao21c.html.
+[43] Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan Zhuang, Zhanghao Wu, Yonghao Zhuang,
+Zi Lin, Zhuohan Li, Dacheng Li, Eric P. Xing, Hao Zhang, Joseph E. Gonzalez, and Ion Stoica.
+Judging LLM-as-a-judge with MT-bench and chatbot arena. In Thirty-seventh Conference
+on Neural Information Processing Systems Datasets and Benchmarks Track, 2023. URL
+https://openreview.net/forum?id=uccHPGDlao.
+
+15
+
+Appendix Outline
+The appendix is organized into five parts.
+App. A: Inference and diff-MRF machinery. The shared mean-field, ELBO, and clamped logpartition machinery that underlies both modes.
+App. B: Solution landscape derivations. Operational forms of the three preference scores and the
+saddle-point Gaussian approximation with explicit moment formulas.
+App. C: Mode 1 — the symmetric-gauge MaxEnt closure. Derivation of the half-potential
+closure, its three structural consequences, and application to the first CMI term. Includes a structural
+mapping that exposes Mode 1 as a Mode-2 instance with N = 2 virtual entities.
+App. D: Mode 2 — top-k machinery. Per-entity MF amortization via linearity, the KL sign-vote
+bracket, and the Lipschitz Layer-0 cluster reduction.
+App. E: Experimental protocol and supplementary results. LLM elicitation, ternary encoding,
+hyperparameters, sanity checks, and supplementary results supporting specific claims in §4 (MaxEnt
+vs. true-gauge, registry pruning, allocation grid, chaos diagnostic).
+Dependencies. App. A is self-contained and underlies everything else. Apps B, C, and D all build
+on App. A but are otherwise independent of each other. App. E is independent methodology and
+references the four preceding appendices for definitions.
+Table 8: Essential notation used in this paper.
+Symbol
+
+Meaning
+
+Core quantities
+X
+feature space (ternary {−1, 0, +1})
+E
+edge set of the MRF
+B (t) , A(t)
+observed and unobserved coordinates at round t
+x
+feature vector
+xobs , xA
+observed and unobserved sub-vectors
+MRF parameters
+αj
+unary potential on feature j
+ψjl
+pairwise potential on edge (j, l)
+α̃j
+effective unary (absorbed pairwise from observed neighbors)
+Z(xobs )
+clamped partition function
+Discriminative MRF
+(v)
+(v)
+∆αj , ∆ψjl
+per-entity log-ratio coefficients
+Sv (x)
+per-entity discriminative score
+Dab (x)
+pairwise score, Sa (x) − Sb (x)
+Distributions and inference
+p e , pv
+class-conditional (Mode 1) or per-entity (Mode 2) distributions
+Q
+mixture distribution, 12 (pa + pb )
+µj (s)
+mean-field marginal at site j
+F(xobs )
+evidence lower bound (ELBO)
+Preference scores and decision
+(1)
+Fab
+sign-magnitude preference score
+(2)
+Fab
+sign-vote preference score
+Λ(t)
+Wald accumulator at round t
+
+16
+
+A
+
+Inference and diff-MRF machinery
+
+The main paper (§3) reduces both modes to a per-step primitive: at round t, score candidate features,
+select one, observe its value, update the diff-MRF state, and recompute the decision quantity. This
+appendix specifies what the diff-MRF state is, how it is updated on each observation, and how the
+decision quantities are computed from it. The same machinery serves three downstream objects
+without modification: the half-potential MRFs of Mode 1 (§3.1), the per-entity MRFs of Mode 2
+(§3.4), and the inter-entity difference MRFs used in pair-level comparisons (App. D.1).
+A.1
+
+Mean-field approximation on pairwise MRFs
+
+Setup. Let x = (x1 , . . . , xM ) ∈ X M be a discrete random vector on a finite feature space X (e.g.,
+X = {−1, 0, +1} for the ternary representation of Eq. 1). A pairwise MRF on x has the form
+
+1
+P (x) =
+exp E(x) ,
+Z
+
+M
+X
+
+E(x) =
+
+αj xj +
+
+j=1
+
+X
+
+ψjl xj xl ,
+
+(10)
+
+(j,l)∈E
+
+with unary potentials αj ∈ {−1, 0, +1}, pairwise potentials ψjl ∈ {−1, 0, +1} on edge set E ⊆
+
+P
+[M ]
+x exp(E(x)). Since E comprises unordered pairs, the pairwise
+2 , and partition function Z =
+potentials are symmetric: ψjl = ψlj for all (j, l) ∈ E.
+Conditioning on partial observations. The index set [M ] partitions into observed coordinates
+B ⊆ [M ] with values xobs and unobserved coordinates A := [M ] \ B. Splitting the energy over
+{A, B} gives
+X
+X
+X
+E(xa , xobs ) =
+α j xj +
+ψjl xj xl +
+ψjl xj xobs
++ π(xobs ),
+(11)
+l
+j∈A
+
+(j,l)∈E
+j,l∈A
+
+j∈A, l∈B
+(j,l)∈E
+
+X
+
+X
+
+where the running constant
+π(xobs ) :=
+
+αj xobs
++
+j
+
+j∈B
+
+obs
+ψjl xobs
+j xl
+
+(12)
+
+j,l∈B
+(j,l)∈E
+
+collects all factors supported entirely in B. Since π(xobs ) does not depend on xa , it is absorbed into
+normalization, and the conditional distribution takes the form
+
+1
+P (xa | xobs ) =
+exp Ered (xa ; xobs ) ,
+(13)
+Z(xobs )
+with the reduced energy
+X
+X
+Ered (xa ; xobs ) =
+α̃j xj +
+ψjl xj xl ,
+(14)
+j∈A
+
+(j,l)∈E
+j,l∈A
+
+itself a pairwise MRF on xa , with effective unaries
+X
+α̃j = αj +
+ψjl xobs
+l ,
+
+j ∈ A,
+
+(15)
+
+l∈B
+(j,l)∈E
+
+and unchanged pairwise potentials ψ̃jl = ψjl for (j, l) ∈ E, j, l ∈ A. The clamped log-partition
+function is
+X
+
+log Z(xobs ) = log
+exp Ered (xa ; xobs ) .
+(16)
+xa ∈X |A|
+
+Incremental conditioning (UpdateMRF). Eq. (15) can be maintained incrementally as observations arrive, avoiding reconstruction of the reduced MRF from scratch. We write the procedure for a
+general diff-MRF score Sv with prior log-odds πv (Eq. 2):
+Sv (x) = πv +
+
+M
+X
+
+∆αj xj +
+
+j=1
+
+X
+
+∆ψjl xj xl .
+
+(j,l)∈E
+
+17
+
+(17)
+
+eff,(0)
+
+Initialize π (0) = πv and ∆αj
+= ∆αj for all j. Applying the batch decomposition above to the
+current observed set yields the invariant
+X
+X
+eff,(t)
+Sv (x) = π (t) +
+∆αj
+xj +
+∆ψjl xj xl .
+(18)
+j∈A
+
+(j,l)∈E
+j,l∈A
+
+When feature i ∈ A is observed with value s = xi at round t + 1, differencing (15) between rounds
+gives
+eff,(t)
+
+π (t+1) = π (t) + ∆αi
+eff,(t+1)
+∆αj
+eff,(t+1)
+
+∆αj
+
+=
+
+· s,
+
+eff,(t)
+∆αj
++ ∆ψij s,
+eff,(t)
+
+= ∆αj
+
+,
+
+j ∈ N (i) ∩ A(t+1) ,
+
+(19)
+
+j ∈ A(t+1) \ N (i).
+
+The first line closes the contribution of i (whose effective unary already absorbed all pairwise terms
+to previously observed neighbors by induction). The second line absorbs the cross-edge ∆ψij s into
+each still-unobserved neighbor’s effective unary, corresponding to one new summand in (15). After
+|B| = M observations the unobserved set is empty, both sums in (18) vanish, and π (M ) = Sv (x)
+exactly (App. E.4). Each update touches only |N (i) ∩ A(t+1) | effective unaries, so the per-round cost
+is bounded by the maximum graph degree.
+Mean-field family. Computing the clamped log-partition function (16) exactly requires summing
+over |X ||A| configurations of the unobserved coordinates, which is intractable for large |A|. We
+therefore approximate P (xa | xobs ) variationally. The mean-field approximation restricts the
+variational family Q to distributions over xa that factorize across the unobserved coordinates:
+Y
+q(xa ) =
+qj (xj ),
+qj ∈ ∆(X ),
+(20)
+j∈A
+
+with mean-field marginals µj (s) := qj (s), {µj }j∈A , comprising |A| · |X | variational parameters
+subject to |A| sum-to-one constraints. For each j ∈ A, write the first moment
+X
+mj := Eµj [Xj ] =
+s µj (s).
+(21)
+s∈X
+
+Because q factorizes, pairwise expectations decouple: Eq [Xj Xl ] = mj ml for (j, l) ∈ EAA , where
+EAA := {(j, l) ∈ E | j, l ∈ A}.
+For any q ∈ Q with full support, Jensen’s inequality gives
+
+
+log Z(xobs ) ≥ Eq Ered (xa ; xobs ) + H(q) =: F (q; xobs ),
+
+Evidence lower bound.
+
+(22)
+
+with slack
+log Z(xobs ) − F (q; xobs ) = KL q P (· | xobs )
+
+
+
+≥ 0,
+
+(23)
+
+with equality if and only if q = P (· | xobs ). Substituting the reduced energy and factorized form:
+X
+X
+XX
+F(q; xobs ) =
+α̃j mj +
+ψjl mj ml −
+µj (s) log µj (s).
+(24)
+j∈A
+
+j∈A s∈X
+
+(j,l)∈E
+j,l∈A
+
+P
+Stationarity of (24) in µj subject to s µj (s) = 1 yields
+ h
+i
+X
+µj (s) ∝ exp s α̃j +
+ψjl ml ,
+j ∈ A, s ∈ X .
+
+Coordinate-ascent updates.
+
+(25)
+
+l∈N (j)∩A
+
+Each update couples µj to its unobserved neighbors only through their first moments {ml }. We apply
+(25) in damped Jacobi form:
+
+(t+1)
+(t)
+µj
+= (1 − η) µj + η µrhs
+µ(t) ,
+(26)
+j
+with η = 0.5 as the default (App. E.3).
+18
+
+Q
+Convergence. A sufficient condition for contraction on the simplex product j∈A ∆(X ) [34, 25]
+is
+X
+β L2X < 1,
+β := max
+|ψjl |,
+LX := max |s|,
+(27)
+j∈A
+
+s∈X
+
+l∈N (j)∩A
+
+derived
+from |∂mj /∂ml | ≤ L2X |ψjl |, since the derivative of the moment map m(h) =
+P
+2
+sh
+s s e /Z(h) is Varµ(h) (X) ≤ LX . Under this condition, iteration converges geometrically
+to a unique fixed point from any initialization. When (27) fails—the high-coupling regime with
+βL2X ∈ [6, 20] (App. E.4)—multiple fixed points may exist and damping η < 1 is necessary for
+stability; run-level convergence diagnostics are reported in App. E.4. We declare convergence when
+(t+1)
+(t)
+maxj∈A, s∈X |µj
+(s) − µj (s)| < ϵ with ϵ = 10−4 , capped at Tmax = 200 iterations. Each
+iteration is O(|A| · |X | + |EAA | · |X |2 ).
+Warm-starting across rounds. Between consecutive observations, the reduced MRF changes by
+exactly one feature transitioning from unobserved to observed. The effective unaries α̃j change only
+for j ∈ N (i), where i is the newly observed feature (one new summand in Eq. 15). We initialize
+the new mean-field iteration from the converged marginals of the previous round, restricted to the
+still-unobserved coordinates. In practice this reduces the per-round cost from O(Tmax ) iterations to
+O(log(1/ϵ)) iterations after the first round, since the post-observation fixed point typically lies close
+to the pre-observation one on the unobserved subgraph.
+Summary. At each observation round t, the procedure yields: (i) the running constant π (t) , accumulating all fully-observed contributions to Sv ; (ii) the converged mean-field marginals {µj }j∈A ,
+approximating the single-site posteriors over unobserved coordinates; and (iii) the ELBO F (24),
+providing a tractable approximation to the clamped log-partition function (16). Together, π (t) and
+the approximate marginal expectations {mj }j∈A give an estimate of the expected diff-MRF score
+P
+P
+eff,(t)
+Eq [Sv (x) | xobs ] = π (t) + j∈A ∆αj
+mj + (j,l)∈EAA ∆ψjl mj ml , which is the quantity used
+for downstream scoring and feature selection. Specifically, the sign of this expectation under the
+(1)
+agnostic mixture Q = 12 (pa + pb ) defines the Chernoff–Wald preference score Fab (Eq. 3), the
+primary decision criterion of §3.2.
+
+B
+
+Solution Landscape derivations
+
+This appendix details the approximation of each preference score from §3.2, the resolution-filtering
+mechanism that prunes the active acquisition set, and the deterministic and probabilistic bounds that
+trigger filtering.
+B.1
+
+Approximating the preference scores
+
+This subsection provides the operational forms underlying each preference score of §3.2.
+Wald accumulator. The Wald score F (t) := π (t) is the running constant maintained by the
+conditioning rule (App. A.1), updated in O(deg(i)) per observation.
+Chernoff–Wald: sign(EQ [S]). The F (1) criterion (Eq. 3) requires per-entity mean-field marginals
+(a)
+(b)
+(App. A.1). Writing m̄j = 12 (mj + mj ) for the mixture first moments, the expected discriminative
+score decomposes as
+X
+X
+eff,(t)
+EQ [Dab | xobs ] = π (t) +
+∆αj
+m̄j +
+∆ψjl m̄j m̄l .
+(28)
+j∈A
+
+(j,l)∈EAA
+
+The per-entity MF solves are performed once per entity and reused across all pairs, avoiding a separate
+MF solve per pair.
+The F (2) criterion (Eq. 4) targets
+
+
+F (2) := EQ sign(D) ∈ [−1, +1],
+
+Saddle-point estimator: EQ [sign(S)].
+
+19
+
+(29)
+
+where D is the diff-MRF energy on xa at fixed xobs . Direct evaluation requires summing the sign
+function over the combinatorial state space of the discrete MRF, which is intractable.
+The saddle-point approximation expands the cumulant-generating function of D under Q to second
+2
+order, approximating its distribution as D ≈ N (µD , σD
+) with
+2
+σD
+:= VQ [D]
+
+µD := EQ [D],
+
+(30)
+
+The required moments are computed from per-entity MF marginals µ(a) , µ(b) (Mode 2) or halfpotential marginals µ(−,S) , µ(+,S) (Mode 1). The formulas below are stated for a generic diff-MRF
+score D with effective unaries ∆αkeff and pairwise potentials ∆ψjk as defined in App. A.1. In Mode 1,
+D = Sv and these are the half-potential parameters. In Mode 2, D = Sa − Sb and these become
+(ab)
+(a)
+(b)
+(ab)
+(a)
+(b)
+the pair-level differences δk := ∆αk − ∆αk and δjk := ∆ψjk − ∆ψjk (defined formally in
+App. D.1).
+X
+
+X
+(a)
+(b)
+(a) (a)
+(b) (b)
+∆αkeff (µk + µk ) +
+∆ψjk (µj µk + µj µk ) , (31)
+µD := EQ [D] = 12
+k∈A
+2
+σD
+:= VQ [D] =
+
+X
+
+(j,k)∈EAA
+
+(∆αkeff )2 VarQ [xk ] +
+
+k∈A
+
+X
+
+(∆ψjk )2 L4X ,
+
+(32)
+
+(j,k)∈EAA
+
+where VarQ [xk ] is the mixture variance at site k, computed from the per-entity second moments,
+and the pairwise variance term uses the worst-case bound |xj xk | ≤ L2X . Under the Gaussian
+approximation, the expectation of the sign function resolves into a difference of probability masses
+above and below zero:
+
+
+µD
+F̂ (2),SP := 2 Φ
+− 1,
+(33)
+σD
+where Φ is the standard normal CDF.
+
+C
+
+Mode 1: the symmetric-gauge MaxEnt closure
+
+This appendix derives the half-potential closure used to anchor binary classification under diff-MRF–
+only access (§3.1), proves its four structural consequences, and applies it to the first term of the
+conditional mutual information criterion.
+C.1
+
+The symmetric-gauge MaxEnt
+
+As established in §3.1, the discriminative score Sv = log(p1 /p0 ) leaves the individual classconditionals undetermined up to a gauge function, blocking access to the standard AFA toolbox.
+Some gauge choice is unavoidable, and any choice imposes structure the elicitation did not provide.
+The maximum-entropy principle offers the canonical resolution: maximize H(p0 ) + H(p1 ) subject
+to the ratio constraint, selecting the pair that adds no distributional assumptions beyond Sv . This
+ensures that all downstream quantities — predictive marginals, CMI rankings, mixture moments —
+are determined solely by the LLM’s discriminative output, not by an arbitrary modelling choice about
+the individual class-conditionals.
+We derive this closure below, additionally requiring that the solution be symmetric under relabeling
+the two classes: swapping p0 ↔ p1 should amount to flipping the sign of Sv . This symmetry,
+combined with MaxEnt, uniquely determines the half-potential MRFs pe ∝ exp((−1)e−1 Sv /2) used
+throughout Mode 1.
+Parameterize the gauge symmetrically between the two classes:
+
+
+
+
+p0 (x) = q(x) exp − 21 Sv (x) ,
+p1 (x) = q(x) exp + 12 Sv (x) ,
+
+(34)
+
+for some positive function q(x) > 0. By construction log p1 − log p0 = Sv , so the ratio constraint is
+satisfied automatically for any q. The involution Sv → −Sv p0 ↔ p1 is preserved.
+20
+
+Reduced objective.
+
+The joint entropy under the ansatz is
+Xh
+
+i
+H(p0 ) + H(p1 ) = −
+q e−Sv /2 log q − 12 Sv + q e+Sv /2 log q + 12 Sv
+x
+
+X
+
+
+= − q(x) e−Sv (x)/2 + e+Sv (x)/2 log q(x)
+
+(35)
+
+x
+
+where the linear-in-Sv cross-terms cancel exactly. The two normalizations are
+X
+X
+q(x) e−Sv (x)/2 = 1,
+q(x) e+Sv (x)/2 = 1.
+x
+
+(36)
+
+x
+
+Stationarity and symmetry.
+With multipliers
+β0 , β1 for the twoP
+normalizations, the Lagrangian
+P
+P
+M(q; β0 , β1 ) = − x q C(x) log q − β0 ( x q e−Sv /2 − 1) − β1 ( x q e+Sv /2 − 1), with C(x) :=
+2 cosh(Sv (x)/2), has stationarity in q(x):
+β0 e−Sv (x)/2 + β1 e+Sv (x)/2
+.
+(37)
+2 cosh(Sv (x)/2)
+The Lagrangian M is invariant under the involution Sv → −Sv β0 ↔ β1 , p0 ↔ p1 ; imposing this
+symmetry on the optimum forces β0 = β1 =: β. Substituting,
+log q(x) = −1 − β,
+(38)
+−1−β
+so q(x) ≡ e
+is constant in x.
+log q(x) = −1 −
+
+From the constant q to the per-class distributions. Substituting q(x) ≡ e−1−β back into the
+symmetric ansatz (34) gives
+
+
+pe (x) = e−1−β exp (−1)e−1 12 Sv (x) ,
+e ∈ {0, 1}.
+(39)
+Since e−1−β is the same constant for both classes, imposing each normalization (36) on (39) gives
+X
+X
+e−1
+e−1
+1
+e−1−β
+e(−1) Sv (x)/2 = 1 =⇒ e−1−β =
+,
+Ze :=
+e(−1) Sv (x)/2 , (40)
+Ze
+x
+x
+which is consistent only if
+Z0 = Z1 =: Z.
+(41)
+We adopt (41) as a calibration condition on Sv (achievable by the customary constant-shift absorbing
+the prior log-odds; see Remark C.1) and substitute back into (39) to obtain the closure:
+
+
+1
+e ∈ {0, 1},
+pe (x) =
+exp (−1)e−1 12 Sv (x) ,
+(42)
+Z
+X
+X
+Z =
+e+Sv (x)/2 =
+e−Sv (x)/2 .
+(43)
+x
+
+x
+
+Both class-conditionals are MRFs on the same factor graph as Sv , with halved and sign-flipped
+potentials.
+Calibration shift For arbitrary Sv , the structural identity (41) need not hold. Replacing Sv → Sv −c
+for a constant c ∈ R leaves the ratio p1 (x)/p0 (x) = eSv (x)−c shifted by a global factor, which
+corresponds to an offset of the prior log-odds πv′ . Choosing c to satisfy (41) thus fixes the prior
+absorbed in Sv ; the closure is invariant to this choice.
+Why the symmetric gauge. The strict pointwise MaxEnt program (maximizing H(p0 ) + H(p1 )
+over (p0 , p1 ) subject to the pointwise ratio constraint without the symmetric ansatz) has the closedform optimum
+w(x) log w(x) α0 + α1 w(x)
+log p0 (x) = −1 −
+−
+,
+w(x) := eSv (x) ,
+(44)
+1 + w(x)
+1 + w(x)
+which is not of the form log p0 ∝ −Sv /2. The strict optimum couples Sv to the local posterior
+w log w
+nonlinearly through
+= Sv σ(Sv ), breaks the involutive symmetry Sv → −Sv ⇔ p0 ↔ p1 ,
+1+w
+and is not an MRF on the graph of Sv . We therefore refer to (42) as the symmetric-gauge MaxEnt
+closure rather than the MaxEnt distribution simpliciter, and adopt it specifically for the operational
+and structural properties developed below.
+21
+
+C.2
+
+Application to scoring and CMI
+
+The closure makes the standard AFA toolbox computable from the diff-MRF alone. The foundational
+result is the calibrated posterior.
+Calibrated posterior.
+rule gives
+
+Under the closure (42) with equal priors P (y = 0) = P (y = 1) = 12 , Bayes’
+P (x | y=1) P (y=1)
+P (x)
+P (x | y=1) P (y=1)
+=
+P (x | y=0) P (y=0) + P (x | y=1) P (y=1)
+p1 (x)
+=
+p0 (x) + p1 (x)
+
+P (y = 1 | x) =
+
+=
+
+1 +Sv /2
+Z e
+1 −Sv /2
++ Z1 e+Sv /2
+Z e
+
+= σ(Sv ),
+
+(45)
+
+where the second line uses equal priors to cancel P (y=e) from numerator and denominator, the
+third substitutes the closure pe (x) = Z −1 exp((−1)e−1 Sv /2), and the fourth cancels the shared 1/Z
+factor (valid because Z0 = Z1 = Z). This identity is what makes the Wald accumulator a valid
+posterior estimate and CMI a well-defined acquisition criterion under diff-MRF–only access.
+Partial posterior and the first CMI term. The first term of the conditional mutual information at
+partial observation xobs is the binary entropy of the partial posterior:
+
+H(y | xobs ) = hb P (y = 1 | xobs ) ,
+(46)
+where hb (p) = −p log p − (1 − p) log(1 − p) is the binary entropy. By Bayes’ rule with equal
+priors, P (y = 1 | xobs ) = σ(ℓ̂(xobs )) where the partial-observation log-likelihood ratio is ℓ̂(xobs ) =
+log P (xobs | y = 1) − log P (xobs | y = 0).
+Reduction via the closure.
+P
+xa P (xa , xobs | y = e),
+P (xobs | y = e) =
+
+Substituting (42) into the marginalization P (xobs | y = e) =
+
+Ze (xobs )
+,
+Z
+
+Ze (xobs ) :=
+
+X
+
+
+
+exp (−1)e−1 12 Sv (xa , xobs ) ,
+
+(47)
+
+xa
+
+so the unclamped Z in numerator and denominator of ℓ̂ cancels (by Z0 = Z1 ), leaving
+ℓ̂(xobs ) = log Z1 (xobs ) − log Z0 (xobs ),
+
+H(y | xobs ) = hb σ(ℓ̂(xobs )) .
+
+(48)
+(49)
+
+Operational form: two-ELBO. We approximate each log Ze (xobs ) by its MF ELBO Fe (xobs ) on
+the half-potential MRF with halved sign-flipped potentials and the observed coordinates clamped:
+
+
+log Ze (xobs ) ≥ Fe (xobs ) = ε2e Eqe Sv (X, xobs ) + H(qe ),
+εe = (−1)e+1
+(50)
+Q
+with qe (xa ) = j∈A qe,j (xj ). Two MF solves, one per class, on the same factor graph as Sv with
+halved and sign-flipped potentials, suffice to evaluate the two-ELBO estimator
+ℓ̂ 2ELBO (xobs ) := F1 (xobs ) − F0 (xobs )
+
+(51)
+
+at any partial observation. The approximation error of this estimator is characterized in Prop. C.4
+below.
+Marginal reuse. The two per-class MF solves required by the two-ELBO also supply the marginals
+needed for the predictive distribution P (xj | xobs ) in the second CMI term and for the saddle-point
+estimator (App. B.1), so no additional inference is required. The convergence advantage of the
+half-potentials is established in Prop. C.4.
+22
+
+C.3
+
+Mode-1-as-Mode-2 with two virtual entities
+
+The half-potential closure exposes a structural correspondence: Mode 1 binary classification is, at the
+level of inference primitives, a Mode 2 top-k problem with N = 2 virtual entities and k = 1. Table 9
+maps each Mode 1 inference object onto its Mode 2 counterpart.
+Object
+
+Mode 1 (binary)
+
+Mode 2 (top-k)
+
+Latent of interest
+Per-class/entity MRF
+Discriminative score
+Mean-field marginals
+Wald accumulator
+Mixture distribution
+F (1) estimator (ELBO)
+F (2) estimator (SP)
+F (1) bracket (ℓ1 )
+F (2) bracket (H–W)
+
+y ∈ {0, 1}
+pe from MaxEnt closure (42)
+Sv (x)
+µ(e) , e ∈ {0, 1}
+(t)
+F (1),(t) = πSv
+1
+Q = 2 (p0 + p1 )
+F̂ (1) = F1 − F0
+F̂ (2),SP via Q
+(1),(t)
+on F (1),(t) vs Funobs
+(2),SP
+on F̂
+
+entity pair (a, b)
+pv directly elicited
+Dab (x) := Sa (x) − Sb (x)
+µ(v) , v ∈ {a, b}
+(1),(t)
+(t)
+Fab
+= πDab
+1
+Qab = 2 (pa + pb )
+(1)
+F̂ab = Fa − Fb
+(2),SP
+F̂ab
+via Qab
+(1),(t)
+(1),(t)
+on Fab
+vs Fab,unobs
+(2),SP
+on F̂ab
+
+Table 9: Mode-1-as-Mode-2 inference-primitive mapping. Mode 1 is the N = 2, k = 1 specialization;
+the only difference is the source of the per-class MRFs (MaxEnt closure on the diff-MRF in Mode 1,
+direct elicitation in Mode 2).
+The mapping clarifies what is and is not shared. The inference layer (MF, ELBO, saddle-point,
+bracket machinery) is identical infrastructure. The source of the per-class MRFs is what distinguishes
+the modes: in Mode 1, the half-potential MRFs are reconstructed from the diff-MRF via the MaxEnt
+closure; in Mode 2, the per-entity MRFs are elicited directly.
+C.4
+
+Structural properties of the closure
+
+Beyond enabling the scoring and CMI computations above, the symmetric-gauge closure has three
+structural properties that shape the behaviour of the estimators.
+(i) Class-symmetric approximation error. The two-ELBO estimator (51) carries an approximation
+error whose sign is uncontrolled:
+b(Sv ; xobs ) := ℓ̂ 2ELBO (xobs ) − ℓ̂(xobs ) = − KL1 + KL0 ,
+
+(52)
+
+a difference of two non-negative MF errors KLe := KL(qe ∥ pe (· | xobs )). This is the standard
+price of variational approximation. The closure does not eliminate this bias, but constrains it to be
+symmetric across classes: under (42),
+b(−Sv ; xobs ) = −b(Sv ; xobs ).
+
+(53)
+
+This follows from the class-swap symmetry of the closure: pe (x; −Sv ) = p1−e (x; Sv ), which
+propagates through the MF fixed-point map to give Fe (xobs ; −Sv ) = F1−e (xobs ; Sv ) and likewise
+for log Ze . The approximation error may be nonzero, but it is the same magnitude for both classes
+meaning there is no systematic drift toward either hypothesis. At full observation the bias vanishes:
+Fe = log Ze when A = ∅, so ℓ̂ 2ELBO (x) = Sv (x) exactly.
+(ii) Improved mean-field convergence. The formulation of the half-potential class conditionals (40) linearly scales the pairwise interaction weights by a factor of one-half (βpe =
+P
+(S )
+maxj l∈N (j) ∥ 21 ψjl v ∥∞ = 12 βSv ). From a statistical mechanics perspective, this scaling is
+mathematically equivalent to operating the inference procedure at an elevated effective temperature.
+This artificially higher temperature smooths the local energy landscape and exactly halves the contraction constant. Consequently, highly coupled configurations that violate the standard contraction
+condition (βSv L2X ≥ 1) can often achieve stability under this relaxed regime ( 12 βSv L2X < 1). We
+observe this empirically in the IBD evaluation, where the contraction parameter drops from a highly
+volatile range of βL2X ∈ [6, 20] down to [3, 10]. While this does not guarantee universal convergence,
+raising the effective temperature strictly dampens the severe oscillatory dynamics typical of strongly
+coupled Markov Random Fields, thereby substantially increasing the reliability of the system.
+23
+
+(iii) Unbiased initialization. Under the closure (42) with the calibration Z0 = Z1 , the agnostic
+mixture Q := 12 (p0 + p1 ) satisfies
+
+
+EQ sign(Sv ) = 0
+at B = ∅.
+(54)
+Before any features are observed, the expected score is exactly zero. The framework has no prior
+preference for either class. This guarantees that the acquisition policy starts from a genuinely agnostic
+state, and any deviation from zero reflects actual observed evidence, not a bias of the gauge choice.
+
+D
+
+Mode 2: top-k machinery
+
+This appendix details the top-k-specific machinery layered on top of the shared inference primitives:
+per-entity MF amortization, the four preference scores and their Mode 2 instantiation, resolution
+filtering with the three brackets that drive it, and the Lipschitz Layer 0 cluster reduction.
+D.1
+
+Per-entity MF and pair-level objects by linearity
+
+Mode 2 maintains N per-entity
+MRFs {pv }N
+v=1 on a shared feature graph, where pv (x) ∝
+
+1 ⊤
+(v)
+(v)⊤
+exp α
+x + 2 x W x is the distribution of features x when entity v’s condition is active,
+parameterized by the LLM-elicited potentials (α(v) , W (v) ). The diff-MRF for any pair (a, b) has
+parameters
+(ab)
+
+δj
+
+(a)
+
+= ∆αj
+
+(b)
+
+− ∆αj ,
+
+(ab)
+
+δjl
+
+(a)
+
+(b)
+
+= ∆ψjl − ∆ψjl ,
+
+Dab (x) = Sa (x) − Sb (x), (55)
+
+obtained by linearity from the per-entity discriminative MRFs.
+Per-entity MF amortization. A single MF solve on each of the N entities yields per-entity
+marginals µ(v) at cost O(N ). For any pair (a, b), the duel score Dab (x) = Sa (x) − Sb (x) is
+evaluated under the agnostic mixture Qab = 12 (pa + pb ), which averages over the two scenarios “a is
+true” and “b is true.” By linearity of expectation under a mixture, this decomposes into per-entity
+terms already available from the MF solves:
+
+
+
+(56)
+EQab Dab = 21 Epa [Sa ] − Epa [Sb ] + Epb [Sa ] − Epb [Sb ] ,
+where each Epv [Su ] is a linear function of entity v’s MF marginals, computed in O(|E|) per pair. The
+per-pair cost thus reduces from O(N 2 ) MF solves (one per pair) to O(N ) total, with all pair-level
+objects derived by reuse.
+Cross-entity expectation caveat. The expression Epa [Sb ] evaluates the discriminative score of
+entity b under the MF marginals of entity a. When a and b have similar parameters (small parameter
+distance, e.g. within a Lipschitz cluster), this approximation is tight. When parameters diverge—
+across clusters—the MF marginals of a may misrepresent the typical x under pb , and the linearitybased pair-level estimate inherits this approximation error. The Lipschitz Layer 0 construction
+(App. D.4) bounds this error in the cluster-elimination logic.
+D.2
+
+Preference scores in Mode 2
+
+The four preference scores of §3.2 split along a fundamental axis: whether the score relies only
+on evidence already observed, or whether it additionally models the unobserved features through
+approximate inference. This is not the classical myopic/non-myopic distinction (which concerns
+whether the acquisition policy looks ahead), but a parallel one: whether the scoring function looks
+beyond what has been measured. The two observed-only scores accumulate evidence sequentially
+and are exact at full observation; the two inference-based scores exploit the MRF structure to predict
+what unobserved features would contribute, at the cost of variational approximation error.
+Observed-only scores. Wald (Λab ): the running constant π (t) from the conditioning rule
+(App. A.1), summing the closed energy of observed features. No inference, no approximation
+error, exact at full observation.
+24
+
+(2)
+
+KL sign-vote (F̂ab ): each observed feature i ∈ B with value xi contributes a discrete vote
+eff,(ab)
+
+Vi = sign δi
+
+xi
+
+
+
+∈ {−1, 0, +1},
+
+(57)
+
+indicating whether that observation favors a (+1), b (−1), or is uninformative (0). The empirical
+positive fraction over the n = |B| observed features is
+p̂ab =
+
+1X
+I[Vi = +1],
+n
+
+(58)
+
+i∈B
+
+(2)
+
+and the sign-vote score is F̂ab = 2p̂ab − 1. Note that both zero votes and negative votes count against
+a. Like Wald, this uses only observed features; unlike Wald, it discards magnitudes, making it robust
+to outlier couplings but less informative when magnitudes are well-calibrated.
+Inference-based scores. Linearity (EQ [Dab ]): the expected duel score under the agnostic mixture, computed from per-entity MF marginals as described in §D.1 above. This extends Wald by
+adding predicted contributions from unobserved features via MF, inheriting whatever bias the MF
+approximation carries.
+(2),SP
+
+Stack A (F̂ab
+): the saddle-point estimator targeting F (2) = EQ [sign(Dab )], computed as
+2Φ(µD /σD ) − 1 from per-entity MF marginals (App. B.1). This extends the KL sign-vote by
+modeling the full distribution of D (under a Gaussian approximation) rather than counting observed
+signs.
+Summary.
+Observed only
+Track
+Uses magnitudes
+Requires MF
+Bracket
+
+Inference-based
+
+Wald
+
+KL sign-vote
+
+Linearity
+
+Stack A
+
+EQ [D]
+Yes
+No
+ℓ1
+
+EQ [sign(D)]
+No
+No
+KL
+
+EQ [D]
+Yes
+Yes
+ℓ1
+
+EQ [sign(D)]
+No
+Yes
+Hanson–Wright
+
+The empirical comparison between these four scores—and in particular, whether inference earns its
+cost over observed-only accumulation—is the subject of §4.2.1 and §4.2.1.
+D.3
+
+Resolution filtering and brackets
+
+As observations accumulate, some pairs become resolvable: the evidence already observed is strong
+enough that no completion of the unobserved features can change the sign of the preference score.
+Detecting such pairs and removing them from the active registry R (Eq. 7) serves two purposes: it
+avoids spending further budget on settled comparisons, and it prunes features exclusively associated
+with resolved pairs from the candidate set in Eq. 8, progressively narrowing the acquisition search
+space.
+Each preference score is paired with a two-sided bracket—a confidence interval on its value—and
+a pair is declared resolved when the entire interval lies on one side of zero (the sign is locked in
+regardless of unobserved values). Three brackets provide this mechanism, each matched to a score:
+• ℓ1 bracket (§D.3.1): deterministic worst-case bound on Sv (x). Serves Wald and Linearity,
+since resolving the sign of Sv (x) settles both.
+• KL bracket (§D.3.2): concentration bound on p̂ab . Serves the KL sign-vote score.
+• Hanson–Wright bracket (§D.3.3): concentration bound on F̂ (2),SP . Serves Stack A.
+Beyond filtering, LUCB-style allocation (App. E.8) uses the bracket bounds to identify the most
+uncertain pair straddling the top-k boundary and directs budget there.
+25
+
+D.3.1
+
+The ℓ1 bracket on the Wald accumulator
+
+The unobserved energy
+(t)
+
+Funobs :=
+
+eff,(t)
+
+X
+
+∆αj
+
+· LX +
+
+j∈A(t)
+
+X
+
+|∆ψjl | · L2X
+
+(59)
+
+(j,l)∈E
+j∈A(t) or l∈A(t)
+
+upper-bounds the absolute energy that the unobserved features could contribute under any completion
+of xa . Combined with the Wald accumulator, this yields the deterministic two-sided bracket
+(t)
+
+(t)
+
+F (t) − Funobs ≤ Sv (x) ≤ F (t) + Funobs .
+
+(60)
+
+Equation (60) is exact (not probabilistic): no inference is invoked. Because the bracket bounds Sv (x)
+directly, it resolves the sign for both Wald and Linearity—any pair settled by the ℓ1 bracket is settled
+(t)
+on the entire EQ [D]-track. The bracket fires—removing the pair from R—when |F (t) | > Funobs .
+The ℓ1 bracket is (i) rigorous, with no variational bias; (ii) O(|E|) to evaluate per round, sharing all
+(t)
+bookkeeping with the conditioning rule; and (iii) conservative, since Funobs is a worst-case bound
+rather than a typical-case estimate. It therefore fires latest among the three brackets, serving as a
+cheap deterministic backstop that is always evaluated.
+D.3.2
+
+KL bracket on the sign-vote score
+(2)
+
+The KL sign-vote score F̂ab = 2p̂ab − 1 (§D.2) is an empirical fraction, so its natural confidence
+interval comes from concentration on Bernoulli proportions. We use the KL formulation rather than
+Hoeffding bounds, as it provides uniformly tighter intervals.
+The KL confidence set on p̂ab is
+
+[p̂lo , p̂hi ] = q ∈ [0, 1] : n · kl(p̂ab ∥ q) ≤ log(k1 nα /γ) ,
+
+(61)
+
+where kl(p ∥ q) = p log(p/q) + (1−p) log((1−p)/(1−q)) is the Bernoulli KL divergence and k1 , α
+(2)
+are standard exploration constants. The bracket on F̂ab is [2p̂lo − 1, 2p̂hi − 1] and fires when entirely
+positive or entirely negative.
+Because the ternary input space induces a high zero rate (approximately 1/3 of observations yield
+Vt = 0, which count against p̂ab alongside negative votes), the effective positive rate is lower than in
+a binary setting and the bracket converges more slowly.
+D.3.3
+
+Hanson–Wright bracket on the saddle-point estimator
+
+For a Gaussian random vector x ∼ N (0, Σ) and a quadratic form x⊤ W x, the Hanson–Wright
+inequality [29] gives
+
+
+
+
+
+2
+Pr x⊤ W x − E[x⊤ W x] > t ≤ 2 exp −c min ∥W ∥t2 ∥Σ∥2 , ∥W ∥t ∥Σ∥ ,
+(62)
+F
+
+for some absolute constant c > 0. Adapted to the discrete-MRF setting under the saddle-point
+Gaussian approximation, this yields a two-sided bracket on F̂ (2),SP :
+s
+log(2/γ)
+(2),SP
+(2)
+F̂
+−F
+≤ C
+,
+(63)
+neff
+with probability ≥ 1 − γ, where neff is an effective sample size determined by the spectral norm of
+the diff-MRF coupling matrix and C depends on the magnitude of the unary differences. The bracket
+fires when its confidence interval is entirely positive or entirely negative.
+Compared to the ℓ1 bracket, the Hanson–Wright bracket is typically tighter in the bulk of the
+trajectory, since it uses second-moment information rather than worst-case magnitude. It does inherit
+MF bias: when the contraction condition (27) fails, the saddle-point Gaussian approximation can
+underestimate σD and the bracket loses calibration. Damped MF iteration (App. A.1) mitigates
+oscillation; convergence diagnostics (App. E.4) flag regimes where the bracket should not be trusted.
+26
+
+D.4
+
+Layer 0: Lipschitz cluster reduction
+
+Before any features are observed, we can sometimes eliminate entire clusters of entities from top-k
+consideration based solely on their MRF parameters. This is Layer 0: a zero-shot filtering step that
+removes clusters whose score intervals are provably dominated by N − k or more other entities, so
+that none of their pairs ever enter the active registry R.
+Score intervals via Lipschitz bounds. Each entity v has fixed MRF parameters (α(v) , W (v) ),
+elicited once from the LLM. At any observation state xobs (shared across all entities for a given
+patient), the preference score Sv (xobs ) is a function of these parameters alone — the observations
+are the same for every entity. The Lipschitz constant Lc bounds how sensitive this function is to
+parameter differences across entities: for any two entities v, u in cluster c, evaluated at the same
+observations,
+|Sv (xobs ) − Su (xobs )| ≤ Lc · ∥θ(v) − θ(u) ∥1 .
+(64)
+Cluster the N entities by ℓ1 distance in MRF parameter space using complete linkage, and let rc
+denote the radius of cluster c (the maximum ℓ1 distance from any member to the centroid θ̄(c) ). A
+single MF solve on the centroid yields a centroid score S̄c . The Lipschitz bound then guarantees that
+every entity in cluster c has a score within Lc · rc of this centroid:
+Sv (xobs ) ∈ [S̄c − Lc rc , S̄c + Lc rc ]
+for all v ∈ c.
+(65)
+Cluster elimination. If cluster c’s entire interval sits above cluster c′ ’s — that is, S̄c − Lc rc >
+S̄c′ + Lc′ rc′ — then even the weakest entity in c beats the strongest entity in c′ at any observation
+state. No dueling between them is needed. When a cluster is dominated by ≥ N − k entities through
+such certificates, it cannot appear in the top-k and is removed entirely, along with all its associated
+pairs.
+Per-criterion Lipschitz constants.
+the entity parameters:
+
+The value of Lc depends on how the preference score relates to
+
+• F (1) (Chernoff–Wald): Lc = 1. At fixed observations, the Wald score is a dot product between the entity’s parameters and the observed feature values. Since each xj ∈ {−1, 0, +1},
+the score changes by at most the ℓ1 parameter distance — one unit of parameter difference
+causes at most one unit of score difference.
+• F (2) (saddle-point): The score difference between entity v and the cluster centroid decomposes into two terms:
+V̄v − V̄c = (Eµ(v) [Hv ] − Eµ(v) [Hc ]) + (Eµ(v) [Hc ] − Eµ̄(c) [Hc ]) .
+(66)
+|
+{z
+}
+{z
+}
+|
+same distribution, different score
+
+The first term is bounded by ∥ϕ
+The second uses MF stability:
+
+(v)
+
+− ϕ̄
+
+(c)
+
+same score, different distribution
+
+∥1 via worst-case ternary features (each |xj | ≤ 1).
+
+∥µ(v) − µ̄(c) ∥1 ≤
+
+∥ϕ(v) − ϕ̄(c) ∥1
+(S)
+
+1 − βc
+
+,
+
+(67)
+
+LX
+
+multiplied by Hc ’s Lipschitz coefficient ∥Hc ∥∞ ≤ Kc ≈ ∥ϕ̄(c) ∥1 . Combining both terms:
+Kc
+Lc = 1 +
+,
+eligible only when βc LX < 1,
+(68)
+1 − β c LX
+where βc is the worst-case contraction constant within the cluster (Eq. 27). When βc LX ≥ 1,
+MF may not converge within the cluster and the bound does not apply; the F (1) criterion
+remains eligible regardless.
+
+E
+
+Experimental protocol
+
+E.1
+
+LLM elicitation methodology
+
+Closed vocabulary construction. For the IBD benchmark, the candidate vocabulary of genes per
+phenotype is constructed in collaboration with physicians in a three-stage process designed to bound
+LLM responses to verifiable biology rather than allow free-form generation.
+27
+
+1. Phenotype-directed unary elicitation. A clinical collaborator (physician) specifies the
+phenotype set {E1 , . . . , EK } of interest. For each phenotype E, we query three independent
+LLMs with unary prompts asking for (i) whether a candidate gene is associated with E, and
+(ii) the direction of effect under E (up- or down-regulation).
+System prompt: unary elicitation (condensed)
+
+You are a clinician-scientist and biomedical literature analyst. Identify genes mechanistically linked to a user-defined phenotype within a specific disease.
+Inclusion: Direct mechanistic relevance, disease-specific evidence, functional support,
+official HGNC symbol. Evidence must relate to the specified disease AND phenotype,
+not generic disease activity.
+Exclusion: General inflammation markers, GWAS-only associations, generic immune
+activation, weak or indirect evidence.
+Per-gene output:
+gene_symbol, category, direction_in_disease (Upregulated/Downregulated), mechanism_of_action (1–2 sentences: gene → mechanism →
+phenotype), tissue, snippet, reference_indices.
+Bibliography: Exactly N references with PMID/DOI when verified; do not invent
+identifiers.
+Output: Valid JSON only, no text outside schema.
+User prompt template
+
+Disease: {disease} Phenotype: {phenotype}
+Snippet length: ≤ {max_chars} characters. References: exactly {N} objects.
+Use web search to verify references before filling metadata. Copy titles verbatim.
+Return only JSON.
+2. Consensus-and-evidence filtering. The unary responses from the three LLMs are filtered in
+two passes. First, a cross-LLM consensus check retains only gene–phenotype associations
+agreed on by the LLMs with consistent direction. Second, a literature-evidence check
+requires each surviving association to be supported by curated literature sources of sufficient
+reliability. Genes failing either filter are dropped from the vocabulary for that phenotype.
+P (X|E=1)
+This provides us: P
+(X|E=0)
+3. Pairwise enumeration on survivors. After filtering by the LLM’s responses, we enumerated
+all gene pairs within each surviving set as the universe of pairwise queries. Each prompt
+was augmented with retrieval-grounded context: top-ranked articles from PubMed and
+bioRxiv, filtered for relevance to the gene, the phenotype, and the IBD context. The LLM
+was instructed to return, for each query, (i) a confidence probability, (ii) a direction of effect
+when one is supported, and (iii) a justification citing the specific article(s) it relied on. When
+retrieval returned no usable evidence, the model was permitted to reply based only on its
+training knowledge but was required to attribute any claim to a named, verifiable source.
+Retrieval-grounded prompting. Each query (unary or pairwise) is augmented with a retrieval
+context: top-ranked articles from PubMed and bioRxiv filtered for relevance to the gene(s), the
+phenotype, and the IBD context. The retrieval is performed via standard sparse-vector ranking with
+phenotype-specific keyword expansion. The LLM is instructed to return, for each query, a structured
+response containing: (i) a confidence probability, (ii) a direction of effect when supported, and (iii) a
+justification citing the specific article(s) it relied on. When retrieval returns no usable evidence, the
+LLM is permitted to reply based only on its training knowledge but is required to attribute any claim
+to a named, verifiable source.
+Eliciting pairwise potentials. The pairwise potential is elicited via conditional queries: “given that
+the expression of gene l is shifted in direction d, how does this modify the likelihood that gene j is
+also shifted in the same direction under phenotype E?” The pairwise is computed from the LLM’s
+(X1 |X2 ,E=1)
+joint direction probability under both phenotype labels: P
+P (X1 |X2 ,E=0) . All the results and pairwise
+potentials were derived by GPT-5.4 mini.
+28
+
+System prompt: pairwise elicitation (condensed)
+
+You are a biomedical literature analyst. Given a phenotype P, an anchor gene1 (with
+known DE direction) and gene2, determine whether they are reported together in the same
+colonic/rectal study and whether their directions agree. Scope: Any tissue, cell type, or
+model participating in colon/rectum function or pathology (biopsy cell types, ENS, DRG/vagal
+afferents, GALT, rodent colitis/IBS models, organoids). Exclusion: Brain-only, lungonly, breast, cardiovascular, dermatology unrelated to gut. Per-pair output: lit_direction
+(same|opposite|unclear; maps to +1/ − 1/0), lit_prob (float ∈ [0, 1]; auxiliary confidence),
+evidence_source (literature|model_knowledge|none), supporting_text (≤ 600 chars; each
+citation prefixed with a disease-context tag, e.g. [UC], [DSS-colitis]). Do not fabricate
+citations; downgrade to none when unverifiable. Output: Valid JSON only, no text outside
+schema.
+User prompt template
+
+Phenotype: {phenotype}
+Gene1 (anchor): {gene1}, direction: {direction1}
+Gene2: {gene2}
+Literature evidence: {N} retrieved abstracts. Return only JSON.
+E.2
+
+Ternary input representation
+
+For each patient sample drawn from a given IBD GEO [2] dataset, we encode every gene Xi as a
+ternary variable X̃i ∈ {−1, 0, +1} indicating whether its expression is significantly shifted relative
+to the control distribution. Let Ci denote the empirical distribution of gene i across control samples in
+the dataset, and let xi denote the patient’s observed expression for that gene. We perform a two-sided
+test of H0 : xi ∼ Ci , pi = PH0 (|X| > |xi |) and assign
+
+sign(xi − µi ) if pi < 0.05,
+X̃i =
+(69)
+0
+otherwise.
+The encoding X̃ ∈ {−1, 0, +1}d thus represents, for each gene, whether the patient is significantly
+up-regulated, significantly down-regulated, or statistically indistinguishable from controls.
+E.3
+
+Hyperparameter table
+Parameter
+
+Value
+
+Description
+
+η
+ϵ
+Tmax
+γ
+K
+Tre
+Cmin
+Tbudget
+
+0.5
+10−4
+200
+0.05
+√
+⌈ N⌉
+50
+5
+dataset-dependent
+
+MF damping (Jacobi)
+MF convergence tolerance (ℓ∞ on marginals)
+MF maximum iterations
+Bracket confidence level
+Cluster count for Layer 0
+Re-cluster frequency (rounds)
+Minimum entities per cluster floor
+Per-run observation budget
+
+Table 10: Hyperparameter settings used in our experiments.
+
+E.4
+
+Sanity checks and acceptance tests
+
+We run the following sanity checks at every experimental run; failure on any check is treated as a
+configuration error rather than a result.
+• Full-observation invariance. At |B| = M , the running constant satisfies π (M ) = Sv (x)
+exactly (Eq. 18, with both unobserved-sum terms zero). The two-ELBO estimator becomes
+exact: ℓ̂ 2ELBO (x) = Sv (x).
+29
+
+• Gauge invariance. The ℓ1 bracket and the Wald decision are invariant under shifting Sv by a
+constant; the two-ELBO estimator and the Hanson–Wright bracket are invariant under the
+full common-gauge family g(x) that preserves the log-ratio. We verify this on synthetic
+data.
+• MF convergence rate. We log per-round MF iteration counts; runs with sustained nonconvergence (Tmax hit repeatedly) are flagged. On IBD, βLX ∈ [6, 20] across patients, so
+non-convergence is expected on a non-trivial fraction of runs and is not automatically a
+failure—but persistent non-convergence on the same patient/cluster across seeds indicates
+the MF tracks should not be relied upon for that case.
+• Bracket soundness. For each pair declared resolved by Layer-1 (any bracket), the resolution
+is checked against the full-observation ground truth at the end of the run. The empirical
+soundness rate (≥ 99.8% on IBD at t = 150) is reported alongside any Layer-1-related
+claim.
+• Copeland aggregation invariance. The top-k output is invariant under permutation of the
+entity indexing.
+
+E.5
+
+MaxEnt-CMI versus true-gauge CMI
+
+We test two questions: how MaxEnt’s approach compare to those of established MRF distributions (validating the equivalence-class structure on real data), and whether the resulting binary
+classifications are operationally adequate.
+Q1: Scalar agreement between MaxEnt and true MRF distributions. We compare two_elbo_maxent and stack_a_maxent against shadow methods two_elbo_true,
+stack_a_true that use per-class entity MRFs (available as Mode-2 by-products, serving here
+as a validation oracle only). Across 5 phenotype pairs, all cohort patients per pair, 3 seeds, and 5
+checkpoints (Table 11):
+Table 11: MaxEnt vs true-gauge comparison, Mode 1. Decision agreement is the fraction of
+(pair, patient, seed) tuples where MaxEnt and true-gauge methods predict the same class. Pearson
+correlation is on the underlying scalar values. Both tracks converge at full observation; intermediate
+values fall below the predefined “equivalent” threshold (95% / 0.95), yielding a divergent verdict.
+t=10
+
+t=50
+
+t=100
+
+t=150
+
+t=216
+
+Decision agreement
+F (1) -track 0.816
+F (2) -track 0.724
+
+0.811
+0.786
+
+0.851
+0.817
+
+0.904
+0.837
+
+1.000
+1.000
+
+Pearson correlation
+F (1) -track 0.978
+F (2) -track 0.962
+
+0.971
+0.936
+
+0.975
+0.907
+
+0.969
+0.912
+
+1.000
+1.000
+
+The verdict is divergent: agreement falls below 91% on the F (1) -track at intermediate checkpoints
+and below 84% on the F (2) -track; Pearson correlation between MaxEnt and true-gauge scalars sits
+in [0.91, 0.98] across the trajectory and reaches 1.0 only at t=M . The two scalar streams are not
+interchangeable. This is the expected outcome: MaxEnt and the true gauge are different points in
+the gauge equivalence class, with no theoretical reason their per-tuple scalars should match.
+Q2: Decision quality. The substantive question is which approach yields better classifications.
+Classification accuracy against the patient’s clinical diagnosis is reported in Table 12.
+30
+
+Table 12: Classification accuracy on Mode 1 against clinical diagnosis. The MaxEnt-anchored methods (rows 2, 4) systematically outperform their true-gauge counterparts (rows 3, 5) at intermediate
+budgets; all methods converge at t=M . The full-observation ceiling near 0.85 reflects irreducible
+task difficulty: some patients have ambiguous clinical diagnoses that the MRF cannot disambiguate.
+Method
+
+t=10
+
+t=50
+
+t=100
+
+t=150
+
+t=216
+
+wald (gauge-invariant)
+
+0.756
+
+0.757
+
+0.793
+
+0.821
+
+0.847
+
+two_elbo_maxent
+two_elbo_true
+
+0.760
+0.682
+
+0.773
+0.697
+
+0.795
+0.740
+
+0.819
+0.802
+
+0.847
+0.847
+
+stack_a_maxent
+stack_a_true
+
+0.751
+0.627
+
+0.767
+0.669
+
+0.786
+0.710
+
+0.813
+0.770
+
+0.858
+0.858
+
+The MaxEnt-anchored methods systematically outperform their true-gauge counterparts at intermediate budgets. At t=100, two_elbo_maxent reaches 79.5% versus two_elbo_true’s 74.0% (a
+5.5pp gap); stack_a_maxent reaches 78.6% versus stack_a_true’s 71.0% (a 7.6pp gap). The
+disparity is largest at low budget: at t=10, stack_a_maxent beats stack_a_true by 12.5pp. At
+full observation the methods converge (F (1) -track 0.847 / 0.847; F -track 0.858 / 0.858), as required
+by the gauge-equivalence class containing both.
+Mechanism. The mechanism is mean-field contraction. Per-entity MF on IBD MRFs is noncontractive in many cells (βLX ∈ [6, 20], so the entity-MF predictions in true-gauge methods
+carry inference bias that propagates through ELBO and saddle-point computations. The MaxEnt
+construction halves the potentials to (±δ/2, ±δW /2), halving the contraction constant (§3.1, Property
+iv); on the same MRFs the half-potential MF converges in many cells where the entity MF does not.
+The MaxEnt closure is therefore not merely a permitted gauge but a numerically superior one on this
+dataset.
+E.6
+
+KL sign-vote and saddle-point at full observation
+
+Both the KL sign-vote estimator (§D.2) and the saddle-point estimator (§B.1) are introduced as
+estimators of the same object EQ [sign(Dab )]. Yet at full observation (A = ∅), they converge to
+different limits — Table 4 shows stack-A reaching 1.000 while kl saturates at 0.945. The gap is
+structural, not a finite-sample artifact.
+Saddle-point at full observation. At A = ∅ the diff-MRF energy is no longer random under Q:
+the only configuration with positive mass is the realized x∗ . The MF moments (Eqs. 31, 32) collapse
+to
+2
+µD → D(x∗ ),
+σD
+→ 0,
+2
+so the Gaussian N (µD , σD
+) used in the saddle-point approximation tends to a point mass at D(x∗ ).
+Substituting into Eq. 33, the standardized argument z = µD /σD diverges to ±∞ with the sign of
+D(x∗ ). Evaluating the standard normal CDF at its limits,
+
+Φ(−∞) = 0,
+
+Φ(0) = 21 ,
+
+Φ(+∞) = 1,
+
+so 2Φ(z) − 1 steps from −1 at z = −∞ through 0 at z = 0 to +1 at z = +∞. The estimator
+therefore collapses to a hard indicator:
+
++1 D(x∗ ) > 0,
+(2),SP
+F̂
+= 2Φ(z) − 1 →
+−1 D(x∗ ) < 0,
+which is exactly sign(D(x∗ )). The vanishing variance is what drives the collapse: in the moment
+2
+formulas (Eqs. 31, 32), a zero observation contributes δieff · 0 = 0 to µD and 0 to σD
+, so it neither
+shifts the Gaussian nor enters its variance.
+KL sign-vote at full observation. The KL estimator (§D.2) undergoes no analogous collapse.
+With N+ = #{i ∈ B : Vi = +1}, N− = #{i ∈ B : Vi = −1}, N0 = #{i ∈ B : Vi = 0}, and
+31
+
+n = N+ + N− + N0 at t = M ,
+2N+ − (N+ + N− + N0 )
+2N+
+−1 =
+n
+n
+N+ − N− − N0
+=
+.
+n
+
+(2)
+
+F̂ab = 2p̂ab − 1 =
+
+(70)
+
+The final decomposition isolates the source of the gap. By construction of p̂ab = N+ /n, zero
+votes enter the denominator but not the numerator; equivalently in the form (70), N0 appears with a
+negative sign alongside N− . A zero observation, however, contributes 0 to D(x∗ ) exactly (the term
+δieff · 0 = 0), and therefore should be inert in any consistent estimator of sign(D(x∗ )). KL instead
+counts it against a. On the IBD ternary encoding the zero rate is approximately 1/3 (App. E.2), so
+(2)
+the −N0 /n term contributes roughly −1/3 to F̂ab at full observation, biasing the estimator below
+the truth even when every nonzero observation favours a.
+E.7
+
+Two-Layer Registry Pruning (Top-K)
+
+The framework includes two registry-pruning mechanisms that reduce the active pair set before and
+during acquisition. Layer 0 eliminates entire clusters before allocation begins; Layer 1 resolves
+individual pairs as observations accumulate.
+Layer 0: cluster-level pre-filtering. Before any features are observed, Layer 0 (App. D.4) uses
+Lipschitz bounds on the fixed MRF parameters to certify that an entire cluster of entities is dominated
+— its best-case score interval sits below the worst-case interval of ≥ N − k other entities. On IBD,
+this layer fires zero eliminations across cluster-count sweeps C ∈ {5, 8, 10, 12, 15, 20}; at C=24
+(near-singleton clustering) it produces 28 cluster-level eliminations across 5 patients but still 0pp
+lift over greedy. The per-phenotype MRFs lie in a unimodal “blob plus outliers” geometry where
+intra-cluster radii are large relative to inter-cluster centroid gaps, violating the separability condition.
+To characterize when Layer 0 does activate, we run a synthetic data-generating-process portfolio
+of 10 configurations spanning six generative stories (Table 13). Layer 0 contributes more than 3pp
+lift on two of ten configurations (B_pathway_C4, D_hier_C3) and 0pp on the rest. The activation
+condition is interpretable:
+′
+
+max ∥δ (v) − δ (c) ∥∞ ≪ ∥δ (c) − δ (c ) ∥∞ ,
+v∈c
+
+that is, within-cluster per-feature distinguishability must be small relative to cluster-level distinguishability. IBD violates this; B_pathway_C4 satisfies it (intra-module < 0.2, inter-module ≈ 5).
+Table 13: Layer 0 synthetic DGP portfolio. Sep ratio is the inter-cluster centroid gap divided by the
+maximum intra-cluster radius. Elim is the count of Layer 0 cluster eliminations. Lift is sign accuracy
+at t=10 versus the matched greedy allocation.
+Sim
+
+Config
+
+A
+A
+B
+B
+C
+C
+D
+D
+E
+F
+
+drug_C4
+drug_C6
+pathway_C4
+pathway_C5
+strain_C3
+strain_C5
+hier_C3
+hier_C4
+compositional
+adversarial_ibd
+
+Story
+
+Sep ratio
+
+Elim
+
+Lift at t=10
+
+drug-family
+drug-family
+pathway-enrich
+pathway-enrich
+strain-id
+strain-id
+hierarchical
+hierarchical
+compositional
+adversarial
+
+9.9
+12.4
+140
+169
+506
+546
+8.5
+14.5
+2.5
+43.6
+
+4
+7
+29
+35
+23
+31
+13
+17
+0
+2
+
++0.0pp
++0.0pp
++8.8pp
+−6.3pp
++0.0pp
+−0.4pp
++3.9pp
++0.0pp
++0.0pp
++0.0pp
+
+Layer 0 is therefore a screening tool with provable certificates whose activation is data-dependent. It
+does not contribute to our IBD headline numbers, but the framework carries it as an opt-in component
+for problems where the activation condition holds.
+32
+
+When Layer 0 applies and when it does not. Layer 0 requires two conditions to be useful:
+(i) the Lipschitz bound must be eligible for the active scoring method, and (ii) the resulting score
+intervals must be tight enough to separate clusters. For the F (1) /Wald criterion, condition (i) holds
+unconditionally (Lc = 1), but condition (ii) demands well-separated clusters in parameter space. For
+the F (2) /Stack A criterion, condition (i) additionally requires MF convergence within each cluster
+(βc LX < 1, Eq. 68); when this fails, the bound is ineligible and Layer 0 cannot use F (2) at all. On
+IBD, βLX ∈ [6, 20] (App. E.4), so F (2) is ineligible and only the F (1) bound is available. The F (1)
+bound is unconditionally valid but too loose to overcome the poor cluster separation in IBD’s “blob
+plus outliers” parameter geometry, resulting in zero eliminations. Layer 0 contributes only when
+both conditions are met — as in the synthetic B_pathway_C4 configuration (well-separated clusters,
+βc LX < 1).
+Layer 1: pair-level free resolutions. Once allocation begins, each preference score is paired
+with a confidence bracket (App. D.3): a two-sided interval on the score’s true value, tightening as
+observations accumulate. When the entire interval falls on one side of zero — meaning no completion
+of the unobserved features can flip the sign — the pair is declared resolved and removed from R,
+saving further budget. The activation rate depends critically on observation order. Under random
+ordering, Layer 1 is nearly inactive: at t=100 the one-sided bracket rate is 0.08% for linearity
+(ℓ1 ), 0.0% for wald (ℓ1 ), 0.46% for kl (KL), and 4.0% for stack-A (Hanson–Wright); brackets
+(t)
+clear only near full observation as Funobs shrinks by attrition.
+Why bandit ordering matters for brackets. Static informed ordering (acquisition by descending
+|δieff |) provides a clean upper bound on what favourable acquisition can do for Layer 1, isolating the
+bracket–acquisition interaction from any bandit-specific machinery. Table 14 shows the contrast.
+Table 14: One-sided bracket rate at t=100 (Mode 2 and Mode 1, IBD). Random ordering keeps Layer
+1 near-zero on every method. Static informed ordering by descending |δieff | activates Layer 1 as a
+primary mechanism. Mis-resolution rate stays below 0.02% on heuristic brackets and 0% on rigorous
+brackets.
+Mode
+
+Method
+
+Random
+
+Informed
+
+M2
+M2
+M2
+M2
+M1
+M1
+
+linearity (L1 )
+wald (L1 )
+kl (KL)
+stack-A (HW)
+wald (L1 )
+stack_a_maxent (HW)
+
+0.08%
+0.0%
+0.46%
+4.0%
+0.5%
+0.08%
+
+40%
+26%
+0.9%
+27%
+71%
+43%
+(t)
+
+High-|δ| features both contribute most to the running point estimate and shrink Funobs fastest;
+observing them first compresses bracket width on a much steeper trajectory. Bandit ordering under
+our priority rule produces the same effect dynamically (§4.2.2).
+Structural ties. About 16% of pair-trajectories never reach a one-sided bracket even under static
+informed ordering. These correspond to entity pairs with structurally similar potentials (small total
+signal Λ(full),(ab) ) whose decision boundary at full observation sits near zero: D(x∗ ) ≈ 0. This is a
+property of the entity set, not of the algorithm, and gives a quantitative lower bound on the irreducible
+difficulty of the task: any method must report the resolved 84% with high confidence and an honest
+tie on the remaining 16%.
+E.8
+
+Allocation
+
+Phase 2 (smart allocation) evaluates 8 cells in the (gain, allocation) grid on 50 patients, holding
+preference score fixed at linearity. Each cell runs all 300 phenotype pairs to full budget with
+periodic gain rescoring at t ∈ {1, 11, 51, 101, 151}.
+Allocation effect. The priority-weighted rule lifts sign accuracy at t=150 to 0.864 with wald-mag
+gain (Table 15), 4.7pp over greedy and 10.5pp over random. The lift holds across both gains tested
+at 50 patients, isolating the allocation rule rather than any specific gain as the source.
+33
+
+Table 15: Sign accuracy at t=150 on the bandit grid (50 patients × 300 pairs). ours (§4.4) lifts
+accuracy by 4–5pp over the strongest non-priority allocation, robustly across both gain functions
+tested at this scale. The F-target gain was validated on a 10-patient pilot due to time constraints
+Allocation
+
+wald-mag gain
+
+cmi gain
+
+0.759
+0.817
+0.817
+0.864
+
+0.759
+0.787
+0.787
+0.833
+
+random
+greedy
+clustered
+ours (priority-weighted)
+
+clustered - Clustered allocation baseline (Cluster-LUCB) To isolate the impact of our priorityweighted allocation rule, Phase 2 evaluates against a classical “clustered” baseline adapted from the
+dueling-bandit literature (Cluster-LUCB). This approach sequentially reduces the O(N 2 ) candidate
+pairs by focusing exploration strictly on the active decision boundaries of the top-k set. First, the
+N entities are grouped into K clusters via complete-linkage agglomerative clustering on their MRF
+parameter vectors, utilizing the same ℓ1 distance metric defined for Layer 0 (§D.4). Within each
+cluster, a current “champion” entity is identified based on empirical Copeland scores.
+The algorithm then applies the LUCB (Lower Upper Confidence Bound) selection rule exclusively
+over this reduced set of champions. Specifically, it identifies the champion currently ranked at the
+boundary of the selection set (rank k, denoted h) and the highest-ranked non-selected champion (rank
+k + 1, denoted l). The algorithm selects the next feature by solving
+f∗ =
+
+arg max
+
+ghl (f ),
+
+(71)
+
+f ∈supp(Dhl )
+
+where h is the champion currently ranked kth (lowest winner), l is the champion ranked (k+1)th
+(highest loser), Dhl = Sh − Sl is their diff-MRF, and ghl (f ) is the discriminative gain (§3.3) for that
+single pair. Contrast with the priority-weighted rule (Eq. 8), which relies on dueling bandit concept
+and sums gains across all active pairs weighted by boundary proximity.
+E.9
+
+Chaos diagnostic full protocol
+
+The chaos diagnostic identifies patients (or, in synthetic experiments, MRFs) for which the observation
+order has a disproportionate effect on the final decision, in the sense that multiple seeds produce
+disagreeing trajectories.
+Definition. For a fixed patient and fixed gain/allocation method, we run the algorithm under few
+seeds. Define:
+• Sign-flip count: the number of rounds within a seed where the running decision sign(V (t) )
+flips, averaged across seeds. This tracks instability of the decision (which side of zero) as
+evidence accumulates, independent of magnitude.
+• Final magnitude: |V (M ) |, the decisiveness of the final answer at full observation.
+• Chaotic-patient threshold: a patient is classified as chaotic if its sign-flip count is in the top
+quartile and its final magnitude |V (M ) | is above the across-patient median. The magnitude
+condition is essential: it excludes genuinely ambiguous patients (unstable trajectory but
+weak final signal regardless of observation order), retaining only the chaotic-but-decisive
+cases where acquisition order matters even though a confident answer exists.
+Use. When chaos stratification is invoked in the main results, the algorithm’s relative performance
+on chaotic patients is compared separately from non-chaotic patients. The diagnostic is a contribution
+in itself: it predicts, in advance of running the full algorithm, which patients benefit most from
+inference-based methods over the deterministic Wald baseline.
+34
+
+E.10
+
+LLM Planning Prompts
+
+System prompt: binary AFA — potentials (condensed)
+
+You are a clinician-scientist and IBD translational expert running active feature acquisition
+(AFA) on a single transcriptomically-profiled patient. Classify the patient as control vs.
+{condition} over a sequential experiment: each turn, choose which single gene to measure
+nextand re-emit a calibrated probability. Knowledge source: Two curated reference tables
+for {condition} only (no control potentials). Unary θ ∈ {−1, 0, +1}: expected direction per
+gene; observation matching θ’s sign is evidence for the condition. Pairwise w ∈ {−1, 0, +1}:
+expected co-deviation of gene pairs; w = +1 same direction, w = −1 opposite. Per-turn output:
+patient_id, next_gene_to_measure (from unobserved list), top_k_labels (length 1: control or
+{condition}), lit_prob (float ∈ [0, 1]; ≥0.5 → condition, <0.5 → control), supporting_text
+(≤ 600 chars; reference observed values and relevant potentials). Output: Valid JSON only, no
+text outside schema. User prompt: shared AFA template (Box E.10).
+System prompt: binary AFA — literature (condensed)
+
+You are a clinician-scientist and IBD translational expert running active feature acquisition
+(AFA) on a single transcriptomically-profiled patient. Classify the patient as control vs.
+{condition} over a sequential experiment: each turn, choose which single gene to measure next
+and re-emit a calibrated probability. Knowledge source: Retrieved abstracts for {condition};
+control has no abstracts and is interpreted as absence of the condition signal. Citations in
+supporting_text must be prefixed with a disease-context tag ([UC], [DSS-colitis], . . . ); do
+not fabricate citations. Per-turn output: patient_id, next_gene_to_measure (from unobserved
+list), top_k_labels (length 1: control or {condition}), lit_prob (float ∈ [0, 1]; ≥0.5 →
+condition, <0.5 → control), supporting_text (≤ 600 chars; may reference gene values and/or
+abstracts). Output: Valid JSON only, no text outside schema. User prompt: shared AFA
+template (Box E.10).
+System prompt: multiclass AFA — literature (condensed)
+
+You are a clinician-scientist and IBD translational expert running active feature acquisition
+(AFA) on a single transcriptomically-profiled patient. Plan a sequential experiment: each turn,
+choose which single gene to measure next (+1/−1/0 relative to healthy baseline) and return
+your current best top-k phenotype ranking from m candidates. Knowledge source: Retrieved
+abstracts ({n_abstracts} papers) covering the candidate IBD phenotypes. Per-turn output:
+patient_id, next_gene_to_measure (from unobserved list), top_k_labels (exactly or up to k labels
+from the candidate list, ranked most→least likely). Optionally done (boolean; true only when
+highly confident further measurements would not change the prediction). Every label must be
+verbatim from the candidate list; no duplicates, no prose outside the JSON object. Output:
+Valid JSON only, no text outside schema. User prompt: shared AFA template (Box E.10).
+System prompt: multiclass AFA — potentials (condensed)
+
+You are a clinician-scientist and IBD translational expert running active feature acquisition
+(AFA) on a single transcriptomically-profiled patient. Plan a sequential experiment: each
+turn, choose which single gene to measure next (+1/−1/0 relative to healthy baseline) and
+return your current best top-k phenotype ranking from m candidates. Knowledge source: Two
+curated reference tables, grouped by disease. Unary θ ∈ {−1, 0, +1}: expected direction per
+gene; observation matching θ’s sign is evidence for that phenotype. Pairwise w ∈ {−1, 0, +1}:
+expected co-deviation of gene pairs; w = +1 same direction, w = −1 opposite. Per-turn output:
+patient_id, next_gene_to_measure (from unobserved list), top_k_labels (exactly or up to k labels
+
+35
+
+from the candidate list, ranked most→least likely). Optionally done (boolean; true only when
+highly confident further measurements would not change the prediction). Every label must be
+verbatim from the candidate list; no duplicates, no prose outside the JSON object. Output:
+Valid JSON only, no text outside schema. User prompt: shared AFA template (Box E.10).
+User prompt template: AFA (shared across all binary and multiclass variants, issued per turn)
+
+Patient: {patient_id} Turn: {t}/{T}
+Observed genes ({n_obs}/{n_total}): per-gene ±1/0 values in observation order.
+Unobserved genes ({n_unobs}/{n_total}): comma-separated, alphabetical; pick exactly one.
+Prior turns (optional, trajectory mode only): turn n: picked gene (observed = v); top_k = [. . .].
+Return only JSON.
+
+36
+
+

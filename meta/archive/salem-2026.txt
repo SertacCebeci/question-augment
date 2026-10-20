@@ -1,0 +1,2082 @@
+Hierarchical Group-Conditional Conformal Risk Control
+for Selective Prediction in Language Models
+Murilo Salem
+Daniel Pontes
+Luísa Böhm
+Anderson Ferrugem
+
+mcsalem@inf.ufpel.edu.br
+dhspbarretos@inf.ufpel.edu.br
+lcbohm@inf.ufpel.edu.br
+ferrugem@inf.ufpel.edu.br
+
+CDTec (Centro de Desenvolvimento Tecnológico)
+Universidade Federal de Pelotas
+Pelotas, RS, Brasil
+
+Abstract
+
+arXiv:2607.24562v1 [cs.AI] 27 Jul 2026
+
+Large language models deployed in real-world settings serve heterogeneous populations
+structured by domain, topic difficulty, and linguistic style. While conformal risk control (CRC)
+provides rigorous marginal risk guarantees for selective prediction with abstain, marginal
+guarantees do not imply per-group guarantees: a model can satisfy the population-level risk
+budget while systematically over-exposing specific subgroups to errors. We demonstrate this
+failure mode concretely: under mild distributional shift in group composition, standard CRC
+violates the risk budget in up to 47% of evaluation trials.
+We propose HG-CRC (Hierarchical Group-Conditional Conformal Risk Control), a posthoc calibration framework that enforces simultaneous risk guarantees across all nodes of
+a user-defined group hierarchy. HG-CRC applies a Bonferroni correction over hierarchy
+nodes and uses a leaf-first selection policy that always applies the most specific applicable
+threshold, falling back to coarser nodes when a finer node is uncertified or its threshold
+rejects the example. The method requires only a held-out calibration set and no retraining.
+We evaluate HG-CRC on three language models (Qwen3-4B, Llama-3.1-8B-Instruct, Gemma3-4B) and two multiple-choice benchmarks (ARC Challenge and MMLU-Pro) across eight
+experimental configurations probing IID generalization, group heterogeneity, mixture shift,
+domain shift, prompt shift, difficulty shift, label noise, and quantization. Our main result:
+HG-CRC achieves an empirical 0% violation rate and WGER = 0 on ARC Challenge for
+models with sufficiently high base accuracy (Qwen3-4B and Llama-3.1-8B). At our evaluation
+resolution of 500 bootstrap trials these zeros are empirical upper bounds—a true violation
+rate of up to ∼0.6% is consistent with an observed zero—rather than certified zeros. The
+result is also benchmark-specific: on MMLU-Pro these models either abstain entirely or,
+for Llama, retain WGER = 0.014. For Gemma-3-4B, whose uncertainty scores are poorly
+calibrated for this task, the method degrades gracefully by abstaining more conservatively.
+The participation cost relative to global CRC ranges from 22 to 37 percentage points for the
+two primary pairs under residual calibration, which aligns the calibration and deployment
+populations of each hierarchy node. Ablation studies show that the hierarchical depth is what
+clears the risk budget on ARC Challenge: removing the difficulty level returns violations
+to the 11% level of standard global CRC. The Bonferroni correction is required for the
+theoretical simultaneous guarantee, though its empirical effect is negligible on ARC’s shallow
+five-node hierarchy and material only when many nodes are tested.
+
+1
+
+Introduction
+
+The deployment of large language models (LLMs) in high-stakes settings—medical question answering,
+educational assessment, legal research—raises fundamental questions about reliability and fairness. A model
+1
+
+that answers every question achieves high availability but may expose users to an unacceptable rate of confident
+errors. Selective prediction addresses this tension: the model is allowed to Abstain on uncertain inputs,
+answering only when it can do so reliably. The practical challenge is to make abstaining principled—calibrated
+to an explicit error budget rather than tuned by hand.
+Conformal Risk Control. Angelopoulos et al. 2023 showed that a simple thresholding procedure on any
+uncertainty score can provide a distribution-free marginal risk guarantee: if the score threshold is chosen
+from a held-out calibration set using the Clopper-Pearson upper bound, then the expected error rate on new
+test examples is at most α with probability at least 1 − δ. This result is elegant, nonparametric, and broadly
+applicable. Global CRC has since been applied to medical imaging (see related work), natural language
+generation (see related work), and code completion (see related work).
+The group coverage gap. Marginal guarantees, however, are not group guarantees. Consider a model
+calibrated on a dataset with an equal mix of easy and hard questions. The global threshold is chosen to
+keep the average error rate below α = 0.10. Now suppose the test set over-represents hard questions. The
+overall error rate may still be controlled, but the hard-question subgroup bears a disproportionate fraction of
+the errors—potentially violating the α budget for that group by a wide margin. This is not a hypothetical
+concern: in our experiments, global CRC violates the per-group risk budget in 47% of bootstrap trials
+under a moderate shift in group composition (Section 5.3). The violation is not a finite-sample artifact;
+it is a structural consequence of the mismatch between the estimand (marginal risk) and the desideratum
+(worst-group risk).
+Our approach. We address this gap with HG-CRC, a method that calibrates one threshold per node of a
+user-specified group hierarchy and applies a Bonferroni correction so that all nodes are simultaneously certified
+with the desired confidence. The hierarchy captures the natural structure of heterogeneous deployments: at
+the coarsest level, a global node covers all users; intermediate nodes stratify by domain or topic category; leaf
+nodes represent the finest granularity, such as domain-by-difficulty cells. At inference time, a leaf-first policy
+routes each example to the deepest certified node in its ancestry path whose threshold the example satisfies,
+falling back to coarser nodes otherwise. The result is a conservative but principled system: it abstains more
+often than a global threshold would, but it does so equitably—no group is sacrificed for the benefit of the
+overall average.
+Summary of contributions.
+1. We formalize the group coverage gap in selective prediction and show that standard CRC fails to
+control per-group risk under realistic distributional shift (Section 2, 5.3).
+2. We propose HG-CRC, a post-hoc calibration procedure that enforces simultaneous risk guarantees
+across all nodes of a group hierarchy through Bonferroni correction and a leaf-first selection policy
+(Section 3).
+3. We provide a cascade of formal guarantees, each about a well-defined procedure, two of which we run:
+the data-split variant controls every node’s risk simultaneously with probability 1 − δ unconditionally
+(Proposition 1); the deployed in-sample variant satisfies the same bound up to an additive slack εn
+that we prove (Lemma 1) and measure to be below 1% on average (with a worst-case εn ≈ 0.34 on
+the small ARC pool; Section 8), with an exact intermediate guarantee under test-point augmentation
+(Proposition 2).
+4. We conduct an empirical study across 8 experimental settings, demonstrating that HG-CRC achieves
+WGER = 0 and a 0% empirical violation rate (an empirical upper bound of ∼0.6% at 500 trials) for
+the primary ARC model–dataset pairs, with a modest participation cost (Section 5).
+5. We show that the method degrades gracefully under label noise, remains robust under model
+quantization, and that its guarantees can be restored after prompt distribution shift via targeted
+recalibration.
+2
+
+2
+
+Background and Related Work
+
+2.1
+
+Selective Prediction and Abstain
+
+Selective prediction (Geifman & El-Yaniv, 2017; El-Yaniv & Wiener, 2010) is the task of producing a prediction
+system (f, g) where f : X → Y is a classifier and g : X → {0, 1} is a selector that decides whether to answer
+(g(x) = 1) or abstain (g(x) = 0). The coverage (also called participation) of the system is ϕ = P(g(x) = 1),
+and the selective risk is R = E[ℓ(f (x), y) | g(x) = 1], where ℓ is a loss function. The fundamental trade-off is
+that more selective systems (lower ϕ) can achieve lower risk, but they answer fewer queries.
+In practice, selectors are typically implemented by thresholding an uncertainty score s : X → R: the system
+answers if s(x) ≤ τ and abstains otherwise. A lower score indicates higher confidence. The question of how
+to choose τ to satisfy a risk constraint while maximizing participation is the central calibration problem.
+2.2
+
+Conformal Risk Control
+
+Angelopoulos et al. (2023) showed that τ can be chosen from a held-out calibration set {(xi , yi )}ni=1 so that
+the selective risk on future exchangeable test points satisfies P(R ≤ α) ≥ 1 − δ. The key ingredient is the
+Clopper-Pearson (CP) upper confidence bound: given k errors among n calibration examples that answered,
+the CP bound UCP (k, n, δ) is the 1 − δ quantile of Beta(k + 1, n − k), which controls the one-sided error. The
+threshold τ ∗ is chosen as the largest value in a finite grid {τ1 , . . . , τT } such that the CP-bound on the error
+rate of the resulting selector is at most α. This is a nonparametric, model-agnostic procedure that requires
+no assumptions about the underlying distribution beyond exchangeability.
+Limitations of marginal CRC. The marginal guarantee is exactly that: marginal. It controls P(E[ℓ |
+g(x) = 1] > α) ≤ δ, but it says nothing about the risk within any particular subgroup G ⊆ X . If the
+calibration set is not representative of the group structure in the test set, the threshold chosen by global
+CRC may be systematically miscalibrated for some groups. In the worst case, global CRC can achieve zero
+excess risk in the majority group while violating the budget entirely in a minority group, with no mechanism
+to detect or correct this.
+2.3
+
+Group-Conditional Guarantees and Fairness
+
+The need for per-group coverage has been extensively studied in the context of conformal prediction (Vovk
+et al., 2009; Boström et al., 2021; Romano et al., 2020b). Mondrian conformal prediction produces prediction
+sets with conditional coverage for each group by running a separate conformal procedure per group. This
+is equivalent to what we call flat groupwise CRC : compute one threshold per group using group-specific
+calibration data. While this controls per-group risk in isolation, it suffers from two problems. First, it treats
+groups independently and does not exploit the hierarchical structure of natural group taxonomies. Second,
+and more critically for our setting, it does not provide a simultaneous guarantee across all groups: running
+K independent tests each at level δ yields a family-wise error rate (FWER) of approximately Kδ under
+independence, not δ.
+The need for simultaneous inference motivates a Bonferroni-style correction, which we incorporate into
+HG-CRC. Recent work on fairness in conformal prediction (Barber et al., 2021; Romano et al., 2020a) has
+studied related problems, but typically in the context of classification prediction sets rather than selective
+prediction with abstain. Our work is the first, to our knowledge, to study group-conditional risk control for
+selective prediction in LLMs with a hierarchical group structure.
+2.4
+
+Uncertainty Quantification in LLMs
+
+Several uncertainty scores have been proposed for LLMs. Token-level entropy (Malinin & Gales, 2021),
+sequence-level NLL, and self-consistency scores (Wang et al., 2023) all proxy model confidence. For multiplechoice tasks, the negative log-likelihood of the model’s selected option (which we call the selected-option
+NLL) is a natural score that correlates well with accuracy and is fast to compute without additional inference
+3
+
+passes. We study the sensitivity of HG-CRC to the choice of uncertainty score in Section 6.3 and find that
+most score choices yield equivalent performance.
+
+3
+
+Method: Hierarchical Group-Conditional CRC
+
+3.1
+
+Setup and Notation
+
+Let X be an input space and Y a label space. We assume access to a pre-trained language model that
+produces, for each input x, a probability distribution over Y from which we extract an uncertainty score
+s(x) ∈ R (lower = more confident). We have a labeled calibration set Dcal = {(xi , yi )}ni=1 drawn i.i.d. from
+a data distribution P, and an unlabeled test stream. Each example is additionally associated with group
+membership indicators derived from metadata (e.g., domain label) or from the model’s own behavior (e.g.,
+estimated difficulty).
+Definition 1 (Hierarchy). A group hierarchy H is a rooted tree where each node v is associated with a
+binary mask mv : X → {0, 1} indicating group membership. The root node has mroot (x) = 1 for all x. For
+any non-root node v with parent p(v), membership is nested: mv (x) = 1 ⇒ mp(v) (x) = 1. For any example x,
+the ancestry path Π(x) is the sequence of nodes from the deepest node v with mv (x) = 1 to the root, ordered
+from leaf to root.
+Definition 2 (Selective Predictor). Given a threshold assignment {τv }v∈H , the HG-CRC selective predictor
+is:
+(
+
+f (x)
+if v ∗ (x) exists
+ŷ(x) =
+v ∗ (x) = arg max depth(v) : v certified, s(x) ≤ τv ,
+(1)
+Abstain otherwise,
+v∈Π(x)
+where v ∗ (x) is the deepest certified ancestor of x whose threshold the example satisfies (s(x) ≤ τv∗ ), and
+Abstain is returned if no such node exists.
+3.2
+
+Per-Node Calibration with Bonferroni Correction
+
+Let |H| denote the number of nodes in the hierarchy. We wish to choose thresholds {τv }v∈H such that,
+with probability at least 1 − δ over the calibration set, the selective risk satisfies Rv ≤ α for every node v
+simultaneously.
+Direct application of the union bound gives the required per-node confidence level:
+δ̂ =
+
+δ
+.
+|H|
+
+(2)
+
+For each node v, let Dv = {i : mv (xi ) = 1} be the subset of calibration examples belonging
+P to node v, with
+nv = |Dv |. Let kv (τ ) be the number of errors in Dv when threshold τ is used: kv (τ ) = i∈Dv ℓ(f (xi ), yi ) ·
+1[s(xi ) ≤ τ ]. The Clopper-Pearson upper bound at level δ̂ is:
+
+
+
+
+−1
+Uv (τ ) = CP kv (τ ), nv (τ ), δ̂ = FBeta
+1 − δ̂; kv (τ ) + 1, nv (τ ) − kv (τ ) ,
+(3)
+where nv (τ ) = |{i ∈ Dv : s(xi ) ≤ τ }| is the number of examples that would answer under threshold τ . Node
+v is certified at threshold τ if Uv (τ ) ≤ α. The optimal threshold for node v is:
+τv∗ = max{τ ∈ T : Uv (τ ) ≤ α},
+
+(4)
+
+where T is a finite grid of candidate thresholds (100 quantiles of the calibration score distribution). If no
+τ ∈ T satisfies the constraint, node v is left uncertified.
+Minimum group size. Nodes with very few calibration examples cannot be certified: even with zero errors,
+the CP bound at small n exceeds α. We therefore include a node in the hierarchy only if |Dv | ≥ Nmin (we use
+Nmin = 30 in all experiments). Nodes below this threshold are pruned from H, reducing |H| and accordingly
+tightening the per-node budget δ̂.
+4
+
+3.3
+
+Residual Calibration
+
+The leaf-first selective predictor (Definition 2) routes each test example to its deepest certified ancestor. A
+node v is therefore deployed only on its residual: examples in group v that are not answered by any certified
+descendant of v. Writing desc(v) for the certified descendants of v and gτ (x) = 1[s(x) ≤ τ ] for the answer
+indicator at threshold τ , the residual membership map is
+Y
+
+ρv (x) = mv (x)
+1 − mc (x) gτc (x) ,
+(5)
+c∈desc(v)
+
+i.e. ρv (x) = 1 iff x belongs to v and is not answered by any certified descendant. A node calibrated on its full
+group Dv but deployed on {x : ρv (x) = 1} suffers a population mismatch: if descendants preferentially answer
+easy examples (lower score), the residual is harder on average and the calibrated threshold no longer controls
+the deployed risk. We therefore calibrate each node on its residual. The two constructions below differ only
+in how the descendant thresholds {τc } that define ρv are estimated — and this difference is exactly what
+determines whether the calibration guarantee holds.
+In-sample residual calibration (deployed default). Process nodes leaf-to-root on the full calibration set.
+After certifying a descendant c at threshold τc , mark the calibration examples it answers (mc = 1 and gτc = 1)
+as claimed; node v is then calibrated on Dvres = {i ∈ Dv : i unclaimed}. This keeps the maximum amount of
+data at every node, hence the highest participation, but the residual partition of Dvres depends on thresholds
+τc estimated from the same examples, which is the exchangeability obstruction analyzed in Proposition 2.
+UL−1
+Split residual calibration (formally valid). Partition Dcal = ℓ=0 Fℓ into L disjoint folds indexed by
+depth (L = number of distinct depths). A node at depth ℓ is calibrated only on Fℓ , and the thresholds τc
+that define its residual ρv are taken from strictly deeper nodes, which were calibrated on the disjoint folds
+Fℓ′ , ℓ′ > ℓ. The residual partition of Fℓ is then a function of data independent of Fℓ , restoring exchangeability
+(Proposition 1). The cost is statistical: each level sees only ≈ |Dcal |/L examples.
+3.4
+
+Leaf-First Selection Policy
+
+Algorithm 1 summarizes the full procedure. At test time, each example x walks its ancestry path Π(x) from
+leaf to root, returning the threshold of the first certified node encountered. If no certified node exists in Π(x),
+the example is abstained.
+The leaf-first ordering is critical. Reversing the order—trying the global threshold first—would route most
+examples through the global node, defeating the purpose of the hierarchy. By trying the most specific node
+first, we ensure that examples in well-characterized subgroups benefit from the most tailored threshold
+available.
+3.5
+
+Formal Guarantee
+
+We state the guarantee first for the split variant, the procedure whose assumptions are met exactly: calibration
+and deployment populations coincide, and the residual partition is independent of the data used to calibrate
+each node.
+Proposition 1 (Simultaneous group risk control, split calibration). Let Dcal = {(xi , yi )}ni=1 be i.i.d. from
+P and let (x, y) ∼ P be an independent test point. Run Algorithm 1 in split mode with δ̂ = δ/|H| and a
+threshold grid T that is either fixed a priori or a permutation-invariant function of the node’s calibration fold
+Fℓ (e.g. its empirical score quantiles). Then for each node v ∈ H,
+P(Rv (τv∗ ) > α | ρv (x) = 1) ≤ δ̂,
+
+Rv (τ ) = E[ℓ(f (x), y) | gτ (x) = 1, ρv (x) = 1],
+
+(6)
+
+where Rv is the risk on the node’s deployed residual (5). By the union bound, P(∃v ∈ H : Rv (τv∗ ) > α) ≤
+|H| · δ̂ = δ.
+Proof. Fix a node v at depth ℓ and condition on the strictly deeper calibration folds {Fℓ′ }ℓ′ >ℓ . The
+descendant thresholds {τc }c∈desc(v) are functions of these deeper folds only, hence so is the residual map ρv
+5
+
+Algorithm 1 HG-CRC: Hierarchical Group-Conditional CRC (residual calibration)
+Require: Calibration set Dcal , hierarchy H, score s, classifier f , risk level α, confidence δ, minimum size
+Nmin , mode ∈ {in-sample, split}
+1: δ̂ ← δ/|H|
+▷ Bonferroni correction
+2: if mode = split then
+3:
+assign each i ∈ Dcal a depth-fold ℓi
+▷ Fℓ = {i : ℓi = ℓ}
+4: end if
+5: for each node v ∈ H in leaf-to-root (decreasing depth) order do
+6:
+Cv ← {i : mv (xi ) = 1, ρv (xi ) = 1, |Cv | ≥ Nmin } ▷ residual (5): drop examples claimed by certified
+deeper nodes
+7:
+if mode = split then
+8:
+Cv ← Cv ∩ Fdepth(v)
+9:
+end if
+10:
+τv∗ ← max{τ ∈ T : Uv (τ ) ≤ α} on Cv , or uncertified
+11: end for
+12: function Predict(x)
+13:
+for v ∈ Π(x) do
+▷ leaf to root
+14:
+if v is certified and s(x) ≤ τv∗ then return f (x)
+15:
+end if
+16:
+end forreturn Abstain
+17: end function
+
+in (5); conditionally, ρv is a fixed measurable function. The node is calibrated on Cv = {i ∈ Fℓ : mv (xi ) =
+1, ρv (xi ) = 1}. Since Fℓ is disjoint from the deeper folds, its points are i.i.d. from P and independent of
+ρv , as is the test point (x, y). Hence, given ρv (·) = 1, the calibration scores in Cv and the test score are
+exchangeable, and the Clopper–Pearson upper bound Uv certifies τv∗ at level δ̂ exactly as in single-node
+CRC (Angelopoulos et al., 2023), giving P(Rv (τv∗ ) > α | ρv (x) = 1) ≤ δ̂. If the grid is fixed a priori it is
+trivially independent of the data; for the empirical quantile grid, note that T is a symmetric function of the
+calibration fold Fℓ . Since ρv depends only on the strictly deeper folds, which are disjoint from Fℓ , it remains
+the fixed function established above when we condition additionally on the unordered multiset of Fℓ ; under
+this joint conditioning T becomes a measurable constant while the exchangeability between the test point
+and the members of the residual cell is preserved, and refining the grid can only tighten the selected threshold.
+Together with the monotone “certify and take the largest τ ” rule, the bound is therefore invariant to the
+choice between an a-priori grid and the empirical quantile grid. Marginalizing over the deeper folds preserves
+the bound, and the Bonferroni union bound over the |H| nodes yields the simultaneous statement.
+The in-sample default deploys the same residual procedure but estimates the descendant thresholds {τc } on
+the data it also calibrates on. We isolate the exact condition under which it remains valid.
+Proposition 2 (Conditional validity, in-sample calibration). Run Algorithm 1 in in-sample mode. Suppose
+each descendant threshold τc is computed by a permutation-invariant estimator of its residual calibration
+multiset and is recomputed on the augmented multiset that also includes the test point (full-/cross-conformal
+augmentation). Then, conditional on {τc }c∈desc(v) , the residual calibration points and the test point are
+exchangeable, and P(Rv (τv∗ ) > α | ρv (x) = 1) ≤ δ̂; the simultaneous bound follows as in Proposition 1.
+Proof. Write Zi = (xi , yi ) for the calibration points and Zn+1 = (x, y) for the test point; the Z1 , . . . , Zn+1
+are i.i.d. and hence exchangeable. In the augmented procedure each descendant threshold τc is a permutationinvariant function of the multiset {{Z1 , . . . , Zn+1 }} (it is computed by a symmetric estimator on Dcal ∪{Zn+1 }).
+Condition on the unordered multiset M = {{Z1 , . . . , Zn+1 }}. Given M, the ordered tuple is uniform over the
+(n+1)! permutations of M by exchangeability, while every τc — a function of M alone — is constant under this
+conditioning. Hence the residual map ρv in (5) is a fixed function and the residual cell S = {z ∈ M : ρv (z) = 1}
+is a fixed sub-multiset. By the uniform-over-permutations property the test point occupies a uniformly
+random position among the members of S, so the test score is exchangeable with the residual calibration
+6
+
+scores. The Clopper–Pearson upper bound on the residual is therefore a valid level-δ̂ bound for the residual
+risk, giving P(Rv (τv∗ ) > α | ρv (x) = 1) ≤ δ̂ exactly as in single-node CRC (Angelopoulos et al., 2023); the
+simultaneous statement follows by the Bonferroni union bound as in Proposition 1.
+The augmentation is exactly what the deployed in-sample procedure does not do: Algorithm 1 (in-sample
+mode) freezes each τc on Dcal and applies it to a test point that never entered the computation, so conditioning
+on τc treats calibration and test points asymmetrically and exchangeability can fail. We give the deployed
+procedure its own guarantee.
+Assumption 1 (Threshold regularity). At all certified nodes outside a boundary set of probability O(εn ),
+the Clopper–Pearson curve Uc (·) crosses the level α transversally at the selected grid threshold τc with a
+margin γ ≫ 1/nc : Uc at the grid points adjacent to τc stays at least γ away from α. Equivalently, outside
+that boundary set the score distribution has no atom at the relevant quantile and has positive density in a
+neighbourhood of it.
+This is the only place we step outside the distribution-free regime; it is mild for the continuous NLL-style
+scores we use. Its role is precise: a one-point change in Dcal shifts each count kc , nc by at most one and
+hence moves Uc by O(1/nc ) at every grid point, so under Assumption 1 (margin γ ≫ 1/nc ) the selected grid
+threshold is unchanged. Without the margin the selection can jump one grid step — a discrete move whose
+size is set by the grid resolution, not by 1/n — which is why we do not claim a clean O(1/n) rate and instead
+measure the effect.
+Lemma 1 (Validity of plain in-sample calibration). Run Algorithm 1 in in-sample mode (no augmentation),
+the procedure deployed in all experiments. Let b
+a(x) be its answer decision for a test point x and b
+a+ (x) the
++
+decision of the augmented procedure of Proposition 2, and set εn = P(b
+a(x) ̸= b
+a (x)). Then
+
+
+P Rv (τv∗ ) > α | ρv (x) = 1 ≤ δ̂ + εn ,
+P ∃v : Rv > α ≤ δ + |H| εn .
+Under Assumption 1, εn vanishes outside the event that some threshold on x’s ancestry path sits within one
+grid step of the α boundary; it is thus governed by the grid resolution and the frequency of boundary thresholds,
+not by a fixed rate in n.
+Proof. Couple the deployed and augmented procedures on the same data. The augmented procedure is
+exactly valid by Proposition 2. For every test point with b
+a(x) = b
+a+ (x) the two induce the identical routing,
+answer, and hence risk event; they can disagree only on {b
+a(x) ̸= b
+a+ (x)}, of probability εn . To make the
+perturbation explicit, write πv = P(gτ (x) = 1, ρv (x) = 1) for the residual-cell answer probability; since the
+disagreement set has probability at most εn and enters both the numerator and the conditioning event of
+Rv = E[ℓ | gτ (x) = 1, ρv (x) = 1], the conditional risks differ by |Rvdeployed − Rvaug | ≤ εn /πv . Equivalently,
+the deployed risk event is contained in the augmented risk event together with the disagreement set, whose
+conditional contribution is at most εn ; this gives the per-node bound, and the Bonferroni union over |H|
+nodes gives the simultaneous bound. A decision flips only if some threshold on x’s path changes between the
+Dcal and the augmented computation — a descendant τc (altering x’s residual membership ρv ) or the node
+threshold τv∗ itself. Each is the largest grid point with U (·) ≤ α; adding one point moves every U by O(1/n),
+so under Assumption 1 the selected grid point, and the decision, are unchanged. The residual contribution is
+the margin event in which a threshold lies within O(1/n) of α and one point moves it a grid step.
+We estimate εn by jackknife (leave-one-out over calibration points, the sample analogue of the augmentation
+perturbation). Across our three models on arc-challenge (α = 0.1) and mmlu-pro (α = 0.3), a one-point
+perturbation changes the selected threshold in fewer than 6% of cases and flips a test decision with mean
+probability below 0.5% (95th percentile below 1%), shrinking with calibration size (mean of order 10−4
+at n ≈ 2.4k); the rare large flips are exactly the predicted grid-step jumps at boundary thresholds. The
+conditional slack the lemma adds to δ̂ is εn /πv : negligible at nodes whose residual cell carries non-negligible
+mass, and correspondingly weaker at sparse nodes (small πv , such as Gemma’s leaf cells), consistent with the
+low participation there. It is therefore empirically negligible for the deployed procedure at the nodes that
+actually answer, while Proposition 1 (split) attains the same guarantee with εn = 0 unconditionally, at the
+participation cost of Remark 2.
+7
+
+Remark 1 (A cascade of guarantees). The three results bracket precisely the three procedures in this paper,
+from strongest guarantee to most data-efficient: Proposition 1 (split) is unconditional but calibrates each level
+on a disjoint fold; Proposition 2 (in-sample with test-point augmentation) is exact but recomputes thresholds
+per test point; and Lemma 1 (plain in-sample) covers the deployed procedure of every experiment, exact up
+to the measured slack εn . Two of the three subjects—split and plain in-sample—are procedures we run; the
+augmented procedure is the exact bridge between them.
+Corollary 2.1 (Zero WGER). Let the Worst-Group Excess Risk be WGER = maxv∈H max(Rv − α, 0).
+Under the event of Proposition 1 (split) or Proposition 2 (augmented in-sample), which occurs with probability
+1 − δ — or of Lemma 1 (plain in-sample), with probability 1 − δ − |H|εn — WGER = 0.
+Remark 2 (The price of formal validity). Proposition 1 holds for the split variant unconditionally;
+Proposition 2 makes the in-sample variant exact under test-point augmentation; and Lemma 1 covers the plain
+in-sample default up to the measured slack εn . The two variants thus trade formal validity against statistical
+efficiency: splitting calibrates each level on ≈ |Dcal |/L examples and so answers fewer. We quantify this gap
+over 200 paired calibration/test resamples (δ = 0.05); within each resample both variants are calibrated on
+the same data, so the participation cost is a within-resample paired difference, which is why its confidence
+intervals are tight. On arc-challenge at the paper’s canonical α = 0.1 (a global → difficulty hierarchy; the
+same three models as Section 5.2), splitting costs between 0.6 pp ([−2.1, 3.3], indistinguishable from zero) and
+5.5 pp ([3.7, 7.4]) of participation depending on the model, while both variants keep every node’s empirical
+violation rate below δ. We do not detect a safety penalty for the in-sample default: a paired McNemar test on
+the node-violation indicators shows no significant difference after Holm correction across the three models
+(smallest adjusted p = 0.09), and the sign of the difference is not even consistent across models. The honest
+reading is therefore not that the variants are equivalent — 200 resamples cannot establish that — but that in
+the regimes we can measure, the in-sample default carries no detectable safety cost, while splitting buys the
+unconditional guarantee of Proposition 1 for a few points of participation.
+A controlled synthetic study (heterogeneous groups, descendants answering the easy examples) maps how this
+cost varies: it is near-zero when scores separate well and the hierarchy is shallow (0.9 pp at depth 2) and grows
+with depth and weaker separation (up to ∼ 14 pp at depth 3), with both variants holding δ throughout. The
+real and synthetic numbers agree in order of magnitude in this cheap corner (shallow hierarchy, well-separated
+scores), which is what licenses reading the synthetic study as a map of the expensive regimes we cannot reach
+empirically. As a second, deliberately harder data point, on mmlu-pro these 4B-class models are too weak
+for α = 0.1 to admit any non-trivial answering — a non-deployability regime in its own right — so only by
+relaxing to α = 0.3 can we measure the trade-off there (2.2–4.9 pp, again with no detected safety difference,
+McNemar p ≥ 0.45); this corroborates the result rather than anchoring it.
+We deploy the in-sample variant by default for its higher participation — it is covered by the stability lemma
+(Lemma 1), whose slack εn we measure to be below 1%, and as shown above it incurs no detectable safety cost
+— and provide the split variant as the unconditionally-guaranteed alternative (Proposition 1) whose price is the
+few points of participation measured above.
+Remark 3. The Bonferroni correction is conservative: it bounds the FWER from above. For |H| nodes, the
+per-node budget δ̂ = δ/|H| may be unnecessarily small when nodes are positively correlated (which they are,
+since higher nodes contain all examples of lower nodes). More powerful procedures such as Holm-Bonferroni
+or hierarchical testing (Yekutieli, 2008) could reduce the conservatism, but we use Bonferroni for its simplicity
+and transparency. We investigate the effect of removing the correction in Section 6.2.
+
+4
+
+Experimental Setup
+
+4.1
+
+Models and Datasets
+
+We evaluate on three publicly available instruction-tuned language models at the 4–8B parameter scale:
+Qwen3-4B (Team, 2025b), a dense model with strong reasoning capabilities; Llama-3.1-8B-Instruct (Dubey
+et al., 2024), a widely-used open-source baseline; and Gemma-3-4B-IT (Team, 2025a), a smaller model
+with competitive accuracy. All models are evaluated in bf16 precision unless otherwise noted.
+8
+
+We use two multiple-choice benchmarks. ARC Challenge (Clark et al., 2018) consists of 1,172 science
+questions drawn from standardized tests, each with four answer choices. The allenai/ai2_arc distribution
+we load exposes no per-question subject or difficulty field, so we treat ARC as a single science domain.
+Consequently the domain level of the hierarchy is trivial for ARC, and the meaningful sub-grouping is by
+difficulty (defined below). MMLU-Pro (Wang et al., 2024) is a harder variant of MMLU with ten answer
+choices per question, covering 57 academic subjects. For each model-dataset pair, we pool all available
+examples and split them 50/50 into calibration and test sets for bootstrap evaluation.
+4.2
+
+Uncertainty Score and Threshold Grid
+
+Our primary uncertainty score is the selected-option NLL.
+a multiple-choice question with K options,
+PFor
+K
+let ℓk be the model’s logit for option k and p′k = exp(ℓk )/ j=1 exp(ℓj ) the probability normalized over the
+option set. The model selects k̂ = arg maxk p′k , and we score the question by the negative log-probability of
+that selected option:
+s(x) = − log p′k̂ = − max log p′k .
+(7)
+k
+
+Intuitively, this score is low when the model concentrates probability mass on a single option (confident) and
+high when the selected option’s normalized probability is small, i.e. mass is spread diffusely across options
+(uncertain). Because the selected option is the arg max, in this multiple-choice setting s(x) coincides exactly
+with the min-log-prob and sequence-NLL scores, which is why those rows are identical in Table 6. We study
+alternative scores in Section 6.3.
+The threshold grid T consists of 100 evenly-spaced quantiles of the NLL scores in the calibration set. We set
+α = 0.10 (acceptable error rate) and δ = 0.05 (confidence) in all experiments.
+4.3
+
+Group Hierarchy
+
+We construct a two-level hierarchy above the global root:
+Domain nodes (level 2). We use the dataset’s provided domain metadata to partition examples into
+domain groups. MMLU-Pro has 57 subjects grouped into broader categories. ARC, as loaded, carries no
+subject metadata and collapses to a single science domain, so for ARC this level is degenerate and the
+hierarchy reduces to global → difficulty. A domain node is included in the hierarchy only if it contains at
+least Nmin = 30 calibration examples.
+Difficulty nodes (level 3). Within each domain, we further partition examples into three difficulty bins
+(easy, medium, hard) based on NLL score percentiles: the k-th calibration example is assigned to hard if its
+NLL exceeds the 67th percentile, easy if it falls below the 33rd percentile, and medium otherwise. Difficulty
+bins with fewer than Nmin examples are pruned.
+Note on endogeneity. Because difficulty bins are derived from NLL percentiles—the same score used for
+thresholding—the “hard” bin by construction contains high-NLL examples, creating an alignment between
+group membership and calibrated threshold values. A cleaner grouping would use an exogenous difficulty
+notion independent of the deployed NLL score. The allenai/ai2_arc distribution we load does not expose
+human difficulty labels, so we construct an exogenous signal from a reference model’s score (independent of
+the deployed threshold) and re-run the mixture-shift experiment under it in Section 5.3; the failure of global
+CRC persists, confirming the effect is structural rather than an artifact of the endogenous bins.
+The full hierarchy thus has at most 1 + |domains| + |domains| × 3 nodes, with pruning typically reducing this
+to 5–15 nodes depending on the dataset.
+4.4
+
+Baselines
+
+We compare against four baselines: B0 (Always Answer): the model answers every question; no threshold
+is applied. This achieves maximum participation but no risk control. B1 (Fixed Threshold): a threshold
+is set at the 50th percentile of calibration scores without any statistical guarantee. B4 (Global CRC):
+the standard CRC procedure applied once over the full calibration set, providing a marginal guarantee. B5
+9
+
+Table 1: IID results on ARC Challenge. α=0.10, δ=0.05. Violation rate ≤ 0.05 satisfies the CRC guarantee.
+Best method per model shown in bold. Identical rows are shaded identically.
+Model
+
+Method
+
+Risk
+
+Participation
+
+WGER
+
+Viol. rate
+
+Qwen3-4B
+
+B0 — Always answer
+B1 — Fixed threshold
+B4 — Global CRC
+B5 — Groupwise CRC
+
+0.126±0.013
+0.087±0.012
+0.070±0.021
+0.070±0.021
+
+1.000
+0.899
+0.849
+0.849
+
+0.026
+0.001
+0.001
+0.001
+
+0.980
+0.142
+0.110
+0.110
+
+Gemma-3-4B
+
+B0 — Always answer
+B1 — Fixed threshold
+B4 — Global CRC
+B5 — Groupwise CRC
+
+0.223±0.016
+0.188±0.016
+0.054±0.040
+0.054±0.040
+
+1.000
+0.896
+0.294
+0.294
+
+0.123
+0.088
+0.001
+0.001
+
+1.000
+1.000
+0.094
+0.094
+
+Llama-3.1-8B
+
+B0 — Always answer
+B1 — Fixed threshold
+B4 — Global CRC
+B5 — Groupwise CRC
+
+0.176±0.015
+0.136±0.014
+0.067±0.023
+0.067±0.023
+
+1.000
+0.897
+0.695
+0.695
+
+0.076
+0.036
+0.001
+0.001
+
+1.000
+0.998
+0.090
+0.090
+
+(Flat Groupwise CRC): independent CRC applied to each domain group separately, without hierarchical
+structure and without Bonferroni correction across groups.
+4.5
+
+Evaluation Protocol
+
+We use bootstrap resampling with 500 trials to estimate variance. In each trial, the calibration and test sets
+are independently resampled by random permutation of the full data pool (50% / 50% split). We report:
+(i) risk mean ± std, the mean and standard deviation of the empirical error rate across bootstrap trials;
+(ii) participation mean, the mean fraction of test examples that receive a prediction; (iii) WGER, the
+worst-group excess risk; and (iv) violation rate, the fraction of bootstrap trials in which the empirical risk
+exceeds α = 0.10. A method with violation rate ≤ δ = 0.05 satisfies the CRC guarantee empirically. Five
+hundred bootstrap trials provide good statistical resolution: by the rule of three, a true violation rate of
+up to 3/500 ≈ 0.6% is compatible with an observed rate of zero at conventional confidence. Reported “0%
+violation rates” should therefore be interpreted as empirical upper bounds of approximately 0.6%, not as
+certified zeros. (An earlier version of this evaluation used 50 trials, for which the corresponding upper bound
+was ≈6%; we re-ran all bootstrap experiments at 500 trials, and report only those numbers here.)
+
+5
+
+Main Results
+
+5.1
+
+IID Sanity Check (E1)
+
+We first verify that global CRC satisfies its marginal guarantee in the IID setting. Table 1 reports results for
+all models on ARC Challenge.
+Several patterns emerge. First, global CRC (B4) successfully controls the marginal risk for all three models:
+mean risk is 0.054–0.070, well below α = 0.10. The violation rate for Qwen is 0.11, which exceeds δ = 0.05
+nominally; this persists at 500 bootstrap trials, so it is not a low-resolution artifact but a genuine finitecalibration-sample effect: with only ∼586 calibration examples the Clopper–Pearson bound is loose, and
+about 11% of resamples fall slightly above the nominal level. This is expected behavior for CRC with small
+calibration sets, and it is a caveat on the baseline that propagates into all downstream comparisons.
+Second, and perhaps most surprisingly, global CRC and flat groupwise CRC are identical across all
+models. The rows for B4 and B5 are numerically indistinguishable. This is not a coincidence: in the IID
+setting, where the joint distribution of examples and group memberships is the same in calibration and test,
+the global threshold is already calibrated for every group. The flat groupwise procedure applies independent
+10
+
+Table 2: Group heterogeneity results on ARC Challenge. HG-CRC is shown in bold. ARC has a single
+domain, so the deployed hierarchy is global → difficulty (the domain node coincides with the global node).
+Model
+
+Method
+
+Risk
+
+Participation
+
+WGER
+
+Viol. rate
+
+Qwen3-4B
+
+B0 — Always answer
+B1 — Fixed threshold
+B4 — Global CRC
+B5 — Groupwise CRC
+HG-CRC (ours)
+
+0.126±0.013
+0.087±0.012
+0.070±0.021
+0.070±0.021
+0.018±0.013
+
+1.000
+0.899
+0.849
+0.849
+0.478
+
+0.026
+0.001
+0.001
+0.001
+0.000
+
+0.980
+0.142
+0.110
+0.110
+0.000
+
+Gemma-3-4B
+
+B0 — Always answer
+B1 — Fixed threshold
+B4 — Global CRC
+B5 — Groupwise CRC
+HG-CRC (ours)
+
+0.223±0.016
+0.188±0.016
+0.054±0.040
+0.054±0.040
+0.025±0.040
+
+1.000
+0.896
+0.294
+0.294
+0.084
+
+0.123
+0.088
+0.001
+0.001
+0.000
+
+1.000
+1.000
+0.094
+0.094
+0.030
+
+Llama-3.1-8B
+
+B0 — Always answer
+B1 — Fixed threshold
+B4 — Global CRC
+B5 — Groupwise CRC
+HG-CRC (ours)
+
+0.176±0.015
+0.136±0.014
+0.067±0.023
+0.067±0.023
+0.020±0.012
+
+1.000
+0.897
+0.695
+0.695
+0.475
+
+0.076
+0.036
+0.001
+0.001
+0.000
+
+1.000
+0.998
+0.090
+0.090
+0.000
+
+CRC to each group and thereby loses statistical power (smaller nv per group, higher variance), ending up at
+the same threshold.
+This finding has an important implication: flat groupwise CRC does not add value in the IID case, and it
+provides no additional guarantees because it does not apply a simultaneous correction. Its advantage over
+global CRC should only emerge in settings with group heterogeneity or distributional shift—which is precisely
+what HG-CRC is designed to address.
+Third, we note that Gemma-3-4B has a substantially lower participation rate than the other two models
+(29.4% vs. 84.9% for Qwen and 69.5% for Llama). This is a structural property of the model on this dataset:
+Gemma assigns probability mass more diffusely over options, yielding high NLL scores even on questions it
+answers correctly. As a result, the CRC threshold is set conservatively, and many examples are abstained.
+This will remain a recurring observation throughout our experiments.
+
+5.2
+
+Group Heterogeneity: Main Results (E2)
+
+Having established the IID baseline, we now evaluate HG-CRC in the setting for which it was designed: a
+dataset with genuine group heterogeneity. On ARC Challenge, which carries a single domain, this heterogeneity
+is across difficulty levels (the general multi-domain case is exercised on MMLU-Pro). Table 2 reports the full
+comparison.
+A careful reader will notice that the Global CRC and Flat Groupwise CRC rows in Table 2 are numerically
+identical to the corresponding rows in Table 1. This is expected: both experiments draw from the same data
+pool with a random 50/50 split, so the IID partition introduces no systematic group imbalance. The 11%
+violation rate of Global CRC in E2 reflects the same finite-sample behavior documented in E1—not a group
+heterogeneity effect. What Table 2 isolates is instead the simultaneous guarantee. Global CRC satisfies its
+marginal guarantee most of the time, but provides no certificate that every group simultaneously meets the
+budget in the same trial. HG-CRC provides exactly that simultaneous certificate. Its participation cost
+relative to global CRC—quantified below as a 22.0–37.1 pp reduction for the two primary pairs—comes
+mainly from the leaf-first residual calibration rather than the Bonferroni correction: the A4 ablation (Table 5)
+attributes ≈10.6 pp to the correction (0.584 → 0.478), with the residual calibration accounting for the
+remainder (0.849 → 0.584). The genuine failure mode of marginal guarantees—where group heterogeneity
+11
+
+causes a single threshold to systematically over-serve one group at the expense of another—is demonstrated
+under controlled mixture shift in Section 5.3.
+HG-CRC eliminates violations. For both Qwen3-4B and Llama-3.1-8B, HG-CRC achieves a violation
+rate of exactly 0.000 across all 500 bootstrap trials. This is in stark contrast to global CRC, which violates
+in 9–11% of trials on the same data. For Gemma-3-4B, the violation rate drops from 0.094 to 0.030—also
+below the target δ = 0.05.
+HG-CRC achieves WGER = 0. For Qwen and Llama, the worst-group excess risk is identically zero,
+meaning that in every bootstrap trial, every certified group meets the α = 0.10 budget. This is the practical
+meaning of simultaneous group certification: no group is sacrificed for the average. Gemma achieves WGER
+= 0.000 as well, with the caveat that its participation is so low (0.084) that the worst-group statistic is
+computed over very few answered examples.
+Participation cost is modest. The leaf-first policy is conservative: it applies the tightest threshold
+available, which necessarily abstains more than the global threshold. For Qwen, participation decreases
+from 0.849 to 0.478—a reduction of 37.1 percentage points. For Llama, it decreases from 0.695 to 0.475—a
+reduction of 22.0 percentage points. These costs are the price of group-conditional guarantees under residual
+calibration: each node is calibrated on the subpopulation it actually sees at deployment, which for parent
+nodes excludes examples already answered by certified descendants. This subpopulation tends to be harder
+on average, requiring more conservative thresholds. If all groups were identical, the hierarchical threshold
+would coincide with the global threshold and the cost would be zero.
+Risk is lower under HG-CRC. Because HG-CRC abstains more aggressively on hard subgroups, the
+examples it does answer tend to be easier and lower-risk. Mean risk drops from 0.070 to 0.018 for Qwen
+(–74%) and from 0.067 to 0.020 for Llama (–70%). This is a secondary benefit: the method simultaneously
+achieves group-level guarantees and improves the overall quality of answers given.
+The case of Gemma. The low participation of HG-CRC for Gemma (0.084) merits discussion. Even at
+the global level, Gemma participates in only 29.4% of questions. The residual calibration further reduces
+participation: parent nodes are calibrated on examples not already answered by leaf nodes, a harder
+subpopulation, requiring more conservative thresholds. This is not a bug in the method—Gemma genuinely
+cannot certify most of its answers on ARC Challenge under α = 0.10—but it limits the practical utility of
+HG-CRC for this model on this dataset. We discuss this limitation further in Section 8.
+5.3
+
+Why Marginal Guarantees Fail: Mixture Shift (E3)
+
+The results of Section 5.2 demonstrate that HG-CRC provides stronger per-group guarantees than global
+CRC. But one might ask: is this difference practically relevant? If real test distributions are close to the
+calibration distribution, global CRC may suffice. The mixture shift experiment directly tests this assumption
+by introducing a controlled mismatch between calibration and test group compositions.
+Setup. We construct a calibration set with equal group weights (1/3 each for easy, medium, hard) and a test
+set with a shifted mixture: hard examples are over-represented (whard = 0.50, wmed = 0.33, weasy = 0.17).
+This simulates a common real-world scenario: the deployment distribution shifts toward harder inputs over
+time, for example as easier questions are resolved and harder ones accumulate. We compare the violation
+rate of global CRC versus groupwise CRC under this shift.
+The results, shown in Table 3 and Figure 1, are striking. Global CRC violates the risk budget in 47% of
+bootstrap trials for Qwen and 32% for Llama. These are not marginal failures: the mean risk under global
+CRC sits right at the budget (0.099 for Qwen, essentially α = 0.10) and exceeds it in nearly half of trials
+on the shifted test distribution. By contrast, groupwise CRC (which uses separate thresholds per difficulty
+group) achieves a violation rate of 0.00 for Qwen and Llama; for Gemma it is 0.11, lower than global’s 0.15
+but still above δ = 0.05, because Gemma’s scores rank examples too poorly for any thresholding scheme to
+certify reliably under shift.
+This experiment reveals the mechanism of failure. Global CRC calibrates a single threshold τ ∗ such that
+the average error rate over the calibration mixture (1/3 easy, 1/3 medium, 1/3 hard) is at most α. On easy
+12
+
+Table 3: Mixture shift results on ARC Challenge. Calibration mixture: equal weights (1/3 each). Test
+mixture: hard over-represented (0.50/0.33/0.17). Groupwise CRC controls per-group risk for Qwen and
+Llama; global CRC fails for all three. For Gemma, groupwise also exceeds δ = 0.05 (0.11), reflecting its
+poorly calibrated scores rather than a failure of the per-group principle.
+Model
+
+Global risk
+
+Global viol.
+
+Groupwise risk
+
+Groupwise viol.
+
+Qwen3-4B
+Llama-3.1-8B
+Gemma-3-4B
+
+0.099±0.028
+0.086±0.032
+0.051±0.044
+
+0.47
+0.32
+0.15
+
+0.034±0.019
+0.032±0.021
+0.047±0.039
+
+0.00
+0.00
+0.11
+
+0.7
+
+E3 Mixture Shift
+
+Arc Challenge
+=0.1
+Global CRC
+Groupwise CRC
+
+0.6
+
+Violation rate
+
+0.5
+0.4
+0.3
+0.2
+0.1
+0.0
+
+Qwen3
+
+Gemma
+
+Llama
+
+Figure 1: Mixture shift violation rates (ARC Challenge). Global CRC (blue) violates the risk budget in
+15–47% of trials. Groupwise CRC (orange) controls per-group risk. The dashed line marks α = 0.10.
+
+examples, the model is accurate and can answer aggressively; on hard examples, it must abstain more. But
+τ ∗ is a compromise: it is too permissive for hard examples (causing violations) and too conservative for easy
+examples (causing unnecessary abstentions). When the test distribution shifts toward hard examples, the
+compromise threshold systematically under-serves that group.
+Groupwise CRC avoids this by estimating a separate threshold for each difficulty group, reflecting each
+group’s true error distribution. Hard examples get a conservative threshold; easy examples get an aggressive
+one. The result is that each group’s risk is controlled independently of the others, and the global risk under
+any test mixture is bounded.
+This experiment provides the core empirical motivation for HG-CRC: group-specific thresholds are necessary,
+and the hierarchical structure allows them to be estimated at multiple levels of granularity.
+What HG-CRC adds over flat groupwise CRC. It is important to note that the groupwise CRC used
+here is equivalent to Baseline B5: separate thresholds per difficulty group, calibrated independently, without
+hierarchical fallback or Bonferroni correction. B5 already resolves the 47% violation because per-group
+thresholds capture the heterogeneous error distributions. What B5 does not provide is a simultaneous
+guarantee: running K independent tests each at level δ yields a family-wise error rate of approximately
+Kδ under independence, not δ. HG-CRC extends B5 with two structural additions: (1) the Bonferroni
+correction, which restores the simultaneous guarantee at level δ (confirmed by the ablation in Section 6.2);
+and (2) the hierarchical structure with leaf-first fallback, which handles groups too small to certify directly by
+falling back to a coarser certified ancestor rather than abstaining all group members. The value of HG-CRC
+over B5 is therefore the formal simultaneous validity and graceful degradation for sparse groups—not the
+per-group thresholding idea itself, which B5 already implements.
+13
+
+Table 4: Endogenous vs. exogenous difficulty under mixture shift (ARC Challenge). In the exogenous rows,
+difficulty is defined by a different model’s score (in parentheses), independent of the deployed threshold.
+Global CRC fails under shift in both cases.
+Model (deployed)
+
+Difficulty source
+
+Global viol.
+
+Groupwise viol.
+
+Qwen3-4B
+
+endogenous (NLL)
+exogenous (Llama)
+
+0.47
+0.31
+
+0.00
+0.02
+
+Llama-3.1-8B
+
+endogenous (NLL)
+exogenous (Qwen)
+
+0.32
+0.36
+
+0.00
+0.02
+
+Gemma-3-4B
+
+endogenous (NLL)
+exogenous (Qwen)
+
+0.15
+0.39
+
+0.11
+0.07
+
+Table 5: Ablation of hierarchy depth (ARC Challenge, Qwen3-4B) and Bonferroni correction. ARC Challenge
+has a single domain (“science”), so its hierarchy is global → difficulty; the “Domain” depth row therefore
+adds a node that coincides with the global node and isolates the effect of the δ/2 Bonferroni tightening alone.
+The correction (A4) rows compare Bonferroni against no correction over the full five-node hierarchy (global
++ domain + three difficulty leaves). All other hyperparameters fixed.
+Ablation
+
+Variant
+
+Risk
+
+Participation
+
+WGER
+
+Viol. rate
+
+Depth (A1)
+
+Global only
+Domain
+Domain+difficulty
+
+0.070±0.021
+0.065±0.021
+0.018±0.013
+
+0.849
+0.830
+0.478
+
+0.001
+0.001
+0.000
+
+0.110
+0.054
+0.000
+
+Correction (A4)
+
+Bonferroni
+None
+
+0.018±0.013
+0.026±0.014
+
+0.478
+0.584
+
+0.000
+0.000
+
+0.000
+0.000
+
+Is the effect structural or an endogeneity artifact? The difficulty bins above are defined by percentiles
+of the deployed NLL score, so “shift toward hard” coincides with “shift toward high deployed-NLL,” which
+could mechanically break an NLL threshold by construction. To test whether the failure is an artifact of this
+endogeneity, we redefine difficulty using an exogenous signal: a reference model’s per-example score (joined by
+example_id), so that group membership is no longer a function of the deployed model’s threshold. We then
+repeat the mixture shift. Table 4 shows that the effect persists: under an exogenous difficulty shift, global
+CRC still violates in 31–39% of trials while groupwise CRC stays at or near the budget. Endogeneity does
+inflate the effect somewhat for Qwen (47% → 31%), but for Llama and Gemma the exogenous violation rate
+is as high or higher. We therefore conclude that the mixture-shift failure of marginal guarantees is structural,
+not an artifact of how difficulty groups are constructed.
+
+6
+
+Ablation Studies
+
+6.1
+
+Effect of Hierarchy Depth (A1)
+
+How much does each level of the hierarchy contribute? An important caveat governs how to read this ablation
+on ARC Challenge: the dataset carries a single domain label (“science”), so ARC exposes no real domain
+level, and its deployed hierarchy is global → difficulty (two levels). We nonetheless report an intermediate
+domain row, but it does not introduce genuine domain structure: the domain node coincides with the
+global node, so this row isolates the effect of the δ/2 Bonferroni tightening on a redundant node rather
+than any subject-matter grouping. The three configurations are therefore: (i) global only, equivalent to
+standard CRC; (ii) domain, which adds the (redundant) single-domain node; and (iii) domain+difficulty, the
+deployed two-level global → difficulty hierarchy. The domain level is exercised as a genuine grouping only on
+MMLU-Pro, which has 57 real subjects (Appendix A), with the caveat that participation there is near zero.
+14
+
+Table 5 (top) shows the progression. Global-only CRC violates in 11.0% of trials. The intermediate domain
+row reduces violations to 5.4%, but on ARC this is not the effect of a domain grouping: the single-domain
+node coincides with the global node, so the only change is that its threshold is calibrated at δ̂ = δ/2 instead
+of δ. The tighter confidence level alone accounts for the drop, and at 500 trials this configuration still sits
+marginally above δ = 0.05 (0.054), so it does not certify the guarantee. Adding the difficulty level brings
+violations to exactly 0.0%—on ARC it is the difficulty level, not any domain structure, that clears the budget.
+This makes the ARC hierarchy a genuine two-level global → difficulty structure whose load-bearing grouping
+is the difficulty binning. We note that these bins are defined by percentiles of the deployed NLL score, and
+Section 5.3 examines directly (via an exogenous difficulty signal) whether this endogeneity is what drives the
+effect; it is not.
+The participation cost falls from 0.849 (global) to 0.478 (global + difficulty). The drop at the difficulty
+level reflects the residual calibration: parent nodes are calibrated only on examples not already answered
+by certified leaf nodes, which are systematically harder, requiring more conservative thresholds. This is a
+reasonable exchange: the method eliminates all violations and achieves WGER = 0 with a theoretically sound
+guarantee that aligns calibration and deployment populations.
+6.2
+
+Necessity of Bonferroni Correction (A4)
+
+A natural question is whether the Bonferroni correction is necessary, or whether the hierarchy alone suffices.
+Table 5 (bottom) compares calibration with and without the correction over the full ARC hierarchy (global
++ domain + three difficulty leaves, |H| = 5).
+The empirical answer on ARC is that the correction is not needed to hold the budget: both the corrected
+(δ̂ = δ/5) and the uncorrected (δ per node) variants achieve a 0.0% violation rate and WGER = 0 across
+all 500 trials. The two differ only in conservatism—Bonferroni answers less (participation 0.478 vs. 0.584)
+and runs at lower realized risk (0.018 vs. 0.026). With only five nodes and well-separated NLL scores, the
+uncorrected per-node calibration is already conservative enough that the multiplicity it ignores does not
+materialize. (Our earlier report of a large “2%-to-16%” or “5.4%-to-11%” gap was an artifact of a degenerate
+ablation that corrected δ over a single node; over the real five-node hierarchy the empirical gap closes.)
+This does not make the correction dispensable—its role is theoretical, and it scales with |H|. Without it,
+each node is calibrated at the full level δ, so the family-wise error rate across |H| nodes may reach |H| · δ; the
+correction is what makes the simultaneous claim of Propositions 1 and 2 valid, independent of any empirical
+run. On ARC (|H| = 5) that theoretical bound leaves ample slack, so removing the correction happens to
+remain safe. When many nodes are tested the effect becomes visible: on MMLU-Pro (57 subjects), removing
+the correction raises the violation rate from 0.6% to 14.0%—though this is in a regime where the model
+answers almost nothing (participation ≈0.001–0.018), so the inflation certifies the theory rather than a
+deployable operating point.
+The honest summary is therefore: the Bonferroni correction is required for the theoretical simultaneous
+guarantee at any |H|, while its empirical cost and benefit are an |H|-dependent participation trade-off—
+negligible on ARC’s shallow hierarchy and pronounced only when many nodes are corrected at once.
+6.3
+
+Uncertainty Score Comparison (A5)
+
+Table 6 shows that the NLL-based scores yield essentially the same participation and violation rates. Three
+of them—selected-option NLL, min log-prob, and sequence NLL—are in fact identical by construction in
+this multiple-choice setting (all equal − maxk log p′k ), so their matching rows are not independent evidence;
+MC margin is a genuinely distinct score that nonetheless performs comparably. Token entropy performs
+comparably but with slightly higher variance. The meta-learner, which combines multiple scores through a
+trained regressor, loses participation (0.772 vs. 0.849) without a corresponding reduction in violations—a
+worse trade-off. The linear probe classifier, trained to predict correctness, performs poorly: it achieves only
+5.0% participation because its confidence estimates are poorly calibrated for this thresholding task.
+These results suggest that the choice of uncertainty score is not a critical design decision for
+CRC-based selective prediction: any NLL-based score that ranks examples by confidence produces similar
+15
+
+Table 6: Uncertainty score comparison on ARC Challenge (Qwen3-4B). NLL-based scores are largely
+equivalent; probe yields negligible participation.
+Score
+
+Risk
+
+Participation
+
+Viol. rate
+
+Selected-option NLL (default)
+Min log-prob
+MC margin
+Token entropy
+Sequence NLL
+Meta-learner
+Linear probe
+
+0.070
+0.070
+0.070
+0.071
+0.070
+0.070
+0.013
+
+0.849
+0.849
+0.841
+0.850
+0.849
+0.772
+0.050
+
+0.110
+0.110
+0.104
+0.100
+0.110
+0.112
+0.100
+
+Table 7: MMLU-Pro → ARC participation by ntarget (Llama-3.1-8B-Instruct). Source-only transfers partially;
+target-only scales from 0 to 71%.
+Strategy
+
+n=0
+
+n=25
+
+n=50
+
+n=100
+
+n=250
+
+n=500
+
+Source only
+Weighted
+Target only
+Combined
+
+0.288
+0.378
+0.000
+0.288
+
+0.288
+0.378
+0.000
+0.327
+
+0.287
+0.377
+0.277
+0.337
+
+0.287
+0.377
+0.559
+0.358
+
+0.287
+0.377
+0.682
+0.386
+
+0.288
+0.377
+0.704
+0.417
+
+results. We use the selected-option NLL as the default throughout, as it requires no additional computation
+beyond the forward pass.
+
+7
+
+Robustness Analysis
+
+7.1
+
+Domain Shift (E4)
+
+We evaluate the ability of a threshold calibrated on one dataset to transfer to a different dataset. We
+consider two domain-shift pairs: MMLU-Pro → ARC Challenge (both multiple-choice) and NQ Open →
+TriviaQA (both open-domain QA). For each pair, we study four strategies: (i) source-only, which uses only
+the source-domain calibration; (ii) target-only, which uses ntarget labeled examples from the target domain;
+(iii) weighted, which re-weights source examples by estimated density ratio; and (iv) combined, which pools
+source and target calibration data.
+Table 7 shows results for Llama on the MMLU → ARC pair. Source-only transfer achieves 28.8% participation,
+which is lower than ARC IID (69.5%) but non-negligible—MMLU and ARC are both multiple-choice reasoning
+tasks, so the score distributions are partially compatible. For Qwen and Gemma, source-only participation is
+zero: the MMLU threshold is too conservative to certify any ARC example, suggesting a larger distributional
+shift in score space for these models.
+The target-only strategy shows a clear sample-efficiency curve: 0% participation with fewer than 50 target
+examples, 27.7% with 50, and reaching 70.4% with 500—close to the IID level. Fewer than 50 examples
+provide insufficient statistical power for the CP bound: with ntarget = 25, even the zero-error threshold
+cannot be certified at α = 0.10 with δ = 0.05. This minimum sample requirement is a practical constraint:
+CRC-based methods cannot be deployed in zero-shot domain transfer scenarios.
+The combined strategy improves over source-only for Llama (41.7% with n = 500) by incorporating target
+data, but it does not outperform target-only at equal n. This suggests that the source distribution provides
+useful information about the general behavior of the uncertainty score, but target-specific examples are
+necessary for domain-adapted certification.
+16
+
+Table 8: Prompt shift results (ARC Challenge, Qwen3-4B). Transferred threshold (from default template) vs.
+recalibrated threshold (using examples from the new template).
+Template
+
+Risk (transfer)
+
+Risk (recalib)
+
+Part (transfer)
+
+Part (recalib)
+
+Default
+Reasoning
+Formal
+
+0.073
+0.203
+0.078
+
+0.073
+0.067
+0.078
+
+0.869
+0.674
+0.900
+
+0.869
+0.360
+0.900
+
+Table 9: Label noise robustness (ARC Challenge, Qwen3-4B). As η increases, the method becomes more
+conservative (lower participation) rather than violating (higher risk).
+η
+
+Risk
+
+Participation
+
+Violation rate
+
+0.00
+0.01
+0.05
+0.10
+
+0.070±0.021
+0.065±0.021
+0.028±0.019
+0.002±0.006
+
+0.849±0.041
+0.830±0.045
+0.566±0.197
+0.085±0.174
+
+0.11
+0.06
+0.00
+0.00
+
+The NQ → TriviaQA transfer shows zero participation under all strategies and all ntarget , indicating that
+open-domain QA tasks are structurally incompatible for threshold transfer: the score distributions and error
+rates differ too substantially across open-domain datasets for source calibration to be useful.
+7.2
+
+Prompt Shift (E5)
+
+Prompt engineering is a common practice in LLM deployment, but changes in prompt formatting alter the
+model’s probability distribution over answers, thereby invalidating a previously calibrated threshold. We
+study three prompt templates: default (standard few-shot), reasoning (chain-of-thought prompt with explicit
+reasoning steps), and formal (formal academic phrasing). For each, we measure the risk and participation
+of the transferred threshold (calibrated on default examples) and the recalibrated threshold (calibrated on
+examples from the new template).
+The results reveal a template-dependent pattern. The formal template produces a distribution close to the
+default: transfer risk is 0.078, only marginally above the default level, and recalibration has no effect. The
+reasoning template, by contrast, induces a severe shift: the transferred threshold yields a risk of 0.203—more
+than twice the budget α = 0.10. This is because reasoning-prompted outputs have a higher entropy: the
+model distributes probability over multiple reasoning steps before committing to an answer, yielding higher
+NLL scores even on correctly-answered questions. The threshold from the default calibration, which was
+chosen for lower-entropy default outputs, is too aggressive for reasoning outputs: it answers many questions
+that the reasoning model is actually uncertain about, leading to high risk.
+Recalibration immediately restores the guarantee: a threshold calibrated on reasoning examples achieves
+risk of 0.067 < 0.10. However, it comes at a significant participation cost (0.360 vs. 0.674 under transfer),
+reflecting the genuinely higher entropy of reasoning-prompted outputs. The message is clear: prompt
+changes require recalibration. The good news is that recalibration is cheap—a few hundred labeled
+examples from the new template suffice—and the guarantee is restored without any retraining.
+7.3
+
+Label Noise Robustness (E7)
+
+Real-world labels are noisy: human annotators make mistakes, automatic evaluation pipelines occasionally
+mis-grade, and ground-truth answers may be ambiguous. We study the sensitivity of HG-CRC to label noise
+by injecting random label flips at rate η ∈ {0, 0.01, 0.05, 0.10} into the calibration labels.
+The results, shown in Table 9 and Figure 2, reveal a highly desirable property: label noise causes the
+method to become more conservative, not less safe. As η increases from 0 to 0.10, participation
+17
+
+E7 Label Noise
+
+Risk
+
+0.08
+
+Qwen3 Risk
+Gemma Risk
+Llama Risk
+=0.1
+
+Arc Challenge
+
+Qwen3 Part.
+Gemma Part.
+Llama Part.
+
+0.8
+0.6
+
+Participation
+
+0.10
+
+0.06
+
+0.4
+
+0.04
+
+0.2
+
+0.02
+0.00
+
+0.0
+0.00 0.01
+
+0.05
+
+Label noise
+
+0.10
+
+Figure 2: Label noise robustness (ARC Challenge). Risk (solid lines, left axis) and participation (dashed
+lines, right axis) as a function of noise rate η for three models. Noise causes conservative abstention, not risk
+violation.
+drops from 0.849 to 0.085, while violations drop from 0.11 to 0.00. The mechanism is straightforward: noisy
+labels artificially inflate the empirical error rate kv (τ )/nv (τ ), which tightens the CP upper bound. To remain
+certified, the threshold must be more conservative, abstaining on more examples.
+At η = 0.01, the effect is mild: participation drops by only 1.9 pp, and violations are already nearly halved
+(0.06). At η = 0.05, the system abstains on nearly half of all examples—a significant participation loss, but one
+that reflects genuine uncertainty about label quality. At η = 0.10, the system becomes nearly non-functional
+(8.5% participation), but it never violates the risk budget.
+This graceful degradation is a valuable property for high-stakes deployments where label quality cannot be
+guaranteed. A system that fails loudly (by abstaining excessively) is preferable to one that fails silently (by
+answering incorrectly with high confidence). The behavior here is the former.
+7.4
+
+Quantization Robustness (E8)
+
+Model quantization is a standard technique for reducing inference cost in production deployments. Quantizing
+weights from 16-bit floating point (bf16) to 8-bit integer (int8) or 4-bit integer (int4) reduces memory by
+2× and 4× respectively, with a typically small accuracy penalty. However, quantization also changes the
+model’s probability distributions, which may affect the uncertainty score distribution and thereby invalidate
+a calibration performed at full precision.
+Table 10 and Figure 3 show the results. Accuracy decreases modestly with quantization: Qwen loses 2.8 pp
+from bf16 to int4, Llama loses 3.1 pp, and Gemma loses 3.7 pp. These are typical quantization penalties.
+The key finding is that risk remains below α = 0.10 at all precision levels for all models. This
+is because CRC calibration is performed at inference time at the same precision used for deployment: if
+the deployment model is quantized, the calibration should also use the quantized model. The calibration
+automatically adapts to the score distribution of the quantized model.
+Participation is more sensitive to quantization. For Gemma, participation drops from 0.294 (bf16) to 0.058
+(int4)—an 80% reduction. This reflects the fact that int4 quantization increases score uncertainty for Gemma,
+pushing more examples above the certification threshold. For Qwen and Llama, the participation drop is
+smaller (9.3 pp and 7.7 pp from bf16 to int4 respectively).
+At our earlier 50-trial resolution, Llama int8 appeared anomalous, with a violation rate of 0.24 against 0.08
+(bf16) and 0.06 (int4). This anomaly does not survive at 500 trials: the Llama violation rates are 0.09 (bf16),
+18
+
+Table 10: Quantization robustness (ARC Challenge). Accuracy decreases modestly; risk stays below α=0.10
+at all precision levels.
+Model
+
+Precision
+
+Accuracy
+
+Participation
+
+Risk
+
+Viol. rate
+
+Qwen3-4B
+
+bf16
+int8
+int4
+
+0.874
+0.863
+0.846
+
+0.849
+0.813
+0.756
+
+0.070
+0.070
+0.069
+
+0.11
+0.08
+0.09
+
+Gemma-3-4B
+
+bf16
+int8
+int4
+
+0.777
+0.760
+0.741
+
+0.294
+0.207
+0.058
+
+0.054
+0.045
+0.025
+
+0.09
+0.11
+0.15
+
+Llama-3.1-8B
+
+bf16
+int8
+int4
+
+0.824
+0.818
+0.793
+
+0.695
+0.702
+0.618
+
+0.067
+0.068
+0.065
+
+0.09
+0.11
+0.08
+
+E8 Quantization
+
+Accuracy
+bf16
+int8
+int4
+
+0.8
+0.7
+
+Participation
+
+0.6
+
+Accuracy
+
+bf16
+int8
+int4
+
+0.4
+
+0.5
+0.4
+
+Qwen3
+
+Gemma
+
+Llama
+
+0.0
+
+0.06
+0.04
+
+0.3
+
+0.02
+
+0.1
+0.0
+
+=0.1
+bf16
+int8
+int4
+
+0.08
+
+0.2
+
+0.2
+
+Risk
+0.10
+
+0.6
+
+Risk
+
+0.8
+
+Arc Challenge
+
+Participation
+
+Qwen3
+
+Gemma
+
+Llama
+
+0.00
+
+Qwen3
+
+Gemma
+
+Llama
+
+Figure 3: Quantization robustness (ARC Challenge). Accuracy (left), participation (center), and risk (right)
+for all three models at bf16, int8, and int4 precision. Risk is controlled at all precision levels; participation is
+most affected for Gemma.
+
+0.11 (int8), and 0.08 (int4), i.e. flat and within sampling noise of one another. The apparent non-monotonicity
+was a small-sample artifact of the 50-trial bootstrap rather than a genuine effect of 8-bit quantization, which
+is a further illustration of why the higher-resolution evaluation matters. Across all models and precisions, risk
+stays below α and violation rates remain in the same finite-calibration-sample regime as the bf16 baseline.
+
+7.5
+
+Difficulty Shift (E6)
+
+The difficulty shift experiment tests a specific covariate shift: calibration and test sets have different difficulty
+compositions. We consider two directions: cal-easy/test-hard, where calibration uses only easy examples and
+the test set contains only hard examples; and cal-hard/test-easy, the reverse.
+In the cal-easy/test-hard direction, both transfer and IID calibration yield 0% participation. This is a
+fundamental limitation: hard examples have an intrinsic error rate above α = 0.10 for these models, meaning
+that no threshold can simultaneously certify them and maintain risk control. The method correctly abstains
+on all hard examples rather than certifying them under false pretenses.
+19
+
+In the cal-hard/test-easy direction, transfer calibration also yields 0% participation—but for a different reason.
+The threshold calibrated on hard examples is excessively conservative: hard examples require a very low NLL
+score to be certifiable, and that same threshold abstains on virtually all easy examples as well. IID calibration
+on easy examples, by contrast, achieves 100% participation with a mean risk of 0.008—well below budget.
+This illustrates the direction-dependence of threshold transfer under difficulty shift: a pessimistic calibration
+is safe but useless; an optimistic calibration is useful but unsafe; correct calibration requires examples from
+the target difficulty distribution.
+We caution that part of this clean behavior is again endogenous: when easy/hard are defined by the deployed
+NLL, the easy-calibrated threshold mechanically abstains on all high-NLL (hard) examples, so the easy→hard
+transfer risk is 0.000 almost by construction. Repeating the experiment with exogenous difficulty (hard defined
+by a reference model’s score, as in Section 5.3) removes this mechanism: the easy-calibrated threshold then
+answers a non-trivial fraction of exogenously-hard examples and incurs a genuine transfer risk of 0.233 for
+Qwen—well above α. The qualitative lesson (optimistic transfer is unsafe) is unchanged, but the exogenous
+version is the honest illustration of it.
+
+8
+
+Discussion
+
+8.1
+
+The Participation-Guarantee Trade-off
+
+The fundamental tension in selective prediction is between answering more (higher participation) and ensuring
+reliability (lower risk, no violations). HG-CRC navigates this trade-off by applying the tightest applicable
+threshold to each example, which necessarily increases abstention relative to global CRC. The trade-off can be
+characterized precisely: the additional abstention of HG-CRC relative to global CRC is proportional to the
+degree of group heterogeneity. In the limit where all groups have identical distributions, the leaf-first policy
+selects the global threshold for every example, and HG-CRC coincides with global CRC. In the limit of
+maximally heterogeneous groups, the leaf-level thresholds dominate and the participation cost is maximized.
+Our results suggest that for ARC Challenge, the heterogeneity across difficulty levels (ARC has a single
+domain) is sufficient to justify the additional abstention: HG-CRC reduces violations from 9–11% to 0% at
+a participation cost of 22–37 pp relative to global CRC. This cost arises from residual calibration: parent
+nodes are calibrated on the harder subpopulation not covered by certified leaf nodes, which requires more
+conservative thresholds. We consider this a principled trade-off—the guarantee now formally covers the
+deployed population—for applications where per-group fairness is a requirement.
+8.2
+
+Equal-Participation Comparison: Is It the Guarantee or the Conservatism?
+
+HG-CRC attains lower risk and fewer violations than global CRC partly because it answers fewer questions.
+To separate the contribution of the per-group structure from that of conservatism, we run a controlled
+comparison: in each bootstrap trial we measure HG-CRC’s participation on the test fold and then construct
+a single global threshold tuned to match that exact participation (the test-score quantile at HG-CRC’s
+coverage—this uses test scores but no test labels), and compare the two at equal coverage. We report the
+worst-group violation rate: the maximum over difficulty groups of the fraction of trials in which that group’s
+realized risk exceeds α. Table 11 shows the result on ARC Challenge, in both the IID setting and under the
+E3 mixture shift.
+The finding is deflating but important for honest framing. At equal participation, a single global
+threshold controls per-group risk about as well as HG-CRC—worst-group violation rates are within
+sampling noise in five of the six cells, the exception being Gemma under shift, where HG-CRC is somewhat
+safer (0.054 vs. 0.086). For comparison, standard global CRC at its own (higher) participation has worst-group
+violation rates of 0.70–0.96 in these same settings; that catastrophic number is therefore overwhelmingly a
+consequence of answering too much, not of single thresholds being intrinsically unable to protect groups.
+This does not make HG-CRC redundant, but it sharpens what its empirical contribution is and is not.
+HG-CRC does not buy a large per-group-safety margin over a coverage-matched global threshold. What
+it buys is (i) an automatic mechanism for finding a safe per-group operating point—the coverage-matched
+20
+
+Table 11: Equal-participation comparison (ARC Challenge, worst-group violation rate over difficulty groups).
+global-eq is a single threshold tuned to HG-CRC’s participation. At matched coverage, global-eq and
+HG-CRC control per-group risk almost equally; the large worst-group violation of standard global CRC (at
+its own, higher participation) is mostly a coverage effect, not a failure of single thresholds per se.
+Setting
+
+Model
+
+Matched part.
+
+global-eq
+
+HG-CRC
+
+IID
+
+Qwen3-4B
+Llama-3.1-8B
+Gemma-3-4B
+
+0.478
+0.475
+0.084
+
+0.010
+0.020
+0.024
+
+0.010
+0.022
+0.024
+
+Qwen3-4B
+Mixture shift Llama-3.1-8B
+Gemma-3-4B
+
+0.350
+0.300
+0.079
+
+0.010
+0.014
+0.086
+
+0.010
+0.014
+0.054
+
+global-eq above requires an oracle (HG-CRC’s own test participation) that a standalone global method does
+not have—and (ii) the formal simultaneous guarantee and graceful degradation for sparse groups (Section 5.3).
+The practical case for HG-CRC rests on these, not on out-violating a global threshold at equal coverage.
+8.3
+
+Limitations
+
+Scope of the main result. Our headline finding—0% violation and WGER = 0—holds specifically on ARC
+Challenge and only for models whose base accuracy is well above 1 − α (Qwen3-4B and Llama-3.1-8B). It
+does not generalize to our second benchmark. On MMLU-Pro, Qwen3-4B and Gemma-3-4B have base error
+rates above 56%, so no non-trivial threshold is certifiable and participation collapses to 0% across all methods;
+Llama-3.1-8B, the only model that participates meaningfully there, retains a non-zero WGER of 0.014 because
+the per-node calibration sets are too small to certify all hierarchy nodes simultaneously (Appendix A). The
+practical envelope of HG-CRC is therefore narrow: it certifies a group-conditional guarantee only when the
+model is already accurate enough on the deployment distribution that a useful fraction of examples clears the
+per-group thresholds; otherwise it correctly, but uninformatively, abstains.
+WGER rewards abstention. Our worst-group excess risk is computed only over answered examples
+(maxg (Rg − α)+ , with the maximum taken over groups that answer at least one example). A group that
+abstains on everything does not contribute to WGER, so a system that abstains heavily can attain WGER ≈ 0
+trivially. This is by design—an abstention carries no error—but it means WGER must be read jointly with
+the participation rate: Gemma’s near-zero WGER coexists with very low participation and is closer to this
+degenerate regime than to a genuine guarantee. We therefore report participation alongside every WGER.
+Empirical, not unconditional, in-sample guarantee. The deployed procedure is the in-sample variant
+covered by Lemma 1, whose guarantee carries an additive slack εn ; the distribution-free split bound (Proposition 1, εn = 0) is implemented but not deployed. While the mean measured slack is below 1%, on the small
+ARC pool the maximum jackknife slack reaches εn ≈ 0.34, so the worst-case in-sample guarantee on that
+benchmark is materially weaker than the headline numbers suggest. The procedure we evaluate thus carries
+an empirical guarantee under Assumption 1, not an unconditional one.
+Minimum group size constraint. The Nmin requirement prunes nodes with insufficient calibration data.
+In datasets with many fine-grained groups (e.g., 57 MMLU-Pro subjects × 3 difficulty levels = 171 potential
+leaf nodes), most leaf nodes will be pruned for typical calibration set sizes. The hierarchy effectively collapses
+to a shallower structure, potentially losing the granularity needed for fine-grained protection. This is an
+inherent limitation of nonparametric methods: statistical power is required to certify each node, and small
+groups simply do not have enough calibration examples.
+Gemma-3-4B on ARC Challenge. The consistently low participation of Gemma across all experimental
+conditions reflects a fundamental incompatibility between the model’s uncertainty distribution and the dataset
+at the chosen α. Gemma’s NLL scores are high and diffuse on ARC questions, suggesting that the model
+is genuinely uncertain about multiple-choice science questions at this scale. Raising α would allow more
+21
+
+participation but at the cost of weaker guarantees. Alternatively, this behavior may improve with larger
+model scales or better uncertainty score calibration.
+Cross-domain transfer without target examples. E4 shows that source-only calibration fails for
+Qwen and Gemma on MMLU → ARC transfer. This limits the applicability of HG-CRC in zero-shot
+domain adaptation scenarios where labeled target examples are not available. Practical deployments must
+either collect target calibration data (which E4 shows requires at least 50 examples) or accept the reduced
+participation of source-only calibration.
+Quantization. An apparent int8 anomaly for Llama (a 0.24 violation rate at 50 trials) turned out to be a
+small-sample artifact: at 500 trials the violation rates across bf16/int8/int4 are flat (0.09/0.11/0.08) and
+within sampling noise. We nonetheless recommend recalibrating from scratch whenever precision is changed,
+rather than reusing a threshold from a different precision level, since the score distribution does shift with
+precision even when the resulting violation rate does not.
+Conservatism of Bonferroni. Bonferroni is a worst-case correction that ignores positive correlation
+between nodes (higher nodes include all examples of lower nodes). More powerful procedures such as HolmBonferroni, Benjamini-Hochberg, or hierarchical testing (Yekutieli, 2008) could recover some participation
+without sacrificing the simultaneous guarantee. We leave this as future work.
+Participation-unequal comparisons. HG-CRC achieves lower violation rates and lower mean risk
+partly because it answers fewer questions: a sufficiently conservative method can always achieve low risk by
+abstaining on uncertain inputs. We now address this confound directly in Section 8.2, where we equalize
+participation by tuning a single global threshold to HG-CRC’s coverage and compare worst-group violation
+at equal coverage. The honest result is that, at matched participation, the global threshold controls per-group
+risk about as well as HG-CRC in our settings; the apparent advantage of HG-CRC over standard global
+CRC is therefore mostly attributable to its lower participation, not to the per-group structure per se. We
+retain HG-CRC for its automatic selection of a safe per-group operating point and its formal simultaneous
+guarantee, rather than for an empirical per-group-safety margin at equal coverage.
+Endogenous difficulty groups. Our difficulty bins are defined by percentiles of the NLL uncertainty
+score—the same score used for thresholding. This creates an alignment between group membership and
+threshold behavior by construction: the “hard” bin contains high-NLL examples, so the CRC threshold
+calibrated on this bin will naturally be a larger NLL value. This caveat is load-bearing rather than cosmetic:
+because ARC collapses to a single domain (above), the only non-trivial grouping for our most dramatic
+experiment (the mixture shift of Section 5.3, where global CRC reaches a 47% violation rate) is the endogenous
+difficulty partition, and “shifting toward hard” is by definition “shifting toward high NLL”—precisely the
+direction that breaks an NLL threshold. We address this directly in Section 5.3 (Table 4) by redefining
+difficulty with an exogenous signal—a reference model’s score, independent of the deployed threshold. The
+mixture-shift failure persists under exogenous difficulty (global CRC violates in 31–39% of trials), so the
+effect is structural rather than an artifact of the endogenous bins; endogeneity inflates the magnitude only
+modestly (47% → 31% for Qwen). The residual limitation is that our exogenous signal is still a model-derived
+score rather than a human difficulty label, which the loaded allenai/ai2_arc distribution does not provide;
+a comparison against human grade-level labels from the original ARC release remains future work.
+
+9
+
+Conclusion
+
+We introduced HG-CRC, a post-hoc calibration framework for selective prediction in language models
+that provides simultaneous risk guarantees across all nodes of a user-defined group hierarchy. The method
+combines three components: Bonferroni correction to control the family-wise error rate across nodes, a
+leaf-first selection policy to apply the most specific applicable threshold, and a minimum group size filter to
+ensure that uncertifiable nodes do not enter the hierarchy.
+Our main empirical finding is that HG-CRC achieves a zero empirical violation rate and WGER = 0
+for Qwen3-4B and Llama-3.1-8B-Instruct on ARC Challenge, with a participation cost of 22 to 37 percentage
+points relative to global CRC. These zeros are upper bounds at the resolution of our 500-trial evaluation
+(∼0.6% by the rule of three), not certified zeros, and they are specific to ARC Challenge and to models
+22
+
+whose base accuracy is well above 1 − α; on MMLU-Pro the guarantee is not met (Llama: WGER = 0.014)
+or the model abstains entirely (Appendix A). Ablation studies show that the hierarchical depth is the
+component that clears the risk budget on ARC: removing the difficulty level reinstates an 11% violation rate.
+The Bonferroni correction is required for the theoretical simultaneous guarantee, but its empirical effect is
+|H|-dependent—negligible on ARC’s five-node hierarchy (where corrected and uncorrected calibration both
+control risk) and visible only when many nodes are tested, as on MMLU-Pro.
+Beyond the main result, our empirical study demonstrates that: global CRC fails catastrophically under mild
+group composition shift (47% violation rate); label noise causes graceful conservatism rather than violation;
+prompt changes require recalibration but can be corrected cheaply; and model quantization does not break
+risk control as long as calibration is performed at the deployed precision.
+These results position HG-CRC as a practically deployable method for equitable selective prediction: it
+requires no retraining, adapts to any pre-trained model and uncertainty score, and provides formal statistical
+guarantees with transparent assumptions.
+
+Ethics Statement
+Selective prediction with abstain can introduce disparate abstention rates across groups: if minority groups
+receive more abstentions, they may receive less service. HG-CRC provides WGER = 0, which ensures that
+no group’s error rate exceeds the budget, but it does not directly control participation equity. A group with
+a structurally high error rate will always receive lower participation than a group with a low error rate, for
+the same α. Practitioners should monitor participation rates across groups in addition to risk rates.
+The datasets used (ARC Challenge, MMLU-Pro) reflect cultural and linguistic biases toward Western
+educational systems and English-language knowledge. Results may not generalize to other languages, cultures,
+or educational backgrounds.
+
+Reproducibility Statement
+All models used are publicly available on HuggingFace. Code, calibration scripts, and evaluation scripts
+will be released upon acceptance. All experiments use fixed random seeds. Key hyperparameters: α = 0.10,
+δ = 0.05, Nmin = 30, nbootstrap = 500, threshold grid of 100 quantiles. Model inference was performed on a
+single NVIDIA A100 GPU; calibration and bootstrap evaluation were performed on CPU. Expected runtimes:
+inference caching ≈2–4 hours per model-dataset pair; calibration+evaluation ≈5 minutes per experimental
+configuration.
+
+References
+Anastasios N. Angelopoulos, Stephen Bates, Adam Fisch, Lihua Lei, and Tal Schuster. Conformal risk
+control. In International Conference on Learning Representations, 2023. URL https://arxiv.org/abs/
+2208.02814.
+Rina Foygel Barber, Emmanuel J. Candès, Aaditya Ramdas, and Ryan J. Tibshirani. The limits of
+distribution-free conditional predictive inference. volume 10, pp. 455–482, 2021.
+Henrik Boström, Ulf Johansson, and Tuwe Löfström. Mondrian conformal prediction. arXiv preprint
+arXiv:2107.08394, 2021.
+Peter Clark, Isaac Cowhey, Oren Etzioni, Tushar Khot, Ashish Sabharwal, Carissa Schoenick, and Oyvind
+Tafjord. Think you have solved question answering? Try ARC, the AI2 reasoning challenge. arXiv preprint
+arXiv:1803.05457, 2018.
+Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad Al-Dahle, Aiesha Lesecq,
+et al. The Llama 3 herd of models. arXiv preprint arXiv:2407.21783, 2024.
+23
+
+Ran El-Yaniv and Yair Wiener. On the foundations of noise-free selective classification. Journal of Machine
+Learning Research, 11:1605–1641, 2010.
+Yonatan Geifman and Ran El-Yaniv. Selective prediction in deep neural networks. In Advances in Neural
+Information Processing Systems, 2017.
+Andrey Malinin and Mark Gales. Uncertainty estimation in autoregressive structured prediction. arXiv
+preprint arXiv:2002.07650, 2021.
+Yaniv Romano, Rina Foygel Barber, Chiara Sabbati, and Emmanuel J. Candès. With malice toward none:
+Assessing uncertainty via equalized coverage. Harvard Data Science Review, 2020a.
+Yaniv Romano, Matteo Sesia, and Emmanuel J. Candès. Classification with valid and adaptive coverage. In
+Advances in Neural Information Processing Systems, 2020b.
+Gemma Team. Gemma 3 technical report. arXiv preprint arXiv:2503.19786, 2025a.
+Qwen Team. Qwen3 technical report. arXiv preprint arXiv:2505.09388, 2025b.
+Vladimir Vovk, Ilia Nouretdinov, and Glenn Shafer. Venn prediction and conformal prediction: A note on
+efficiency. arXiv preprint arXiv:0911.4728, 2009.
+Xuezhi Wang, Jason Wei, Dale Schuurmans, Quoc Le, Ed Chi, Sharan Narang, Aakanksha Chowdhery, and
+Denny Zhou. Self-consistency improves chain of thought reasoning in language models. In International
+Conference on Learning Representations, 2023.
+Yubo Wang, Xueguang Ma, Ge Zhang, Yuansheng Ni, Abhranil Chandra, Shengquan Guo, Weiming Ren,
+Aaran Arulraj, Xuan He, Ziyan Jiang, et al. MMLU-Pro: A more robust and challenging multi-task
+language understanding benchmark. In Advances in Neural Information Processing Systems, 2024.
+Daniel Yekutieli. Hierarchical false discovery rate-controlling methodology. Journal of the American Statistical
+Association, 103(481):309–316, 2008.
+
+A
+
+Extended Results: MMLU-Pro
+
+MMLU-Pro results are qualitatively different from ARC Challenge due to structural model limitations. Qwen34B and Gemma-3-4B have base error rates above 56% on MMLU-Pro, meaning that even the most conservative
+threshold cannot certify a non-trivial fraction of examples under α = 0.10. As a result, participation is
+essentially 0% for these models across all methods (at 500 trials, global participation is exactly 0.000 for both,
+with at most ∼2% residual participation for the groupwise variant of Qwen). Llama-3.1-8B-Instruct achieves
+moderate accuracy and participates meaningfully (∼2.7% under the hierarchy, 9.1% under global); however,
+hierarchical results for Llama on MMLU-Pro show a non-zero WGER of 0.014, indicating that simultaneous
+certification of all hierarchy nodes is not fully achieved with the available calibration size (MMLU-Pro has
+fewer examples per domain than ARC Challenge). This is smaller than the 0.059 we measured at 50 trials,
+but it remains above zero, so the headline “WGER = 0” result does not extend to this benchmark.
+These results illustrate an important practical point: HG-CRC is most effective when the model’s base
+accuracy on the deployment dataset is well above 1 − α. For weaker models or harder datasets, the method
+correctly abstains rather than providing false guarantees, but this comes at the cost of utility.
+
+B
+
+Extended E5: All Models
+
+Table 12 extends the prompt shift results to Llama-3.1-8B-Instruct and Gemma-3-4B.
+24
+
+Table 12: Prompt shift results (ARC Challenge, all models).
+Model
+
+Template
+
+Risk (transfer)
+
+Risk (recalib)
+
+Part (transfer)
+
+Part (recalib)
+
+Llama-3.1-8B
+
+Default
+Reasoning
+Formal
+
+0.077
+0.043
+0.099
+
+0.077
+0.075
+0.074
+
+0.729
+0.525
+0.812
+
+0.729
+0.640
+0.760
+
+Gemma-3-4B
+
+Default
+Reasoning
+Formal
+
+0.073
+0.048
+0.062
+
+0.073
+0.071
+0.073
+
+0.521
+0.354
+0.504
+
+0.521
+0.460
+0.599
+
+Interestingly, for Llama and Gemma, the reasoning template does not cause a transfer risk violation—it actually
+reduces risk below α (0.043 and 0.048 respectively). This is the reverse of the Qwen behavior. The reasoning
+template shifts probability mass toward the correct answer for these models (chain-of-thought improves
+accuracy), so the transferred threshold is too conservative: it abstains more than needed. Recalibration
+adjusts the threshold upward, recovering participation. For Qwen, by contrast, reasoning outputs are more
+diffuse (CoT introduces uncertainty), causing the transferred threshold to be too aggressive.
+This model-dependence underscores the importance of per-model recalibration after prompt changes: the
+direction of the transfer error depends on whether the new prompt improves or degrades model confidence.
+
+C
+
+Domain Shift: NQ → TriviaQA
+
+The NQ → TriviaQA transfer consistently shows zero participation under all strategies and all ntarget values.
+We attribute this to two factors. First, open-domain QA has a fundamentally higher variance in difficulty
+than multiple-choice tasks: question phrasing, required factual knowledge, and answer specificity vary widely.
+Second, NQ and TriviaQA differ substantially in answer style (NQ requires short answers to web queries;
+TriviaQA requires recall of trivia facts), leading to different NLL distributions. The NQ threshold cannot
+certify TriviaQA examples because the score distributions do not overlap usefully.
+
+D
+
+Ablation: Nmin Sensitivity (A3)
+
+Table 13: Nmin sensitivity (ARC Challenge, Qwen3-4B, 500 bootstrap trials). Nmin is the minimum node size
+below which a leaf is pruned and its examples fall back to the parent. ARC has a single domain, so the full
+hierarchy is global + domain + three difficulty leaves (|H| = 5); once Nmin exceeds the per-leaf calibration
+size the difficulty leaves are pruned and |H| collapses to 2.
+Nmin
+
+|H|
+
+Risk
+
+Participation
+
+WGER
+
+Viol. rate
+
+25
+50
+100
+200
+
+5
+5
+5
+2
+
+0.018
+0.018
+0.018
+0.065
+
+0.478
+0.478
+0.478
+0.830
+
+0.000
+0.000
+0.000
+0.000
+
+0.000
+0.000
+0.000
+0.054
+
+Table 13 shows a single, interpretable transition. As long as Nmin is small enough to retain the three difficulty
+leaves (Nmin ≤ 100, since each leaf holds ≈110–120 calibration examples in a 50% split), the hierarchy has
+|H| = 5 and achieves zero violations at participation 0.478. Once Nmin = 200 prunes the difficulty leaves,
+the hierarchy collapses to |H| = 2 (global + the redundant single domain), participation rises to 0.830, and
+violations reappear (5.4%)—the system has degenerated to essentially global CRC. The lesson is that Nmin
+must be small enough to keep the difficulty leaves alive; we recommend Nmin ∈ [25, 100] for ARC. The range
+of |H| here is modest (2–5) because ARC has one domain and three difficulty bins; datasets with real domain
+structure (MMLU-Pro) admit larger hierarchies.
+25
+
+Correction. An earlier version of this table reported |H| up to ∼18 with a graded participation sweep.
+Those numbers did not correspond to the ARC pipeline (which admits at most five nodes) and could not be
+reproduced by the ARC or the MMLU-Pro ablation harness; they have been replaced by the run above.
+
+26
+
+

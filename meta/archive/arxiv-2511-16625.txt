@@ -1,0 +1,2258 @@
+MedBayes-Lite: A Clinical Uncertainty Governance Layer for Risk-Aware
+Medical Decision Support
+Elias Hossain1,* , Md Mehedi Hasan Nipu2 , Maleeha Sheikh3 , Tasfia Nuzhat1 , Rajib Rana4 , Subash
+Neupane5 , Björn W. Schuller6,7 , and Niloofar Yousefi1
+1 College of Engineering and Computer Science, University of Central Florida, Orlando, FL 32816, USA
+2
+
+Department of Computer Science and Engineering, North South University, Dhaka 1229, Bangladesh
+Department of Electrical and Computer Engineering, Purdue University Fort Wayne, Fort Wayne, IN 46805, USA
+4
+School of Mathematics, Physics and Computing, University of Southern Queensland, Springfield Central, QLD 4300, Australia
+5
+Meharry Medical College, Nashville, TN 37208, USA
+6
+CHI – Chair of Health Informatics, Technical University of Munich (TUM), Munich, Germany
+7
+GLAM – Group on Language, Audio, & Music, Imperial College London, London, UK
+*
+Corresponding Author: mdelias.hossain@ucf.edu
+
+arXiv:2511.16625v3 [cs.AI] 22 Jun 2026
+
+3
+
+Abstract
+Clinical language models can be overconfident, assigning high confidence to incorrect predictions,
+especially on high-severity and out-of-distribution benchmark cases. We present MedBayes-Lite1 ,
+a clinical uncertainty governance layer that converts inference-time uncertainty into a risk-aware
+decision policy for transformer-based clinical predictors. The layer combines Monte Carlo dropout
+uncertainty, calibration of the predictive distribution, and a confidence-guided abstention gate that
+defers low-confidence predictions for human review. It requires no retraining and adds no trainable
+parameters, and it applies directly to open-weight encoder models. A limited sampling-only generative
+contrast using Qwen2.5-7B-Instruct is included solely for qualitative comparison. We evaluate the
+framework as a governance mechanism rather than as a ranking method. On clinical multiple-choice
+question answering (MedMCQA and MedQA-USMLE), the layer reduces expected calibration error
+by 0.23 to 0.33 absolute and drives harmful overconfident errors, those that are confident, incorrect,
+and clinically high-severity, toward zero (p ≈ 0). The benefit is strongest under medical domain shift:
+when models trained on MedMCQA are evaluated on MedQA-USMLE, an uncalibrated baseline
+commits confident errors on about 21% of high-severity items, and the governance layer reduces this
+to near zero while roughly halving the calibration drift. We introduce and empirically evaluate the
+Clinical Uncertainty Score (CUS), a severity-weighted calibration metric that correlates strongly with
+harmful overconfidence (r ≈ 0.88). We also report negative results honestly: the framework does not
+improve the area under the risk-coverage curve, temperature scaling matches its calibration at lower
+cost, deep ensembles achieve better risk ranking, the safety gains carry a measurable coverage cost,
+and on already well-calibrated models the layer provides no benefit. A contrast with an open-weight
+generative model (Qwen2.5-7B-Instruct) shows that naive self-consistency does not confer safety,
+which further motivates explicit uncertainty governance. The reported experiments evaluate the
+calibration and confidence-guided abstention components; the optional uncertainty-weighted attention
+pathway remained inactive (λ = 0). We position MedBayes-Lite not as a new uncertainty-aware
+architecture, but as a deployable calibration-and-abstention layer that reduces confident high-severity
+errors on clinical question-answering benchmarks.
+
+1
+
+Introduction
+
+Transformer-based language models are increasingly used in clinical decision support, for symptom triage
+and preliminary differential diagnosis [1–4], clinical note drafting [5], medication reconciliation and
+1
+
+Source code and experimental implementation
+eliashossain001/medbayes-lite.
+
+are
+
+1
+
+publicly
+
+available
+
+at:
+
+https://github.com/
+
+dosing checks [6], retrieval and synthesis of guideline-based recommendations [7], and patient-facing
+communication [8–12]. As these systems move toward routine use, a specific safety failure becomes
+central: they are frequently confidently wrong. Modern clinical predictors are poorly calibrated, and
+their miscalibration is worst exactly where the cost of error is highest, on ambiguous, high-severity, and
+out-of-distribution cases [13–15]. A single confidently incorrect recommendation in triage, diagnosis, or
+dosing can cascade into harm, and an automated answer engine that never signals doubt invites automation
+bias [16, 17]. The central risk is therefore not only factual error, but the absence of a mechanism that
+recognizes when a prediction should not be acted upon.
+Clinical decision-making is inherently probabilistic. Uncertainty arises from measurement noise and
+physiological variability, incomplete or missing evidence, symptom-to-disease ambiguity, conflicting
+findings across modalities or time, and documentation noise. Bayesian modeling organizes these into
+two classes: aleatoric uncertainty, the irreducible randomness in observations and outcomes, and
+epistemic uncertainty, the model and knowledge uncertainty due to limited data, domain shift, or misspecification [18, 19]. Clinicians respond to uncertainty by slowing down, ordering additional tests, and
+escalating to expert consultation. Current clinical models rarely expose such signals or act on them, and
+instead collapse weak, missing, or contradictory evidence into overconfident outputs.
+Existing uncertainty quantification offers partial answers but leaves a governance gap. Post-hoc calibration,
+such as temperature scaling and isotonic regression, rescales reported confidence; it is cheap and effective,
+but it adjusts probabilities without changing what the model does with them, and it can degrade under
+distribution shift [20, 21]. Ensemble and Bayesian methods estimate epistemic uncertainty more directly
+but are computationally heavy [22, 23]. Crucially, most of this work stops at estimating uncertainty and
+reports it as a number. Clinical deployment requires a further step: a layer that uses the uncertainty to
+decide when to answer and when to defer, that is sensitive to clinical severity, and that remains reliable
+when the input distribution shifts. The open question we address is therefore not how to produce a better
+uncertainty score in the abstract, but how to turn uncertainty into safe clinical behavior.
+We develop MedBayes-Lite, a clinical uncertainty governance layer for transformer-based clinical predictors. The layer estimates predictive uncertainty at inference time through Monte Carlo dropout,
+calibrates the resulting predictive distribution, and applies a confidence-guided abstention gate that defers
+low-confidence predictions for human review. It adds no trainable parameters and needs no retraining,
+so it attaches to existing pretrained encoders, and it degrades gracefully to a sampling-only mode for
+generative models without internal access. We deliberately evaluate it as a governance mechanism: we
+ask whether it prevents harmful confident errors and abstains appropriately, not whether it sets a new state
+of the art on uncertainty estimation.
+This framing also distinguishes our study from prior uncertainty-aware transformer methods. We do
+not claim a new attention mechanism or a holistic layer-wise propagation result; where we incorporate
+uncertainty into attention scoring we treat it as one optional component of the governance layer, and our
+empirical claims rest on the calibration-and-abstention behavior that we can measure. This lets us report,
+honestly, both where the layer helps and where it does not.
+Our contributions are as follows:
+• A clinical uncertainty governance layer. We recast lightweight Bayesian inference for clinical
+language models as a governance problem: rather than only estimating uncertainty, the framework
+converts inference-time uncertainty into a risk-aware decision policy that defers low-confidence
+predictions. The layer combines Monte Carlo dropout uncertainty, calibration of the predictive
+distribution, and an entropy-based abstention gate, and attaches to pretrained encoders or samplingonly generative models without retraining or added parameters.
+• Reduction of harmful overconfident clinical errors. On clinical multiple-choice QA (MedMCQA, MedQA-USMLE) the layer drives harmful overconfident errors (confident, wrong, high
+2
+
+clinical severity) toward zero and reduces expected calibration error by 0.23 to 0.33 absolute,
+with paired-bootstrap significance (p ≈ 0). The effect is strongest under domain shift, where an
+uncalibrated base model commits confident errors on about 21% of high-severity items and the
+layer reduces this to near zero.
+• A comprehensive, honest clinical evaluation. We evaluate across datasets, 13 rule-based clinical
+risk categories used as transparent, reproducible evaluation strata (not clinical ground-truth labels),
+controlled clinical perturbations, in- versus out-of-distribution transfer, and an open-weight generative contrast (Qwen2.5-7B-Instruct), reporting standard calibration and selective-prediction metrics
+(ECE, NLL, Brier, AURC, selective accuracy, coverage, abstention recall) alongside clinical risk
+metrics, and reporting negative results including a flat AURC and a null result on already-calibrated
+PubMedQA models.
+• Empirical analysis of CUS as a clinically motivated summary. We introduce the Clinical
+Uncertainty Score (CUS), a severity-weighted calibration metric, and assess it empirically: across
+739 model/method/category groups CUS correlates strongly with harmful overconfident error
+rate (r ≈ 0.88) and severity-weighted error (r ≈ 0.90). In the same analysis the Zero-shot
+Trustworthiness Index (ZTI) is found to be threshold-confounded and largely redundant with AURC;
+we therefore report CUS as a pre-specified, clinically motivated supplementary summary, while
+the primary selective-prediction conclusions rest on standard metrics (ECE, NLL, Brier, AURC,
+selective accuracy, coverage, and abstention recall); ZTI is demoted to a secondary descriptor.
+The remainder of this paper is organized as follows: Section 2 reviews existing (UQ) techniques; Section 3
+outlines the proposed framework. In Section 4, we describe our dataset and provide the details of the
+experimental setup and our evaluation strategy. Section 5 presents the empirical results. Section 6
+discusses broader implications and limitations. Finally, Section 8 concludes our paper.
+
+2
+
+Related Work
+
+The drive toward developing trustworthy clinical AI has highlighted the need for effective UQ. Accuracy
+alone is often insufficient in healthcare settings, where models must also signal when their predictions
+may be unreliable. The landscape of UQ methods for LLMs is broad, spanning foundational Bayesian
+techniques to clinical risk–based evaluation frameworks. However, the diversity of these approaches
+makes it challenging to determine which are most suitable for real-world deployment. This section
+synthesizes these methods to clarify how our work fits within and contributes to this space.
+
+2.1
+
+Foundational Bayesian Methods in Deep Learning
+
+The quest to develop deep learning models that can represent their own uncertainty gained momentum
+with the work of Gal and Ghahramani [24]. They showed that dropout training can be interpreted
+as approximate Bayesian inference, enabling uncertainty estimation via Monte Carlo (MC) dropout
+without changing the underlying architecture. At inference time, MC dropout requires multiple stochastic
+forward passes, which can increase latency unless parallelized. MC dropout has also been applied
+to transformer-based models for uncertainty estimation, with some MC-dropout-based scores used to
+estimate epistemic uncertainty [25]. However, for clinical decision support, uncertainty is often reported
+only at the predictive output and does not by itself incorporate contextual or risk-aware calibration, while
+requiring multiple stochastic forward passes at inference can reduce efficiency and scalability.
+Prior work in uncertainty quantification for deep health diagnostics has often relied on Softmax confidence
+or predictive entropy, but these output-level scores do not explicitly capture model uncertainty and can
+3
+
+remain overconfident, particularly when inputs deviate from the training distribution [26]. Bayesian
+approaches such as Monte Carlo Dropout and deep ensembles have been explored to better capture
+model uncertainty, but they typically increase inference-time computation due to repeated stochastic
+forward passes or multiple models. Evidential deep learning (EDL) offers a single-pass alternative by
+predicting a Dirichlet distribution over class probabilities for simultaneous prediction and uncertainty
+estimation. However, much of the EDL literature has been developed and evaluated on standard benchmark
+settings [27] [28], while the behavior of uncertainty estimates under class imbalance, especially for
+minority classes in realistic medical data, remains less systematically studied.
+
+2.2
+
+Post-Hoc Calibration and Their Limitations
+
+A commonly used approach to improve confidence reliability is post-hoc calibration, which applies a probabilistic correction after training using a held-out validation set and typically assumes train/validation/test
+are drawn from the same distribution [20]. For multiclass models, Temperature Scaling (TS) rescales
+the logit vector with a single scalar temperature parameter before softmax, adjusting confidence without
+changing the predicted class [20]. In contrast, Isotonic Regression (IR) is a widely used non-parametric
+alternative that learns a monotone, piecewise-constant mapping from uncalibrated scores to calibrated
+probabilities [21]. Because these methods are fitted on a validation set under an in-distribution protocol,
+their calibration quality is coupled to the calibration data and can degrade when evaluation conditions
+shift [20]. In addition to these, Ye et al. [29] demonstrate that output-level probability shaping, such as
+adjusting the softmax temperature, can substantially change the predicted probability distribution without
+changing the model’s accuracy. In particular, low temperatures can induce overly sharp probabilities,
+making the model appear overconfident even though predictive correctness is unchanged. They further
+show that conformal prediction is less sensitive to this effect, yielding more conservative uncertainty
+behavior when temperature-based probabilities become artificially confident.
+
+2.3
+
+Clinical UQ and Risk-Aware Decision Making
+
+In healthcare, overconfident model outputs can have meaningful clinical consequences, which has
+motivated domain-specific work on reliability, interpretability, and human oversight. Salvi et al. [16]
+argue that Explainable AI alone is insufficient to guarantee trustworthy behavior and propose integrating
+Uncertainty Quantification (UQ) with XAI to improve reliability and reduce over-reliance in clinical
+workflows. Complementary to this direction, Catak and Kuzlu introduce a geometric UQ approach for
+LLMs that measures dispersion in response-embedding space via convex hull analysis, showing that
+uncertainty varies with prompt complexity and generation temperature [17]. Together, these perspectives
+highlight an emerging shift from treating uncertainty as a reporting artifact toward using uncertainty
+signals to support cautious decision support and more robust human-AI collaboration, while fully
+integrating uncertainty into LLM reasoning and generation remains an open challenge.
+
+2.4
+
+Benchmarking and Model Ensembles
+
+For uncertainty quantification benchmarking, Deep Ensembles [22] and Stochastic Weight Averaging
+Gaussian (SWAG) [23] are widely used, high-fidelity reference methods. Deep Ensembles estimate
+predictive uncertainty by averaging predictions from multiple independently trained networks, which
+can improve robustness and calibration. However, for an ensemble of size K, parameter storage, model
+memory, training cost, and inference cost all scale approximately linearly with K, since the method
+requires maintaining and evaluating multiple independently trained models [22]. SWAG instead constructs
+an approximate posterior over weights from the SGD trajectory and performs Bayesian model averaging
+
+4
+
+by sampling multiple weight vectors at test time and averaging predictions, so inference cost increases
+with the number of posterior samples used [23].
+In clinical informatics settings with strict latency or memory constraints, these multi-model or multisample procedures can be difficult to deploy at scale, motivating lightweight uncertainty estimation
+methods that preserve reliability and transparency while reducing ensemble-level overhead.
+
+2.5
+
+Positioning MedBayes-Lite
+
+The current landscape of UQ for clinical LLMs reveals a clear trade-off between efficiency and the
+depth of uncertainty integration. Existing approaches generally fall into three categories: (i) superficial
+post-hoc calibration techniques that adjust model confidence without addressing internal uncertainty, (ii)
+computationally expensive ensemble methods that require multiple forward passes, and (iii) fragmented
+Bayesian implementations that apply stochasticity only to isolated components. MedBayes-Lite is
+designed as a lightweight inference-time uncertainty governance layer. Rather than retraining the model
+or adding parameters, it injects uncertainty estimates into the inference pipeline of pretrained transformers
+and converts them into a calibrated, confidence-guided abstention policy. Relative to ensemble methods it
+adds no parameters and keeps memory close to the backbone, though its compute scales roughly linearly
+with the number of Monte Carlo samples. We do not claim it dominates these baselines: temperature
+scaling matches its calibration at lower cost and deep ensembles achieve better risk ranking. Its distinctive
+value is severity-aware clinical evaluation, harmful-error reduction, and improved behavior under domain
+shift, which we establish empirically.
+MedBayes-Lite is evaluated as a calibration-and-abstention governance layer. The empirical evaluation
+focuses exclusively on predictive uncertainty estimation, calibration, and confidence-guided abstention.
+Optional attention-level extensions are documented in Appendix A and are not evaluated in this study.
+Table 1 summarizes the comparative positioning of existing UQ methods and the proposed framework.
+Table 1: Comparison of UQ Approaches for Clinical LLMs. Post-hoc, Bayesian, and ensemble methods
+are compared against the proposed MedBayes-Lite framework based on integration depth, computational
+cost, and clinical applicability.
+
+3
+
+Approach
+Post-hoc Calibration
+
+Representative Methods
+TS [20], IR [21]
+
+Integration Level
+Output-only
+
+Comp. Overhead
+Minimal
+
+Bayesian
+Transformers
+
+MC Dropout on BERT
+[30]
+
+Partial (e.g., output/embeddings)
+
+Low to Moderate
+
+Ensemble
+Methods
+Proposed
+Framework
+
+Deep Ensembles [22],
+SWAG [23]
+MedBayes-Lite
+
+Model-level
+
+Very High (N ×)
+
+MC-dropout + calibration
++ confidence-guided abstention
+
+Memory ≈ backbone; compute ∝ M
+samples
+
+Key Clinical Limitation
+Output-only rescaling; a
+strong and cheap baseline
+that the proposed layer
+matches on calibration but
+does not surpass.
+Uncertainty not severityaware;
+no risk-aware
+deferral policy.
+Computationally prohibitive
+for real-time deployment.
+Reduces harmful overconfidence and abstains under
+shift; matches temperature
+scaling on calibration and
+does not improve AURC.
+
+MedBayes-Lite Framework
+
+MedBayes-Lite is a post-training, inference-time uncertainty quantification framework for pretrained
+transformer models. Instead of modifying the training procedure or introducing additional learnable
+parameters, the framework estimates predictive uncertainty through stochastic inference and uses these
+uncertainty signals during inference to support calibration and confidence-guided abstention decisions.
+5
+
+This design enables uncertainty-aware prediction without retraining the backbone architecture, which is
+particularly advantageous in safety-critical domains such as clinical decision support where retraining
+large pretrained models may be computationally or operationally impractical.
+
+3.1
+
+Framework Overview
+
+Figure 1 illustrates the evaluated MedBayes-Lite pipeline used throughout this study. The evaluated
+framework operates through three stages. First, repeated stochastic forward passes under Monte Carlo
+dropout yield multiple predictions whose average forms the predictive distribution and whose dispersion
+provides a predictive-uncertainty signal.
+Second, this predictive distribution is calibrated (for example, by temperature scaling fit on a held-out
+calibration set) so that the reported confidence better aligns with empirical accuracy.
+Third, the predictive distribution produced by the model is converted into a normalized confidence
+score derived from predictive entropy. This confidence score determines whether a prediction should be
+accepted or deferred. Predictions with insufficient confidence can therefore be flagged for human review,
+enabling a risk-aware decision process.
+Taken together, these stages convert inference-time uncertainty into a calibrated, confidence-guided
+accept-or-defer decision, without modifying the training procedure of the pretrained model.
+The evaluated pipeline consists of predictive uncertainty estimation, calibration, and confidence-guided
+abstention. Optional attention-level extensions are described separately in Appendix A and are not part of
+the evaluated framework.
+
+MC dropout /
+Confidence-guided
+Input → predictive uncertainty → Calibration →
+abstention
+→ Human review
+Figure 1: Evaluated MedBayes-Lite pipeline. Monte Carlo dropout sampling produces predictive uncertainty estimates that are calibrated and converted into a confidence-guided abstention decision. Lowconfidence predictions are deferred for human review. Optional attention-level extensions are discussed
+separately in Appendix A and are not part of the evaluated pipeline.
+
+3.2
+
+Implementation Under Different Model Access Settings
+
+The implementation of MedBayes-Lite depends on the level of access to internal transformer states, that
+is, whether inference-time dropout and internal tensors are available. Accordingly, two implementation
+settings are considered.
+(A) Open-weight (internal-access) setting.
+For open-weight transformer models with inference-time dropout and accessible internal tensors, the
+evaluated method, namely MC-dropout predictive uncertainty estimation, calibration, and confidenceguided decision shaping, is implemented directly. Additional uncertainty-aware extensions are possible
+in this setting but are not evaluated here (Appendix A). In this study, the experimental evaluation is
+restricted to encoder-based transformer models that satisfy these implementation requirements, specifically
+BioBERT, Bio ClinicalBERT, PubMedBERT, and BERT-base.
+(B) Sampling-only generative setting.
+In the sampling-only generative setting, internal embeddings, hidden states, and attention tensors are
+not used. Uncertainty is estimated at the output level by collecting multiple stochastic generations
+6
+
+and constructing an empirical predictive distribution over the resulting outputs. Confidence is then
+computed from this distribution using entropy-based and self-consistency statistics, after which the same
+confidence-guided abstention rule is applied.
+We evaluate a local open-weight generative model (Qwen2.5-7B-Instruct) under a restricted output-only
+protocol: predictive uncertainty is estimated only from sampled generations (self-consistency, semantic
+entropy, and a verbalized confidence). We do not claim that these results generalise to proprietary
+closed-API systems. Results in this configuration reflect output-level predictive uncertainty estimation
+rather than internal uncertainty integration.
+When internal transformer states are accessible, additional uncertainty-aware extensions may be implemented. However, all reported results in this study reflect only predictive uncertainty estimation,
+calibration, and confidence-guided abstention. In the sampling-only generative setting, uncertainty
+estimation and abstention are based on observable output distributions.
+
+3.3
+
+Core Components
+
+The framework comprises two primary components, evaluated in this paper, corresponding to the stages
+described in the overview: MC-dropout predictive uncertainty estimation and confidence-guided decision
+shaping. An optional uncertainty-weighted attention component, inactive (λ = 0) in all reported
+experiments, is described in Appendix A for completeness and is not evaluated here. To maintain
+consistent notation throughout the presentation of these components, Table 2 summarizes the symbols
+used in the subsequent derivations and algorithmic descriptions.
+Table 2: Notation summary for the MedBayes-Lite framework. Symbols and variables are defined for
+reference throughout Section 3.
+Symbol
+
+Definition
+
+X = {x1 , . . . , xn }
+
+Input clinical text sequence consisting of n tokens.
+
+fθ (·)
+
+Transformer mapping with parameters θ.
+
+zm
+
+Dropout mask (Bernoulli latent variables) sampled at inference
+for MC pass m.
+
+M
+
+Number of MC dropout samples used to estimate uncertainty.
+
+Notation for the embedding-level statistics and the optional uncertainty-weighted
+attention mechanism (h(m) (x), µ̂(x), Σ̂(x), U (xj ), eij , ẽij , αij , α̃ij , λ) is provided
+in Appendix A.
+p = [p1 , . . . , pK ]
+
+3.3.1
+
+H(p)
+
+Predictive probability distribution over K possible classes.
+P
+Shannon entropy: H(p) = − K
+k=1 pk log pk .
+
+C(p)
+
+H(p)
+Normalized confidence: C(p) = 1 − log
+K.
+
+τ
+
+Abstention threshold: predict only if C(p) ≥ τ .
+
+Predictive Uncertainty Estimation via MC Dropout
+
+The first stage estimates predictive uncertainty. Rather than relying on a single deterministic forward pass,
+MedBayes-Lite enables dropout at inference time and performs M stochastic forward passes, averaging
+the resulting predictive distributions into a single predictive distribution,
+M
+
+1 X
+p̄(x) =
+softmax fθ (x; zm ) ,
+M
+m=1
+
+7
+
+where zm denotes the dropout mask of pass m. This averaged distribution p̄(x) is the predictive distribution used by the downstream calibration and confidence-guided abstention stages, and its dispersion
+(for example, its predictive entropy) provides an uncertainty estimate derived from MC-dropout sampling. This follows the standard interpretation of MC dropout as approximate variational inference [24].
+Embedding-level representation statistics and the optional uncertainty-weighted attention component that
+uses them are described in Appendix A and are not part of the evaluated method.
+3.3.2
+
+Confidence-Guided Decision Shaping
+
+The final stage implements the clinical principle of “when in doubt, defer.” For a predictive distribution
+p = [p1 , . . . , pK ],
+the model computes a normalized confidence score
+C(p) = 1 −
+
+H(p)
+,
+log K
+
+H(p) = −
+
+K
+X
+
+pk log pk .
+
+k=1
+
+The normalization by log K is used because log K is the maximum possible value of the Shannon entropy
+over a K-class distribution, attained when p is uniform. Dividing by log K therefore maps entropy to the
+interval [0, 1], which in turn ensures that the confidence score C(p) also lies in [0, 1].
+A prediction is accepted only if
+C(p) ≥ τ,
+otherwise it is flagged as uncertain for human review.
+Here, τ ∈ [0, 1] is a user-specified constant threshold that controls the abstention policy. Larger values of
+τ make the decision rule more conservative by requiring greater predictive concentration before accepting
+a prediction.
+Remark 3 (Interpretation of the confidence gate). The confidence score C(p) is a monotone transformation of the predictive entropy, with larger values corresponding to more concentrated predictive
+distributions. The decision rule C(p) ≥ τ therefore defines an acceptance–rejection mechanism based on
+predictive concentration: low-entropy outputs are accepted, whereas high-entropy outputs are deferred.
+In the clinical setting considered here, this rule provides a simple mechanism for abstention when the
+model’s predictive distribution does not support a sufficiently concentrated decision.
+
+3.4
+
+Algorithmic Summary
+
+Algorithm 1 summarizes the operational workflow of MedBayes-Lite. Given an input sequence, the
+procedure first performs repeated stochastic forward passes under MC dropout and averages them into a
+predictive distribution. This distribution is optionally calibrated and then mapped to an entropy-based
+confidence score, which determines whether the prediction is accepted or deferred according to the
+abstention threshold.
+This algorithmic view complements the component-level formulation presented above by showing how
+the three stages of the framework are executed sequentially within the inference pipeline. It also clarifies
+that MedBayes-Lite is implemented as an inference-time procedure that reuses the pretrained transformer
+backbone without introducing additional trainable parameters.
+
+8
+
+Complexity. The cost is dominated by the M stochastic forward passes, so runtime scales as O(M Tfwd )
+where Tfwd is one forward pass; the framework adds no trainable parameters and reuses the backbone,
+so memory is essentially unchanged. The term Lite refers to this parameter- and memory-efficiency:
+dropout-based posterior sampling rather than multiple trained models, and compatibility with existing
+pretrained checkpoints without retraining. Detailed latency and memory measurements are reported in
+Section 5.8.
+Algorithm 1: High-level Pseudocode of MedBayes-Lite (evaluated pipeline)
+Input: Input sequence x = (x1 , . . . , xn ), MC samples M , optional temperature T , abstention
+threshold τ
+Output: Prediction ŷ, confidence C(p)
+1 1) MC-Dropout Sampling and Predictive Distribution
+2 for m = 1 to M do
+
+3
+Enable inference-time dropout (mask zm ) and compute p(m) = softmax fθ (x; zm ) ;
+1 PM
+(m) ;
+4 Form the predictive distribution (Bayesian model average) p̄ = M
+m=1 p
+5 2) Calibration (optional)
+6 p ← temperature-calibrated p̄ (temperature T fit on a held-out calibration set);
+7 3) Confidence-Guided Decision Shaping
+PK
+H(p)
+8 Compute entropy H(p) = −
+k=1 pk log pk and normalized confidence C(p) = 1 − log K ;
+9 if C(p) ≥ τ then
+10
+ŷ = arg maxk pk ;
+11 else
+12
+ŷ = “Uncertain (defer to clinician)”;
+13 return ŷ, C(p);
+
+Note: an optional uncertainty-weighted attention stage (Appendix A) may be inserted before the predictive
+distribution is formed; it was inactive (λ = 0) in all reported experiments and is therefore omitted from
+the evaluated pipeline.
+
+4
+
+Experimental Setup
+
+Having introduced the conceptual design and architectural components of MedBayes-Lite, we now
+describe the experimental setup used to evaluate its effectiveness. This section presents the datasets,
+evaluation metrics, training configurations, task protocols, and baseline methods used in our study. The
+objective is to ensure that all experiments are conducted under controlled, transparent, and reproducible
+conditions, thereby enabling a fair assessment of MedBayes-Lite with respect to calibration, uncertainty
+quantification, and clinical trustworthiness.
+
+4.1
+
+Dataset Details
+
+A central aspect of evaluating MedBayes-Lite is the selection of datasets that reflect both the linguistic
+complexity of biomedical text and the practical demands of clinical decision-making. To this end,
+we use three complementary, publicly available, de-identified clinical question-answering benchmarks:
+MedMCQA, MedQA-USMLE, and PubMedQA. Together they cover exam-style clinical knowledge,
+licensing-style diagnostic reasoning, and literature-based evidence synthesis, and they support both
+in-distribution evaluation and a controlled domain-shift study (Table 3). MIMIC-III electronic health
+records require credentialed access and are not evaluated in this study.
+
+9
+
+PubMedQA: PubMedQA [31] is a biomedical question-answering benchmark constructed from PubMed,
+a large-scale repository of biomedical literature. It pairs clinical questions with answers derived from
+research abstracts, making it suitable for literature-based question answering and evidence synthesis for
+decision support. In our experiments, we use the supervised pqa labeled split and follow the official
+split definitions. When controlled-size evaluation is required due to computational constraints, we report
+the exact subset sizes used in Table 3.
+MedQA: MedQA [32] consists of clinically relevant multiple-choice questions curated from medical
+licensing-style examinations and standard medical references. It reflects common diagnostic and treatment
+questions encountered in medical reasoning and is therefore well aligned with diagnostic reasoning and
+clinical decision-making tasks. We follow the official dataset partitions, and any reduced subset used for
+computational efficiency is explicitly reported in Table 3.
+MedMCQA: MedMCQA is a large-scale multiple-choice clinical question-answering benchmark drawn
+from medical entrance-examination questions spanning many clinical subjects. It is our primary indistribution multiple-choice task (n = 3,683 test items) and the source domain for the domain-shift
+experiment, in which MedMCQA-trained models are evaluated out-of-distribution on MedQA-USMLE.
+Exact split sizes are reported in Table 3.
+Table 3: Datasets used in the experimental evaluation. All three are publicly available de-identified
+biomedical QA benchmarks. MIMIC-III electronic health records require credentialed access and were
+not evaluated in this study; the in-hospital mortality task is left as a separable future axis (a credentialedaccess adapter is provided in the code). Reported sizes correspond to the exact test splits used.
+Dataset
+MedMCQA
+MedQA-USMLE
+PubMedQA
+
+4.2
+
+Task
+4-way single-best-answer
+clinical exam QA
+4-way clinical licensingexam QA
+3-way (yes/no/maybe) evidence QA
+
+Test size
+3,683
+973
+350
+
+Role in this study
+Primary in-distribution multiple-choice task;
+source domain for the domain-shift experiment.
+Out-of-distribution target for MedMCQA-trained
+models; also evaluated directly.
+Literature-based QA; used with a locally finetuned encoder family that is already well calibrated (a null-result control).
+
+Clinical Risk Category Assignment
+
+To evaluate clinical safety beyond aggregate accuracy, we stratify every item into one or more rule-based
+clinical risk categories. Each category is assigned by transparent keyword and regular-expression rules
+over the item text (for example, drug-name suffixes and dose patterns for the medication category, or a
+count of negation cues for the negation-heavy category), so an item may belong to several categories
+at once. Each category carries a severity weight encoding the clinical cost of a confident error; these
+weights define harmful overconfident errors (those in high-severity categories, severity ≥ 2.5) and weight
+the Clinical Uncertainty Score. Table 4 lists the categories, example rules, severity weights, and clinical
+motivation. These categories are heuristic evaluation strata, not ground-truth clinical labels; they give
+a transparent, reproducible way to ask where a model’s confident errors fall, and are hereafter used as
+evaluation strata.
+
+4.3
+
+Evaluation Metrics
+
+To evaluate the calibration and clinical reliability of MedBayes-Lite, we employ both standard uncertainty
+quantification metrics and two clinically motivated measures. This combination allows the models to be
+assessed not only in terms of statistical calibration, but also in terms of properties relevant to safe clinical
+deployment.
+
+10
+
+Table 4: Rule-based clinical risk categories used as evaluation strata. Each item is assigned to one or
+more categories by transparent keyword and regular-expression rules over its text; the severity weight is
+used to define harmful overconfident errors (severity ≥ 2.5) and to weight the Clinical Uncertainty Score.
+These categories are heuristic evaluation strata, not ground-truth clinical labels.
+Clinical risk category
+Medication / drug interaction
+Diagnosis / differential
+Treatment recommendation
+Risk / prognosis
+Rare / uncommon condition
+Laboratory / biomarker
+Numeric / vital-heavy
+Ambiguous symptoms
+Missing / incomplete evidence
+Contradictory evidence
+Negation-heavy text
+High-severity case
+Low-severity (routine)
+
+4.3.1
+
+Rule examples
+drug-name suffixes (-pril, -olol, -statin, -mab);
+dose amounts (e.g. 500 mg); “interaction”, “contraindicated”
+“diagnosis”, “differential”, “most likely”, “consistent with”
+“treat”, “therapy”, “management”, “first-line”,
+“next step”
+
+Sev. wt.
+3.0
+
+“prognosis”, “mortality”, “survival”, “recurrence”
+“rare”, “atypical”, “syndrome”, “congenital”
+
+2.5
+2.5
+
+“serum”, “creatinine”, “WBC”, “mg/dl”, “titer”
+
+2.0
+
+≥ 4 numeric or unit tokens (mmHg, bpm,
+mg/dL)
+“nonspecific”, “vague”, “could be”, “atypical
+presentation”
+“not available”, “unknown”, “insufficient”, “no
+history”
+“however”, “despite”, “inconsistent”, “conflicting”
+≥ 3 negation cues (no, not, denies, absent)
+
+2.0
+
+“acute”, “severe”, “critical”, “ICU”, “sepsis”,
+“STAT”
+fallback when no higher-risk category fires
+
+3.0
+3.0
+
+2.0
+2.0
+2.0
+1.5
+3.0
+1.0
+
+Clinical motivation
+Dosing and interaction errors
+translate directly into patient
+harm.
+Misdiagnosis drives downstream management errors.
+An incorrect treatment recommendation is directly actionable and harmful.
+Miscommunicated risk distorts
+shared decision-making.
+Rare presentations are highuncertainty and high-stakes.
+Lab misinterpretation propagates to diagnosis and dosing.
+Numeric-dense items are
+prone to value misreading.
+Ambiguity warrants more conservative deferral.
+Incomplete evidence should
+lower confidence.
+Conflicting findings require
+cautious aggregation.
+Negation flips clinical meaning
+and is error-prone.
+Emergent cases carry the highest cost of confident error.
+Routine factual QA; baseline
+severity.
+
+Standard Calibration Metrics
+
+• Expected Calibration Error (ECE) [20]: ECE measures the discrepancy between model confidence and empirical accuracy. Predictions are partitioned into B = 15 confidence bins, and ECE is
+computed as
+B
+X
+|Bb |
+|acc(Bb ) − conf(Bb )| ,
+ECE =
+N
+b=1
+
+where acc(Bb ) and conf(Bb ) denote the accuracy and average confidence within bin Bb , respectively. Lower ECE indicates better calibration.
+• Negative Log-Likelihood (NLL): NLL is a proper scoring rule that penalizes inaccurate and
+poorly calibrated probabilistic predictions. For a classification task with K classes,
+N
+
+NLL = −
+
+K
+
+1 XX
+yi,k log(pi,k ),
+N
+i=1 k=1
+
+where yi,k is the ground-truth indicator and pi,k is the predicted probability for class k. Lower NLL
+indicates better probabilistic predictions.
+4.3.2
+
+Clinically Motivated Trustworthiness Metrics
+
+• CUS: We introduce a weighted calibration metric that accounts for clinical risk by assigning larger
+penalties to overconfident predictions in safety-critical scenarios. Unlike standard ECE, CUS
+11
+
+incorporates clinical severity weights wclinical (b) that scale with the potential harm associated with
+an error:
+B
+X
+CUS =
+|acc(b) − conf(b)| × P (b) × wclinical (b),
+b=1
+
+where b indexes confidence bins, acc(b) and conf(b) denote the accuracy and mean confidence
+in bin b, P (b) is the proportion of samples in bin b, and wclinical (b) assigns larger weight to highconfidence errors in clinically severe cases. Lower CUS values indicate more clinically aware
+uncertainty estimation. We empirically evaluate CUS in Section 5: across model/method/category
+groups it correlates strongly with the harmful overconfident error rate (r ≈ 0.88), so it is reported
+as a pre-specified, clinically motivated supplementary summary. The primary selective-prediction
+conclusions are based on standard metrics: ECE, NLL, Brier score, AURC, selective accuracy,
+coverage, and abstention recall.
+• ZTI: This metric formalizes the trade-off between coverage (the fraction of instances for which the
+model makes a prediction) and reliability (the accuracy of predictions when the model is sufficiently
+confident). ZTI rewards models that maintain strong predictive performance while abstaining when
+uncertainty is high:
+Coverage × Calibrated Accuracy
+ZTI = 2 ×
+,
+Coverage + Calibrated Accuracy
+where
+Coverage =
+
+|Sconfident |
+,
+|Stotal |
+
+Calibrated Accuracy = Accuracy on Sconfident .
+
+Here, Sconfident denotes the set of predictions whose confidence exceeds a threshold τ , and Stotal
+denotes the full test set. Higher ZTI values nominally indicate a better balance between applicability
+and safety. However, we find ZTI to be threshold-confounded and largely redundant with the area
+under the risk-coverage curve (Section 5); we therefore report it only as a secondary descriptor and
+rely on AURC, selective accuracy, coverage, and abstention recall for selective-prediction claims.
+4.3.3
+
+Metric Alignment with Clinical Objectives
+
+The relationship between these metrics and the goals of MedBayes-Lite is deliberate. Calibration of the
+predictive distribution reduces overconfidence, thereby improving both ECE and CUS. The confidenceguided abstention component governs the trade-off between coverage and accepted accuracy, which we
+report primarily through AURC, selective accuracy, coverage, and abstention recall; ZTI is reported only
+as a secondary descriptor. Taken together, these metrics provide a broader assessment of whether a model
+is not only accurate, but also sufficiently reliable for clinical use. Their roles and interpretations are
+summarized in Table 5.
+
+4.4
+
+Training Configuration
+
+To ensure consistency and fairness in evaluation, all models were trained and evaluated under standardized
+configurations. Table 6 summarizes the key hyperparameters used across model families, including
+sequence length, temperature, and token limits. These settings were selected to balance reproducibility,
+computational efficiency, and the need to capture extended clinical context. The maximum sequence
+length was fixed at 512 tokens for all models to support long biomedical narratives, such as PubMed
+abstracts and MIMIC-III clinical notes, while preserving computational feasibility.
+Fine-tuning of discriminative models. For BERT-based architectures (BERT, BioBERT, ClinicalBERT,
+and RoBERTa), we used the AdamW optimizer with learning rates between 2 × 10−5 and 5 × 10−5 , batch
+
+12
+
+Table 5: Summary of evaluation metrics and their clinical interpretation. Primary metrics are ECE, NLL,
+AURC, selective accuracy, coverage, and abstention recall. CUS is reported as a clinically motivated
+supplementary calibration summary. ZTI is reported for completeness but is not used for primary
+conclusions, because subsequent analysis (Section 5) shows it is threshold-confounded and largely
+redundant with AURC.
+Metric
+ECE
+NLL
+CUS
+ZTI
+
+Clinical Interpretation
+Alignment between predictive confidence and empirical accuracy
+Quality of probabilistic predictions
+Clinically motivated supplementary calibration summary (severityweighted calibration error)
+Secondary descriptor (coverage/accuracy harmonic mean;
+threshold-confounded)
+
+Desired Direction
+↓ (Lower is better)
+↓ (Lower is better)
+↓ (Lower is better)
+↑ (Higher is better)
+
+sizes of 16–32, and 3–5 training epochs depending on convergence. Early stopping was applied based
+on validation loss, with checkpoints saved when validation loss did not improve for three consecutive
+epochs. A validation split was reserved from each dataset, and metrics such as ECE and NLL were used
+to guide model selection. These settings follow established fine-tuning practice for transformer-based
+biomedical classification tasks.
+Generative model configuration. For the open-weight generative model (Qwen2.5-7B-Instruct) we
+use a sampling-only mode: predictive uncertainty is estimated from multiple stochastic generations
+(self-consistency and semantic entropy) and from an elicited verbalized confidence, after which the same
+confidence-guided abstention rule is applied. Generative outputs are constrained to short answers for
+PubMedQA (Yes/No/Maybe) and to a single option letter for the multiple-choice tasks, as described in
+Section 4.5. Proprietary GPT-class API models, GPT-2, and LLaMA-2 were not evaluated.
+Bayesian dropout and uncertainty estimation. MC dropout is used as an inference-time uncertainty
+estimator within MedBayes-Lite via repeated stochastic forward passes. Unless otherwise stated, all
+reported experiments use an inference dropout rate of 0.2 and 15 Monte Carlo samples. A sensitivity
+analysis over dropout rates 0.1–0.5 and Monte Carlo sample counts 5–50 is reported in the Supplementary
+Material (Tables 18 and 17): calibration and harmful-error metrics are stable with respect to the number
+of Monte Carlo samples (for M ≥ 10), and increasing the dropout rate trades improved calibration for
+reduced coverage and risk ranking, with 0.2 providing a balanced operating point. Only calibration and
+confidence-guided abstention are evaluated in this study; the optional attention pathway remained inactive
+(λ = 0).
+Validation and model selection. Each model is validated using stratified splits to preserve representative
+coverage of common and rare clinical cases. Early stopping based on validation loss, together with
+repeated evaluation across random seeds, is used to improve robustness and reproducibility.
+Temperature scaling for discriminative models. Although temperature is typically associated with
+generative decoding, we also apply temperature scaling to discriminative architectures as a post-hoc
+calibration method at the logit level. Temperature scaling reduces overconfidence by rescaling logits prior
+to softmax normalization, thereby improving the alignment between predicted probabilities and empirical
+accuracy in safety-sensitive settings.
+Overall, the configurations in Table 6 define a uniform experimental protocol across model families.
+This controlled setup enables reliable comparison of the uncertainty quantification and trustworthiness
+measures used to evaluate MedBayes-Lite.
+
+13
+
+Table 6: Models evaluated in this study. Encoder predictors are evaluated with full internal access (Monte
+Carlo dropout, calibration, abstention); the generative model is evaluated in a sampling-only generative
+mode. We report three random seeds and 15 Monte Carlo dropout samples (inference dropout rate 0.2).
+GPT-class API models, GPT-2, and LLaMA-2 were not run.
+Model
+BioBERT (MedMCQA-tuned)
+PubMedBERT (MedMCQA-tuned)
+BERT-base (fine-tuned)
+BioBERT (fine-tuned)
+Bio ClinicalBERT (fine-tuned)
+PubMedBERT (fine-tuned)
+Qwen2.5-7B-Instruct (generative)
+
+4.5
+
+Task / head
+
+Max length
+
+4-way multiple choice
+4-way multiple choice
+PubMedQA 3-way
+PubMedQA 3-way
+PubMedQA 3-way
+PubMedQA 3-way
+sampling-only (self-consistency /
+semantic entropy / verbalized)
+
+320
+320
+512
+512
+512
+512
+512
+
+Task Protocols and Output Standardization
+
+Because the suite includes both discriminative encoder classifiers (BioBERT, Bio ClinicalBERT, PubMedBERT, BERT-base) and a generative large language model (Qwen2.5-7B-Instruct), we standardize
+the evaluation protocol to ensure comparable task-level outputs across model types.
+PubMedQA (3-way classification). For encoder models, we fine-tune a three-class classifier head and
+evaluate the predicted labels directly. For generative models, we prompt the model to output exactly one
+label from the set {Yes, No, Maybe}. Outputs outside this set are mapped to the nearest valid label
+using a deterministic normalization rule based on case-insensitive string matching; otherwise, they are
+marked invalid and excluded from accuracy while still included in abstention statistics.
+MedQA (multiple choice). For encoder models, we fine-tune a 4-way (or 5-way, when applicable)
+classifier head. For generative models, we prompt the model to output exactly one option letter (e.g.,
+A/B/C/D). If a model produces additional text, only the first valid option letter is retained. If no valid
+option is found, the sample is treated as invalid and counted as an abstention for coverage calculations.
+MedMCQA (multiple choice). MedMCQA is evaluated identically to MedQA-USMLE: encoder
+models score the four options and the generative model outputs a single option letter, under the same
+normalization and abstention handling.
+Uncertainty estimation and abstention. For open-weight models, uncertainty signals are computed
+from inference-time stochasticity under MC dropout and used for confidence-guided decision shaping;
+the optional attention pathway was inactive (λ = 0). In a sampling-only generative setting, predictive
+uncertainty may be estimated from repeated sampled generations, after which the same confidence-guided
+abstention rule can be applied. We report both accuracy on accepted predictions and coverage (the
+fraction of non-abstained outputs), which together determine ZTI.
+
+4.6
+
+Baseline Implementations
+
+For comparison, we implement several widely used post-hoc calibration baselines alongside MedBayesLite. Maximum Softmax Probability (MSP) uses the maximum predicted class probability as a confidence
+proxy [33]. Temperature Scaling (TS) applies a scalar temperature parameter, optimized on the validation
+set using LBFGS to minimize cross-entropy loss, thereby rescaling logits prior to softmax. Isotonic
+Regression (IR) provides a non-parametric mapping between predicted confidence and empirical accuracy
+14
+
+and is implemented using scikit-learn’s monotone regression with clipping for out-of-range predictions [21]. All baselines are applied to the same predicted logits obtained from the Bio ClinicalBERT
+backbone and are evaluated using ECE, NLL, CUS, and ZTI. For reproducibility, ECE is computed with
+15 bins, TS optimization uses a learning rate of 0.01 for 50 iterations, and IR is trained on raw top-class
+confidence values.
+These baselines represent commonly used calibration strategies and provide reference points against
+which MedBayes-Lite is compared. For the locally fine-tuned encoder family, all baselines start from
+the same pretrained backbone and use identical data splits, preprocessing, and optimization, so that
+differences are attributable to the uncertainty-handling strategy rather than to initialization or data. Deep
+ensembles are formed from independently fine-tuned seeds; as reported in Section 5, they achieve the
+best risk ranking among the methods compared. We use 15 Monte Carlo dropout samples at inference
+(dropout rate 0.2) throughout.
+To avoid ambiguity regarding what is implementable under different access settings, we explicitly
+summarize which MedBayes-Lite components apply to open-weight models and which apply in the
+sampling-only generative setting. Table 7 provides this mapping and clarifies that the optional embeddingand attention-level extensions require internal access and were not evaluated in this study, whereas
+confidence-guided abstention applies in both settings.
+Table 7: Applicability of MedBayes-Lite components under different model access settings. The openweight (internal-access) mode permits inference-time dropout and internal interventions, whereas the
+sampling-only generative mode is limited to output-level sampling-based uncertainty estimation and
+confidence-guided abstention. The confidence-guided abstention used throughout this study applies in
+both settings.
+Component
+Predictive Uncertainty
+Estimation
+(MCdropout sampling)
+Uncertainty-Weighted
+Attention (optional;
+inactive in reported
+experiments)
+Confidence-Guided
+Decision
+Shaping
+(abstention)
+Predictive uncertainty
+via multi-sample outputs (entropy / selfconsistency)
+
+5
+
+Open-weight models
+✓
+
+Sampling-only generative setting
+–
+
+✓
+
+–
+
+✓
+
+✓
+
+optional
+
+✓
+
+Results
+
+We evaluate MedBayes-Lite as a clinical uncertainty governance layer. The questions are whether it
+reduces harmful overconfident clinical errors (Section 5.1), improves calibration (Section 5.2), supports
+appropriate abstention (Section 5.3), remains useful under medical domain shift (Section 5.4), resolves to
+clinically meaningful risk categories (Section 5.5), and whether the proposed CUS summary is meaningful
+(Section 5.6). Section 5.7 reports the negative findings that bound these claims. All numbers are from
+runs over three seeds on the full encoder test splits, with 15 Monte Carlo dropout samples; confidence
+intervals use a per-sample bootstrap.
+
+15
+
+5.1
+
+Harmful Overconfident Error Reduction
+
+Table 8 reports the central result on clinical multiple-choice QA. A harmful overconfident error is a
+prediction that is incorrect, accepted at a confidence threshold (here 0.8), and clinically high-severity.
+Where the base model is overconfident, MedBayes-Lite drives these errors toward zero and sharply
+reduces calibration error. On MedMCQA with PubMedBERT, expected calibration error falls from 0.255
+to 0.023 and the harmful overconfident error rate from 0.056 to 0.003; on BioBERT, from 0.317 to 0.021
+and 0.067 to 0.000. A paired bootstrap (n = 2000) confirms significance: across the four multiple-choice
+settings the harmful-error reduction ranges from 0.05 to 0.22 and the ECE reduction from 0.23 to 0.33,
+all with p ≈ 0. Temperature scaling already captures most of the calibration gain, which we discuss in
+Section 5.2; the mechanism of the harmful-error reduction is calibration together with confidence-guided
+abstention rather than improved error ranking (Section 5.7).
+Table 8: Harmful overconfident error reduction on clinical multiple-choice QA. ECE and harmful@0.8
+(confident, wrong, high-severity) are lower-is-better; selective accuracy at τ =0.7 is higher-is-better;
+AURC is the area under the risk-coverage curve (lower-is-better). MedBayes-Lite removes nearly all
+harmful overconfident errors and improves calibration, but does not improve AURC.
+Dataset Method
+ECE↓
+MedMCQA, PubMedBERT
+base
+0.255
+temperature scaling 0.081
+MC-dropout
+0.087
+MedBayes-Lite
+0.023
+MedMCQA, BioBERT
+base
+0.317
+temperature scaling 0.085
+MC-dropout
+0.163
+MedBayes-Lite
+0.021
+MedQA-USMLE, PubMedBERT
+base
+0.325
+temperature scaling 0.094
+MC-dropout
+0.171
+MedBayes-Lite
+0.046
+MedQA-USMLE, BioBERT
+base
+0.410
+temperature scaling 0.162
+MC-dropout
+0.253
+MedBayes-Lite
+0.084
+
+5.2
+
+harmful@0.8↓
+
+SelAcc@0.7↑
+
+Cov@0.7
+
+AURC↓
+
+0.056
+0.012
+0.009
+0.003
+
+0.571
+0.721
+0.723
+0.818
+
+0.541
+0.217
+0.200
+0.100
+
+0.376
+0.375
+0.392
+0.392
+
+0.067
+0.003
+0.013
+0.000
+
+0.457
+0.618
+0.541
+0.714
+
+0.508
+0.083
+0.189
+0.021
+
+0.517
+0.515
+0.521
+0.521
+
+0.213
+0.015
+0.045
+0.002
+
+0.437
+0.583
+0.483
+0.539
+
+0.541
+0.106
+0.201
+0.026
+
+0.539
+0.533
+0.558
+0.554
+
+0.217
+0.004
+0.051
+0.000
+
+0.288
+0.182
+0.292
+0.143
+
+0.486
+0.034
+0.164
+0.002
+
+0.724
+0.726
+0.724
+0.720
+
+Calibration Performance
+
+Figure 3 shows reliability diagrams for MedMCQA. The base model is markedly overconfident; both
+temperature scaling and MedBayes-Lite restore close agreement between confidence and accuracy. As
+Table 8 makes explicit, temperature scaling, a single-parameter post-hoc method, already achieves most
+of the calibration gain (ECE 0.255 → 0.081 on PubMedBERT), and MedBayes-Lite, which adds Monte
+Carlo averaging on top of calibration, reaches the lowest ECE (0.023) and Brier score (0.652 versus
+0.750 for the base model). We therefore present temperature scaling as a strong, cheap baseline rather
+than a strawman.
+
+16
+
+Figure 2: Risk-coverage curves on MedMCQA. MedBayes-Lite and the baselines trace nearly the same
+curve, illustrating that the method changes the confidence scale (and thus calibration and threshold-based
+harmful-error rates) but not the underlying ordering of predictions by reliability.
+
+5.3
+
+Risk-Aware Abstention
+
+The governance value of the layer is in how it defers. Under MedBayes-Lite the accuracy of accepted
+predictions at τ =0.7 rises sharply (Table 8): from 0.571 to 0.818 on MedMCQA with PubMedBERT,
+and from 0.457 to 0.714 on BioBERT. Abstention recall, the fraction of incorrect predictions that are
+deferred, reaches 0.97 to 0.99 at τ =0.7 versus roughly 0.55 for the base model. This safety is bought at a
+coverage cost that we report explicitly: coverage at τ =0.7 falls from 0.541 to 0.100 on MedMCQA with
+PubMedBERT. The model answers less often, but is right far more often when it does. Figures 4a and 4b
+show the abstention precision-recall behavior and the severity-weighted error as a function of coverage.
+
+5.4
+
+Domain-Shift Robustness
+
+The strongest result is under medical domain shift. We train (or load) MedMCQA models and evaluate
+them out-of-distribution on MedQA-USMLE. Table 9 reports the drift. The base models become acutely
+dangerous under shift: they commit confident errors on about 21% of high-severity items (harmful@0.8
+of 0.213 for PubMedBERT and 0.217 for BioBERT). MedBayes-Lite reduces this to near zero (0.002
+and 0.000) and roughly halves the calibration drift on PubMedBERT (ECE drift +0.070 → +0.026). A
+clinical model that is most overconfident exactly when it is most likely to be wrong is the failure this
+layer is designed to contain.
+
+5.5
+
+Clinical Risk Category Analysis
+
+We assign every item to one or more of 13 rule-based clinical risk categories (Table 4) with severity weights
+(medication and drug interaction, diagnosis, treatment, risk and prognosis, laboratory interpretation,
+rare disease, ambiguous symptoms, contradictory and missing evidence, negation-heavy and numeric-
+
+17
+
+Figure 3: Reliability diagrams on MedMCQA. The base model sits well below the diagonal (overconfident); calibration and MedBayes-Lite bring confidence into agreement with accuracy.
+heavy text, and high- versus low-severity). Figure 6 shows that base-model harmful overconfidence
+concentrates in the high-severity, diagnosis, treatment, and medication categories, where confident error
+is most costly, and that MedBayes-Lite drives the harmful-error rate in these categories toward zero. This
+severity-resolved view is the governance result a clinical reader cares about.
+
+5.6
+
+Empirical Analysis of CUS
+
+As a supplementary analysis, we empirically evaluate the proposed clinical summary metrics against
+the clinical failure metrics they are meant to summarize, computed across 739 model/method/category
+groups (Table 10). CUS correlates strongly with the harmful overconfident error rate (Pearson r = 0.88)
+and with severity-weighted error (r = 0.90), and negatively with abstention recall (r = −0.81); its weak
+correlation with AURC (r = 0.24) is expected, since CUS is a calibration metric, not a ranking metric.
+ZTI, by contrast, has no monotone relationship with coverage (Spearman r = −0.05) and correlates
+strongly only with AURC (r = −0.70), a standard metric it does not improve upon. We therefore retain
+CUS as a clinical-calibration summary and demote ZTI to a secondary descriptor.
+Incremental value over ECE. Because CUS is a severity-weighted calibration error, we further ask
+whether it adds information beyond standard ECE. We regress each clinical failure metric on ECE alone
+and on ECE+CUS across model/method/category groups (Table 11). Adding CUS raises the explained
+18
+
+(a) Abstention precision-recall.
+
+(b) Severity-weighted error vs coverage.
+
+Figure 4: Selective-prediction behavior on MedMCQA. MedBayes-Lite defers a large fraction of incorrect
+predictions (high abstention recall) and reduces severity-weighted error among accepted predictions, at
+the cost of lower coverage.
+Table 9: Out-of-distribution transfer (train MedMCQA, evaluate MedQA-USMLE). “Drift” is the indistribution to out-of-distribution change in ECE. Under shift the base model commits confident errors on
+∼21% of high-severity items; MedBayes-Lite reduces this to near zero.
+Model
+PubMedBERT
+PubMedBERT
+BioBERT
+BioBERT
+
+Method
+base
+MedBayes-Lite
+base
+MedBayes-Lite
+
+ID ECE
+0.255
+0.030
+0.317
+0.015
+
+OOD ECE
+0.325
+0.055
+0.410
+0.084
+
+ECE drift
++0.070
++0.026
++0.093
++0.069
+
+ID harmful
+0.056
+0.003
+0.067
+0.000
+
+OOD harmful
+0.213
+0.002
+0.217
+0.000
+
+variance in the harmful overconfident error rate from R2 = 0.60 to 0.79 (∆R2 = 0.19, bootstrap 95%
+CI [0.14, 0.25], partial-F p < 10−4 ), and in severity-weighted error from 0.73 to 0.82 (∆R2 = 0.08, CI
+[0.06, 0.11]). CUS therefore explains additional variance in clinical failure beyond ECE: it captures the
+severity structure of miscalibration that ECE, which weights all errors equally, does not, while remaining
+interpretable as a severity-weighted extension of ECE.
+
+5.7
+
+Generative Contrast and Negative Findings
+
+Risk ranking does not improve (AURC). The improvements above are to the confidence scale, not
+to the ordering of predictions by reliability. In Table 8 the AURC of MedBayes-Lite is statistically
+indistinguishable from the base model in three of four settings (paired bootstrap p between 0.6 and 0.96)
+and marginally worse in one, and the error-detection AUROC is no higher. Consistent with this, on
+PubMedQA deep ensembles achieve the best AURC (0.345 to 0.363 across the encoder family) while
+MedBayes-Lite does not (Table 13). Ranking gains come from ensembling; calibration gains come from
+temperature scaling or Monte Carlo averaging; MedBayes-Lite combines the latter two and should not be
+claimed to improve ranking.
+Component ablation. Table 12 isolates the components of the layer on MedMCQA (PubMedBERT).
+Temperature calibration is the dominant lever (ECE 0.255 → 0.081); MC-dropout averaging contributes
+a smaller, complementary improvement (0.255 → 0.092); the abstention-only variant is numerically
+identical to the base predictor, since abstention is a threshold policy applied to the underlying confidence;
+and the full layer (MC-dropout, temperature, and abstention) is best (ECE 0.030, harmful 0.002). AURC
+19
+
+Figure 5: Predictive uncertainty in-distribution (MedMCQA) versus out-of-distribution (MedQAUSMLE). Uncertainty shifts upward under domain shift, which the abstention gate converts into more
+deferral on the harder distribution.
+Table 10: Empirical analysis of the secondary clinical summary metrics. Correlations are across 739
+model/method/category groups. CUS tracks clinical failure; ZTI is threshold-confounded and redundant
+with AURC.
+Summary
+CUS
+CUS
+CUS
+CUS
+ZTI
+ZTI
+ZTI
+
+Target metric
+harmful overconfident error rate
+severity-weighted error
+abstention recall
+AURC
+AURC
+selective accuracy
+coverage
+
+Correlation
+Pearson 0.88
+Pearson 0.90
+Pearson −0.81
+Pearson 0.24 (weak, expected)
+Pearson −0.70
+Pearson 0.34
+Spearman −0.05 (none)
+
+is unchanged across all variants. The uncertainty-weighted attention component is inactive in these
+runs (λ = 0) and is not independently isolated (Section 7); the gains are attributable to calibration and
+abstention.
+No benefit when the model is already calibrated. Table 13 also shows a null result. Our locally finetuned PubMedQA encoders are already well calibrated (ECE 0.06 to 0.08) with no measurable harmful
+overconfidence, and MedBayes-Lite leaves these properties essentially unchanged. The framework helps
+only when there is harmful overconfidence to remove.
+Generative models are more dangerous, and self-consistency does not fix it. Table 14 evaluates
+Qwen2.5-7B-Instruct in the sampling-only mode. The generative model is far more overconfident than
+the encoders: on PubMedQA, self-consistency gives an ECE of 0.445 and a harmful overconfident error
+rate of 0.360, and it does not improve over semantic entropy because the samples agree on the wrong
+answer. Eliciting a verbalized confidence calibrates substantially better (PubMedQA ECE 0.167, harmful
+0.110). Notably, on PubMedQA the model’s uncertainty ranks its errors well (AUROC of error detection
+20
+
+Figure 6: Harmful overconfident error rate by rule-based clinical risk category (MedMCQA). Categories
+are assigned using transparent keyword and pattern rules and are used only as evaluation strata, not as
+ground-truth clinical labels. Base-model harmful errors concentrate in high-severity, diagnosis, treatment,
+and medication categories; MedBayes-Lite reduces them toward zero.
+0.78), so the failure is a miscalibrated confidence scale, precisely the regime a calibration-and-abstention
+governance layer is meant to address. This contrast motivates governance rather than demonstrating a
+uniform improvement.
+Sensitivity to clinical perturbations is partial. Table 15 reports how MedBayes-Lite responds to
+controlled corruptions of MedMCQA items. It raises uncertainty and abstention appropriately for
+irrelevant distractors (mean confidence drop 0.051) and contradictory findings (0.033), but it is essentially
+insensitive to corruption of numeric or vital-sign values (confidence change −0.001) and to vague
+phrasing (0.000). The layer governs aggregate predictive uncertainty and does not detect local numeric
+implausibility, a limitation that matters for dosing and laboratory interpretation.
+
+5.8
+
+Computational Efficiency
+
+MedBayes-Lite adds no trainable parameters and reuses the backbone across stochastic passes, so its
+parameter count and memory footprint match the base model; the primary cost is the M Monte Carlo
+forward passes, so latency grows approximately linearly with M . Table 16 reports measured latency
+and memory on a Bio ClinicalBERT backbone. Memory is constant at 0.43 GB across Monte Carlo
+settings, in contrast to a five-member deep ensemble (541M parameters, 2.85 GB). We note that, unlike
+memory, compute is not negligible: latency roughly doubles at M =10 relative to a single pass, so the
+“Lite” property refers to parameter and memory efficiency, not a flat compute overhead. The exact figures
+are hardware-dependent.
+
+6
+
+Discussion
+
+The primary contribution of MedBayes-Lite is not a new uncertainty estimator, but a practical governance
+mechanism that converts uncertainty estimates into calibrated abstention behavior. Read this way,
+MedBayes-Lite is best understood as a governance layer, not as an uncertainty estimator that dominates
+prior work. Read this way, the evidence is consistent and interpretable.
+
+21
+
+Table 11: Incremental value of CUS over ECE. Nested regressions of each clinical failure metric on ECE
+alone versus ECE+CUS, across model/method/clinical-risk-category groups. ∆R2 is the variance in the
+failure metric explained by CUS beyond ECE; the interval is a 2000-sample bootstrap CI, and the p-value
+is a partial-F test for adding CUS. CUS explains additional variance in clinical failure beyond ECE.
+Scope
+n
+R2 (ECE)
+Target: harmful overconfident error rate
+pooled (all groups)
+686
+0.601
+78
+0.321
+model=bert base
+model=biobert
+78
+0.192
+130
+0.657
+model=biobert medmcqa
+model=clinicalbert
+78
+0.260
+model=pubmedbert
+78
+0.391
+0.529
+model=pubmedbert medmcqa 130
+114
+0.223
+model=qwen2 5 7b
+Target: severity-weighted error
+pooled (all groups)
+686
+0.734
+78
+0.326
+model=bert base
+model=biobert
+78
+0.285
+130
+0.795
+model=biobert medmcqa
+model=clinicalbert
+78
+0.347
+model=pubmedbert
+78
+0.402
+0.670
+model=pubmedbert medmcqa 130
+model=qwen2 5 7b
+114
+0.551
+
+6.1
+
+R2 (ECE+CUS)
+
+∆R2
+
+∆R2 95% CI
+
+partial-F p
+
+0.793
+0.461
+0.312
+0.848
+0.511
+0.477
+0.812
+0.762
+
+0.192
+0.140
+0.120
+0.191
+0.251
+0.086
+0.284
+0.539
+
+[0.136, 0.248]
+[0.037, 0.267]
+[0.001, 0.273]
+[0.098, 0.293]
+[0.010, 0.451]
+[0.019, 0.172]
+[0.170, 0.403]
+[0.328, 0.693]
+
+<1e-4
+<1e-4
+0.001
+<1e-4
+<1e-4
+0.001
+<1e-4
+<1e-4
+
+0.818
+0.466
+0.333
+0.878
+0.521
+0.489
+0.820
+0.800
+
+0.084
+0.140
+0.048
+0.082
+0.174
+0.087
+0.150
+0.249
+
+[0.057, 0.114]
+[0.035, 0.269]
+[0.001, 0.130]
+[0.036, 0.134]
+[0.009, 0.318]
+[0.018, 0.173]
+[0.096, 0.209]
+[0.096, 0.403]
+
+<1e-4
+<1e-4
+0.023
+<1e-4
+<1e-4
+0.001
+<1e-4
+<1e-4
+
+What the layer does
+
+First, it reduces confident high-severity errors on the benchmark clinical QA tasks. On clinical multiplechoice QA it reduces calibration error substantially (0.23 to 0.33 absolute ECE) and removes nearly
+all harmful overconfident errors, those that are simultaneously confident, incorrect, and clinically highseverity. Second, it supports appropriate abstention: at a fixed acceptance threshold the accuracy of
+accepted predictions rises sharply (for example from 0.57 to 0.82 on MedMCQA with PubMedBERT),
+and abstention recall, the fraction of incorrect predictions that are deferred, reaches 0.97 to 0.99. Third,
+and most relevant to settings with distribution shift, the benefit is largest under domain shift. When
+models trained on MedMCQA are evaluated on MedQA-USMLE, the uncalibrated baseline becomes
+acutely dangerous, committing confident errors on roughly 21% of high-severity items; the governance
+layer reduces this to near zero and roughly halves the calibration drift. A clinical model that is most
+overconfident exactly when it is most likely to be wrong is the central failure this layer is designed to
+contain.
+
+6.2
+
+What the layer does not do
+
+We are explicit about the boundaries of these claims. The layer does not improve the model’s ability to
+rank its predictions by reliability: the area under the risk-coverage curve is statistically unchanged in three
+of four multiple-choice settings and marginally worse in the fourth, and the area under the error-detection
+ROC curve is no higher. The improvement is a change to the confidence scale, not to the ordering of
+predictions, and a perfectly calibrated and a poorly calibrated model can share the same risk-coverage
+curve. Consequently, temperature scaling, a far cheaper post-hoc method, matches most of the calibration
+gain, and deep ensembles achieve better risk ranking than our layer. The safety we report is also bought
+at a measurable cost in coverage: the model answers less often. And on models that are already well
+22
+
+Table 12: Component ablation on MedMCQA (PubMedBERT). Temperature calibration is the dominant
+lever for calibration and harmful-error reduction; MC-dropout averaging adds a smaller improvement; the
+abstention-only variant equals the base predictor because abstention is a threshold policy applied to the
+(here uncalibrated) confidence. The full layer is MC-dropout plus temperature plus abstention. AURC is
+essentially unchanged across variants.
+Variant
+Base
+MC dropout only
+Temperature scaling only
+Abstention only
+Full (MC + temperature + abstention)
+
+Acc
+0.465
+0.455
+0.465
+0.465
+0.455
+
+ECE↓
+0.255
+0.092
+0.081
+0.255
+0.030
+
+harmful@0.8↓
+0.056
+0.010
+0.012
+0.056
+0.002
+
+SelAcc@0.7↑
+0.571
+0.734
+0.721
+0.571
+0.811
+
+Cov@0.7
+0.541
+0.198
+0.217
+0.541
+0.102
+
+AURC↓
+0.376
+0.395
+0.375
+0.376
+0.395
+
+Table 13: Null-result control on PubMedQA, where the fine-tuned encoders are already well calibrated.
+MedBayes-Lite neither helps nor hurts calibration; deep ensembles give the best AURC. Harmful overconfident error rate is 0.000 for all rows.
+Model
+BERT-base
+BioBERT
+Bio ClinicalBERT
+PubMedBERT
+
+base ECE / AURC
+0.069 / 0.376
+0.069 / 0.376
+0.060 / 0.394
+0.075 / 0.371
+
+MedBayes-Lite ECE / AURC
+0.074 / 0.385
+0.074 / 0.399
+0.078 / 0.428
+0.071 / 0.382
+
+ensemble AURC
+0.351
+0.345
+0.346
+0.363
+
+calibrated, such as our fine-tuned PubMedQA encoders, the layer provides no benefit because there is no
+harmful overconfidence left to remove.
+A contrast with an open-weight generative model sharpens the motivation rather than the method.
+Qwen2.5-7B-Instruct is markedly more overconfident than the encoders, confidently wrong on about
+36% of high-severity PubMedQA items, and self-consistency does not repair this because the samples
+agree on the wrong answer. Notably, the model’s uncertainty does separate its errors well in a ranking
+sense, so the failure is purely a miscalibrated confidence scale, exactly the regime a calibration-andabstention governance layer is meant to address. Eliciting a verbalized confidence calibrates better than
+self-consistency, which is itself a useful, if narrow, finding for sampling-only deployments.
+The empirical evidence suggests that MedBayes-Lite should not be viewed as a replacement for strong
+calibration baselines or ensemble uncertainty methods. Temperature scaling achieves comparable calibration at lower cost, while deep ensembles provide stronger risk ranking. The primary contribution of
+MedBayes-Lite is instead a practical uncertainty-governance mechanism that combines calibration and
+confidence-guided abstention to reduce harmful overconfident clinical errors.
+
+6.3
+
+Clinical relevance
+
+The practical value of the layer is in the deployment interface it creates. By deferring predictions whose
+calibrated confidence falls below a threshold, it converts a silent answer engine into a system that escalates
+uncertain, high-stakes cases for human review. This is most useful under the conditions clinicians actually
+face at deployment time: new institutions, new note styles, and case mixes that differ from training. It
+does not replace clinical judgment, and it should not be presented as a guarantee of safety; it reduces the
+rate at which a model commits confident high-severity errors, and it does so without retraining or added
+parameters, which matters when the underlying predictor cannot be modified.
+
+23
+
+Table 14: Generative model (Qwen2.5-7B-Instruct), sampling-only uncertainty. The model is strongly
+overconfident; self-consistency does not repair it, and verbalized confidence calibrates better.
+Dataset
+PubMedQA
+PubMedQA
+PubMedQA
+MedQA-USMLE
+MedQA-USMLE
+MedMCQA
+MedMCQA
+
+Method
+self-consistency
+semantic entropy
+verbalized
+self-consistency
+verbalized
+self-consistency
+verbalized
+
+Accuracy
+0.525
+0.525
+0.650
+0.685
+0.690
+0.495
+0.480
+
+ECE↓
+0.445
+0.417
+0.167
+0.307
+0.167
+0.484
+0.355
+
+harmful@0.8↓
+0.360
+0.345
+0.110
+0.265
+0.260
+0.115
+0.125
+
+Table 15: Response of MedBayes-Lite to controlled clinical perturbations (MedMCQA, n = 300).
+Positive confidence drop and abstention increase indicate appropriate added caution.
+Perturbation
+add irrelevant distractor
+add contradictory symptom
+remove key evidence
+remove lab value
+alter numeric value
+vague evidence
+
+6.4
+
+Confidence drop
+0.051
+0.033
+0.015
+0.006
+−0.001
+0.000
+
+Abstention increase
+0.073
+0.060
+0.037
+0.017
+0.013
+0.000
+
+Flip rate
+0.37
+0.34
+0.19
+0.16
+0.14
+0.16
+
+Relation to standard metrics
+
+Our metric analysis cautions against summarizing clinical uncertainty with a single composite score. The
+Clinical Uncertainty Score is useful: it is a severity-weighted calibration metric and it tracks harmful
+overconfidence closely (Pearson r ≈ 0.88). Its limitation is that it is, by construction, a severity-weighted
+extension of ECE rather than an independent metric, and its severity weights are a modeling choice; we
+therefore report it only as a supplementary summary and validate its robustness to those weights in the
+Supplementary Material. The Zero-shot Trustworthiness Index, by contrast, is threshold-confounded and
+adds little beyond the standard area under the risk-coverage curve, so we report it only as a secondary
+descriptor. More generally, the right evaluation for a governance layer pairs calibration metrics (ECE,
+CUS) and selective-prediction metrics (AURC, selective accuracy, coverage, abstention recall) rather than
+collapsing them, because the layer improves the former without improving the latter.
+
+7
+
+Limitations
+
+We report the following limitations so that the scope of our claims is unambiguous.
+No improvement in risk ranking (AURC). The layer changes the confidence scale but not the ordering
+of predictions by reliability. The area under the risk-coverage curve is statistically unchanged in three
+of four multiple-choice settings (p between 0.6 and 0.96) and marginally worse in the fourth, and the
+error-detection AUROC is no higher. Temperature scaling matches the calibration gain at lower cost, and
+deep ensembles achieve better risk ranking on PubMedQA. Claims for this layer should be confined to
+calibration, harmful-error reduction, and abstention behavior, not selective-prediction superiority.
+
+24
+
+Table 16: Computational efficiency on a Bio ClinicalBERT backbone. “MC/Ens.” is the number of
+Monte Carlo samples (MedBayes-Lite, SWAG) or ensemble members. MedBayes-Lite keeps the backbone
+parameter count and a constant memory footprint; latency scales approximately linearly with the number
+of Monte Carlo samples.
+Model Variant
+
+Params
+
+MC/Ens.
+
+Latency (ms)
+
+GPU Mem (GB)
+
+Bio ClinicalBERT (Baseline)
+MedBayes-Lite (MC=5)
+MedBayes-Lite (MC=10)
+MedBayes-Lite (MC=20)
+MedBayes-Lite (MC=50)
+SWAG (n=10 samples)
+Deep Ensemble (N=5)
+
+108M
+108M
+108M
+108M
+108M
+108M
+541M
+
+–
+5
+10
+20
+50
+10
+–
+
+32.04
+32.61
+60.13
+119.08
+298.54
+103.93
+31.15
+
+0.43
+0.43
+0.43
+0.43
+0.43
+0.98
+2.85
+
+Null result on already-calibrated models. On our fine-tuned PubMedQA encoders, which are already
+well calibrated (ECE around 0.06 to 0.08 with no measurable harmful overconfidence), the layer provides
+no benefit. The framework helps only when there is harmful overconfidence to remove; it is not a universal
+improvement.
+Coverage cost. The safety gains are bought by answering less often. At a fixed acceptance threshold,
+coverage can fall substantially (for example from 0.54 to 0.10 on MedMCQA with PubMedBERT). For a
+hard exam-style task this conservative behavior is defensible, but in deployment the abstention threshold
+must be tuned to an acceptable workload, and the coverage-reliability trade-off must be reported, not
+hidden.
+Insensitivity to local numeric corruption. In controlled perturbation tests the layer raised uncertainty
+appropriately for irrelevant distractors and contradictory findings, but it did not respond to clinically
+implausible numeric or vital-sign values (mean confidence change near zero) or to vague phrasing. The
+layer governs aggregate predictive uncertainty and does not detect local numeric implausibility, which is
+precisely the failure mode that matters for dosing and laboratory interpretation.
+The optional attention extension is not evaluated. Empirically the layer behaves as Monte Carlo
+dropout plus calibration plus a confidence-guided abstention gate. The optional uncertainty-weighted
+attention extension (Appendix A) was inactive (λ = 0) in all reported experiments, so we draw no
+empirical conclusions about it; evaluating alternative uncertainty estimation strategies remains future
+work.
+Datasets and access constraints. The evaluation covers MedMCQA, MedQA-USMLE, and PubMedQA. The domain-shift evidence rests on a single source-to-target transfer (MedMCQA to MedQAUSMLE), so the magnitude of the out-of-distribution benefit should be read as indicative rather than
+exhaustive. We did not evaluate on MIMIC-III electronic health records, which require credentialed
+access and were outside the scope of this study; the in-hospital mortality task is left as a clearly separable
+future axis, and the released code includes a credentialed-access adapter for it. The generative evaluation
+uses a single open-weight model on a sampled subset rather than a broad sweep, and we did not evaluate
+proprietary API models.
+
+25
+
+Experimental scale. Results use three random seeds rather than five; for the pretrained multiple-choice
+checkpoints the deterministic baselines have no seed variance, and confidence intervals for all methods
+are obtained by per-sample bootstrap. The generative evaluation uses 200 items per dataset for cost
+reasons. We expect the qualitative conclusions to be stable, but the exact magnitudes may shift with larger
+runs.
+Clinical deployment is not evaluated. All results are retrospective, on benchmark data. We make no
+claim about prospective clinical safety, workflow integration, or effect on clinician behavior. Demonstrating that confident high-severity errors are reduced on benchmarks is a necessary precondition for, but not
+evidence of, safe clinical use.
+
+8
+
+Conclusion
+
+We presented MedBayes-Lite, a clinical uncertainty governance layer for pretrained clinical predictors.
+Rather than adding parameters or retraining, it converts inference-time Monte Carlo dropout uncertainty
+into a calibrated, confidence-guided abstention policy that defers low-confidence predictions for human
+review. Across clinical multiple-choice question answering, the layer substantially improved calibration
+and drove harmful overconfident clinical errors toward zero, with the largest benefit under medical domain
+shift, where it contained the confident high-severity errors that an uncalibrated baseline commits. We
+introduced and empirically evaluated the Clinical Uncertainty Score as a severity-weighted calibration
+summary of harmful overconfidence, and we showed that the previously proposed ZTI is thresholdconfounded and should be demoted.
+We also retain the negative findings that bound these claims: the layer does not improve risk ranking
+(its risk-coverage area is statistically unchanged, temperature scaling matches its calibration, and deep
+ensembles rank risk better), it provides no benefit on already well-calibrated models, it carries a coverage
+cost, it does not detect local numeric implausibility, and the optional attention pathway was inactive
+in all reported experiments. A contrast with an open-weight generative model showed that naive selfconsistency does not confer safety, reinforcing the case for explicit governance.
+These results reframe lightweight Bayesian inference for clinical models as a governance problem:
+the goal is not a better uncertainty score in the abstract, but a practical mechanism that converts uncertainty into calibrated, risk-aware deferral. Future work includes broader domain-shift evaluation
+across additional source-target pairs, additional healthcare benchmarks, alternative uncertainty estimators, prospective clinical studies, and evaluation on credentialed electronic-health-record tasks such as
+MIMIC-III in-hospital mortality, detectors for local numeric and dosing implausibility, and prospective
+study of how confidence-guided abstention affects clinician decision-making.
+
+Author Contributions
+E.H. conceived the study, designed the methodology, conducted the experiments, implemented the framework, analyzed the results, and wrote the main manuscript. M.M.H.N. contributed to the development of
+MedBayes-Lite and assisted with the experiments. M.S. contributed to data analysis, visualization, and
+manuscript editing. T.N. and B.W.S. contributed to manuscript editing, revision, and critical feedback.
+R.R., S.N., and N.Y. supervised the study and reviewed the manuscript. All authors reviewed and
+approved the final manuscript.
+
+26
+
+Acknowledgement
+We would like to express our special thanks to Dr. Yongchao Huang, Assistant Professor at the University
+of Aberdeen, UK, for reviewing the methodology of this paper and providing valuable feedback. His
+insightful comments and suggestions greatly helped improve the quality and rigor of this work.
+
+Ethics Statement
+This study is based entirely on publicly available, de-identified biomedical QA datasets (MedMCQA,
+MedQA-USMLE, PubMedQA) and does not involve direct interaction with human participants. Therefore,
+formal ethics approval was not required. These benchmarks do not contain identifiable patient information.
+MIMIC-III electronic health records were not used in this study. All data handling complied with
+applicable data privacy guidelines and ethical standards for secondary data analysis.
+
+Declaration of Competing Interest
+The authors declare that they have no known competing financial interests or personal relationships that
+could have appeared to influence the work reported in this paper.
+
+Data Availability
+All datasets used in this study are de-identified. PubMedQA [31] and MedQA [32] are publicly downloadable from their official repositories as referenced in the manuscript. MIMIC-III [34] is accessible
+via PhysioNet under credentialed access but was not evaluated in this study; the released code includes
+a credentialed-access adapter for the in-hospital mortality task as a future axis. Processed evaluation
+subsets, per-sample predictions, metric tables, and plots generated during this study are released with the
+accompanying code.
+
+Funding Statement
+This research did not receive any specific grant from funding agencies in the public, commercial, or
+not-for-profit sectors.
+
+27
+
+References
+[1] J. C. L. Ong, L. Jin, K. Elangovan, G. Y. San Lim, D. Y. Z. Lim, G. G. R. Sng, Y. H. Ke, J. Y. M.
+Tung, R. J. Zhong, C. M. Y. Koh et al., “Large language model as clinical decision support system
+augments medication safety in 16 clinical specialties,” Cell Reports Medicine, vol. 6, no. 10, 2025.
+[2] S. Nerella, S. Bandyopadhyay, J. Zhang, M. Contreras, S. Siegel, A. Bumin, B. Silva, J. Sena,
+B. Shickel, A. Bihorac et al., “Transformers and large language models in healthcare: A review,”
+Artificial intelligence in medicine, vol. 154, p. 102900, 2024.
+[3] B. Arslan, C. Nuhoglu, M. Satici, and E. Altinbilek, “Evaluating llm-based generative ai tools
+in emergency triage: A comparative study of chatgpt plus, copilot pro, and triage nurses,” The
+American Journal of Emergency Medicine, vol. 89, pp. 174–181, 2025.
+[4] D. McDuff, M. Schaekermann, T. Tu, A. Palepu, A. Wang, J. Garrison, K. Singhal, Y. Sharma,
+S. Azizi, K. Kulkarni et al., “Towards accurate differential diagnosis with large language models,”
+Nature, pp. 1–7, 2025.
+[5] J. D. Oliveira, H. D. Santos, A. H. D. Ulbrich, J. C. Couto, M. Arocha, J. Santos, M. M. Costa,
+D. Faccio, F. O. Tabalipa, and R. F. Nogueira, “Development and evaluation of a clinical note
+summarization system using large language models,” Communications medicine, vol. 5, no. 1, p.
+376, 2025.
+[6] K. Sridharan and G. Sivaramakrishnan, “Unlocking the potential of advanced large language models
+in medication review and reconciliation: A proof-of-concept investigation,” Exploratory Research
+in Clinical and Social Pharmacy, vol. 15, p. 100492, 2024.
+[7] D. Li, N. Jiang, K. Huang, R. Tu, S. Ouyang, H. Yu, L. Qiao, C. Yu, T. Zhou, D. Tong et al.,
+“Streamlining evidence based clinical recommendations with large language models,” npj Digital
+Medicine, 2025.
+[8] Z. Lu, Y. Peng, T. Cohen, M. Ghassemi, C. Weng, and S. Tian, “Large language models in
+biomedicine and health: Current research landscape and future directions,” Journal of the American
+Medical Informatics Association, vol. 31, no. 9, pp. 1801–1811, 2024.
+[9] I. L. Alberts, L. Mercolli, T. Pyka, G. Prenosil, K. Shi, A. Rominger, and A. Afshar-Oromieh, “Large
+language models (LLM) and chatgpt: what will the impact on nuclear medicine be?” European
+Journal of Nuclear Medicine and Molecular Imaging, vol. 50, no. 6, pp. 1549–1552, 2023.
+[10] A. J. Thirunavukarasu, D. S. J. Ting, K. Elangovan, L. Gutierrez, T. F. Tan, and D. S. W. Ting,
+“Large language models in medicine,” Nature Medicine, vol. 29, no. 8, pp. 1930–1940, 2023.
+[11] S. Neupane, S. Mitra, S. Mittal, M. Gaur, N. A. Golilarz, S. Rahimi, and A. Amirlatifi, “Medinsight:
+A multi-source context augmentation framework for generating patient-centric medical responses
+using large language models,” ACM Transactions on Computing for Healthcare, vol. 6, no. 2, pp.
+1–19, 2025.
+[12] S. Neupane, H. Tripathi, S. Mitra, S. Bozorgzad, S. Mittal, S. Rahimi, and A. Amirlatifi, “Clinicsum:
+Utilizing language models for generating clinical summaries from patient-doctor conversations,” in
+2024 IEEE International Conference on Big Data (BigData). IEEE, 2024, pp. 5050–5059.
+[13] V. Liévin, C. E. Hother, A. G. Motzfeldt, and O. Winther, “Can large language models reason about
+medical questions?” Patterns, vol. 5, no. 3, 2024.
+[14] T. Savage, J. Wang, R. Gallo, A. Boukil, V. Patel, S. A. Ahmad Safavi-Naini, A. Soroush, and J. H.
+Chen, “Large language model uncertainty measurement and calibration for medical diagnosis and
+treatment,” medRxiv, pp. 2024–06, 2024.
+28
+
+[15] M. Mora-Cantallops, E. Garcı́a-Barriocanal, and M.-Á. Sicilia, “Trustworthy AI guidelines in
+biomedical decision-making applications: A scoping review,” Big Data and Cognitive Computing,
+vol. 8, no. 7, p. 73, 2024.
+[16] M. Salvi, S. Seoni, A. Campagner, A. Gertych, U. R. Acharya, F. Molinari, and F. Cabitza,
+“Explainability and uncertainty: Two sides of the same coin for enhancing the interpretability of
+deep learning models in healthcare,” International Journal of Medical Informatics, p. 105846, 2025.
+[17] F. O. Catak and M. Kuzlu, “Uncertainty quantification in large language models through convex
+hull analysis,” Discover Artificial Intelligence, vol. 4, no. 1, pp. 1–14, 2024.
+[18] E. Hüllermeier and W. Waegeman, “Aleatoric and epistemic uncertainty in machine learning: An
+introduction to concepts and methods,” Machine Learning, vol. 110, no. 3, pp. 457–506, 2021.
+[19] M. Abdar, F. Pourpanah, S. Hussain, D. Rezazadegan, L. Liu, M. Ghavamzadeh, P. Fieguth,
+X. Cao, A. Khosravi, U. R. Acharya et al., “A review of uncertainty quantification in deep learning:
+Techniques, applications and challenges,” Information Fusion, vol. 76, pp. 243–297, 2021.
+[20] C. Guo, G. Pleiss, Y. Sun, and K. Q. Weinberger, “On calibration of modern neural networks,” in
+Proceedings of the 34th International Conference on Machine Learning - Volume 70, ser. ICML’17.
+JMLR.org, 2017, p. 1321–1330.
+[21] A. Niculescu-Mizil and R. Caruana, “Predicting good probabilities with supervised learning,” in
+Proceedings of the 22nd International Conference on Machine Learning, 2005, pp. 625–632.
+[22] B. Lakshminarayanan, A. Pritzel, and C. Blundell, “Simple and scalable predictive uncertainty
+estimation using deep ensembles,” in Advances in Neural Information Processing Systems, vol. 30,
+2017.
+[23] W. J. Maddox, P. Izmailov, T. Garipov, D. P. Vetrov, and A. G. Wilson, “A simple baseline for
+bayesian uncertainty in deep learning,” Advances in neural information processing systems, vol. 32,
+2019.
+[24] Y. Gal and Z. Ghahramani, “Dropout as a bayesian approximation: Representing model uncertainty
+in deep learning,” in International Conference on Machine Learning. PMLR, 2016, pp. 1050–1059.
+[25] A. Vazhentsev, G. Kuzmin, A. Shelmanov, A. Tsvigun, E. Tsymbalov, K. Fedyanin, M. Panov,
+A. Panchenko, G. Gusev, M. Burtsev et al., “Uncertainty estimation of transformer predictions
+for misclassification detection,” in Proceedings of the 60th Annual Meeting of the Association for
+Computational Linguistics (Volume 1: Long Papers), 2022, pp. 8237–8252.
+[26] T. Xia, T. Dang, J. Han, L. Qendro, and C. Mascolo, “Uncertainty-aware health diagnostics via classbalanced evidential deep learning,” IEEE Journal of Biomedical and Health Informatics, vol. 28,
+no. 11, pp. 6417–6428, 2024. [Online]. Available: https://doi.org/10.1109/JBHI.2024.3360002
+[27] M. Sensoy, L. Kaplan, and M. Kandemir, “Evidential deep learning to quantify classification
+uncertainty,” Advances in neural information processing systems, vol. 31, 2018.
+[28] J. Gao, M. Chen, L. Xiang, and C. Xu, “A comprehensive survey on evidential deep learning and its
+applications,” IEEE Transactions on Pattern Analysis and Machine Intelligence, 2025.
+[29] F. Ye, M. Yang, J. Pang, L. Wang, D. F. Wong, E. Yilmaz, S. Shi, and Z. Tu, “Benchmarking llms
+via uncertainty quantification,” in Proceedings of the 38th International Conference on Neural
+Information Processing Systems, ser. NIPS ’24. Red Hook, NY, USA: Curran Associates Inc.,
+2024.
+
+29
+
+[30] T. Joo, U. Chung, and M.-G. Seo, “Being bayesian about categorical probability,” in International
+conference on machine learning. PMLR, 2020, pp. 4950–4961.
+[31] Q. Jin, B. Dhingra, Z. Liu, W. Cohen, and X. Lu, “Pubmedqa: A dataset for biomedical research
+question answering,” in Proceedings of the 2019 conference on empirical methods in natural
+language processing and the 9th international joint conference on natural language processing
+(EMNLP-IJCNLP), 2019, pp. 2567–2577.
+[32] H. Yang, H. Chen, H. Guo, Y. Chen, C.-S. Lin, S. Hu, J. Hu, X. Wu, and X. Wang, “LLM-medqa:
+Enhancing medical question answering through case studies in large language models,” 2025.
+[Online]. Available: https://arxiv.org/abs/2501.05464
+[33] D. Hendrycks and K. Gimpel, “A baseline for detecting misclassified and out-of-distribution
+examples in neural networks,” 2018. [Online]. Available: https://arxiv.org/abs/1610.02136
+[34] A. E. Johnson, T. J. Pollard, L. Shen, L.-w. H. Lehman, M. Feng, M. Ghassemi, B. Moody,
+P. Szolovits, L. Anthony Celi, and R. G. Mark, “Mimic-iii, a freely accessible critical care database,”
+Scientific data, vol. 3, no. 1, pp. 1–9, 2016.
+
+30
+
+A Optional Uncertainty-Weighted Attention (Not Evaluated in This Paper)
+When internal transformer states are accessible, token-level uncertainty can optionally modulate attention.
+From MC-dropout embedding samples {h(m) (x)} with empirical mean µ̂(x) and covariance Σ̂(x), a
+scalar token uncertainty
+
+1 
+U (xj ) = tr Σ̂(xj )
+d
+penalizes the pre-softmax attention logits,
+qi⊤ kj
+ẽij = √
+− λ U (xj ),
+dk
+
+α̃ij = softmaxj (ẽij ).
+
+(1)
+
+This component is optional and was inactive (λ = 0) in all reported experiments; no empirical conclusion
+in this paper depends on it.
+
+Token uncertainty and absence of double counting. The scalar token uncertainty U (xj ) is computed
+directly from the Monte Carlo dropout embedding covariance Σ̂(xj ), that is, from the variability of the
+token representation across stochastic forward passes prior to√any attention reweighting. It therefore
+does not depend on either the unadjusted attention logits qi⊤ kj / dk or the adjusted weights α̃ij , and the
+penalty in Eq. (1) cannot circularly reuse, and hence cannot double-count, the attention signal it modifies.
+Because λ = 0 throughout, U (xj ) does not enter any reported result; it is defined here only to make the
+optional extension self-contained.
+Role in this study. This appendix is retained solely for completeness of the original framework design
+and to document notation used in earlier versions of the manuscript. The uncertainty-weighted attention
+mechanism is optional: it is not part of the evaluated MedBayes-Lite pipeline, was not included in
+Algorithm 1 or the main framework figure, and was not empirically assessed in any experiment reported
+in this paper. Consequently, no claims regarding calibration, harmful-error reduction, selective prediction,
+domain-shift robustness, or clinical utility should be attributed to this component. The empirical findings
+of this paper should be interpreted entirely as the effect of Monte Carlo dropout, calibration, and
+confidence-guided abstention, independent of this optional extension.
+
+B
+
+Aleatoric and Epistemic Uncertainty
+
+For completeness, predictive variance decomposes by the law of total variance into an aleatoric and an
+epistemic term,
+Var[ŷ] = E[Var[ŷ | h]] + Var[E[ŷ | h]],
+(2)
+|
+{z
+} |
+{z
+}
+aleatoric
+
+epistemic
+
+where the epistemic term reflects variability induced by the stochastic representation h and is expected
+to be larger for under-supported cases such as rare conditions or out-of-distribution inputs. In this work
+uncertainty is propagated operationally rather than through a closed-form layer-wise decomposition:
+MC-dropout variability yields uncertainty estimates that are used operationally for calibration and
+confidence-guided abstention.
+
+31
+
+C
+
+Supplementary Material: Sensitivity Analyses
+
+All sensitivity analyses below use the same evaluation pipeline and data as the main results; no main-text
+result is altered.
+Table 17: Sensitivity to the number of Monte Carlo samples (MedMCQA, PubMedBERT). Calibration
+and harmful-error metrics are stable for M ≥ 10.
+MC samples M
+5
+10
+15
+20
+50
+
+Acc
+0.4475
+0.4572
+0.4627
+0.4621
+0.4689
+
+ECE
+0.118
+0.0955
+0.0843
+0.0825
+0.0706
+
+harmful@0.8
+0.0122
+0.01
+0.0084
+0.0079
+0.0073
+
+AURC
+0.4038
+0.3899
+0.3895
+0.3872
+0.3834
+
+Cov@0.7
+0.2278
+0.2034
+0.1998
+0.1949
+0.1882
+
+Table 18: Sensitivity to the inference dropout rate (MedMCQA, PubMedBERT; M = 15). Higher
+dropout monotonically improves calibration (ECE) and reduces harmful overconfidence by deflating
+confidence, but does not improve risk ranking (AURC) and, at a high rate (0.5), degrades accuracy and
+drives coverage to zero. The default 0.2 is a balanced operating point, consistent with the paper’s main
+finding that the layer improves calibration and abstention rather than ranking.
+Dropout rate
+0.1
+0.2
+0.3
+0.5
+
+Acc
+0.4654
+0.4662
+0.439
+0.3326
+
+ECE
+0.1559
+0.0829
+0.0309
+0.0103
+
+harmful@0.8
+0.0244
+0.0098
+0.0019
+0.0
+
+AURC
+0.3771
+0.3895
+0.4248
+0.5932
+
+Cov@0.7
+0.3416
+0.1974
+0.0815
+0.0
+
+Table 19: Abstention-threshold sweep (MedMCQA, MedBayes-Lite). The safety/coverage trade-off is
+transparent: higher τ raises selective accuracy and abstention recall and lowers harmful overconfident
+error, at the cost of coverage.
+Threshold τ
+0.5
+0.6
+0.7
+0.8
+0.9
+
+Coverage
+0.251
+0.122
+0.06
+0.027
+0.01
+
+Selective acc
+0.603
+0.708
+0.8
+0.828
+0.881
+
+32
+
+Abst. recall
+0.827
+0.938
+0.979
+0.992
+0.998
+
+harmful@τ
+0.035
+0.012
+0.005
+0.001
+0.0
+
+Table 20: CUS severity-weight sensitivity. Under random ±25% per-category perturbation of the severity
+weights (20 trials), the correlation between CUS and the harmful overconfident error rate is essentially
+unchanged, so CUS is not an artefact of the chosen weights.
+Severity weights
+baseline (chosen weights)
+random +/-25% (mean over 20)
+random +/-25% (min)
+random +/-25% (max)
+
+Pearson r (CUS vs harmful@0.8)
+0.882
+0.883
+0.871
+0.892
+
+33
+
+n groups
+572
+572
+572
+572
+
+

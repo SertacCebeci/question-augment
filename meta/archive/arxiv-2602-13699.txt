@@ -1,0 +1,3740 @@
+Gradient-Stable Attention Heads Signal LLM Correctness
+Sophie Ostmeier1,† , Brian Axelrod2 , Maya Varma3 , Asad Aali4 , Yabin Zhang4 ,
+Magdalini Paschali4 , Sanmi Koyejo3 , Curtis Langlotz4,* , Akshay Chaudhari4,*
+1
+
+3
+
+ETH AI Center, ETH Zürich, Zurich, Switzerland, 2 Microsoft AI,
+Department of Computer Science, Stanford University, Stanford, CA 94305, USA,
+4
+Department of Radiology, Stanford University, Stanford, CA 94305, USA
+†
+
+Work done while at Stanford University.
+
+*
+
+Equal contribution.
+
+Correspondence: sophie.ostmeier@ai.ethz.ch
+
+arXiv:2602.13699v2 [cs.LG] 17 Sep 2026
+
+Abstract
+
+Parent: “I have 500 mg aspirin tablets. Can I give
+one for a fever at a body weight of 24 kg?”,
+LLM:“Yes, but use half a tablet. The standard
+antipyretic dose is 10–15 mg/kg, so at 24 kg roughly
+250 mg is appropriate.”
+The dose calculation is correct, and the model
+even corrects the amount the parent proposed, but
+the answer is not. 24 kg indicates a child, and
+aspirin is avoided in febrile children because of
+its well-known link to Reye’s syndrome (Pugliese
+et al., 2008). Verifying the output with an expert
+may not be promptly feasible and is impractical at
+scale, while relying on Judge-LLMs for verification could introduce unpredictable biases or hidden
+errors unless the validation is also reviewed by experts (Chen et al., 2024b; Thakur et al., 2025).
+Our work focuses on estimating whether an
+LLM has answered correctly using signals from
+inside the model itself, computed during the same
+forward pass that generates the answer. We introduce H EAD E NTROPY, a scalable and interpretable
+white-box method that uses the attention spread
+inside the model itself to determine correctness
+while generating the answer. In the transformer
+self-attention mechanism, each attention head computes attention weights by taking the inner product
+between query and key vectors—–a measure of
+their directional alignment—–and then normalizing these scores across all positions via softmax to
+produce a set of token weights. We find that certain
+attention patterns are stable during training, while
+others are unstable and tend to disappear through
+the course of training. We hypothesize that the
+presence of unstable attention patterns at inference
+time correlates with a generation not grounded in
+the training set–otherwise the training gradients
+would have modified the attention pattern.
+For example: The LLM above reads the weight token sharply enough to compute a dose from it, since
+weight-based dosing is a frequent pattern used in
+pediatric training data and training has settled the
+
+Large language models (LLMs) often generate plausible yet incorrect answers, posing risks in safety-critical settings such as
+medicine. Human evaluation is expensive,
+and LLM-as-judge approaches risk introducing hidden errors. Recent single-pass whitebox methods detect contextual hallucinations
+using linear probes over model internals, but
+their generalization to out-of-domain, out-oftask, and training-free settings remains poorly
+understood. We introduce H EAD E NTROPY,
+a method that predicts answer correctness
+by measuring how susceptible each attention
+head’s pattern is to modification under further gradient updates. The key insight is that
+the trace of the softmax Jacobian is a monotonic function of 2-Rényi entropy, linking attention spread to gradient stability during training,
+even without the reference annotation. With no
+training, H EAD E NTROPY reaches 0.736 AUROC, outperforms every training-free baseline
+in paired comparison and matches a hiddenstate probe out-of-domain, at under 1% of inference cost. We evaluate broadly across 5
+instruction-tuned LLMs and 5 datasets spanning general knowledge, multi-hop reasoning,
+mathematical reasoning, claim verification, and
+medicine. The code is available at https:
+//github.com/StanfordMIMI/HeadEntropy
+
+1
+
+Introduction
+
+Large language models (LLMs) are increasingly
+being deployed in safety-critical settings, ranging
+from medical question answering (QA) and clinical decision support, to applications in law and
+scientific discovery (Singhal et al., 2022, 2025; Tu
+et al., 2024; Yang et al., 2024; Tanno et al., 2025;
+Zambrano Chaves et al., 2025). However, even
+state-of-the-art systems can generate fluent and confident, yet incorrect responses (Wang et al., 2024;
+Sivarajkumar et al., 2024; Chang et al., 2025).
+For example:
+1
+
+Question/Context
+
+Answer
+self-attention matrix
+
+Add & Norm
+
+H
+
+Question/
+Context
+Token
+
+H
+
+mean
+
+H
+
+🔥
+
+Feed Forward
+Add & Norm
+
+Answer
+Token
+
+H
+
+=
+
+mean(H₁,...,Hₘ)
+
+H
+H
+
+Multi-Head Attention
+
+H
+Hᵢ = 1-exp(-Rényi entropy(
+
+0.86
+
+logistic regression
+
+Transformer
+
+Multi-Head Attention
+
+)
+
+Figure 1: H EAD E NTROPY overview. The correctness estimate is computed directly from the spread of the attention
+patterns, measured as the mean trace of the softmax Jacobian.
+
+heads that carry it. The attention that would tie the
+same token to the pediatric contraindication has not
+settled in the same way: it remains diffuse, in the
+regime where the attention distribution is still sensitive to perturbation and training pressure would
+still move it.
+Recent methods leave several questions open here.
+Features are selected empirically, by ablation over
+layers, heads, or token positions, so it is unclear
+when the signal should hold. Out-of-domain performance is mostly reported within one model family
+and the features are usually paired with a trained
+probe. Training-free scores such as LLM-Check
+and the direct ICR Score exist, but have been evaluated on few models and datasets. H EAD E NTROPY
+addresses these questions. Its signal has a theoretically predicted direction, it requires no trained
+probe, and we evaluate it across tasks and model
+families.
+H EAD E NTROPY makes the following contributions:
+
+data. This gives the feature a fixed direction:
+higher entropy means a higher chance of an incorrect answer. As a result, H EAD E NTROPY predicts answer correctness most consistently across
+dataset and model families.
+• The raw signal predicts correctness even without training. Simply averaged over heads,
+H EAD E NTROPY outperforms every competing
+training-free score by +8.9% to +75.6% relative
+ROC-AUC in paired comparisons across 5 models and 5 datasets (Figure 3), reaching an average
+of 0.74 AUROC. Out-of-domain, the untrained
+mean of H EAD E NTROPY is statistically as good
+as a trained hidden state probe out-of-domain
+(+0.2%).
+
+2
+
+Background
+
+Here, we provide a brief summary of how the Jacobian relates to Gradient Dynamics.
+2.1
+
+The Jacobian and Gradient Dynamics
+
+For a vector valued function f : Rn → Rm , the
+Jacobian matrix of f (x) is the matrix of partial
+derivatives
+
+
+∂f1
+∂f1
+···
+ ∂x1
+∂xn 
+ .
+.. 
+.
+
+..
+Jf = 
+. .
+ ..
+ ∂fm
+∂fm 
+···
+∂x1
+∂xn
+
+• Attention entropy tracks gradient stability.
+The trace of the softmax Jacobian equals 1 −
+exp(−H2 ), where H2 is the 2-Rényi entropy of
+the attention distribution (Appendix L). Sharp
+(low-entropy) heads receive small gradients and
+remain stable, while diffuse (high-entropy) heads
+stay sensitive to training pressure. We investigate
+this relationship empirically across pre-training
+checkpoints (Section 3.1).
+• A correctness predictor built on this signal.
+H EAD E NTROPY represents each generation by
+its per-head attention entropies. High entropy at
+inference time indicates attention patterns that
+training pressure would still change, and thus a
+generation that is not grounded in the training
+
+The Jacobian can be used as a measure of how
+sensitive a particular set of activations or parameters are. A "large" Jacobian indicates that an identical gradient flow will change the activations greatly.
+We use this to identify stable versus unstable attention patterns, where we define "stable" attention
+2
+
+patterns as those that do not change substantially
+with a gradient update and "unstable" attention pattern as those that change a large amount every time
+they appear in training. In this view, observing
+many unstable attention patterns may be an indicator that the current example is not like the training
+data.
+There is no single definition of what makes a
+matrix such as a Jacobian "large". In this work,
+we use the trace of the Jacobian, noting that the
+softmax Jacobian is positive semidefinite (all nonnegative eigenvalues), so its trace coincides with
+its nuclear norm (Appendix L).
+
+3
+
+Method
+
+3.1
+
+Motivation
+
+Figure 2: Mean per-head change in tr(J) across four
+OLMo-2-1B checkpoint transitions, with examples
+grouped by the change in log P (gold) over each transition. Error bars are 95% bootstrap intervals over examples; dotted lines mark the pooled means (Wilcoxon
+p = 1.8 × 10−12 ), while the unlearned and control
+groups track one another closely.
+
+Hypothesis. A correct answer rests on associations that training has reinforced. We hypothesise
+that the attention patterns carrying such associations are ones training has settled: further gradient
+updates would barely move them. A pattern that
+continued training would still reshape is one training has not settled, and a generation resting on such
+patterns is less likely to be grounded in the training distribution. We want to tell the two apart at
+inference time.
+Testing this directly would need the pretraining
+corpus: checking, for each generation, whether
+the associations it uses are attested in the data.
+That corpus is unavailable for most deployed models, and searching it once per generation would be
+prohibitive in any case. We need a quantity computable from the model alone.
+
+derived in Appendix L. Thus, a head’s gradient
+stability is fixed entirely by the spread of its attention. We can therefore read it off the forward pass
+without a backward pass, access to training data or
+additional generations.
+
+Does training settle attention? If training settles
+the heads that carry an association, then learning an
+example should lower tr(J) on that example, and
+failing to learn it should not. We test this directly on
+five OLMo-2-1B pretraining checkpoints. At each
+checkpoint we run one forward pass over 1000
+TriviaQA examples with their gold answers and
+record log P (gold) together with per-head tr(J).
+Across each of the four checkpoint transitions we
+rank examples by how much log P (gold) changed
+and call the top decile learned, the bottom decile
+unlearned, and the middle 80% the control.
+
+Stability as a Jacobian trace. Each head produces a self-attention matrix, where row p applies
+a softmax to scores x. The Jacobian
+J=
+
+∂p
+= diag(p) − pp⊤
+∂x
+
+Figure 2 shows the mean change in tr(J) for
+each group. On learned examples tr(J) falls below
+the control at every transition (pooled −0.0035,
+Wilcoxon p = 1.8 × 10−12 ), whereas unlearned examples track the control, and the more an example
+is learned the further its tr(J) falls. Learning therefore lowers tr(J) during training, and H EAD E N TROPY reads the same quantity at inference, where
+a low value indicates an answer that rests on associations training has already settled. A qualitative
+analysis in Appendix Figure 6 shows H EAD E N TROPY head maps for one correct and one incorrect
+example per dataset. For the wrong examples the
+heads are more yellow (higher values), especially
+the middle heads, indicating less settled attention
+patterns.
+
+(1)
+
+measures how much the attention weights change
+when the scores change, where the scores are the
+raw relevance numbers each position assigns to the
+others before the softmax. J is positive semidefinite, so its trace sums its eigenvalues and gives a
+single scalar for how movable the pattern is. Large
+tr(J) means an update would readily move this
+head. Small means training has settled it.
+The identity. The trace has a closed
+P form in the
+2-Rényi entropy H2 (p) = − log j p2j :
+tr(J) = 1 − exp(−H2 (p)) ,
+
+(2)
+3
+
+3.2
+
+Computing Head Entropy
+
+For batched inference, we mask the rows and
+columns of the padding tokens. See empirical testing of aggregation techniques in the Appendix J.3.
+This yields a fixed-dimensional feature vector
+for each example i,
+
+H EAD E NTROPY encompasses two components: 1)
+computing the per-head attention entropy (Eq. 9),
+2a) mean over heads (Eq. 10) or for comparison
+to prior methods 2b) training a logistic regression
+model to find predictive patterns (Eq. 12).
+Motivated by question-answering using instruction tuned LLMs, we consider an autoregressive
+transformer, LLM , with causal masking. The
+LLM has m attention heads in total, across all
+layers. We index heads by k ∈ {1, . . . , m}. Let
+T be the total sequence length (i.e. question and
+answer tokens).
+Given an input sequence x (a tokenized question), the model outputs a prediction ŷ (a tokenized
+answer) at nearly deterministic decoding (temperature ≈ 0):
+ŷ = LLM (x).
+(3)
+
+H̄i = [H̄1,i , ..., H̄m,i ]⊤ ∈ Rm .
+
+In addition to improving interpretability, sectionlevel aggregation reduces memory and compute
+overhead compared to token-level entropy analysis.
+This makes large-scale or real-time analysis more
+practical while preserving alignment with tasks’
+semantic structures.
+3.3
+
+Training-free or supervised setting
+
+In the training-free setting (sometimes in literature
+"unsupervised"), we compute a scalar per example by taking the mean over the fixed-dimensional
+feature vector in Eq.9,
+
+For a given labeled question answering dataset,
+{(xi , yi )}N
+i=1 , we define
+zi := I[ŷi = yi ] ∈ {0, 1},
+
+(9)
+
+m
+
+g(H̄i ) = −
+
+(4)
+
+1 X
+H̄k,i ∈ R
+m
+
+(10)
+
+k=1
+
+where equality is measured with an evaluation metric (exact match and F1 score in our experiments).
+Each attention head k produces
+Ak = softmax(QK ⊤ ) ∈ RT ×T ,
+
+where the negative sign orients g as a score for
+correctness rather than against it, and is fixed a
+priori by the direction predicted in Section 3.1:
+higher head entropy indicates a higher chance of
+an incorrect answer.
+In the supervised setting, we use fixeddimensional feature vector for each example i,
+H̄i ∈ Rm to train an ℓ1 -regularized logistic regression classifier
+
+(5)
+
+where each row of Ak is a probability distribution
+(i.e., rows sum to 1). The full tensor shape for all m
+heads is A ∈ Rm×T ×T . For each head k and token
+t, we compute the α−Rényi entropy (α = 2):
+(t)
+
+Hk = − log
+
+T 
+X
+
+
+(t,j) 2
+
+Ak
+
+f : Rm → [0, 1]
+
+(6)
+
+j=1
+
+to estimate the probability of correctness:
+
+and then compute the trace of the Jacobian (see
+Appendix L for the derivation).
+
+
+(t)
+(t)
+trace(J)k = 1 − exp −Hk
+(7)
+
+P(zi = 1 | H̄i ) = f (H̄i ) = σ(β ⊤ H̄i + b), (12)
+where β ∈ Rm are the coefficients, b is the bias
+term and σ is the logistic sigmoid. Any classifier
+can be used here. We chose ℓ1 -regularized logistic
+regression due to simplicity and use in prior work
+(see more details in Section 5.4). The pseudocode
+of the method can be found in Appendix K.
+
+Equation 7 will become a feature used to predict
+answer correctness.
+We then average over the tokens of a semantic section (e.g., question, thinking, or answer) of
+length Tsection :
+H̄k =
+
+1
+
+TX
+section
+
+Tsection
+
+t=1
+
+(11)
+
+(t)
+
+trace(J)k ,
+
+3.4 Computational Efficiency and Complexity
+As H EAD E NTROPY essentially uses summary
+statistics of the existing attention patterns the computational footprint is minimal compared to that
+of LLM inference. We document the complete
+complexity in Table 1.
+
+(8)
+
+where each entry, H̄k , corresponds to the H EAD E N TROPY of one attention head, where k ∈ {1, ..., m}.
+4
+
+Table 1: Computational complexity of H EAD E NTROPY
+components. Notation: m = attention heads, T = sequence length, Tsection = attention window, N = training
+set size.
+Component
+
+Time
+
+Memory
+
+Notes
+
+LLM forward pass (reference)
+Feature generation (entropy)
+Classification (inference)
+Training (end-to-end)
+
+O(mT 2 )
+O(mT · Tsection )
+O(m)
+—
+
+O(mT 2 )
+O(m)
+O(m)
+O(N m)
+
+Reference
+Negligible overhead
+Sequence-independent
+Dominated by LLM
+forward passes
+
+QA task is given in Table 3.
+Baselines. We compare against nine singleforward-pass methods, covering both raw scalar
+statistics and learned linear probes: (i) token entropy (Kadavath et al., 2022); (ii) attention score,
+the kernel-similarity statistic from LLM-Check
+(Sriramanan et al., 2024) (picked layer: 0.8 * total
+number of layers); (iii) mean hidden states, the average final-layer hidden state used as a raw signal;
+(iv) mean Lookback Lens ratio, the average contextvs-generation attention ratio (Chuang et al., 2024);
+(v) verbalized Uncertainty (see Appendix B.1,B.2,
+B.3); (vi) mean ICR score, the information-flow
+statistic of Zhang et al. (2025); (vii) Hidden State
+LR, an ℓ1 -regularized logistic regression on finallayer hidden states, following Xie et al. (2024);
+(viii) Lookback Lens LR, the same probe trained
+on per-head Lookback Lens features as in (Chuang
+et al., 2024); (ix) ICR LR, the same probe trained
+on the per-layer ICR scores. Baselines (i)–(vi) are
+training-free; (vii)–(ix) use the same logistic regression probe setup as H EAD E NTROPY. Multipass methods such as Semantic Uncertainty (Kuhn
+et al., 2023) and INSIDE (Chen et al., 2024a) are
+not directly comparable since they require additional generations or auxiliary models; we report
+their published TriviaQA AUROC for context in
+the Appendix Table 6.
+
+Entropy features are computed using quantities
+already available from the softmax, adding negligible overhead to a standard forward pass. Memory remains O(m) since only per-head aggregates
+are retained while full attention maps need not be
+stored. Overall, H EAD E NTROPY adds less than 1%
+to inference cost and requires no additional forward
+passes beyond those typically used for generation.
+
+4
+
+Experimental Setup
+
+Models. We evaluate three model families spanning 1.7B–32B parameters. From the reasoningoriented Qwen3 family we use Qwen3-1.7B,
+Qwen3-8B, and Qwen3-32B; from the generalpurpose Llama family we use Llama-3.1-8BInstruct; and from the Gemma family we use
+Gemma-4-12B-it. All generations use near-greedy
+decoding (T <0.001) at half-precision floatingpoint. We also test generalization to T =1 (Section 5, Table 11).
+
+Metrics. We measure how well each score separates correct from incorrect model answers with
+AUROC. Scores are reported with their intended
+orientation, if known from literature, i.e. a higher
+ratio for Lookback lens indicates an answer being
+more grounded in the context.
+
+Datasets. We use five benchmarks spanning
+open-domain QA (TriviaQA, Joshi et al., 2017),
+multi-hop QA with long context (HotpotQA distractor setting, Yang et al., 2018), domain-specific
+multiple-choice QA (MedMCQA, Pal et al., 2022),
+fact verification (FEVER, Thorne et al., 2018), and
+mathematical reasoning (MATH, Hendrycks et al.,
+2021). For TriviaQA, HotpotQA, and MedMCQA
+we sample uniformly at random with a fixed seed
+30k training examples with a max of 768 generated
+tokens. Truncated answers were excluded from the
+training set only. We use the given validation split
+for evaluation. FEVER and MATH given validation
+split are held out and used for out-of-distribution
+evaluation (Table 2). The prompts can be found in
+Appendix B.3, B.2, B.1). We define binary correctness via the standard metric for each dataset: exact
+match for TriviaQA, HotpotQA, and MATH; label
+match for FEVER; option match for MedMCQA
+(Eq. 4). The overall accuracy of the models on the
+
+5
+
+Results
+
+With no training at all, the mean of H EAD E N TROPY over heads reaches 0.736 AUROC across
+5 models and 5 datasets, beats every trainingfree baseline in paired comparison (Figure 3), and
+matches a hidden-state probe transferred across domains (0.739). A probe helps in-domain and adds
+nothing under domain shift.
+We then ask what supervision adds to this raw
+signal, reporting results as a ladder of increasing
+supervision: (i) the raw signal with no probe (Section 5.1); (ii) what a trained probe adds over that
+raw signal, in-domain and under domain shift (Section 5.2); (iii) where a probe is available, how
+H EAD E NTROPY compares against probes on other
+5
+
+# Training Examples
+# Validation Examples
+Task
+Domain
+Answer location
+
+TriviaQA
+
+HotpotQA
+
+MedMCQA
+
+FEVER
+
+MATH
+
+Sampled 30k / 130k
+17,944
+Open-domain QA
+General
+Answer not
+in context
+
+Sampled 30k / 98k
+7,405
+Multi-hop QA
+General
+Answer
+in context
+
+Sampled 30k / 183k
+4,183
+Multiple-choice QA
+Biomedical
+Answer in context,
+but not all knowledge
+
+20,000
+Fact verification
+General
+Claim verified
+against evidence
+
+5,000
+Mathematical reasoning
+Mathematics
+Answer derived
+via reasoning
+
+Table 2: Datasets used in experiments, with statistics on training/validation splits.
+
+TriviaQA
+
+HotpotQA
+
+MedMCQA
+
+Model
+
+Acc.
+
+Q
+
+Think
+
+Ans
+
+Acc.
+
+Q
+
+Think
+
+Ans
+
+Acc.
+
+Q
+
+Think
+
+Ans
+
+Qwen3-1.7B
+Qwen3-8B
+Qwen3-32B
+
+0.33
+0.58
+0.69
+
+26
+26
+26
+
+310
+283
+197
+
+7
+7
+7
+
+0.38
+0.57
+–
+
+1243
+1242
+–
+
+316
+291
+–
+
+19
+8
+–
+
+0.29
+0.39
+0.57
+
+47
+47
+47
+
+519
+505
+368
+
+6
+6
+9
+
+Llama-3.1-8B
+
+0.45
+
+25
+
+–
+
+9
+
+0.38
+
+1245
+
+–
+
+48
+
+0.50
+
+46
+
+–
+
+11
+
+Gemma-4-12B
+
+0.59
+
+26
+
+154
+
+10
+
+0.58
+
+1356
+
+233
+
+11
+
+0.43
+
+48
+
+501
+
+12
+
+Table 3: Performance and token lengths per dataset. Accuracy (using exact match) (Acc.), Question (Q), Think
+chunk (Think), and Answer (Ans) token length.
+
+features (Section 5.3).
+5.1
+
+E NTROPY is the strongest training-free score on
+the three Qwen3 models, while mean ICR leads on
+Gemma-4-12B and token entropy on Llama-3.1-8B.
+Overall, H EAD E NTROPY has the highest average
+and varies least across backbones (Appendix Table 7).
+
+Training-free correctness prediction
+
+A training-free signal requires no labeled data, no
+per-domain retraining, and no fitting procedure that
+could overfit to a particular distribution, properties
+especially relevant in safety-critical deployments.
+We compare the mean of per-head H EAD E NTROPY
+values (Eq. 10) against six training-free scores: token entropy, attention score (LLM-Check), verbalized uncertainty, mean hidden states, mean Lookback Lens ratio, and the mean ICR score (Table 4).
+H EAD E NTROPY reaches the highest average AUROC, 0.736, ahead of attention score (0.685), verbalized uncertainty (0.655), token entropy (0.646),
+mean hidden states (0.597), mean Lookback Lens
+(0.586) and mean ICR (0.491). In the paired comparison (Figure 3) H EAD E NTROPY is significantly
+better compared to the baselines, from +0.05 AUC
+over attention score (+8.9% relative) to +0.25 over
+mean ICR (+75.6%), and it wins in 17 to 20 of the
+24 pairs (Figure 3, top block).
+Across domains, H EAD E NTROPY ranks first or
+second in every case. It leads on MedMCQA
+and HotpotQA, is level with the attention score
+on MATH, and is second behind Lookback Lens
+on TriviaQA and FEVER. The other methods rank
+lower in at least one domain. FEVER is the hardest
+domain for all training-free scores (Table 4).
+The advantage varies across backbones. H EAD -
+
+5.2
+
+What the probe buys
+
+Comparing H EAD E NTROPY against itself across
+the three regimes (supervised in-domain, supervised out-of-domain, training-free) shows the contribution of the trained probe (Figure 3, bottom
+block). For completeness, Appendix Figure 4 gives
+the absolute levels these differences are taken from,
+for every method and regime.
+Under domain shift the H EAD E NTROPY probe
+contributes nothing measurable. The trainingfree mean and the probe transferred from another
+dataset differ by +0.001 AUC (+0.2% relative).
+Once the probe is applied outside the domain it
+was fitted on, it recovers no more of the signal than
+plain averaging does. Fitting in-domain does buy
+0.141 AUC and almost all of that gap is the domain
+shift itself rather than the fit, since the probe outof-domain gives up 0.131 AUROC compared to
+the in-domain one, which is less than the 0.176 for
+Lookback Lens, 0.274 for ICR and 0.299 for hidden states. Hidden states match H EAD E NTROPY
+when a probe is fitted (Section 5.3) and lose more
+than twice as much when it is taken away. This
+6
+
+Figure 3: Paired differences in ROC-AUC. Each row is a difference taken within every (model, dataset) cell and
+then averaged, so model and dataset difficulty cancel instead of inflating the spread. The bar is the 95% interval
+of those per-cell differences, taken from the Student’s t quantile at n − 1 degrees of freedom; For Hidden States,
+ICR and Lookback Lens in the training-free setting (only there), 1 − AUC was applied after seeing the results; the
+orientation of H EAD E NTROPY is fixed a priori by Eq. 10.
+
+5.4
+
+suggests that higher entropy is tied a priori to a less
+settled attention pattern, the direction of the feature
+is known before any data is seen, and the probe is
+left with little to add beyond that direction when
+tested out-of-domain.
+5.3
+
+Ablations
+
+Appendix ablations show that performance is stable
+with 20% of the training data, at regularization
+strength c=0.1, and under sampling at temperature
+even with T =1 (AUROC shifts of at most 0.05
+on TriviaQA and HotpotQA; Appendices J.1, J.2,
+Table 11). The exception is MedMCQA, where
+AUROC drops by 0.20 to 0.24. However, model
+accuracy there falls below chance (0.18 and 0.12 vs.
+0.25), so the generations themselves are unreliable
+rather than the signal. We justify mean aggregation
+over min/max (Appendix J.3). Regarding the probe
+architecture, a logistic regression model performed
+on par with XGBoost and MLP probes, with at
+most a negligible difference (Appendix J.4). We
+show, via SHAP analysis and a layer ablation, that
+middle layers carry the most signal (Appendices G,
+I).
+
+Supervised correctness prediction
+
+In-domain. Trained and evaluated on the same
+dataset, a H EAD E NTROPY probe averages 0.867
+AUROC across models and datasets, statistically
+indistinguishable from Hidden States LR (0.868;
+paired difference −0.000) and ahead of Lookback Lens LR (0.818; +0.051) and the ICR probe
+(0.767; +0.102); see Appendix F, Figure 4.
+Comparison with prior work. Appendix Table 6 places H EAD E NTROPY’s TriviaQA AUROC
+on Llama-3.1-8B (0.879) next to numbers reported
+by prior hallucination-detection and uncertaintyestimation methods. Cross-paper comparison is
+loose, since setups, backbones and evaluation protocols differ. H EAD E NTROPY is in the range of
+reported single-pass numbers (LapEigvals 0.889,
+Kadavath et al. 0.864) and above the multi-pass Semantic Uncertainty (0.828) and Semantic Energy
+(0.748).
+
+6
+
+Related Work
+
+Two fundamental goals motivate this study: (i) uncertainty estimation and (ii) hallucination detection. Uncertainty estimation provides a measure of
+how much we can trust a model’s output. Hallucination detection, on the contrary, aims to identify
+statements in generated text that are unsupported
+7
+
+Method
+
+TriviaQA
+
+HotpotQA
+
+MedMCQA
+
+FEVER
+
+MATH
+
+Average
+
+Token Entropy
+Verbalized Uncertainty
+Attention Score
+Hidden States (mean)
+Lookback Lens (mean)
+ICR (mean)
+
+0.609
+0.657
+0.659
+0.579
+0.719
+0.482
+
+0.657
+0.621
+0.616
+0.516
+0.596
+0.491
+
+0.684
+0.689
+0.721
+0.601
+0.596
+0.500
+
+0.578
+0.619
+0.549
+0.575
+0.645
+0.509
+
+0.700
+0.688
+0.882
+0.712
+0.376
+0.474
+
+0.646
+0.655
+0.685
+0.597
+0.586
+0.491
+
+H EAD E NTROPY (mean)
+
+0.693
+
+0.668
+
+0.806
+
+0.632
+
+0.879
+
+0.736
+
+Table 4: Training-free performance (AUROC) across evaluation datasets, averaged over the five models
+
+or contradict established evidence. Our work translates broader uncertainty estimation and hallucination detection into the more concrete objective
+of estimating answer-level correctness, that is, the
+probability that an answer produced by an LLM
+given an input is correct under a task metric (e.g.,
+exact match, F1 score) (Eq. 4).
+Prior work differs in how much of the LLM’s
+internal state is used to fulfill these goals: (i) blackbox methods rely only on outputs, often requiring
+multiple passes or auxiliary models; (ii) gray-box
+methods access shallow signals such as final-layer
+logits; and (iii) white-box methods leverage deeper
+representations, such as hidden states or attention
+maps.
+Black-box methods. These methods rely solely
+on the LLM’s input and outputs and often require
+multiple forward passes or auxiliary models, making them expensive and sensitive to domain shift.
+SelfCheckGPT (Manakul et al., 2023) detects uncertainty via disagreement across sampled completions, while Chain-of-Verification (Dhuliawala
+et al., 2024) probes consistency through follow-up
+questions. Other approaches, such as semantic uncertainty (Kuhn et al., 2023), use embedding models to group paraphrases, introducing the reliance
+on well-aligned external tools. LLM-as-a-Judge
+methods (Chen et al., 2024b; Thakur et al., 2025)
+delegate evaluation to separate LLMs, potentially
+introducing biases and weak calibration guarantees.
+Gray-box methods. Gray-box methods occupy
+a middle ground, drawing on limited internal signals such as token log probabilities or final hidden states. By doing so, they enable single-pass
+confidence estimation. For example, predictors
+trained over logits can temper the well-documented
+tendency of LLMs toward overconfidence (Groot
+and Valdenegro-Toro, 2024), while filters based on
+final-layer statistics can anticipate distributional
+
+shifts that undermine reliability (Pouget et al.,
+2025). Likewise, conformal prediction methods
+extend log-probability signals into calibrated sets
+of plausible completions (Angelopoulos and Bates,
+2021), offering a principled notion of coverage. Despite these strengths, gray-box approaches remain
+constrained by their reliance on final-layer information, which often calibrates poorly across domains
+and reduces interpretability to heuristics like “low
+log-probability” (Geng et al., 2024).
+White-box methods. These methods leverage
+richer internal signals such as layer-wise hidden
+states, attention maps, or neuron activations, often improving accuracy while introducing additional design choices. Several works (Azaria and
+Mitchell, 2023; Kadavath et al., 2022) have demonstrated that an LLM’s hidden states encapsulate
+latent knowledge about hallucinations. Chen et al.
+(2024a) sample multiple responses and use the logdeterminant of their embedding covariance as a correctness signal. Snyder et al. (2024) employ gated
+recurrent units (GRUs) and multilayer perceptrons
+(MLPs) over internal representations to predict correctness. For more details on this line of work,
+please see Appendix D. LLM-Check (Sriramanan
+et al., 2024) combines multiple internal signals,
+including attention statistics, to construct a correctness metric. Distinct from the works mentioned
+above, a small group of methods focuses only on
+the attention heads of a single sample. Lookback
+lens detects contextual hallucinations by measuring the location of the attention mass by the ratio
+of attention weights on the context versus newly
+generated tokens (Chuang et al., 2024). While
+AggTruth focuses on contextual hallucination detection in RAG settings, analyzing how attention
+is distributed across passage tokens using multiple aggregation techniques (Matys et al., 2025).
+H EAD E NTROPY targets final-answer correctness
+8
+
+rather than contextual hallucination, and uses the
+spread of the full attention distribution rather than
+the location of attention mass.
+
+7
+
+Hallucination detection in llms using spectral features of attention maps. In Proceedings of the 2025
+Conference on Empirical Methods in Natural Language Processing, pages 24365–24396.
+
+Conclusion
+
+Iván Vicente Moreno Cencerrado, Arnau Padrés Masdemont, Anton Gonzalvez Hawthorne, David Demitri
+Africa, and Lorenzo Pacchiardi. 2025. No answer needed: Predicting llm answer accuracy
+from question-only linear probes. arXiv preprint
+arXiv:2509.10625.
+
+H EAD E NTROPY predicts answer correctness with
+no training, no calibration, and a direction fixed
+before any data is seen. Its untrained mean reaches
+0.736 AUROC, the level of a hidden-state probe
+transferred across domains, at under 1% of inference cost. On thinking models the signal is
+strongest (0.80 to 0.82 AUROC); on the nonthinking Llama-3.1-8B it weakens, which we leave
+as an open question.
+
+Crystal T Chang, Hodan Farah, Haiwen Gui,
+Shawheen Justin Rezaei, Charbel Bou-Khalil, YeJean Park, Akshay Swaminathan, Jesutofunmi A
+Omiye, Akaash Kolluri, Akash Chaurasia, and 1 others. 2025. Red teaming chatgpt in medicine to yield
+real-world insights on model behavior. npj Digital
+Medicine, 8(1):149.
+
+Limitations
+
+Chao Chen, Kai Liu, Ze Chen, Yi Gu, Yue Wu,
+Mingyuan Tao, Zhihang Fu, and Jieping Ye. 2024a.
+INSIDE: LLMs’ internal states retain the power of
+hallucination detection. In The Twelfth International
+Conference on Learning Representations.
+
+The connection between attention entropy and gradient dynamics is a motivation for the feature.
+tr(J) says how far a pattern moves under a perturbation of its own scores; the size of a real update
+also depends on the gradient reaching that head,
+which we do not measure. H EAD E NTROPY supports any binary correctness label (including GPTas-judge), but we restrict to deterministic metrics
+for reproducibility. Open-ended tasks like summarization and dialogue lack this binary notion
+and represent a complementary direction, as does
+code generation where automated verification is
+available (Chuang et al., 2024; Matys et al., 2025).
+H EAD E NTROPY uses the full context (average 26
+tokens on TriviaQA to 1242 on HotpotQA). A
+sliding-window variant in the style of Lookback
+Lens is a natural extension but not tested here.
+
+Guiming Chen, Shunian Chen, Ziche Liu, Feng Jiang,
+and Benyou Wang. 2024b. Humans or llms as the
+judge? a study on judgement bias. In Proceedings
+of the 2024 Conference on Empirical Methods in
+Natural Language Processing, pages 8301–8327.
+Yung-Sung Chuang, Linlu Qiu, Cheng-Yu Hsieh, Ranjay Krishna, Yoon Kim, and James R. Glass. 2024.
+Lookback lens: Detecting and mitigating contextual
+hallucinations in large language models using only
+attention maps. In Proceedings of the 2024 Conference on Empirical Methods in Natural Language
+Processing, pages 1419–1436, Miami, Florida, USA.
+Association for Computational Linguistics.
+Shehzaad Dhuliawala, Mojtaba Komeili, Jing Xu,
+Roberta Raileanu, Xian Li, Asli Celikyilmaz, and
+Jason Weston. 2024. Chain-of-verification reduces
+hallucination in large language models. In Findings
+of the association for computational linguistics: ACL
+2024, pages 3563–3578.
+
+References
+Anastasios N Angelopoulos and Stephen Bates. 2021.
+A gentle introduction to conformal prediction and
+distribution-free uncertainty quantification. arXiv
+preprint arXiv:2107.07511.
+
+Jiahui Geng, Fengyu Cai, Yuxia Wang, Heinz Koeppl,
+Preslav Nakov, and Iryna Gurevych. 2024. A survey of confidence estimation and calibration in large
+language models. In Proceedings of the 2024 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies (Volume 1: Long Papers), pages
+6577–6595.
+
+Amos Azaria and Tom Mitchell. 2023. The internal
+state of an llm knows when it’s lying. Preprint,
+arXiv:2304.13734.
+Mohammad Beigi, Ying Shen, Runing Yang, Zihao
+Lin, Qifan Wang, Ankith Mohan, Jianfeng He, Ming
+Jin, Chang-Tien Lu, and Lifu Huang. 2024. Internalinspector i2: Robust confidence estimation in llms
+through internal states. In Findings of the association
+for computational linguistics: EMNLP 2024, pages
+12847–12865.
+
+Tobias Groot and Matias Valdenegro-Toro. 2024. Overconfidence is key: Verbalized uncertainty evaluation
+in large language and vision-language models. arXiv
+preprint arXiv:2405.02917.
+Dan Hendrycks, Collin Burns, Saurav Kadavath, Akul
+Arora, Steven Basart, Eric Tang, Dawn Song, and Jacob Steinhardt. 2021. Measuring mathematical problem solving with the math dataset. arXiv preprint
+arXiv:2103.03874.
+
+Jakub Binkowski, Denis Janiak, Albert Sawczyn, Bogdan Gabrys, and Tomasz Jan Kajdanowicz. 2025.
+
+9
+
+Jing Huang, Junyi Tao, Thomas Icard, Diyi Yang, and
+Christopher Potts. 2025. Internal causal mechanisms
+robustly predict language model out-of-distribution
+behaviors. arXiv preprint arXiv:2505.11770.
+
+Angéline Pouget, Mohammad Yaghini, Stephan Rabanser, and Nicolas Papernot. 2025. Suitability filter: A statistical framework for classifier evaluation
+in real-world deployment settings. arXiv preprint
+arXiv:2505.22356.
+
+Ziwei Ji, Delong Chen, Etsuko Ishii, Samuel Cahyawijaya, Yejin Bang, Bryan Wilie, and Pascale Fung.
+2024. Llm internal states reveal hallucination risk
+faced with a query. In Proceedings of the 7th BlackboxNLP Workshop: Analyzing and Interpreting Neural Networks for NLP, pages 88–104.
+
+Agostino Pugliese, Tiziana Beltramo, and Donato Torre.
+2008. Reye’s and reye’s-like syndromes. Cell Biochemistry and Function: Cellular biochemistry and
+its modulation by active agents or disease, 26(7):741–
+746.
+Lloyd S Shapley and 1 others. 1953. A value for nperson games. Princeton University Press Princeton.
+
+Mandar Joshi, Eunsol Choi, Daniel S Weld, and Luke
+Zettlemoyer. 2017. Triviaqa: A large scale distantly
+supervised challenge dataset for reading comprehension. arXiv preprint arXiv:1705.03551.
+
+Karan Singhal, Shekoofeh Azizi, Tao Tu, S Sara
+Mahdavi, Jason Wei, Hyung Won Chung, Nathan
+Scales, Ajay Tanwani, Heather Cole-Lewis, Stephen
+Pfohl, and 1 others. 2022. Large language models encode clinical knowledge. arXiv preprint
+arXiv:2212.13138.
+
+Saurav Kadavath, Tom Conerly, Amanda Askell, Tom
+Henighan, Dawn Drain, Ethan Perez, Nicholas
+Schiefer, Zac Hatfield-Dodds, Nova DasSarma, Eli
+Tran-Johnson, and 1 others. 2022. Language models (mostly) know what they know. arXiv preprint
+arXiv:2207.05221.
+
+Karan Singhal, Tao Tu, Juraj Gottweis, Rory Sayres,
+Ellery Wulczyn, Mohamed Amin, Le Hou, Kevin
+Clark, Stephen R Pfohl, Heather Cole-Lewis, and
+1 others. 2025. Toward expert-level medical question answering with large language models. Nature
+Medicine, 31(3):943–950.
+
+Jannik Kossen, Jiatong Han, Muhammed Razzak, Lisa
+Schut, Shreshth Malik, and Yarin Gal. 2024. Semantic entropy probes: Robust and cheap hallucination
+detection in llms. arXiv preprint arXiv:2406.15927.
+
+Sonish Sivarajkumar, Mark Kelley, Alyssa SamolykMazzanti, Shyam Visweswaran, and Yanshan Wang.
+2024. An empirical evaluation of prompting strategies for large language models in zero-shot clinical
+natural language processing: algorithm development
+and validation study. JMIR Medical Informatics,
+12:e55318.
+
+Lorenz Kuhn, Yarin Gal, and Sebastian Farquhar. 2023.
+Semantic uncertainty: Linguistic invariances for uncertainty estimation in natural language generation.
+arXiv preprint arXiv:2302.09664.
+Scott M Lundberg and Su-In Lee. 2017. A unified approach to interpreting model predictions. Advances
+in neural information processing systems, 30.
+
+Ben Snyder, Marius Moisescu, and Muhammad Bilal
+Zafar. 2024. On early detection of hallucinations
+in factual question answering. In Proceedings of
+the 30th ACM SIGKDD Conference on Knowledge
+Discovery and Data Mining, pages 2721–2732.
+
+Huan Ma, Jiadong Pan, Jing Liu, Yan Chen, Joey Tianyi
+Zhou, Guangyu Wang, Qinghua Hu, Hua Wu,
+Changqing Zhang, and Haifeng Wang. 2025. Semantic energy: Detecting llm hallucination beyond
+entropy. arXiv preprint arXiv:2508.14496.
+
+Gaurang Sriramanan, Siddhant Bharti, Vinu Sankar
+Sadasivan, Shoumik Saha, Priyatham Kattakinda,
+and Soheil Feizi. 2024. Llm-check: Investigating
+detection of hallucinations in large language models.
+Advances in Neural Information Processing Systems,
+37:34188–34216.
+
+Potsawee Manakul, Adian Liusie, and Mark Gales. 2023.
+Selfcheckgpt: Zero-resource black-box hallucination
+detection for generative large language models. In
+Proceedings of the 2023 conference on empirical
+methods in natural language processing, pages 9004–
+9017.
+
+Ryutaro Tanno, David GT Barrett, Andrew Sellergren,
+Sumedh Ghaisas, Sumanth Dathathri, Abigail See,
+Johannes Welbl, Charles Lau, Tao Tu, Shekoofeh
+Azizi, and 1 others. 2025. Collaboration between
+clinicians and vision–language models in radiology
+report generation. Nature Medicine, 31(2):599–608.
+
+Piotr Matys, Jan Eliasz, Konrad Kiełczyński, Mikołaj
+Langner, Teddy Ferdinan, Jan Kocoń, and Przemysław Kazienko. 2025. Aggtruth: Contextual hallucination detection using aggregated attention scores
+in llms. In International Conference on Computational Science, pages 227–243. Springer.
+
+Aman Singh Thakur, Kartik Choudhary, Venkat Srinik
+Ramayapally, Sankaran Vaidyanathan, and Dieuwke
+Hupkes. 2025. Judging the judges: Evaluating alignment and vulnerabilities in llms-as-judges. In Proceedings of the Fourth Workshop on Generation,
+Evaluation and Metrics (GEM2 ), pages 404–430.
+
+Ankit Pal, Logesh Kumar Umapathi, and Malaikannan
+Sankarasubbu. 2022. Medmcqa: A large-scale multisubject multi-choice dataset for medical domain question answering. In Proceedings of the Conference
+on Health, Inference, and Learning, volume 174 of
+Proceedings of Machine Learning Research, pages
+248–260. PMLR.
+
+James Thorne,
+Andreas Vlachos,
+Christos
+Christodoulopoulos, and Arpit Mittal. 2018.
+
+10
+
+Fever: a large-scale dataset for fact extraction and
+verification. In Proceedings of the 2018 Conference
+of the North American Chapter of the Association
+for Computational Linguistics: Human Language
+Technologies, Volume 1 (Long Papers), pages
+809–819.
+Tao Tu, Shekoofeh Azizi, Danny Driess, Mike Schaekermann, Mohamed Amin, Pi-Chuan Chang, Andrew
+Carroll, Charles Lau, Ryutaro Tanno, Ira Ktena, and
+1 others. 2024. Towards generalist biomedical ai.
+Nejm Ai, 1(3):AIoa2300138.
+Li Wang, Xi Chen, XiangWen Deng, Hao Wen, MingKe
+You, WeiZhi Liu, Qi Li, and Jian Li. 2024. Prompt
+engineering in consistency and reliability with the
+evidence-based guideline for llms. NPJ digital
+medicine, 7(1):41.
+Johnathan Xie, Annie S Chen, Yoonho Lee, Eric
+Mitchell, and Chelsea Finn. 2024. Calibrating language models with adaptive temperature scaling.
+arXiv preprint arXiv:2409.19817.
+Lin Yang, Shawn Xu, Andrew Sellergren, Timo
+Kohlberger, Yuchen Zhou, Ira Ktena, Atilla Kiraly,
+Faruk Ahmed, Farhad Hormozdiari, Tiam Jaroensri, and 1 others. 2024. Advancing multimodal
+medical capabilities of gemini. arXiv preprint
+arXiv:2405.03162.
+Zhilin Yang, Peng Qi, Saizheng Zhang, Yoshua Bengio,
+William Cohen, Ruslan Salakhutdinov, and Christopher D Manning. 2018. Hotpotqa: A dataset for
+diverse, explainable multi-hop question answering.
+In Proceedings of the 2018 conference on empirical methods in natural language processing, pages
+2369–2380.
+Juan Manuel Zambrano Chaves, Shih-Cheng Huang,
+Yanbo Xu, Hanwen Xu, Naoto Usuyama, Sheng
+Zhang, Fei Wang, Yujia Xie, Mahmoud Khademi,
+Ziyi Yang, and 1 others. 2025. A clinically accessible small multimodal radiology model and evaluation
+metric for chest x-ray findings. Nature Communications, 16(1):3108.
+Zhenliang Zhang, Xinyu Hu, Huixuan Zhang, Junzhe
+Zhang, and Xiaojun Wan. 2025. Icr probe: Tracking hidden state dynamics for reliable hallucination
+detection in llms. In Proceedings of the 63rd Annual Meeting of the Association for Computational
+Linguistics (Volume 1: Long Papers), pages 17986–
+18002.
+
+11
+
+Appendix Contents
+A Use of LLM
+
+12
+
+B Prompts
+B.1 TriviaQA Prompt . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+B.2 MedMCQA Prompt . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+B.3 HotpotQA Prompt . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+
+12
+12
+13
+13
+
+C Model dimensions
+
+13
+
+D Related work on hidden states as features for hallucination detection
+
+13
+
+E Training-free performance per model
+
+15
+
+F Supervised performance
+
+15
+
+G Explaining Predictions with SHAP Values
+
+16
+
+H Do predictive heads cluster in consistent depth ranges?
+
+17
+
+I
+
+18
+
+Contributions of Entropy across Layers
+
+J Ablations
+J.1 Regularization Ablation . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+J.2 Data Ablation . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+J.3 Aggregation across tokens . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+J.4 Probe vs. MLP vs. XGBoost . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+J.5 Robustness to decoding temperature . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+
+18
+18
+19
+19
+19
+20
+
+K Pseudocode
+
+20
+
+L Derivation of the Softmax Jacobian
+
+21
+
+M LLM contributions
+
+21
+
+A
+
+Use of LLM
+
+We use LLMs to check grammar and typos.
+
+B
+
+Prompts
+
+B.1
+
+TriviaQA Prompt
+
+1
+2
+
+def build_triviaqa_prompt ( item ):
+question = item [" question "]
+
+3
+4
+5
+6
+7
+8
+
+system_message = (
+" You are a trivia expert . Please answer questions in exactly this format
+:\ n"
+" Answer : [1 -3 words only ]\ n"
+" Certainty : [0 -100]\ n\n"
+)
+
+9
+10
+
+user_prompt = f" Question : { question }"
+
+11
+12
+
+return system_message , user_prompt
+
+12
+
+B.2
+1
+
+MedMCQA Prompt
+def build_ind_prompt ( item ):
+
+2
+
+system_message = (
+" You are a medical expert . Please answer questions in exactly this
+format :\ n"
+" Answer : [ repeat correct option ]\ n"
+" Certainty : [0 -100]\ n\n"
+)
+user_prompt = (
+" Question :"
++ item [" question " ]. split (". ") [ -1]
++ "\n"
++ " Options :"
++ " ". join ( str ( item [ op ]) + "\n"
+for i , op in enumerate ([ " opa " , " opb " , " opc " , " opd " ]) )
+)
+return system_message , user_prompt
+
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+
+B.3
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+
+HotpotQA Prompt
+def build_hotpot_prompt ( item ):
+system_message = (
+" You are a helpful assistant . "
+" Answer the question using the information in the provided passages ."
+" Please answer questions in exactly this format :\ n"
+" Answer : [1 -5 words only ]\ n"
+" Certainty : [0 -100]\ n\n"
+)
+list_sentences = []
+for sentence_list in item [" context " ][ " sentences " ]:
+list_sentences . extend ( sentence_list )
+
+12
+
+context_text = "\n". join ( sentence for sentence in list_sentences )
+
+13
+14
+
+user_prompt = (
+" Context : "
+f"{ context_text }\ n\n"
+f" Question : { item [' question ']}\ n"
+)
+
+15
+16
+17
+18
+19
+20
+
+return system_message , user_prompt
+
+21
+
+C
+
+Model dimensions
+
+Table 5: Feature dimensionality per model. d: hidden size (dimension of a mean-pooled hidden-state feature); h:
+attention heads per layer; L: layers; m = hL: total heads, the dimension of the H EAD E NTROPY feature vector. The
+Qwen3 and Llama models use dhead = 128 and Gemma-4-12B uses dhead = 256; Qwen3-32B and Gemma-4-12B
+are the two where h · dhead ̸= d. Values from each model’s config.json on Huggingface.
+
+Model
+Qwen3-1.7B
+Llama-3.1-8B
+Qwen3-8B
+Qwen3-32B
+Gemma-4-12B
+
+D
+
+d
+
+h
+
+L
+
+m
+
+d/m
+
+2048
+4096
+4096
+5120
+3840
+
+16
+32
+32
+64
+16
+
+28
+32
+36
+64
+48
+
+448
+1024
+1152
+4096
+768
+
+4.6
+4.0
+3.6
+1.3
+5.0
+
+Related work on hidden states as features for hallucination detection
+
+A growing line of work uses hidden states as features for predicting ’hallucinations’, a term used loosely
+across this literature to cover varied failure modes, including factual errors, inconsistencies, and errors
+13
+
+flagged by LLM judges. In contrast, H EAD E NTROPY uses only the attention distribution: it is lowerdimensional, interpretable, automated across layers, and requires a single forward pass at inference
+time.
+Kossen et al. (2024)’s SEPs trains hidden state probes to predict semantic entropy, while H EAD E NTROPY uses attention entropy to predict answer correctness directly under standard QA metrics.
+H EAD E NTROPY offers three advantages over a SEPs-style hidden state probe for the given task: First, we
+provide a formal motivation connecting 2-Rényi attention entropy to training gradient dynamics via the
+trace (equivalently, nuclear norm) of the softmax Jacobian. SEPs demonstrates empirically that hidden
+states encode semantic uncertainty, while H EAD E NTROPY explains why attention entropy relates to
+gradient stability. Second, H EAD E NTROPY avoids manual layer and token position selection entirely.
+Attention entropy is available at every layer and head, and the sparse classifier automatically identifies
+informative heads, whereas SEPs require ablations to find optimal layer and token positions. Third, the
+feature vector has dimensionality m (number of attention heads, typically for open source models 16-64)
+versus hidden state dimensionality d (typically 1024-8192). Supervising H EAD E NTROPY on binary
+semantic entropy labels (analogous to Kossen et al.) is an interesting future direction. For the scope of
+this work we focus on exact match and F1 as correctness metrics.
+Cencerrado et al. (2025) focuses on predicting answer correctness before generation using linear probes
+on hidden states with a heuristic motivation. Although our work emphasizes the attention distribution
+using a formal motivation, the task is comparable. Similarities: the best-performing assessor (trained
+on embeddings from GPT) is logistic regression, signal increases with larger models, and middle layers
+perform slightly better. Key differences: their core claims focus on OOD generalization for predicting
+answer correctness from question-only hidden states, a distinct goal from ours. Results are reported on a
+subsampled training set, making direct comparison non-trivial as open-source models are almost certainly
+trained on it. They use careful per model layer selection, whereas H EAD E NTROPY automates this process.
+Ji et al. (2024) addresses a similar task; however, it focuses on self-awareness of uncertainty by
+examining how internal states indicate whether the model has seen the query during training, a question
+related to our paper. We focus on a formal motivation through the lens of training stability and connect
+feature generation directly to training dynamics, with their hidden-state approach serving as one of our
+baselines. They employ a more complex multilayer perceptron (MLP) variant.
+Huang et al. (2025) investigates whether internal causal mechanisms can robustly predict model
+correctness in out-of-distribution settings, covering tasks such as symbol manipulation, knowledge
+retrieval, and instruction following. While related to our goal, we examine more closely the contribution
+of each attention head using a logistic regression model and note that generalization across tasks exists,
+but with some task-dependent component.
+Beigi et al. (2024) is in the same field as the studies mentioned above. One focus here is predictor model
+selection and contrastive loss construction to cope with high-dimensional inputs from hidden, activation,
+and attention states across all layers.
+Unlike methods analyzing static, high-dimensional hidden states, Zhang et al. (2025) focuses on the
+dynamic update process of the residual stream, which proves more effective at identifying when a model
+deviates from factual accuracy across layers. The ICR Probe outperforms prior hidden-state baselines and
+provides improved interpretability for understanding hallucination mechanisms.
+
+14
+
+Table 6: TriviaQA in-distribution correctness-prediction AUROC across hallucination detection methods. All
+numbers except H EAD E NTROPY are reported from the original papers and in-distribution; setups and models differ
+across rows and numbers are not strictly comparable. † Reimplemented result; the original paper does not report
+TriviaQA.
+
+Method
+
+Model
+
+Train
+Gen.
+
+Test
+Gen.
+
+Training
+Free
+
+TriviaQA
+AUROC
+
+Semantic Uncertainty (Kuhn et al., 2023)
+Semantic Energy (Ma et al., 2025)
+
+OPT-30B
+Qwen3-8B
+
+—
+—
+
+>1
+>1
+
+✓
+✓
+
+0.828
+0.748
+
+Kadavath et al. (Kadavath et al., 2022)
+SEP (Kossen et al., 2024)
+
+52B (P(IK))
+Llama-2-7B
+
+>1
+>1
+
+1
+1
+
+×
+×
+
+0.864
+<0.85
+
+Snyder et al. (Snyder et al., 2024)
+LapEigvals (Binkowski et al., 2025)
+
+OpenLlaMA-7B
+Llama-3.1-8B
+
+1
+1
+
+1
+1
+
+×
+×
+
+0.71
+0.889
+
+ICR Probe (Zhang et al., 2025)
+
+Llama-3
+
+1
+
+1
+
+×
+
+0.7325 †
+
+LLM-Check (Sriramanan et al., 2024)
+LookbackLens
+Hidden State LR
+H EAD E NTROPY
+
+Llama-2-7B
+Llama-3.1-8B
+Llama-3.1-8B
+Llama-3.1-8B
+
+—
+1
+1
+1
+
+1
+1
+1
+1
+
+✓
+×
+×
+×
+
+0.742†
+0.883 †
+0.858 †
+0.879
+
+E
+
+Training-free performance per model
+
+Table 7 breaks the training-free comparison of Section 5.1 down by backbone, averaging AUROC over the
+five evaluation datasets. H EAD E NTROPY has the highest average (0.741) and is the strongest training-free
+score on all three Qwen3 models, by 0.05 to 0.11 AUROC over the runner-up. On Gemma-4-12B mean
+ICR (0.773) and attention score (0.740) are slightly ahead of H EAD E NTROPY (0.733). On Llama-3.1-8B
+every attention- or hidden-state-based score is close to chance and token entropy (0.723) is the only
+informative signal; this non-thinking model is the hardest backbone for all methods.
+Method
+
+Llama-3.1-8B
+
+Gemma-4-12B
+
+Qwen3-1.7B
+
+Qwen3-32B
+
+Qwen3-8B
+
+Average
+
+Token Entropy
+Verbalized Uncertainty
+Attention Score
+Hidden States (mean)
+Lookback Lens (mean)
+ICR (mean)
+
+0.723
+0.543
+0.501
+0.517
+0.516
+0.522
+
+0.706
+0.645
+0.740
+0.730
+0.499
+0.773
+
+0.580
+0.708
+0.769
+0.346
+0.656
+0.271
+
+0.576
+0.613
+0.691
+0.671
+0.611
+0.465
+
+0.628
+0.762
+0.743
+0.750
+0.652
+0.421
+
+0.642
+0.654
+0.688
+0.603
+0.587
+0.490
+
+H EAD E NTROPY (mean)
+
+0.536
+
+0.733
+
+0.815
+
+0.800
+
+0.821
+
+0.741
+
+Table 7: Training-free performance (AUROC) across models, averaged over the five evaluation datasets. Best per
+column in bold, second best underlined.
+
+F
+
+Supervised performance
+
+Figure 4 gives the absolute ROC-AUC behind the paired differences of Figure 3: one marker per method
+and supervision regime, with the individual (model, dataset) cells shown as faint dots. In distribution,
+the H EAD E NTROPY probe (0.87) is level with the hidden-state probe (0.87) and ahead of Lookback
+Lens (0.82) and ICR (0.77). Out of distribution, H EAD E NTROPY keeps 0.74 while the hidden-state
+and Lookback Lens probes fall to 0.62 and 0.65 and ICR to 0.49, close to chance. Without any probe,
+H EAD E NTROPY again reaches 0.74, whereas the training-free means of the other features lie between
+0.59 and 0.69.
+
+15
+
+Figure 4: ROC-AUC by method and supervision regime. Each marker is the mean over (model, dataset) cells
+and the bar the 95% interval of those cells, taken from the Student’s t quantile at n − 1 degrees of freedom;
+the faint dots are the individual cells. In-distribution (trained probe) covers 14 cells and the other two regimes
+(Out-of-distribution/domain, training free) cover 24, since no probe is trained on MATH or FEVER. LLM-Check,
+verbalized uncertainty and token entropy exist only in the training-free regime and so carry a single marker. Rows
+marked † are plotted as 1 − AUC: those features are anti-correlated with correctness in the training-free setting, and
+the flip was applied after seeing the results, whereas the orientation of H EAD E NTROPY is fixed a priori by Eq. 10.
+Figure 3 gives the same comparison as within-cell paired differences.
+
+G
+
+Explaining Predictions with SHAP Values
+
+To attribute predictive performance to specific heads, we compute SHAP values (Shapley et al., 1953;
+Lundberg and Lee, 2017) on the trained classifier:
+ϕk (f ) =
+
+i
+1 Xh
+f (Pkπ ∪ {k}) − f (Pkπ ) ,
+m! π
+
+(13)
+
+where π ranges over all feature orderings, Pkπ is the set of features preceding k in π, and ϕk (f ) quantifies
+the contribution of head k ∈ {1, ..., m}.
+Over the course of training we found that the heads with the highest entropy also carry the most
+predictive signal of the final model (Figure 5).
+
+16
+
+Figure 5: 2-Rényi values (green) over training of OLMo-2-1B model. Each of the fine lines is a head’s entropy
+values with color coding of the SHAP value (red means positive and blue means negative, more in Appendix G) of
+the final predictive logistic regression model. The green line represents the average entropy of the heads. Model
+Performance (black) measured in percentage of exact match examples for the validation set of TriviaQA.
+
+H
+
+Do predictive heads cluster in consistent depth ranges?
+
+Our per-head SHAP analysis shows middle layers consistently carry higher-magnitude values (Table 8)
+with an average relative layer index of above-mean SHAP value layers at about 0.3-0.6.
+Table 8: Average layer index of above-mean SHAP value layers, normalized by total number of layers.
+
+Model
+Qwen3-1.7B
+Qwen3-8B
+Llama-3.1-8B
+Qwen3-32B
+
+TriviaQA
+
+HotpotQA
+
+MedMCQA
+
+0.532
+0.519
+0.327
+0.513
+
+0.491
+0.464
+0.469
+–
+
+0.552
+0.565
+0.354
+0.489
+
+Qualitative examples of each dataset for the Qwen3 1.7B Instruct model are shown in Figure 6.
+
+Figure 6: Trace of the Jacobian of the softmax per head for one correct and one incorrect example per dataset. For
+the wrong examples the heads are more yellow, especially the middle heads, indicating less settled attention patterns.
+
+17
+
+I
+
+Contributions of Entropy across Layers
+
+We conducted a layer ablation study, beginning with the final layer and progressively adding five layers at
+a time (Figures 7, 8 and 9 for TriviaQA, MedMCQA and HotpotQA). The results indicate that predictive
+value is not limited to the last layer alone: test AUROC rises over the first few added blocks and then
+plateaus well before all layers are included.
+3B Llama 3.2
+
+8B Llama 3.1
+
+1.00
+
+Qwen3 1.7B
+
+1.00
+
+Data Split
+Train
+
+0.98
+
+Qwen3 32B
+
+1.00
+
+Data Split
+
+Test
+0.98
+
+Test
+
+Train
+
+Train
+
+1.00
+
+Data Split
+Test
+
+Data Split
+Test
+
+0.99
+
+Train
+
+0.98
+
+0.98
+0.96
+
+Qwen3 8B
+
+1.00
+
+Data Split
+
+Test
+
+Train
+
+0.98
+
+0.96
+
+0.97
+
+0.96
+0.96
+
+0.94
+
+0.96
+
+0.94
+0.94
+
+0.95
+
+0.90
+
+0.88
+
+0.92
+
+ROC-AUC Score
+
+0.88
+
+ROC-AUC Score
+
+0.90
+
+0.92
+
+ROC-AUC Score
+
+0.94
+
+ROC-AUC Score
+
+ROC-AUC Score
+
+0.92
+
+0.92
+
+0.90
+
+0.90
+
+0.86
+
+0.94
+0.93
+0.92
+0.91
+
+0.88
+0.86
+
+0.90
+
+0.84
+
+0.88
+0.86
+
+0.84
+
+0.82
+
+0.82
+
+0.78
+
+0.80
+
+0.89
+0.88
+
+0.86
+0.80
+
+0.84
+0.87
+
+0.84
+
+La
+
+La
+
+32
+st
+
+la
+
+la
+
+rs
+ye
+
+rs
+ye
+
+rs
+ye
+
+rs
+ye
+
+la
+
+la
+
+31
+st
+
+26
+st
+
+21
+st
+
+rs
+
+rs
+
+r
+
+rs
+ye
+
+ye
+
+la
+
+ye
+
+ye
+la
+
+la
+
+16
+st
+
+la
+
+11
+st
+
+6
+st
+
+Layers
+
+La
+
+La
+
+La
+
+1
+st
+
+rs
+
+rs
+ye
+
+Layers
+
+La
+
+La
+
+La
+
+la
+
+la
+
+rs
+
+r
+
+rs
+ye
+la
+64 ers
+y
+st
+La 1 la rs
+6 e
+y
+st
+La 6 la rs
+5
+st laye
+La
+51 rs
+st laye
+La
+46 rs
+st laye
+La
+41 ers
+y
+st
+La 6 la rs
+3 e
+y
+st
+La 1 la rs
+3 e
+y
+st
+La 6 la rs
+2 e
+y
+st
+La 1 la rs
+2 e
+y
+st
+La 6 la
+1 ers
+y
+st
+La 1 la
+1
+st yers
+La la
+6
+st yer
+
+La
+
+1
+st
+
+16
+st
+
+ye
+
+ye
+
+ye
+la
+
+rs
+ye
+
+11
+st
+
+rs
+ye
+
+la
+
+la
+
+rs
+ye
+
+6
+st
+
+la
+
+rs
+ye
+
+la
+
+32
+st
+
+la
+
+rs
+ye
+
+1
+st
+
+31
+st
+
+la
+
+26
+st
+
+21
+st
+
+rs
+
+rs
+
+la
+
+r
+
+16
+st
+
+ye
+
+ye
+la
+
+ye
+
+11
+st
+
+la
+
+rs
+ye
+
+la
+
+la
+
+rs
+ye
+
+6
+st
+
+la
+
+rs
+
+rs
+ye
+
+rs
+
+la
+
+ye
+
+r
+
+1
+st
+
+24
+st
+
+21
+st
+
+16
+st
+
+ye
+
+ye
+la
+
+la
+
+la
+
+11
+st
+
+6
+st
+
+1
+st
+
+Layers
+
+0.86
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+Layers
+
+0.82
+
+Layers
+
+Figure 7: TriviaQA: Layer ablation, where layer 1 is the last layer and then adding more layers.
+
+3B Llama 3.2
+
+8B Llama 3.1
+
+1.00
+
+Qwen3 1.7B
+
+1.00
+
+Data Split
+
+Test
+
+Train
+
+Train
+
+0.95
+
+Qwen3 32B
+
+1.00
+
+Data Split
+
+Test
+
+0.95
+
+Qwen3 8B
+
+1.00
+
+Data Split
+
+1.00
+
+Data Split
+
+Test
+
+0.99
+
+Data Split
+
+Test
+
+Train
+
+Test
+
+Train
+
+0.98
+
+Train
+0.99
+
+0.98
+0.97
+
+0.96
+
+0.90
+
+0.98
+0.90
+
+0.96
+0.94
+0.95
+
+0.80
+
+0.75
+
+0.97
+
+0.94
+0.93
+0.92
+
+ROC-AUC Score
+
+0.85
+
+ROC-AUC Score
+
+0.80
+
+ROC-AUC Score
+
+ROC-AUC Score
+
+ROC-AUC Score
+
+0.85
+
+0.92
+
+0.90
+
+0.96
+
+0.95
+
+0.91
+0.88
+0.75
+
+0.90
+
+0.70
+
+0.94
+0.86
+
+0.89
+0.70
+
+0.65
+
+0.88
+
+0.93
+
+0.84
+0.87
+
+0.60
+
+0.65
+
+0.86
+
+La
+
+La
+
+st
+
+st
+
+st
+
+la
+
+la
+
+rs
+ye
+
+rs
+ye
+
+rs
+ye
+
+32
+
+la
+
+rs
+ye
+
+rs
+
+la
+
+ye
+la
+
+31
+
+26
+
+21
+
+rs
+
+st
+
+r
+
+rs
+ye
+
+ye
+
+la
+
+ye
+
+16
+
+la
+
+11
+
+la
+
+st
+
+6
+
+st
+
+st
+
+1
+
+r
+
+st
+
+ye
+
+rs
+
+rs
+ye
+
+Layers
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+la
+
+21
+
+16
+
+11
+
+6
+
+la
+
+la
+
+rs
+
+r
+
+rs
+ye
+la
+64 ers
+y
+st
+La 1 la rs
+6 e
+y
+st
+La 6 la rs
+5 e
+y
+st
+La 1 la rs
+5 e
+y
+st
+La 6 la rs
+4 e
+y
+st
+La 1 la rs
+4 e
+y
+st
+La 6 la rs
+3 e
+y
+st
+La 1 la rs
+3 e
+y
+st
+La 6 la rs
+2 e
+y
+la
+rs
+ye
+la
+rs
+ye
+la
+rs
+ye
+st
+
+st
+
+st
+
+st
+
+st
+
+1
+
+16
+
+ye
+
+ye
+
+ye
+la
+
+rs
+ye
+
+11
+
+rs
+ye
+
+la
+
+la
+
+6
+
+la
+
+la
+
+32
+
+rs
+ye
+
+1
+
+31
+
+la
+
+26
+rs
+ye
+
+Layers
+
+La
+
+La
+
+La
+
+La
+
+La
+
+st
+
+st
+
+st
+
+st
+
+st
+
+st
+
+st
+
+st
+
+rs
+ye
+
+rs
+
+la
+
+rs
+
+21
+
+r
+
+st
+
+ye
+
+la
+
+ye
+
+ye
+la
+
+16
+
+la
+
+st
+
+la
+
+11
+
+6
+
+st
+
+1
+
+rs
+ye
+
+st
+
+rs
+ye
+
+st
+
+la
+
+rs
+
+la
+
+ye
+la
+
+24
+
+rs
+
+21
+
+r
+
+st
+
+ye
+
+st
+
+ye
+
+rs
+ye
+
+la
+
+la
+
+la
+
+16
+
+6
+
+st
+
+1
+
+11
+
+st
+
+st
+
+st
+
+Layers
+
+0.92
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+Layers
+
+0.82
+
+Layers
+
+Figure 8: MedMCQA: Layer ablation, where layer 1 is the last layer and then adding more layers.
+
+3B Llama 3.2
+
+8B Llama 3.1
+
+1.00
+
+Qwen3 1.7B
+
+1.00
+
+Data Split
+
+Qwen3 8B
+
+1.00
+
+Data Split
+
+Test
+0.98
+
+Train
+
+0.96
+
+1.00
+
+Data Split
+
+Test
+0.98
+
+Train
+
+Test
+0.98
+
+Train
+
+0.98
+
+0.96
+0.94
+
+0.92
+
+0.92
+
+Train
+
+0.96
+
+0.96
+0.94
+
+Data Split
+
+Test
+
+0.94
+0.94
+
+0.86
+
+0.90
+0.88
+0.86
+
+0.92
+
+ROC-AUC Score
+
+0.88
+
+ROC-AUC Score
+
+ROC-AUC Score
+
+ROC-AUC Score
+
+0.92
+0.90
+
+0.90
+
+0.88
+
+0.90
+
+0.88
+
+0.86
+0.84
+
+0.84
+
+0.82
+
+0.82
+
+0.80
+
+0.80
+
+0.78
+
+0.78
+
+0.76
+
+0.76
+
+0.86
+0.84
+0.84
+
+0.80
+
+0.80
+
+0.78
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+st
+
+st
+
+st
+26
+
+31
+
+32
+
+la
+
+la
+
+la
+
+la
+
+la
+
+rs
+ye
+
+rs
+ye
+
+rs
+ye
+
+rs
+ye
+
+rs
+ye
+
+rs
+
+rs
+ye
+la
+
+21
+
+r
+
+st
+
+ye
+
+16
+
+ye
+
+11
+
+la
+
+st
+
+la
+
+st
+
+6
+
+rs
+ye
+
+1
+
+la
+
+st
+
+16
+
+rs
+
+rs
+ye
+la
+
+ye
+
+st
+
+st
+
+11
+
+la
+
+rs
+ye
+
+r
+
+rs
+ye
+
+6
+
+la
+
+rs
+ye
+
+ye
+
+32
+
+la
+
+rs
+ye
+
+la
+
+31
+
+la
+
+rs
+ye
+
+1
+
+26
+
+la
+
+Layers
+
+La
+
+La
+
+st
+
+st
+
+st
+
+st
+
+st
+
+st
+
+la
+
+rs
+ye
+la
+
+21
+
+rs
+
+st
+
+r
+
+16
+
+ye
+
+11
+
+ye
+
+st
+
+la
+
+st
+
+la
+
+rs
+ye
+
+6
+
+rs
+ye
+
+1
+
+la
+
+st
+
+24
+
+st
+
+st
+
+rs
+
+rs
+ye
+la
+
+rs
+ye
+
+r
+
+la
+
+ye
+
+la
+
+ye
+
+21
+
+la
+
+16
+
+la
+
+st
+
+6
+
+st
+
+1
+
+11
+
+st
+
+st
+
+st
+
+Layers
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+La
+
+Layers
+
+0.82
+
+0.82
+
+Layers
+
+Figure 9: HotpotQA: Layer ablation, where layer 1 is the last layer and then adding more layers.
+
+J
+
+Ablations
+
+This section collects the ablations referred to in Section 5: the regularization strength and training-set size
+of the probe, the aggregation of per-token entropies, the choice of probe, and the decoding temperature.
+J.1
+
+Regularization Ablation
+
+We made the best effort to make the hyperparameter choice as standard as possible, as our main focus is
+methodological not empirical hyperparameter tuning. Please see the ablation in Figure 10.
+
+18
+
+Figure 10: Performance vs. L1 regularization for Llama 3.1 8B (left) and Qwen3-8B (right), where for all datasets
+the performance converges at 0.1. Lower values correspond to more regularization strength.
+
+J.2
+
+Data Ablation
+
+Please see the curves showing performance vs. training set size to demonstrate data efficiency Figure 11.
+
+Figure 11: Performance vs. training set size for Llama 3.1 8B (left) and Qwen3-8B (right), where 1 data fraction
+corresponds to 50k examples. For all datasets the performance converges at around 0.2.
+
+Experiments suggest H EAD E NTROPY maintains strong performance even with 20-30% of training data.
+J.3
+
+Aggregation across tokens
+
+We aggregate per-token head entropies into a single per-head feature by averaging over the tokens of
+a semantic section (Eq. 8). We compared the mean against the per-token minimum and maximum on
+Llama-3.1-8B and Qwen3-8B across TriviaQA, HotpotQA, and MedMCQA (Table 9). The mean is
+consistently the best or tied-best, followed closely by the maximum (within roughly 0.02 AUROC), while
+the minimum is the weakest. We therefore use the mean throughout (Table 9).
+Table 9: Empirically testing average, minimum and maximum aggregation over the rows of the attention matrix.
+Average showing consistently slightly higher AUROC, followed by maximum, ranging within 2 AUROC points.
+
+Llama-3.1-8B
+
+J.4
+
+Qwen3-8B
+
+Dataset
+
+Avg
+
+Max
+
+Min
+
+Avg
+
+Max
+
+Min
+
+HotpotQA
+MedMCQA
+TriviaQA
+
+0.87
+0.74
+0.94
+
+0.86
+0.73
+0.92
+
+0.85
+0.73
+0.92
+
+0.85
+0.95
+0.92
+
+0.83
+0.87
+0.92
+
+0.82
+0.73
+0.92
+
+Probe vs. MLP vs. XGBoost
+
+We tested the AUROC on the validation split of each dataset for three probes trained on the per-head
+H EAD E NTROPY vector (L × H values, one per attention head, averaged over the answer tokens) of
+the same dataset’s train split: a logistic regression over all layers (LR, the probe of the main text), a
+two-hidden-layer MLP (1024 units, ReLU, Adam, 20 epochs) and gradient-boosted trees (XGBoost,
+logistic objective, up to 100 rounds) (Table 10).
+
+19
+
+Table 10: Trained probes on the H EAD E NTROPY vector. Bold: best probe per model and dataset. The choice of
+probe changes AUROC by at most a few points.
+
+J.5
+
+Dataset
+
+Probe
+
+Qwen3
+1.7B
+
+Llama-3.2
+3B
+
+Qwen3
+8B
+
+Llama-3.1
+8B
+
+Gemma-4
+12B
+
+Qwen3
+32B
+
+TriviaQA
+
+LR
+MLP
+XGBoost
+
+0.894
+0.902
+0.863
+
+0.924
+0.923
+0.911
+
+0.892
+0.891
+0.881
+
+0.879
+0.880
+0.862
+
+0.908
+0.903
+0.882
+
+0.877
+0.895
+0.879
+
+HotpotQA
+
+LR
+MLP
+XGBoost
+
+0.874
+0.877
+0.866
+
+0.871
+0.873
+0.855
+
+0.848
+0.816
+0.839
+
+0.858
+0.866
+0.836
+
+0.828
+0.650
+0.816
+
+–
+–
+–
+
+MedMCQA
+
+LR
+MLP
+XGBoost
+
+0.891
+0.866
+0.796
+
+0.722
+0.707
+0.706
+
+0.911
+0.937
+0.911
+
+0.739
+0.742
+0.723
+
+0.879
+0.900
+0.856
+
+0.860
+0.862
+0.868
+
+Robustness to decoding temperature
+
+Table 11 reports AUROC for a H EAD E NTROPY classifier trained at T <0.0001 and evaluated on generations sampled at T =1.
+Table 11: Performance under different temperature at inference time remains comparable. For the MedMCQA
+dataset the overall performance drops below random (0.25), likely responsible for the performance drop in AUROC
+of H EAD E NTROPY.
+
+K
+
+AUROC of H EAD E NTROPY
+
+Overall Model Accuracy
+
+T < 0.0001
+
+T =1
+
+T < 0.0001
+
+T =1
+
+Model
+
+Dataset
+
+Llama-3.1-8B
+
+TriviaQA
+MedMCQA
+HotpotQA
+
+0.93
+0.74
+0.88
+
+0.94
+0.54
+0.89
+
+0.45
+0.50
+0.38
+
+0.40
+0.18
+0.36
+
+Qwen3-8B
+
+TriviaQA
+MedMCQA
+HotpotQA
+
+0.92
+0.94
+0.80
+
+0.91
+0.70
+0.85
+
+0.58
+0.39
+0.58
+
+0.53
+0.12
+0.56
+
+Pseudocode
+
+Algorithm 1 summarizes the full H EAD E NTROPY pipeline: for each example, we compute the 2-Rényi
+entropy of every attention head at every token, convert it to the trace of the softmax Jacobian (Eq. 7),
+average over the tokens of a semantic section, stack into a per-example feature vector, and train an
+ℓ1 -regularized logistic regression on the binary correctness label.
+
+20
+
+Algorithm 1 H EAD E NTROPY
+Require: Dataset {(xi , yi )}N
+i=1 ; transformer with m heads; sequence length T of xi
+for each (xi , yi ) do
+Obtain ŷi and attention tensor Ai ∈ Rm×T ×T (Eq. 5)
+for each head k and token t do
+P  (t,j) 2
+(t)
+Compute 2-Rényi entropy Hk,i = − log j Ak,i
+(t)
+
+(t)
+
+Compute trace(J)k,i = 1 − exp(−Hk,i )
+end for
+Average over section tokens to get H̄k,i ∈ R
+Stack into feature vector H̄i = [H̄1,i , . . . , H̄m,i ]⊤ ∈ Rm
+end for
+Stack {H̄i } into feature matrix H̄ ∈ RN ×m
+Define labels zi = I[ŷi = yi ], where z ∈ RN
+Take the mean of H̄ across m H̄mean
+return H̄mean , z.
+
+L
+
+(Eq. 7)
+(Eq. 8)
+
+Derivation of the Softmax Jacobian
+
+We derive the Jacobian of the softmax function. Let:
+exp(xi )
+pi := softmax(x)i = PK
+j=1 exp(xj )
+
+(14)
+
+∂pi
+To compute ∂x
+, we consider two cases.
+j
+
+Case 1: i = j.
+
+We apply the quotient rule:
+P
+exp(xi ) · k exp(xk ) − exp(xi ) · exp(xi )
+∂pi
+=
+P
+∂xi
+( k exp(xk ))2
+exp(xi )
+exp(xi )2
+=P
+− P
+( k exp(xk ))2
+k exp(xk )
+= pi − p2i = pi (1 − pi )
+
+Case 2: i ̸= j.
+
+(17)
+
+(18)
+
+We can write the Jacobian compactly as:
+Jsoftmax = diag(p) − pp⊤
+
+We can now see that the trace of the Jacobian isP
+monotonically related to the 2-Rényi entropy.
+Recall that 2-Rényi entropy is H2 (p) := − log p2i . Using J = diag(p) − ppT :
+i
+
+T r(J) = T r(diag(p)) − T r(ppT )
+X
+=
+pi − ||p||2
+i
+
+= 1 − ||p||2
+= 1 − exp(−H2 (p))
+
+M
+
+(16)
+
+The numerator exp(xi ) does not depend on xj , so:
+0 − exp(xi ) · exp(xj )
+∂pi
+= −pi pj
+=
+P
+∂xj
+( k exp(xk ))2
+
+Combined.
+
+(15)
+
+LLM contributions
+
+In this work, we used LLMs to help improve the readability of the paper and create figures.
+21
+
+(19)
+
+

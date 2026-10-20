@@ -1,0 +1,1309 @@
+Co-ReAct: Rubrics as Step-Level Collaborators
+for ReAct Agents
+Jiazheng Kang1,* , Bowen Zhang2,* , Zixin Song2,* , Jiangwang Chen2,* , Xiao Yang1 , Da Zhu1 and Guanjun Jiang1
+1 Qwen Business Unit, {kangjiazheng.kjz,yx501135,zhuda.zd,guanj.jianggj}@alibaba-inc.com, 2 Tsinghua
+
+University, {zbw23,songzx24,jw-chen24}@mails.tsinghua.edu.cn
+
+arXiv:2605.23590v2 [cs.AI] 2 Aug 2026
+
+* Equal contribution.
+
+ReAct-style agents for search-intensive, multi-step reasoning tasks rely largely on their own internal
+judgment to decide what evidence to seek, which reasoning or action step to take next, and when to
+stop, often producing shallow, redundant, or poorly targeted trajectories. Prior work has explored rubrics
+as external quality signals, but existing uses are mostly evaluative rather than action-guiding: rubrics
+typically serve as training-time rewards or post-hoc evaluators of completed outputs, and in deep-research
+settings they are often coarse-grained and report-level rather than step-level. We introduce Co-ReAct, a
+rubric-guided action-selection framework that uses rubrics as step-level guidance during inference. At
+each decision step, Co-ReAct injects a rubric into the agent’s context to guide the next Reason-or-Act
+decision, specifying what the agent should target in evidence seeking, search, reasoning, or self-evaluation.
+To make this guidance reliable, we train a dedicated rubric generator with GRPO. Unlike prior pairwise
+or binary preference formulations, our objective optimizes a list-wise Spearman rank-correlation reward
+against multi-judge expert consensus rankings, encouraging rubrics that are discriminative rather than
+merely plausible. On DeepResearchBench and SQA-CS-V2, Co-ReAct consistently improves over ReAct and
+representative test-time compute baselines across search agents built on both 8B/14B open-source and
+frontier closed-source base models. The trained rubric generator can also serve as a drop-in component
+that improves these baselines without changing their underlying decision mechanisms.
+
+1. Introduction
+Deep research agents built on the ReAct paradigm (Yao et al., 2022) conduct search by repeatedly deciding
+what evidence to seek, what action to take next, and when to stop. In current systems, these decisions are
+driven largely by the agent’s own internal judgment. This self-direction can be brittle. Agents may reissue
+near-duplicate queries, stop before sufficient evidence has been gathered, or rely on a narrow set of sources
+even when the question would benefit from comparison across multiple perspectives (Wang et al., 2025; Shao
+et al., 2025a). The resulting trajectories can therefore become shallow, redundant, or misaligned with the
+specific demands of the current step. What is missing is an external, verifiable specification of what the next
+step should accomplish: a step-level signal that tells the agent, at a particular branching point in a particular
+trajectory, what fine-grained requirements the next action should satisfy.
+Rubrics (Popham, 1997) are a natural candidate for such a specification because they express quality as
+a small set of checkable criteria. However, existing rubric-based methods use rubrics primarily as evaluative
+objects rather than guidance signals (Gunjal et al., 2025). In general LLM alignment, rubrics are commonly
+used as training-time rewards, judge templates, or post-hoc evaluators of completed outputs (Xu et al., 2026a).
+In deep-research settings, rubrics are also typically defined at the level of the final report, where they check
+whether a completed answer is comprehensive, well-cited, and faithful to the evidence (Lv et al., 2026; Shao
+et al., 2025b). These uses answer the question: how much credit does an output already produced deserve?
+They do not answer the question a search agent faces during inference: given what has already been observed,
+what concrete requirements should the next action satisfy?
+Using rubrics for this prescriptive role requires more than attaching a generic checklist to the prompt.
+(Brookhart, 2018) First, the rubric must be step-level: it should specify what the next action should cover, rather
+
+Co-ReAct: Rubrics as Step-Level Collaborators for ReAct Agents
+
+than what the final report should contain. Second, it must be conditioned on the current partial trajectory,
+because the right next action depends on what the agent has already tried and what evidence it has already
+found. Third, it must be discriminative: the actions favored by the rubric should actually be better than the
+actions it penalizes. This last requirement is crucial. As we show in ablation study, an unreliable rubric may not
+merely fail to help: when injected into the agent’s context, untrained rubrics can actively mislead the search
+process and degrade performance.
+We therefore propose Co-ReAct, a rubric-guided ReAct framework for deep research. The name Co-ReAct
+reflects the rubric’s role as a step-level collaborator: before the agent acts, it specifies fine-grained requirements
+for the next step; after the action is executed, it provides a basis for verification and feedback. Co-ReAct trains a
+dedicated rubric generator to produce discriminative step-level guidance. Unlike prior rubric-learning methods
+(Xu et al., 2026b) that rely on pairwise preferences or binary accept/reject labels, Co-ReAct uses a listwise
+formulation. At each ReAct decision point, multiple next actions may appear plausible, so the useful signal is
+not only whether an action is acceptable or better than another, but how a slate of candidate actions should be
+ranked relative to one another. We therefore sample candidate next actions for each decision point and obtain
+a multi-judge expert consensus ranking over the full slate. The rubric generator is trained with GRPO (Shao
+et al., 2024b) using a Spearman rank-correlation (Spearman, 1904; Song et al., 2025b) reward between the
+expert ranking and the ranking induced by the generated rubric. A rubric receives high reward only when
+its criteria lead to an action ranking that agrees with the expert consensus, encouraging rubrics that induce
+expert-aligned preferences rather than merely sounding plausible.
+At inference time, the rubric generator serves two roles. As a complete system, Co-ReAct extends the
+standard ReAct loop with an inject–verify–retry procedure. Before each tool call, a trajectory-conditioned
+rubric is injected into the agent’s context to specify what the next action should target. After the action is
+proposed but before it is executed, an independent verifier checks the proposed action against the rubric. If the
+verification passes, the action is accepted; otherwise, the verifier returns feedback on which criteria remain
+unsatisfied, and the agent regenerates the action accordingly. As a drop-in plug-in, the same trained rubric
+can also be injected into existing test-time compute methods such as Best-of-N (Snell et al., 2024), Step-Back
+(Zheng et al., 2024), and CRITIC (Gou et al., 2024)without changing their decision mechanisms. In both cases,
+the rubric is consumed by the agent at inference time as a step-level action-selection signal, rather than by an
+optimizer or evaluator after the output has already been produced.
+The primary contributions of this work are:
+• We recast rubrics from an evaluative object consumed by the training pipeline into a prescriptive, step-level
+action-selection signal consumed by the agent at inference time. To our knowledge, Co-ReAct is the first
+system to train rubrics for this role in a ReAct deep research agent.
+• We train the rubric generator with a listwise GRPO objective that rewards rank-correlation with multijudge expert consensus, so the learned rubric is discriminative by construction rather than merely
+plausible.
+• We empirically show that Co-ReAct consistently improves deep-research performance across multiple
+benchmarks, agent backbones, and test-time compute baselines. Plugging the same learned rubric into existing methods further yields positive transfer, indicating that step-level rubric guidance is complementary
+to current inference-time enhancement techniques.
+
+2. Related Work
+2.1. ReAct-paradigm enhancements.
+A first line of work augments a fixed ReAct agent with extra inference-time computation to improve step-level
+decisions. Self-Refine (Madaan et al., 2023) has the agent critique and rewrite its own output; Best-of-N
+samples multiple parallel trajectories and selects among them with an external or self-scoring model; Step-Back
+prompts for a higher-level abstraction of the question before acting; CRITIC issues tool-interactive critique
+queries to verify and correct intermediate steps; Reflexion (Shinn et al., 2023) and Tree-of-Thought (Yao et al.,
+2023) extend the same idea with episodic memory and branching search. In all of these methods the guidance
+signal—critique, scoring model, abstraction prompt—is produced by an untrained, prompted LLM. Co-ReAct
+occupies the same slot in the pipeline but replaces the prompted signal with a GRPO-trained rubric generator
+2
+
+Co-ReAct: Rubrics as Step-Level Collaborators for ReAct Agents
+
+whose output is rank-calibrated against expert consensus, and our plug-in study (Sec. 4.6) shows this trained
+signal is additive with these methods rather than a substitute for them. OnePred (Chen et al., 2026b) also
+models what comes next in an interaction, but predicts the user’s next query from a recursive intent memory
+rather than guiding the search agent’s next action.
+2.2. End-to-end trained search agents.
+A parallel line of work retrains the search policy itself so that the agent issues better queries. Search-R1 (Jin
+et al., 2025), R1-Searcher (Song et al., 2025a), and WebGPT (Nakano et al., 2021) train the policy against
+verifiable or preference-based rewards; MAPD distills structured multi-agent search protocols into a student
+policy (Liu et al., 2026); and DR-Tulu (Shao et al., 2025b) maintains an evolving rubric buffer that supervises
+the policy during training. These methods change what the agent does by modifying the policy itself, whereas
+we train an external guidance signal and leave the search policy untouched; the rubric lives outside the agent
+and is consumed by it at inference time. We therefore view this line as an orthogonal axis of system design and
+do not treat it as a direct baseline; stacking our rubric on top of a trained search agent is out of scope here and
+left to future work.
+2.3. Rubric-based reward and evaluation.
+A growing line of work treats rubrics as a signal for LLM alignment. Rubric-ARM (Xu et al., 2026a) alternates
+RL between a rubric generator and a judge; OpenRubrics (Liu et al., 2025) trains a rubric-conditioned reward
+model on large-scale prompt–rubric data; AdvancedIF (He et al., 2025) trains a rubric verifier for complex
+instruction following; Lv et al. (2026) and DR-Tulu (Shao et al., 2025b) train or evolve rubrics for deep
+research, both at the report level; Seed (Sheng et al., 2026) self-evolves CoT rubrics during RL. DecoEvo
+likewise co-evolves persistent solver and rubric-generator skills, while decoupling generator updates from
+aggregate solver scores (Chen et al., 2026a). Broader LLM-as-a-judge (Lee et al., 2024; Bai et al., 2022) and
+process-reward-model work (Wang et al., 2024; Lightman et al., 2024) similarly use LLM-derived signals to
+score or supervise reasoning steps. In all these settings, the rubric is consumed evaluatively—by a training
+pipeline as reward, judge template, or post-hoc verifier—to decide how much credit an already-produced
+response deserves. Our rubric is consumed prescriptively by the agent itself at inference time, and is generated
+step-by-step from the current partial trajectory rather than once per query or per completed report. To our
+knowledge, Co-ReAct is the first system to train rubrics for this prescriptive, step-level role in a ReAct agent.
+
+3. Method
+Our method has three stages: (i) collect branching points from real ReAct trajectories and label each with an
+expert ranking over candidate next actions, (ii) train a rubric generator with GRPO so that the rubric it emits
+produces a ranking consistent with the expert ranking, and (iii) use the trained rubric at inference time inside
+an inject–verify–retry loop. Figure 1 gives an overview, and the same generator also serves as a drop-in plug-in
+for other test-time methods (Sec. 4.6).
+3.1. Preference Data Collection
+We construct training data from branching points of real ReAct trajectories, so the rubric is supervised on the
+same decision states the downstream agent encounters. Let 𝑞 denote a research query. A ReAct trajectory for 𝑞
+is a sequence of interleaved actions and observations ( 𝑎1 , 𝑜1 , 𝑎2 , 𝑜2 , . . .), where 𝑎𝑡 is the action taken at step 𝑡
+and 𝑜𝑡 is the corresponding observation. We write ℎ𝑡 = ( 𝑎1 , 𝑜1 , . . . , 𝑎𝑡 −1 , 𝑜𝑡 −1 ) for the trajectory prefix up to step
+𝑡.
+Starting from a pool of deep research queries, we run a search agent on each query to obtain a full ReAct
+trajectory. At every tool-calling step 𝑡 , we treat the pair ( 𝑞, ℎ𝑡 ) as a branching point and collect a slate of 𝑘
+candidate next actions A𝑡 = { 𝑎𝑡(1) , . . . , 𝑎𝑡( 𝑘 ) }.
+To ensure the slate is diverse rather than filled with near-duplicates, we generate 12 continuations at each
+branching point by three ReAct agents of different scales—Qwen3-8B, Qwen3-14B, and Qwen3-32B—each
+sampled at temperatures {0.1, 0.4, 0.7, 1.0}. Mixing model scales and temperatures broadens the range of
+3
+
+Co-ReAct: Rubrics as Step-Level Collaborators for ReAct Agents
+
+1 Collect Data
+
+2 Train
+
+Q: Latest advances in software-defined radio?
+a research question
+
+Step 1
+
+a1
+
+a2
+
+a3
+
+a4
+
+google_search
+
+academic _search
+
+google_ search
+
+browse_website
+
+3 Infer
+
+(question, trajectory)
+
+1 Rubric Generator
+
+preference
+batch
+
+Rubric Generator
+
+GRPO
+
+Generated Rubric
+
+Expert Consensus Ranking (Step 1):
+
+Step 2
+
+b1
+
+b2
+
+a3＞ a1 > a2 > a4
+
+b3
+
+c1 [0.4] use google_search
+
+Expert LLMs
+consensus ranking
+
+c2 [0.3] query covers 2022-2025
+c3 [0.2] restrict to en results
+
+b4
+
+At each depth,
+
+c1
+
+academic_search
+
+browse_website
+
+expanding the
+
+1
+
+3
+
+2
+
+Expert LLM
+
+next step
+
+(final depth)
+
+c1
+
+c2
+
+c3
+
+c4
+
+google_search
+
+iacademic _search
+
+browse_website
+
+google_search
+
+Expert Consensus Ranking (Step n): c ＞ c > c > c
+3
+
+1
+
+4
+
+2
+
+Rubric-induced
+Ranking:
+
+reward = Spearman ρ
+
+OBSERVATION
+...after max steps
+
+FINAL ANSWER
+
+ReAct:
+
+Expert Ranking:
+
+Rubric-induced
+Ranking:
+
+Preference Data
+
+Misses ht. parameters
+
+a3 > a1 >a4 >a2
+
+Expert LLM score candidate actions using
+the rubric and derive rankings.
+
+Expert LLMs
+consensus ranking
+
+Query hits 2022-25
+
+aggregate
+score
+
+a3
+a4
+
+Step n
+
+3 VERIFY
+Check rubric
+google search true
+
+Pass
+
+FINAL ANSWER
+
+a2
+
+top-ranked parent
+4
+
+c3
+
+a1
+
+actions and continue
+
+google_ search
+
+Expert Consensus Ranking (Step 2): b ＞ b > b > b
+
+c2
+
+Action
+
+people search("SDR advances 2022-25")
+
+Fail X
+retry action
+with feedback
+
+score candidates with rubric
+sample N candidate
+
+google_search
+
+2 REASON + ACT
+
+Step 2/10 Rubric (example)
+
+[0.4] use google_search (latest version)
+[0.3] query spans dates 2022-NP
+[0.2] Set the“en”for English results
+
+a2 > a4 > a1 > a3
+
+a3 > a1 > a4 > a2
+
+from panel 1
+
+Reason
+
+Act
+
+(3-tuple)
+GRPO update
+
+Co-ReAct:
+Rubric
+
+Observation
+Act
+
+Reason
+Verify
+
+Observation
+
+(5-tuple)
+
+Figure 1 | Overview of Co-ReAct. (i) Collect: sample candidate next actions at each branching point and rank
+them with multi-judge expert consensus. (ii) Train: GRPO with a Spearman reward between the rubric-induced
+ranking and the expert ranking. (iii) Infer: the trained rubric drives a five-tuple (Rubric, Reason, Act, Verify,
+Observe) loop.
+search strategies and surface forms in the slate. From this pool we remove exact duplicates and then select
+𝑘=4 actions using Maximum-Marginal-Relevance with BM25 (Robertson & Zaragoza, 2009) similarity on the
+tokenized action string. We discard branching points that have already emitted a final answer or where fewer
+than 𝑘 distinct actions can be obtained.
+Expert ranking via multi-judge consensus. Each branching point ( 𝑞, ℎ𝑡 , A𝑡 ) is paired with an expert consensus
+ranking 𝜎★𝑡 over A𝑡 that serves as the supervision target. Using a single LLM as a pointwise judge is brittle:
+pointwise scores are poorly calibrated across prompts, and one model’s idiosyncratic preferences become a
+bias shared across all supervision. We therefore use a listwise, multi-judge protocol. The four candidates are
+randomly permuted and relabeled with neutral identifiers { 𝑋, 𝑌 , 𝑍, 𝑊 } to remove positional bias, then shown to
+𝐽 independent frontier LLM judges drawn from different model families. Each judge returns a full ranking
+of the slate rather than a scalar score. We aggregate the rankings via Borda count—each candidate’s rank
+positions across judges are summed into a single score, and 𝜎★𝑡 is the permutation induced by sorting these
+scores. Borda over listwise judgments respects each judge’s full ordering and is robust to a single judge being
+an outlier. We only keep branching points on which at least two judges return a valid, parseable ranking.
+Depth-wise expansion. Branching points at successive depths are collected along a single trajectory spine:
+after obtaining the expert ranking 𝜎★𝑡 at depth 𝑡 , we commit only the top-ranked action 𝑎★𝑡 and its observation
+𝑜★𝑡 to the history, then re-sample a fresh slate A𝑡+1 at the resulting prefix ℎ𝑡+1 .
+3.2. Rubric Generator Training with Listwise GRPO
+We formalize the rubric generator as an autoregressive policy 𝜋𝜃 ( 𝑅 | 𝑞, ℎ𝑡 ) that emits a rubric 𝑅: a short list of
+weighted criteria specifying what a good next action should cover. A rubric is useful only if it can discriminate
+good actions from bad ones at the same branching point; a rubric that sounds plausible but induces a ranking
+uncorrelated with expert consensus is useless. We therefore define the reward of a sampled rubric as the rank
+correlation between the ranking it induces over A𝑡 and the expert consensus ranking 𝜎★𝑡.
+3.2.1. Rubric Reward Design
+Rubric-induced ranking. Given a rubric 𝑅 and a candidate action 𝑎 ∈ A𝑡 , an independent evaluator LLM
+reads ( 𝑞, ℎ𝑡 , 𝑎, 𝑅) and returns the weighted fraction of rubric criteria the action satisfies. Sorting these scores in
+descending order yields the rubric-induced ranking 𝜎
+b𝑡 ( 𝑅).
+4
+
+Co-ReAct: Rubrics as Step-Level Collaborators for ReAct Agents
+
+Listwise Spearman reward. The main reward is the Spearman rank correlation between 𝜎
+b𝑡 ( 𝑅) and 𝜎★𝑡,
+rescaled to [0, 1]:
+
+
+𝑟rank ( 𝑅) = 12 𝜌 𝜎
+b𝑡 ( 𝑅) , 𝜎★𝑡 + 1 ,
+(1)
+where 𝜌 is Spearman’s rank correlation coefficient
+𝜌 ( 𝜎 𝑎 , 𝜎𝑏 ) = 1 −
+
+6
+
+Í𝑛
+
+𝑖=1 𝜎𝑎 ( 𝑖) − 𝜎𝑏 ( 𝑖)
+
+𝑛 ( 𝑛2 − 1)
+
+2
+(2)
+
+,
+
+and 𝜎𝑎 ( 𝑖) , 𝜎𝑏 ( 𝑖) denote the rank of candidate 𝑖 under the two rankings (𝑛 = |A𝑡 |). An anti-correlated ranking
+gets 0, a random ranking gets 0.5 in expectation, and perfect agreement gets 1; a plausible-sounding rubric
+that cannot sort candidates in the expert order earns no credit above chance.
+Total reward. We combine 𝑟rank with two light shaping terms—an atomicity reward 𝑟atom that encourages each
+criterion to check a single verifiable fact, and a format reward 𝑟fmt that enforces the expected schema—into the
+final reward
+𝑟 ( 𝑅) = 𝑤1 𝑟rank ( 𝑅) + 𝑤2 𝑟atom ( 𝑅) + 𝑤3 𝑟fmt ( 𝑅) ,
+(3)
+with 𝑤1 ≫ 𝑤2 , 𝑤3 , so the rank-correlation signal drives learning and the shaping terms only refine how the
+rubric is phrased.
+3.2.2. GRPO Optimization
+We optimize 𝜋𝜃 with Group Relative Policy Optimization (Shao et al., 2024a). For each branching point ( 𝑞, ℎ𝑡 ),
+we sample a group of 𝐺 rubrics { 𝑅1 , . . . , 𝑅𝐺 } from the current policy 𝜋𝜃old and compute the rewards {𝑟 ( 𝑅 𝑖 )}𝐺𝑖=1
+via Eq. 3. The policy is updated with the standard clipped surrogate objective:
+𝐺
+
+L ( 𝜃) = −
+
+1 ∑︁
+𝐺
+
+min 𝜔𝑖 𝐴ˆ𝑖 , clip( 𝜔𝑖 , 1−𝜖, 1+𝜖) 𝐴ˆ𝑖
+
+𝑖=1
+
+
+(4)
+
+
+
++ 𝛽 𝕂𝕃 𝜋𝜃 ∥ 𝜋ref ,
+where 𝜔𝑖 = 𝜋𝜃 ( 𝑅 𝑖 | 𝑞, ℎ𝑡 )/𝜋𝜃old ( 𝑅 𝑖 | 𝑞, ℎ𝑡 ) is the importance ratio, and advantages are normalized within each
+group:
+𝑟 ( 𝑅 𝑖 ) − mean({𝑟 ( 𝑅 𝑗 )}𝐺𝑗=1 )
+𝐴ˆ𝑖 =
+.
+(5)
+std({𝑟 ( 𝑅 𝑗 )}𝐺𝑗=1 )
+The output of this stage is the trained generator 𝜋★𝜃, which at inference time takes any ( 𝑞, ℎ𝑡 ) and emits a rubric
+targeting the next search step.
+3.3. Co-ReAct Inference: Inject, Verify, Retry
+At inference time we use 𝜋★𝜃 to drive a rubric-guided ReAct loop, extending ReAct’s three-tuple (Reason, Act,
+Observe) to a five-tuple (Rubric, Reason, Act, Verify, Observe). At each tool-calling step with history ℎ𝑡 , Co-ReAct
+performs three operations:
+1. Inject. The rubric generator produces 𝑅𝑡 ∼ 𝜋★𝜃 (· | 𝑞, ℎ𝑡 ), which is appended to the agent’s context as an
+explicit specification of what the next action should cover. The search agent then decides on a next action
+𝑎𝑡 conditioned on both ℎ𝑡 and 𝑅𝑡 .
+2. Verify. Before executing the action, an independent verifier LLM reads ( 𝑞, ℎ𝑡 , 𝑎𝑡 , 𝑅𝑡 ) and checks each
+criterion in 𝑅𝑡 against the proposed action, returning a per-criterion verdict. The step is accepted if the
+weighted fraction of satisfied criteria exceeds a threshold 𝜏.
+3. Retry. If the step fails verification, the agent is asked once to re-plan the step with the same rubric 𝑅𝑡 and
+the verifier’s per-criterion feedback pinned in context, so it can directly address the failed criteria. The
+retried step replaces the failed one, and at most one retry is issued per step to bound compute.
+The rubric generator, search agent, and verifier each play a distinct role, so the trained rubric can also be
+used outside this loop: we simply inject 𝑅𝑡 into a baseline’s context and skip the verify–retry step, letting the
+baseline’s own decision mechanism consume the rubric (Sec. 4.6).
+5
+
+Co-ReAct: Rubrics as Step-Level Collaborators for ReAct Agents
+
+4. Experiments
+4.1. Experimental Settings
+Datasets. We evaluate on two deep research benchmarks that stress different aspects of open-ended, citationgrounded research. DeepResearchBench (DRB) (Du et al., 2025) contains Chinese and English research
+questions that require multi-turn web search and long-form report generation with citations, and is judged under
+the RACE protocol that scores comprehensiveness, insight, instruction following, and readability. SQA-CS-V2
+(Asai et al., 2024) contains scientific questions that require search and citation-grounded synthesis; evaluation
+focuses on factual completeness (ingredient recall, answer precision) and citation quality (citation recall and
+precision).
+Evaluation Metrics. For DRB, we report the RACE metric comprising Comprehensiveness (Comp.), Insight
+(Ins.), Instruction Following (IF), Readability (Read.), and their Global Average (Avg.). For SQA-CS-V2, we
+report Ingredient Recall (IR), Answer Precision (AP), Citation Recall (CR), Citation Precision (CP), and their
+Global Average (Avg.).
+Agent Architecture and Tool Set. All methods share a two-stage pipeline: a search agent gathers evidence
+through a ReAct loop, and an answer agent synthesizes a citation-grounded report from the full trajectory.
+The search agent has access to three tools: an academic search tool, a Google search tool, and a webpage
+browsing tool. It interleaves these tool calls with reasoning steps. Baselines differ only in how the search agent
+decides what to call next or whether to retry. The tool set and answer agent are identical across methods, so
+comparisons isolate decision quality from writing ability.
+Compared Methods. We compare Co-ReAct against four test-time methods on the same ReAct loop: SelfRefine (Madaan et al., 2023) applies iterative self-critique at each step, retrying when the agent judges its own
+output insufficient; Best-of-N (Snell et al., 2024) samples 𝑁 =4 trajectories at temperature 0.7 and picks the
+best via an external scorer (answer generation is greedy); Step-Back (Zheng et al., 2024) prepends a high-level
+perspective before each action to encourage broader reasoning; CRITIC (Gou et al., 2024) runs a verification
+search after each action to generate grounded feedback for retries. Co-ReAct (Ours) emits a calibrated rubric
+from an RL-trained generator before each step, injects it as structured guidance, and verifies the action against
+the criteria with targeted retry on failure.
+Table 1 | Comparison results on DeepResearchBench (DRB) and SQA-CS-V2 with two search agents. All methods
+use Qwen3-235B as the answer rewriter to isolate search quality from writing ability. Improvement (%) is
+relative to ReAct. Bold: best; underline: second best.
+Model
+
+DeepResearchBench
+
+Method
+
+SQA-CS-V2
+
+Comp.
+
+Ins.
+
+IF
+
+Read.
+
+Avg.
+
+IR
+
+AP
+
+CR
+
+CP
+
+Avg.
+
+30.13
+30.71
+30.19
+28.40
+30.25
+31.48
+
+27.42
+27.66
+26.82
+25.97
+27.45
+28.18
+
+40.58
+41.44
+40.90
+39.50
+41.03
+41.19
+
+37.82
+38.25
+38.62
+37.95
+37.93
+39.26
+
+33.18
+33.71
+33.27
+32.05
+33.37
+34.01
+
+49.01
+50.25
+45.77
+43.02
+50.56
+50.91
+
+76.74
+77.07
+75.66
+81.08
+74.93
+79.99
+
+71.29
+72.71
+67.93
+66.24
+68.77
+73.45
+
+93.98
+96.70
+90.98
+85.65
+92.50
+94.84
+
+72.76
+74.18
+70.08
+69.00
+71.69
+74.80
+
+Improvement (%)
+
+4.5% ↑
+
+2.8% ↑ 1.5% ↑ 3.8% ↑ 2.5% ↑ 3.9% ↑ 4.2% ↑ 3.0% ↑ 0.9% ↑ 2.8% ↑
+
+ReAct
+Self-Refine
+Best-of-N
+Qwen3-14B
+Step-Back
+CRITIC
+Co-ReAct
+
+31.25
+31.37
+30.34
+27.93
+32.53
+34.63
+
+28.29
+28.64
+27.04
+25.55
+30.35
+31.76
+
+Qwen3-8B
+
+ReAct
+Self-Refine
+Best-of-N
+Step-Back
+CRITIC
+Co-ReAct
+
+Improvement (%)
+
+41.44
+41.17
+40.74
+39.39
+42.64
+43.50
+
+39.39
+38.83
+37.99
+37.58
+40.17
+40.52
+
+34.23
+34.24
+33.19
+31.69
+35.64
+36.92
+
+48.23
+49.72
+44.98
+43.61
+50.63
+57.62
+
+73.43
+77.69
+78.40
+82.19
+75.96
+75.29
+
+71.58
+71.81
+69.25
+62.31
+71.63
+73.82
+
+10.8% ↑ 12.3% ↑ 5.0% ↑ 2.9% ↑ 7.9% ↑ 19.5% ↑ 2.5% ↑ 3.1% ↑
+
+97.67
+97.65
+90.61
+84.65
+95.36
+97.48
+
+72.73
+74.22
+70.81
+68.19
+73.40
+76.05
+
+–
+
+4.6% ↑
+
+Implementation Details. We use Qwen3-8B and Qwen3-14B as search agents (vLLM, greedy decoding); the
+rubric generator is initialized from Qwen3-14B and GRPO-trained on branching-point data from the DR-Tulu
+training queries (Shao et al., 2025b), with expert rankings from a three-judge council (Claude 4.5 Sonnet,
+Gemini 2.5 Pro, GPT-5) aggregated by Borda count. To isolate search quality from writing ability, all methods
+6
+
+Co-ReAct: Rubrics as Step-Level Collaborators for ReAct Agents
+
+Table 2 | Ablation study on SQA-CS-V2 (Qwen3-8B search agent). Each row removes one component from the
+full Co-ReAct method.
+Method
+w/o Co-ReAct
+w/o RL Rubric
+w/o Listwise
+w/o Verification
+Co-ReAct (Full)
+
+RL Training
+
+Verify
+
+Global Avg.
+
+✗
+✗
+Pairwise
+Listwise
+Listwise
+
+✗
+✓
+✓
+✗
+✓
+
+72.76
+72.44
+74.04
+74.08
+74.80
+
+Table 3 | Search behavior analysis on SQA-CS-V2 (Qwen3-8B search agent).
+Method
+
+Tool Calls
+
+Links
+
+Citations
+
+Utils
+
+ReAct
+Self-Refine
+Best-of-N
+Step-Back
+CRITIC
+Co-ReAct
+
+5.2
+4.3
+3.0
+4.1
+5.0
+6.5
+
+12.7
+16.6
+9.7
+10.5
+14.2
+19.3
+
+11.2
+15.1
+8.2
+9.1
+12.8
+18.6
+
+0.88
+0.91
+0.85
+0.87
+0.90
+0.96
+
+share the same answer rewriter Qwen3-235B. For evaluation we adopt each benchmark’s official setting: DRB
+is scored by the official RACE protocol (Du et al., 2025) with Gemini as the judge, and SQA-CS-V2 is scored by
+its official evaluation script (Asai et al., 2024) also with Gemini as the judge. Full data-collection statistics,
+judge configuration, and hyperparameters are in Appendix A.
+4.2. Main Results
+Results on DRB and SQA-CS-V2 are shown in Table 1.
+(1) Co-ReAct achieves the best Global Average on both benchmarks and both scales, confirming that rubricguided search consistently yields higher-quality trajectories. With Qwen3-8B, it improves over the strongest
+baseline Self-Refine by 0.89% on DRB and 0.84% on SQA. Gains amplify with Qwen3-14B: 7.86% on DRB and
+4.56% on SQA over ReAct, surpassing the second-best CRITIC by 3.59% on DRB and Self-Refine by 2.47% on
+SQA.
+(2) Self-Refine and CRITIC are the most competitive baselines. Both share the intuition behind our
+verification component, which is to catch and correct suboptimal actions. However, they rely on the search
+agent to diagnose its own quality gaps. In contrast, Co-ReAct offloads this process to a dedicated RL-trained
+rubric generator, yielding more targeted guidance.
+(3) Best-of-N and Step-Back consistently underperform on SQA. Best-of-N produces shorter trajectories on
+average (3.0 tool calls vs. 5.2 for ReAct; Table 3) because its candidates tend to stop once a plausible answer
+appears, and the best-scoring candidate is often one of these shorter, less exhaustive runs. Step-Back’s abstract
+perspective diverts the agent from fine-grained retrieval—though it achieves the highest Answer Precision on
+SQA (81.08 / 82.19), suggesting abstraction trades recall for precision.
+(4) The scaling behavior from 8B to 14B reveals a clear trend: Co-ReAct’s relative gain over ReAct grows
+from 2.50% to 7.86% on DRB and from 2.80% to 4.56% on SQA, indicating that stronger agents better leverage
+structured rubric guidance. The largest sub-metric gain, 19.5% on Ingredient Recall at 14B, shows the rubric
+especially helps the agent cover more key information points.
+4.3. Ablation Study
+Table 2 isolates the contribution of each Co-ReAct component on SQA-CS-V2.
+All three components, listwise training, RL optimization, and verification, are essential. w/o Co-ReAct
+(72.76): removing the rubric mechanism reduces the method to standard ReAct. w/o RL Rubric (72.44):
+
+7
+
+Co-ReAct: Rubrics as Step-Level Collaborators for ReAct Agents
+
+ReAct
+
+Self-Refine
+
+Best-of-N
+
+Step-Back
+
+CRITIC
+
+Co-ReAct
+
+44.25
+
+44
+42
+
+41.37
+
+Score
+
+40
+38
+
+37.13
+
+36
+34
+
+33.40
+
+32.49
+
+32
+30
+28
+
+Comp.
+
+Ins.
+
+IF
+
+Read.
+
+Overall
+
+Figure 2 | DRB RACE sub-metric results with Gemini 3.1 Pro used as the search agent, answer generator, and
+rubric generator. Co-ReAct achieves the best score on every sub-metric. Dashed lines mark the ReAct baseline
+in each group.
+replacing the RL-trained generator with an untrained base model hurts performance below even ReAct,
+confirming that rubric quality matters. Miscalibrated rubrics mislead the agent rather than guide it. w/o
+Listwise (74.04): switching listwise to pairwise GRPO degrades performance, because listwise Spearman
+optimization provides richer gradient signals across full rankings. w/o Verification (74.08): removing verifyand-retry reduces Global Average by 0.96%; the verification step catches 21.4% of tool calls that fail rubric
+criteria and triggers targeted retries (Section 4.5).
+4.4. Generalization to Commercial Models
+To verify the effectiveness of the Co-ReAct paradigm itself under a closed-source setting, we further apply a
+prompt-only Co-ReAct variant to Gemini 3.1 Pro on DRB. In this setting, Gemini serves as the search agent
+and answer generator, and is prompted to generate step-level rubrics and verification feedback without GRPO
+fine-tuning (Figure 2).
+Co-ReAct reaches 37.13 Overall RACE, improving over ReAct by 4.44% and over the strongest baseline
+Step-Back by 3.89%. All other test-time methods (Self-Refine, Best-of-N, CRITIC) fail to improve over ReAct
+on this strong model, suggesting that self-correction and resampling offer diminishing returns when the base
+agent is already capable.
+4.5. Search Behavior
+Co-ReAct produces more thorough search trajectories. Table 3 compares search behavior. Co-ReAct averages
+6.5 tool calls and 19.3 links per question vs. 5.2 / 12.7 for ReAct—a ∼52% increase in retrieved documents
+with only ∼25% more tool calls, indicating the rubric guides the agent toward more targeted queries rather
+than simply increasing search volume. CRITIC uses comparable tool calls (5.0) but retrieves fewer links (14.2),
+suggesting its verification searches check existing results rather than discover new ones. Co-ReAct also produces
+the largest pool of unique cited sources (18.6), a ∼66% relative gain over ReAct (11.2) and above every baseline.
+Despite retrieving the most links, Co-ReAct achieves the highest utilization ratio (Utils 0.96 vs. 0.88–0.91),
+which we attribute to the rubric’s ability to generate more step-appropriate queries that steer the agent toward
+more relevant and useful evidence.
+Verification is well-calibrated. Across the SQA evaluation set, Co-ReAct executes 743 rubric-guided steps
+(7.4 per example); 159 (21.4%) fail verification and trigger a retry. This rate balances quality and efficiency,
+and the improvement from inject-only (74.08) to full Co-ReAct (74.80) confirms these retries meaningfully
+improve search quality.
+4.6. Plug-in Rubric Portability Study
+We test whether the trained rubric can be reused outside the Co-ReAct loop by injecting the 14B rubric generator
+into Best-of-N, Step-Back, and CRITIC as a drop-in context signal, with verify-and-retry disabled and all other
+8
+
+Co-ReAct: Rubrics as Step-Level Collaborators for ReAct Agents
+
+(a) DeepResearchBench
+
+(b) SQA-CS-V2
+78
+
+Score with rubric injected
+
+37
+
+36.4
+
+35.7
+
+35
+
+36.3
+
+CRITIC
++1.8%
+
+33.2
+
+33
+
+70.8
+
+68.2
+
+68
+
+Step-Back
++14.8%
+
+31
+
+73.4
+
+72
+
+70
+
+31.7
+
+31
+
+74.2
+CRITIC
++1.2%
+
+74
+
+35.6
+
+Best-of-N
++7.6%
+33
+
+35
+
+Original score
+
+Best-of-N
+75.7+6.9%
+
+75.3
+
+76
+
+37
+
+Step-Back
++10.5%
+
+68
+
+70
+
+72
+
+74
+
+76
+
+78
+
+Original score
+
+Figure 3 | Plug-in rubric portability. The rubric trained inside Co-ReAct is injected into three other test-time
+methods (with verify-and-retry disabled) on DRB and SQA. Arrows connect each method’s original score
+(hollow) to its score after rubric injection (filled).
+components unchanged. Evaluation follows Table 1’s protocol on both DRB and SQA ; results are in Figure 3.
+The rubric yields positive transfer in all six (method, benchmark) cells, with the largest gains on the weakest
+method (Step-Back) and the smallest on the method whose built-in tool-interactive critique already overlaps
+with the rubric signal (CRITIC). The rubric is thus complementary to existing test-time compute techniques,
+not a substitute, and can serve as a drop-in component on top of them.
+4.7. Case Study
+Figure 4 illustrates the rubric–verify–retry mechanism on a single SQA-CS-V2 question about DepthCrafter.
+ReAct and Co-ReAct issue identical first two actions; at 𝑎3 , the rubric guides Co-ReAct to open the arXiv page
+rather than issuing another snippet query. The initial attempt fails verification due to wrong tool selection and
+insufficient disambiguation, triggering a retry with browse_webpage. This single corrected action produces
+the third answer bullet that ReAct gets wrong, demonstrating how step-level rubrics translate into concrete
+factual improvements.
+
+5. Conclusion
+We presented Co-ReAct, a rubric-guided extension of ReAct that inserts a Rubric stage before action and
+a Verify stage after, turning the agent’s three-tuple into a five-tuple (Rubric, Reason, Act, Verify, Observe).
+The rubric generator is trained with listwise GRPO, using Spearman agreement between rubric-induced and
+expert rankings as the reward. Across DeepResearchBench and SQA-CS-V2, Co-ReAct consistently outperforms
+Self-Refine, Best-of-N, Step-Back, and CRITIC on Qwen3-8B, Qwen3-14B, and Gemini 3.1 Pro agents; the
+learned rubric also transfers as a drop-in module, improving every baseline it is plugged into. These results
+suggest that externally generated, trajectory-aware rubrics are a lightweight and composable way to improve
+agentic search.
+
+Limitations
+Scope of the method. Co-ReAct is a ReAct-paradigm enhancement: it sits on top of a fixed search policy
+and improves step-level decision quality through additional inference-time computation, without retraining
+the underlying agent. Accordingly, we compare against other ReAct enhancements (Self-Refine, Best-of-N,
+Step-Back, CRITIC) and do not benchmark against end-to-end RL-trained search agents such as Search-R1 or
+R1-Searcher, which retrain the policy itself and belong to an orthogonal line of work. Our plug-in study only
+
+9
+
+Co-ReAct: Rubrics as Step-Level Collaborators for ReAct Agents
+
+Q: What is DepthCrafter and how does it differ from prior monocular depth estimators?
+ReAct
+a1
+
+academic_search (query="DepthCrafter
+video depth", year="2024", limit=8)
+
+Answer - ReAct
+
+obs: 3 arXiv hits, top = DepthCrafter
+
+a2
+
+a3
+
+1.
+
+DepthCrafter estimates consistent depth
+for long videos (~110 frames).
+
+obs: project page + press coverage
+
+2.
+
+Released by Tencent AI Lab;
+CVPR 2025 Oral.
+
+academic_search (query="DepthCrafter
+architecture details", year="2024",
+limit=8)
+
+3.
+
+Uses a diffusion-based video model
+trained from scratch.
+(inconsistent w/ primary source)
+
+google_search(query="DepthCrafter
+paper CVPR 2025")
+
+obs: abstract snippet only
+
+Co-ReAct
+a1
+
+academic_search (query="DepthCrafter
+video depth", year="2024", limit=8)
+
+obs: 3 arXiv hits, top = DepthCrafter
+
+a2
+
+google_search(query="DepthCrafter
+paper CVPR 2025")
+
+obs: project page + press coverage
+
+a3
+
+Answer - Co-ReAct
+
+Rubric (a3)
+1. [0.5] Use browse webpage to open the primary source
+2. [0.3] Query must compare against Marigold / ChronoDepth
+3. [0.2] Restrict results to year 2024
+
+attempt 1
+academic_search(query="DepthCrafter
+architecture details", year="2024", limit=8)
+
+Verify
+
+Fails criteria 1 & 2: wrong tool (snippet not primary source);
+query does not compare against Marigold / ChronoDepth.
+attempt 2 (retry)
+
+browse_webpage(url="https://arxiv.org/abs/2409.02095") Verify pass
+obs: "fine-tunes Stable Video Diffusion"; distinct
+from Marigold / ChronoDepth
+
+1.
+
+DepthCrafter estimates consistent depth
+for long videos (~110 frames).
+
+2.
+
+Released by Tencent AI Lab;
+CVPR 2025 Oral.
+
+3.
+
+Fine-tunes Stable Video Diffusion
+
+rather than training from scratch;
+distinct from Marigold and
+ChronoDepth, which operate frame-wise
+on image diffusion models.
+retry output
+
+this retry produces this answer point
+
+Figure 4 | Case study: ReAct vs. Co-ReAct on the same SQA-CS-V2 question (DepthCrafter). Co-ReAct’s rubric–
+verify–retry mechanism at 𝑎3 corrects a factual error that ReAct fails to catch.
+evaluates compositionality within the ReAct-enhancement family; whether the trained rubric can be stacked
+on top of RL-trained search agents is an open question we leave to future work.
+Evaluation scale and judging. Our evaluation relies on LLM-based judges (Gemini for DRB and SQA, and
+a three-model council during rubric training), which inherit known failure modes of LLM-as-a-judge such as
+verbosity bias.
+
+References
+Akari Asai, E Chen, K Chen, J Luo, X Qiu, H Peng, M Tan, M Yasunaga, P Liang, and L Dong. Openscholar:
+synthesizing scientific literature with retrieval-augmented language models. Preprint at Arxiv https://arxiv.
+org/abs/2411.14199, 2024.
+Yuntao Bai, Saurav Kadavath, Sandipan Kundu, Amanda Askell, Jackson Kernion, Andy Jones, Anna Chen,
+Anna Goldie, Azalia Mirhoseini, Cameron McKinnon, et al. Constitutional ai: Harmlessness from ai feedback.
+arXiv preprint arXiv:2212.08073, 2022.
+Susan M Brookhart. Appropriate criteria: Key to effective rubrics. In Frontiers in education, volume 3, pp. 22.
+Frontiers Media SA, 2018.
+
+10
+
+Co-ReAct: Rubrics as Step-Level Collaborators for ReAct Agents
+
+Jiangwang Chen, Zixin Song, Junlin Liu, Shuaiyu Zhou, Haiyan Wu, Haihan Shi, Chenxi Zhou, Hanqing Li,
+Xiao Yang, Da Zhu, Guanjun Jiang, Hai Wan, and Xibin Zhao. Decoevo: Score-decoupled co-evolution
+of solver and rubric-generator skills in text space. arXiv preprint arXiv:2607.25675, 2026a. URL https:
+//arxiv.org/abs/2607.25675.
+Jiangwang Chen, Bowen Zhang, Zixin Song, Jiazheng Kang, Xiao Yang, Da Zhu, and Guanjun Jiang.
+Onepred: Next-query prediction via recursive intent memory in multi-turn conversations. arXiv preprint
+arXiv:2605.23668, 2026b. URL https://arxiv.org/abs/2605.23668.
+Mingxuan Du, Benfeng Xu, Chiwei Zhu, Xiaorui Wang, and Zhendong Mao. Deepresearch bench: A comprehensive benchmark for deep research agents. arXiv preprint arXiv:2506.11763, 2025.
+Zhibin Gou, Zhihong Shao, Yeyun Gong, Yujiu Yang, Nan Duan, Weizhu Chen, et al. Critic: Large language
+models can self-correct with tool-interactive critiquing. In International Conference on Learning Representations,
+volume 2024, pp. 57734–57811, 2024.
+Anisha Gunjal, Anthony Wang, Elaine Lau, Vaskar Nath, Yunzhong He, Bing Liu, and Sean Hendryx. Rubrics as
+rewards: Reinforcement learning beyond verifiable domains. arXiv preprint arXiv:2507.17746, 2025.
+Yun He, Wenzhe Li, Hejia Zhang, Songlin Li, Karishma Mandyam, Sopan Khosla, Yuanhao Xiong, Nanshu
+Wang, Xiaoliang Peng, Beibin Li, et al. Advancedif: Rubric-based benchmarking and reinforcement learning
+for advancing llm instruction following. arXiv preprint arXiv:2511.10507, 2025.
+Bowen Jin, Hansi Zeng, Zhenrui Yue, Jinsung Yoon, Sercan Arik, Dong Wang, Hamed Zamani, and Jiawei Han.
+Search-r1: Training llms to reason and leverage search engines with reinforcement learning. arXiv preprint
+arXiv:2503.09516, 2025.
+Harrison Lee, Samrat Phatale, Hassan Mansoor, Thomas Mesnard, Johan Ferret, Kellie Ren Lu, Colton Bishop,
+Ethan Hall, Victor Carbune, Abhinav Rastogi, and Sushant Prakash. RLAIF vs. RLHF: Scaling reinforcement
+learning from human feedback with AI feedback. In Proceedings of the 41st International Conference on
+Machine Learning, volume 235 of Proceedings of Machine Learning Research, pp. 26874–26901. PMLR, 2024.
+Hunter Lightman, Vineet Kosaraju, Yuri Burda, Harrison Edwards, Bowen Baker, Teddy Lee, Jan Leike, John
+Schulman, Ilya Sutskever, and Karl Cobbe. Let’s verify step by step. In International Conference on Learning
+Representations, volume 2024, pp. 39578–39601, 2024.
+Junlin Liu, Jiangwang Chen, Zixin Song, Shuaiyu Zhou, Chunji Lv, Hank Wu, Kailin Jiang, Jinyang Wu, Bohan
+Yu, and Chenxi Zhou. From proprietary to open-source: Bridging the distribution gap via multi-agent protocol
+distillation in agentic search. arXiv preprint arXiv:2607.24280, 2026. URL https://arxiv.org/abs/
+2607.24280.
+Tianci Liu, Ran Xu, Tony Yu, Ilgee Hong, Carl Yang, Tuo Zhao, and Haoyu Wang. Openrubrics: Towards
+scalable synthetic rubric generation for reward modeling and llm alignment. arXiv preprint arXiv:2510.07743,
+2025.
+Changze Lv, Jie Zhou, Wentao Zhao, Jingwen Xu, Zisu Huang, Muzhao Tian, Shihan Dou, Tao Gui, Le Tian,
+Xiao Zhou, et al. Learning query-specific rubrics from human preferences for deepresearch report generation.
+arXiv preprint arXiv:2602.03619, 2026.
+Aman Madaan, Niket Tandon, Prakhar Gupta, Skyler Hallinan, Luyu Gao, Sarah Wiegreffe, Uri Alon, Nouha
+Dziri, Shrimai Prabhumoye, Yiming Yang, et al. Self-refine: Iterative refinement with self-feedback. Advances
+in neural information processing systems, 36:46534–46594, 2023.
+Reiichiro Nakano, Jacob Hilton, Suchir Balaji, Jeff Wu, Long Ouyang, Christina Kim, Christopher Hesse,
+Shantanu Jain, Vineet Kosaraju, William Saunders, et al. Webgpt: Browser-assisted question-answering with
+human feedback. arXiv preprint arXiv:2112.09332, 2021.
+W. James Popham. What’s wrong—and what’s right—with rubrics. Educational Leadership, 55(2):72–75, 1997.
+Stephen Robertson and Hugo Zaragoza. The probabilistic relevance framework: BM25 and beyond. Foundations
+and Trends in Information Retrieval, 3(4):333–389, 2009.
+
+11
+
+Co-ReAct: Rubrics as Step-Level Collaborators for ReAct Agents
+
+Jiaqi Shao, Yuxiang Lin, Munish Prasad Lohani, Yufeng Miao, and Bing Luo. Do llm agents know how to
+ground, recover, and assess? a benchmark for epistemic competence in information-seeking agents. arXiv
+preprint arXiv:2509.22391, 2025a.
+Rulin Shao, Akari Asai, Shannon Zejiang Shen, Hamish Ivison, Varsha Kishore, Jingming Zhuo, Xinran Zhao,
+Molly Park, Samuel G Finlayson, David Sontag, et al. Dr tulu: Reinforcement learning with evolving rubrics
+for deep research. arXiv preprint arXiv:2511.19399, 2025b.
+Zhihong Shao, Peiyi Wang, Qihao Zhu, Runxin Xu, Junxiao Song, Xiao Bi, Haowei Zhang, Mingchuan Zhang,
+YK Li, Yang Wu, et al. Deepseekmath: Pushing the limits of mathematical reasoning in open language models.
+arXiv preprint arXiv:2402.03300, 2024a.
+Zhihong Shao, Peiyi Wang, Qihao Zhu, Runxin Xu, Junxiao Song, Xiao Bi, Haowei Zhang, Mingchuan Zhang,
+YK Li, Yang Wu, et al. Deepseekmath: Pushing the limits of mathematical reasoning in open language models.
+arXiv preprint arXiv:2402.03300, 2024b.
+Leheng Sheng, Wenchang Ma, Ruixin Hong, Xiang Wang, An Zhang, and Tat-Seng Chua. Reinforcing chain-ofthought reasoning with self-evolving rubrics. arXiv preprint arXiv:2602.10885, 2026.
+Noah Shinn, Federico Cassano, Ashwin Gopinath, Karthik Narasimhan, and Shunyu Yao. Reflexion: Language
+agents with verbal reinforcement learning. Advances in neural information processing systems, 36:8634–8652,
+2023.
+Charlie Snell, Jaehoon Lee, Kelvin Xu, and Aviral Kumar. Scaling llm test-time compute optimally can be more
+effective than scaling model parameters. arXiv preprint arXiv:2408.03314, 2024.
+Huatong Song, Jinhao Jiang, Yingqian Min, Jie Chen, Zhipeng Chen, Wayne Xin Zhao, Lei Fang, and Ji-Rong
+Wen. R1-searcher: Incentivizing the search capability in llms via reinforcement learning. arXiv preprint
+arXiv:2503.05592, 2025a.
+Zixin Song, Bowen Zhang, Qian-Wen Zhang, Di Yin, Xing Sun, and Chunping Li. Poli-rl: A point-to-list reinforcement learning framework for conditional semantic textual similarity. arXiv preprint arXiv:2510.04080,
+2025b.
+Charles Spearman. The proof and measurement of association between two things. The American Journal of
+Psychology, 15(1):72–101, 1904. doi: 10.2307/1412159.
+Peiyi Wang, Lei Li, Zhihong Shao, Runxin Xu, Damai Dai, Yifei Li, Deli Chen, Yu Wu, and Zhifang Sui. Mathshepherd: Verify and reinforce llms step-by-step without human annotations. In Proceedings of the 62nd
+Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pp. 9426–9439,
+2024.
+Yiding Wang, Zhepei Wei, Xinyu Zhu, and Yu Meng. Beyond outcome reward: Decoupling search and answering
+improves llm agents. arXiv preprint arXiv:2510.04695, 2025.
+Ran Xu, Tianci Liu, Zihan Dong, Tony Yu, Ilgee Hong, Carl Yang, Linjun Zhang, Tao Zhao, and Haoyu Wang.
+Alternating reinforcement learning for rubric-based reward modeling in non-verifiable llm post-training.
+arXiv preprint arXiv:2602.01511, 2026a.
+Ran Xu, Tianci Liu, Zihan Dong, Tony Yu, Ilgee Hong, Carl Yang, Linjun Zhang, Tao Zhao, and Haoyu Wang.
+Alternating reinforcement learning for rubric-based reward modeling in non-verifiable llm post-training.
+arXiv preprint arXiv:2602.01511, 2026b.
+Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran, Karthik Narasimhan, and Yuan Cao. React:
+Synergizing reasoning and acting in language models. arXiv preprint arXiv:2210.03629, 2022.
+Shunyu Yao, Dian Yu, Jeffrey Zhao, Izhak Shafran, Tom Griffiths, Yuan Cao, and Karthik Narasimhan. Tree of
+thoughts: Deliberate problem solving with large language models. Advances in neural information processing
+systems, 36:11809–11822, 2023.
+Huaixiu Steven Zheng, Swaroop Mishra, Xinyun Chen, Heng-Tze Cheng, Ed H Chi, Quoc V Le, and Denny Zhou.
+Take a step back: Evoking reasoning via abstraction in large language models. In International Conference on
+Learning Representations, volume 2024, pp. 20279–20316, 2024.
+
+12
+
+Co-ReAct: Rubrics as Step-Level Collaborators for ReAct Agents
+
+A. Additional Implementation Details
+This appendix records the concrete hyperparameters and configuration choices referenced from Sec. 3 and the
+Experimental Settings.
+Rubric training data. We collect branching-point data (Sec. 3.1) from 11,406 research queries drawn from
+the training set of DR-Tulu (Shao et al., 2025b), so that the rubric generator is supervised on the same query
+distribution as the downstream deep research setting. For each query, we construct a trajectory through
+depth-wise expansion rather than rolling out a fixed single-agent trajectory. At each branching point, we
+sample 12 candidate next actions using three ReAct agents of different scales—Qwen3-8B, Qwen3-14B, and
+Qwen3-32B—each decoded at four temperatures {0.1, 0.4, 0.7, 1.0}. The candidate slate is then ranked by
+the multi-judge expert consensus procedure described in Sec. 3.1, and the top-ranked action is executed to
+extend the trajectory prefix for the next depth. From each candidate pool, we remove exact duplicates and
+select 𝑘=4 diverse actions via Maximum-Marginal-Relevance with BM25 similarity on the tokenized action
+string. After discarding branching points where the agent has already emitted a final answer or where fewer
+than four distinct actions can be obtained, we obtain 29,866 branching points used as the unit of supervision.
+Expert consensus judges. For each branching point, the four candidates are relabeled { 𝑋, 𝑌 , 𝑍, 𝑊 } under
+a random permutation and submitted to a council of 𝐽 =3 frontier LLM judges drawn from different model
+families: Claude 4.5 Sonnet, Gemini 2.5 Pro, and GPT-5. Each judge is asked for a full listwise ranking (not
+a scalar score) with a chain-of-thought rationale; rankings are parsed from the judge’s final answer block.
+GRPO hyperparameters. The rubric generator is initialized from Qwen3-14B and trained with GRPO on D ★.
+We sample 𝐺 =8 rubrics per branching point and form group-relative advantages within each group. The reward
+mixes the listwise Spearman term with atomicity and format terms at weights ( 𝑤1 , 𝑤2 , 𝑤3 ) = (0.75, 0.15, 0.10),
+and a repetition gate zeroes out the total reward whenever the 4-gram repetition rate of the rubric exceeds
+40%. The Spearman ranking is computed by an independent evaluator LLM (Gemini 2.5 Pro) that scores each
+candidate against the sampled rubric. We train for 2 epochs with learning rate 2 × 10−6 , a KL coefficient of
+5 × 10−3 against a frozen reference policy, and gradient clipping at norm 1.0.
+Co-ReAct inference. At inference time, the rubric generator is served via vLLM with temperature 0 and a
+maximum of 1024 output tokens per rubric; the search agent and the independent verifier both run on the
+same base model with temperature 0. Verification accepts a step when the weighted fraction of satisfied rubric
+criteria exceeds 𝜏 = 0.6, and at most one retry is issued per step (max_retries=1) to bound compute. Each
+search trajectory is truncated to a 8,000-token budget before the answer-rewriter stage, matching the protocol
+used for all baselines.
+
+13
+
+

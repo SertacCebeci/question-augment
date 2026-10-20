@@ -1,0 +1,2164 @@
+Towards Active Synthetic Data Generation
+for Finetuning Language Models
+
+arXiv:2512.00884v2 [cs.LG] 9 Feb 2026
+
+Samuel Kessler∗†, Menglin Xia†, Daniel Madrigal Diaz†,
+Dongge Han†, Helia Heshemi†, Saravan Rajmohan†, Victor Ruehle‡†, Jordan T. Ash‡§
+
+Abstract
+A common and effective means for improving language model capabilities involves finetuning
+a “student” language model’s parameters on generations from a more proficient “teacher” model.
+Termed “synthetic data”, these generations are often produced before any student finetuning,
+but some work has considered generating new synthetic samples as training progresses. This
+paper studies and advocates for the latter case, where data are generated in an iterative, closedloop fashion that is guided by the current state of the student model. For a fixed budget of
+generated samples, or a budget in terms of compute spent querying a teacher, we show that
+this curation of finetuning data affords improved student performance over static generation.
+Further, while there have been several LLM-specific methods proposed that operate in this
+regime, we find that simple, inexpensive selection criteria from the active learning literature
+tend to be most performant. We validate these claims across four mathematical and logical
+reasoning datasets using four different small language models.
+
+1
+
+Introduction
+
+Despite the tremendous cost of inference, Large Language Models (LLMs) have risen to prominence
+as a result of their remarkable abilities across a wide array of reasoning and factual knowledge
+tasks (Achiam et al., 2023; Bubeck et al., 2023; Katz et al., 2024). As agentic systems capable of
+interacting with the external world emerge, these models are poised to become even more ubiquitous
+in science, technology, and society, but the tremendous inference cost presents a challenge for
+realizing the full potential of these agents.
+One way to quell the computational expense associated with LLM inference is to use small
+language models (SLMs). With orders of magnitude fewer parameters, SLMs are faster, cheaper,
+and easier to finetune for specialised skills like tool use, making them natural specialists using
+proprietary data or within bespoke agentic systems (Belcak et al., 2025).
+Training language models typically involves three stages: pre-training on large, general-purpose
+corpora, supervised finetuning (SFT), and reinforcement learning from human feedback (RLHF) or
+from verifiable rewards (RLVR) (Ouyang et al., 2022). SFT, the focus of this work, is critical for
+∗
+
+Corresponding author: samuel.kessler@microsoft.com.
+Equal advising.
+†
+Microsoft.
+§
+Microsoft Research NYC.
+‡
+
+1
+
+adapting a base model to a target distribudata point scoring
+data point selection
+tion, and is especially common when training SLMs to improve their task-specific
+performance.
+In practice, real-world data for SFT
+can be hard to obtain, or may lack delow score
+high score
+sirable properties such as chain-of-thought
+student
+teacher
+reasoning (Wei et al., 2022). Consequently,
+a typical strategy involves synthesizing a
+corpus of question and answer pairs from
+synthetic data finetuning
+a larger, more capable model (Mitra et al.,
+2024; Liu et al., 2024a). This process Figure 1: Overview of iterative synthetic data
+usually begins with a small seed dataset, generation (Algorithm 1). The student model
+which a teacher LLM uses to produce sup- guides synthetic data generation by prioritizing which
+plementary synthetic samples before the data are used as an example for the teacher model
+student SLM is finetuned on the resulting to generate a new synthetic data point (Section 4.2).
+sequences.
+The student finetunes on teacher generated synthetic
+Still, evidence suggests that generat- instruction data.
+ing a large, static synthetic dataset is frequently wasteful, as it can often be drastically pruned with little to no degradation in trained
+model capabilities (Chen et al., 2023; Zhou et al., 2024). As such, this paper explores an iterative, targeted approach to synthetic data generation that is student-aware and improves data
+efficiency—achieving stronger performance under a fixed data generation budget than naive, static
+generation—thereby yielding a superior performance–training-set-size Pareto frontier (see Section 2
+for a formal definition).
+To facilitate productive learning, this work studies how we can effectively cater to the state
+of the student model and guide synthetic data generation by a teacher LLM via prompting (Mitra et al., 2024; Liu et al., 2024a; Luo et al., 2025). This results in an iterative scheme, where
+the updated student can be reused to guide further teacher-generated samples (Figure 1). Prior
+work has considered this paradigm by prioritizing incorrect student answers (Lee et al., 2024) and
+using LLM-as-a-judge scoring (Jiang et al., 2023b), but they do not draw upon the vast active
+learning and data selection literature. Instead, this paper advocates for the generation of data
+that are conditioned on samples that have been prioritized by an active learning algorithm. The
+resulting dataset enables more effective and data efficient finetuning of the SLM student model
+(see Section 5.4 for evidence supporting this claim).
+Our work makes the following contributions:
+• We provide a benchmark study for iterative synthetic data generation rooted in
+prior work on active learning and data selection, and compare to static synthetic
+dataset generation. We show improvements in data efficiency when comparing to generating a single large synthetic instruction dataset, which is a typical approach to student
+post-training (Mitra et al., 2024; Luo et al., 2025).
+• We compare a range of methods for selecting samples for seeding synthetic data generation,
+including those that favour uncertainty, diversity, or difficulty. We conclude that simple
+methods rooted in active learning, such as using the loss of the student’s own
+2
+
+prediction are most data efficient. In contrast, expensive and contemporary methods
+that use an LLM to judge the difficulty and quality of data, i.e. LLM-as-a-judge (Zheng et al.,
+2023; Jiang et al., 2023b), surprisingly underperform when compared to simpler alternatives.
+• We show that synthetic data generation is, to a certain extent, steerable: properties of
+teacher-generated synthetic data resemble those used to seed the generation process. If the student selects challenging data—measured as samples that induce high student
+loss—the teacher generates data with correspondingly high loss on average. Given this relationship, and the fact that recent, specialised, LLM-based strategies often fall short, we argue
+that research in selection strategies is a fruitful and underexplored avenue for advancing the
+performance of small language models.
+
+2
+
+Preliminaries
+
+Notation. We use i to index a datapoint in a dataset and j to index a token’s position in the
+sequence. In our framework, learning happens iteratively, where synthetic samples are acquired from
+the teacher, the student trains on the new, larger dataset, and the process repeats. We use t to index
+the iteration of synthetic data generation. We denote question and answer pairs z = (x, y), from a
+dataset of size n drawn from a ground truth distribution P : D0 = {z}ni=1 ∼ P . We use the terms
+“question” and “instruction” interchangeably for x, and “answer” and “response” interchangeably
+for y. The rationales or chain-of-thought steps (Wei et al., 2022) are incorporated into the answers
+y, however some datasets are comprised of answers without including chain-of-thought steps. A
+model fθ (·) with parameters θ generates an answer ŷ given a question x: ŷ = fθ (x). Synthetic
+questions and answers are denoted ẑ = (x̂, ŷ). Text is encoded into tokens, we denote V as the
+vocabulary and each token is an indicator vector {0, 1}|V | . SFT involves minimizing the next-token
+prediction loss, the length-normalized cross-entropy, over answer tokens given a question,
+L(z, θ) = −1/|y|
+
+|y|
+X
+
+yj log fθ (x, y<j ).
+
+j=1
+
+The model fθ (·) autoregressively generates the next token ŷj = fθ (x, ŷ<j ) in the sequence.
+Data Efficiency. For a fixed number of samples, if better generalization performance can be
+achieved by training on one subset of a larger dataset than on another, the former can be considered
+more data efficient. Formally, let P be the true data distribution over our data z = (x, y). For a
+ϕ
+
+selection algorithm ϕ that produces a dataset Snϕ = {zi }ni=1 ∼ P , model parameters θnϕ result from
+minimizing the loss over Snϕ . We define the performance, accuracy for example, on a single sample as
+o
+n
+ϕ
+(1)
+perfϕ (z, θn ) = 1 y = fθϕ (x) ,
+n
+
+and the expected performance as
+h
+i
+perfϕ (n) = Ez∼P ES ϕ ∼P perfϕ (z, θn (Snϕ )) .
+n
+
+3
+
+(2)
+
+Assuming a monotonic increase in performance with n, for some target performance τ , the sample
+complexity can be defined as
+
+Nϕ (τ ) = inf n : perfϕ (n) ≥ τ ,
+(3)
+which measures the smallest n such that perfϕ (n) ≥ τ . For a fixed architecture f (·), algorithm
+α is more data-efficient than algorithm β at level τ only if Nα (τ ) < Nβ (τ ) or if, for a fixed n,
+perfα (n) > perfβ (n).
+
+3
+
+Related Work
+
+Distillation. Fitting models on synthetic datasets composed of pairs z = (x, ŷ) of sequences,
+where ŷ is produced by a teacher model conditioned on separately available prompts x—often referred to as distillation (Hinton, 2015)—has been shown to be extremely effective in improving
+capabilities of SLM student models (Taori et al., 2023; Peng et al., 2023; Team et al., 2024).
+Synthetic question and answer generation. Going one step further, we can generate both
+questions and answers: ẑ = (x̂, ŷ). SFT on synthetic question-answer pairs results in improved
+capabilities without being restricted by small seed dataset sizes (Mitra et al., 2024). Much like
+in the distillation setting, generating a question-answer pair only requires prompting the teacher
+model with a seed data point (Liu et al., 2024a; Luo et al., 2025; Zeng et al., 2024).
+Selective question and answer generation. Synthetic datasets are known to be compressible—
+synthetic samples filtered by high LLM-as-a-judge (Chen et al., 2023) values or low student loss (Li
+et al., 2024), for example, obtain the same performance as finetuning on the entire unpruned corpus. To remedy this inefficiency, rather than generating a large static synthetic dataset and then
+filtering, we can instead carefully select the seed data used to generate the synthetic samples to
+produce fewer semantically similar sequences. This is effective when distilling on synthetic answers,
+(x, ŷ), by balancing correct and incorrect seed data (Liu et al., 2024a) and conversely by prioritizing
+high uncertainty seed data (Zhang et al., 2024). Moreover, data efficiencies have been shown on
+synthetic question and answer generation by prioritizing incorrect seed data, which is more data
+efficient than finetuning on the original corpus (Lee et al., 2024). LLM-as-a-judge selection is also
+more data efficient than finetuning on public static synthetic datasets (Jiang et al., 2023b; Jazbec
+et al., 2024). We include LLM-as-a-judge scoring due to its widespread use and prioritizing incorrectly answered student responses due to its simplicity. It is worth noting that no prior work
+benchmarks against static synthetic question and answer generation.
+
+3.1
+
+Assigning a Value to Data
+
+Active learning. Our work makes use of ideas from active learning, which seeks to maximise
+data efficiency by iteratively identifying and prioritising informative samples for labelling (Settles,
+2009; Settles and Craven, 2008). Classic strategies for active learning include model prediction disagreement (Freund et al., 1997; Houlsby et al., 2011), uncertainty (MacKay, 1992; Gal et al., 2017;
+Kirsch et al., 2019), and dataset summarization (Sener and Savarese, 2018; Mirzasoleiman et al.,
+2020; Coleman et al., 2019). Effective, contemporary methods trade-off between predictive uncertainty and sample diversity in a fashion that is commensurate with large neural networks (Ash
+et al., 2021; Saran et al., 2023). We consider language model-aligned variations of two popular
+4
+
+Algorithm 1 Iterative synthetic data generation algorithm for question and answer datasets.
+Input: Seed dataset D0 , test set Dtest , train set D̂−1 = { }, student fθ (·), selection algorithm ϕ.
+1: for t = 0, . . . , T do
+2:
+Generate SLM predictions on Dt : {zi = (xi , ŷi )}ni=1 where xi ∈ D0 and ŷ = fθ (x).
+3:
+Select data subset: D̄t = ϕ(Dt ).
+▷ See Section 4.1 for details.
+4:
+Generate synthetic dataset: D̂t = Generate(D̄t ).
+▷ See Section 4.2 for details.
+5:
+SFT on fθ (·) using D̂t := D̂t ∪ D̂t−1 and evaluation on Dtest .
+6: end for
+methods for active learning: uncertainty sampling (Settles and Craven, 2008), and BADGE, a
+more modern algorithm that trades-off between predictive uncertainty and the diversity of selected
+data (Ash et al., 2019).
+Data selection. Related methods aim to estimate the value of data to guide selection, typically using a labelled dataset (x, y). Data can be valued using Shapley values (Ghorbani and
+Zou, 2019), influence functions Koh and Liang (2017) or by matching training data to evaluation
+datasets Just et al. (2023); Kessler et al. (2025); these methods have shown limited effectiveness
+for language modelling. LLMs have been used to score data points (Zheng et al., 2023) and for
+selecting question-answer samples for SFT (Liu et al., 2024b; Jiang et al., 2023b; Chen et al.,
+2023). Still, it has been shown that LLM scores exhibit biases that hinder their effectiveness in this
+setting (Xiong et al., 2024; Dorner et al., 2025; Panickssery et al., 2024). Alternative approaches
+use training loss or gradient norms with respect to student parameters as an estimate of learning
+progress (Loshchilov and Hutter, 2015; Katharopoulos and Fleuret, 2018; Jiang et al., 2019; Li
+et al., 2024; Mindermann et al., 2022; Evans et al., 2024; Dai et al., 2025). However, this has shown
+limited data efficiency for language models (Kaddour et al., 2023). Reward models are commonly
+used to select data points for SFT (Cao et al., 2023; Dubey et al., 2024). This work focuses on
+reward selection because of its popularity.
+
+4
+
+Iterative Synthetic Data Generation
+
+The general iterative synthetic data generation process studied in this paper is shown in Algorithm 1 (Jiang et al., 2023b; Lee et al., 2024). We expand upon the algorithm’s design choices
+in the next sections. Most of these methods can be thought of as explicitly scoring each sample
+with a value {si }ni=1 where n = |D0 | and D0 is the initial question-answer seed dataset. In these
+cases, we can select m = |D̄t | points with the highest scores equivalent to selecting the “hardest”
+points, with the highest uncertainty for instance (described in the next section), which is sometimes
+called “argmax” selection D̄t = argmaxm {si }ni=1 . For completeness, we ablate these decisions, for
+example instead selecting the “easiest” points with lowest uncertainty, and sampling proportionally to scores instead of using argmax selection (Section C.6). Concrete instantiations of selection
+strategies ϕ are outlined below.
+
+5
+
+4.1
+
+Selection Algorithms
+
+Uncertainty sampling. A common method in the active learning literature is uncertainty sampling, which, for non-sequential classification models, prioritizes data whose probability mass on the
+most likely class predicted by the model is smallest (MacKay, 1992). In the sequential, Transformerbased setting, we can score a data point with the loss of the response tokens under the student fθ (·)
+with parameters θ as L(zi , θ) (Settles and Craven, 2008). When the targets used to produce a loss
+are the model’s own generations, this score reflects an uncertainty in the produced sequence. Note
+that our setting gives us access to the ground-truth label associated with x as well, and thus allows
+us to compute a true loss in a fashion commensurate with conventional model training (Loshchilov
+and Hutter, 2015). Interestingly, we find this to be less effective empirically than using the former,
+uncertainty-based approach (Section C.6).
+Reward scores. Using the student’s own generated sequence ŷ, a common method for scoring
+data is to obtain a prediction from a separate reward model r(x, ŷ). Resulting scores can be
+interpreted as the quality of the student’s response, and indicative of its competence on questions
+of this sort in general. We are not limited to using the student’s predictions, and can instead obtain
+a reward for the ground truth answer y (Dubey et al., 2024). In this manner, rewards capture the
+difficulty of the data, but this score has no dependence on the student model—we find that using
+r(x, y) underperforms using r(x, ŷ) empirically for this reason (Section C.6).
+LLM-as-a-judge scores. We can also leverage the reasoning ability of an LLM teacher model to
+score an SLM’s predictions. This strategy asks the LLM teacher to score the detail, quality and
+correctness of the student’s answer and reasoning with a value between [1, 10]. In particular, we use
+pairwise LLM-as-a-judge scoring which has been shown to be most effective (Zheng et al., 2023).
+Two separate answers are given for the teacher to decide which it prefers by providing scores for
+both: sti , si = LLM(ŷit , ŷi , xi ) where ŷit = LLM(xi ) is teacher’s answer, sti is the score for the teachers
+answer and ŷi the student answer. This is expensive, as it requires the teacher to produce an answer
+in addition to scoring.
+BADGE. Batch Active learning by Diverse Gradient Embeddings (BADGE) is a two-stage active learning algorithm. It first represents all candidate data using the last-layer gradient of the
+loss induced by treating the generated sequence as ground truth, ∇θo L(ŷ = fθ (x)), where θo are
+output-head parameters. BADGE then approximately samples from a k-DPP to identify gradients
+that are both high-magnitude and diverse (note that high-magnitude gradients are high-loss generations, suggesting high predictive uncertainty) (Ash et al., 2019). Like in uncertainty sampling, our
+setting allows us to use ground-truth target sequences, which would make these gradient representations of the sort used for optimization, but we found that using generated sequences resulted in
+better performance. Because the un-embedding layer of a Transformer is typically extremely large,
+we use a sparse random projection to efficiently reduce dimensionality while preserving geometric
+relationships (Johnson et al., 1984).
+
+4.2
+
+Prompt-based Synthetic Data Generation
+
+Selected data points x̄i ∈ D̄t are added to a synthetic data generation prompt for the LLM teacher
+model to generate a synthetic question x̂i (Xu et al., 2024; Mitra et al., 2024; Jiang et al., 2023b;
+6
+
+Lee et al., 2024). The teacher is then prompted to produce chain-of-thought reasoning and a final
+answer for ŷi . We generate a synthetic data point ẑi = (x̂i , ŷi ) using x̂ = LLM(x̄i ) and ŷi = LLM(x̂i ).
+So D̂t = Generate(D̄t ) = {x̂i = LLM(x̄i ), ŷi = LLM(x̂i )}m
+i=1 , where x̄i ∼ D̄t . For details on prompts
+used for each dataset see Section D.2.
+
+5
+
+Experiments
+
+This section empirically probes the data efficiency of iterative synthetic data generation against
+static data generation, and provides recommendations for scoring and selection design choices for
+data efficiency. We find that prioritizing challenging data, as measured by the student’s
+loss on its own generations, to be at least as data efficient as teacher-based LLM
+scoring methods, and often more efficient.
+LLM-based scoring can behave erratically, particularly for unusual tasks likely outside of the
+model’s training data distribution. Paired with the additional expense of using a large LLM to score
+data, more general approaches, like uncertainty sampling, appear to be more reliable and effective.
+We further explore this improved data efficiency and show that on average synthetic data
+inherits some properties from samples used to generate them. If we select data that
+are difficult for the student—measured by a high loss or a low reward for example—the resulting
+synthetic data from the teacher is difficult as well, resulting in lower student accuracies on these
+generated samples than random selection.
+At each iteration t we use a given acquisition algorithm to select 1k samples D̄t from Dt , before
+sending each to the teacher model to generate corresponding synthetic data D̂t . These data are
+appended to synthetic data from all previous iterations before reinitializing the student model and
+refitting its parameters with gradient descent.
+
+5.1
+
+Datasets
+
+This section presents results on four distinct reasoning datasets in conjunction with four different
+models. GSM8k is a popular mathematics dataset comprised of school level maths problems (Cobbe
+et al., 2021), which we use with a Mistral-7B-Instruct-v0.3 student (Jiang et al., 2023a). Similarly, we include the more challenging Math1-3 dataset (Hendrycks et al., 2021), which is comprised
+of 5 distinct levels of question difficulty—we use the easiest levels, 1 to 3, to finetune a Llama3-8B-Instruct student (Dubey et al., 2024). We further experiment with the logical reasoning
+dataset ProntoQA (Saparov and He, 2023), composed of synthetically generated chain-of-thought
+style reasoning questions, with a Qwen1.5-7B-Chat student. Finally, we consider the Game of 24
+dataset, which requires finding arithmetic operations to obtain 24 given 4 input integers. Here we
+use a Qwen2.5-7B-Instruct student (Qwen et al., 2025). Specifics are provided in Section D.1.
+For all datasets except for Game of 24 we use prompt-based synthetic data generation with a
+GPT-4o teacher (prompts in Section D.2). Instead, we use backward reasoning: if the answer is
+13*8-10*8=24, for example, we can construct a new question by setting two integers to variables
+a*b-10*8=24 and solving to generate new questions (Jiang et al., 2024). We use a GPT-o3-mini
+teacher for backward reasoning, it qualitatively produces better question-response pairs than GPT4o (Section D.2.4).
+
+7
+
+Figure 2: SFT performance on 1k data points for various datasets and SLMs. We
+compare the effect of synthetic answer generation and synthetic question and answer generation
+to using the seed dataset, D0 for SFT. 0-shot SLM and teacher performances are included for
+reference. All datasets use a GPT-4o teacher, for Game of 24 we use a GPT-o3-mini teacher.
+Using synthetic data, either as answers paired with real questions (syn. a) or both questions and
+answers (syn. q&a) improve performance past using the seed dataset alone (FT).
+
+5.2
+
+Finetuning Setup
+
+To enable new instruction-following capabilities we finetune our student on synthetic data D̂t , which
+are appended to synthetic data from all previous iterations D̂<t . For efficient training we adapt
+LoRA layers (Hu et al., 2022) after each iteration of acquiring data and fitting the model. We
+avoid warm starting SFT parameters from their pre-trained values and instead use a fresh, random
+reinitialization (Ash and Adams, 2020; Springer et al., 2025). We set the LoRA rank and alpha
+parameters to the same value (see Section B.1) and adapt all linear layers. For optimization we use
+Adam (Kingma and Ba, 2014), clamp the gradient norm to a maximum of 2.0, and use a batch size
+of 24 with 2 gradient accumulation steps. The learning rate decays linearly with a warm up period
+of 15% of the total number of epochs. For Game of 24 we use a cosine decay learning rate schedule
+down to a minimum of 1e-9 (Ni et al., 2025). During optimization we perform checkpointing and
+load the checkpoint with the best performance on a held-out validation set after SFT. We search
+over learning rates, LoRA ranks and the number of training epochs on this held-out validation set
+as well (Section B). We use a single 80Gb A100 or H100 GPU for all experiments.
+
+5.3
+
+Algorithms
+
+This paper considers a variety of selection algorithms. Prior work has shown that prioritizing
+“hard” samples accelerates learning (Section 3.1), which we also find to be the case for iterative
+synthetic data generation (Section C.6). This approach prioritizes high-uncertainty data, measured
+as the model’s loss on greedily decoded student generations, which we denote as “loss (high)”
+throughout this section. We also consider a low-reward selection algorithm (“rwd (low)”), also
+using the student’s own predictions, which scores generations using an external model. We use
+a Skywork-Reward-Llama-3.1-8B-v0.2 reward model which is the highest scoring 8b model on
+RewardBench (Lambert et al., 2025) at the time of writing.
+We use Lion (Jiang et al., 2023b) as a baseline, which compares the student and teacher answer
+LLM-as-a-judge scores to classify each data point as either an easy or a hard before sampling
+equally from both sets. For completeness, we also consider a baseline that only samples from the
+hard set, denoted as LLM-as-a-judge (hard) (Jazbec et al., 2024). We use the same prompts for
+LLM-as-a-judge scoring as Jiang et al. (2023b).
+8
+
+2.0x
+
+1.3x
+
+1.4x
+
+1.4x
+
+Figure 3: Student performance over successive synthetic data iterations with growing
+training sets. In all cases, selection based on uncertainty (loss) performs approximately as well
+as LLM-based scoring strategies (rwd and llm-judge), without requiring additional queries to an
+LLM. Further, for tasks that are out-of-distribution for the scoring model, like Game of 24, these
+mechanisms can perform even worse than random sampling. Horizontal lines in each inset plot
+denotes the proportion of data random sampling would require to achieve the same performance
+as the best active selection strategy in the corresponding experiment.
+We further consider prioritizing data with incorrect student answers, si = 1{ŷi ̸= y} as a
+proxy for prioritizing hard samples (Lee et al., 2024). In a similar spirit to Lion, we can instead
+sample evenly from correct and incorrect pools to maintain diversity in the seed data (Liu et al.,
+2024a). Since correct and incorrect scoring requires a verifier and ground-truth answers, we do not
+compare them to other scoring methods that do not use label information and instead place these
+supplementary results in Section C.1.
+
+5.4
+
+Results
+
+This subsection presents our main results, which includes (1) performance comparisons between
+fitting the SLM on seed data and synthetic data (Section 5.4.1), and (2) between standard active learning strategies and more modern, LLM-based alternatives (Section 5.4.2). Further, we (3)
+analyse synthetically generated data to demonstrate it retains important properties of the original
+seed data, providing the underlying property of this mechanism affording the effectiveness of active methods (Section 5.4.3). Throughout this section, note that static generation is equivalent to
+random sampling of prompts for synthetic data generation in our setting, as it is not conditioned
+on the current state of the student. Unless stated otherwise, results show the mean and standard
+deviation over 3 independent runs∗ .
+5.4.1
+
+Synthetic Data Improves Performance
+
+SFT on synthetic data results in significantly improved capabilities when compared to
+using the original seed dataset. Figure 2 compares SFT performance on the seed data to synthetic data of equal size, showing a dramatic increase in performance across all datasets when doing
+SFT on synthetic question-answers pairs. In the same figure, we see large increases in performance
+when using synthetic answers zi = (xi , ŷi ) instead of seed answers y, likely due to better formatting
+and high quality chain-of-thought in synthetic answers. In Game of 24 there is a small drop in
+∗
+
+Website and code: https://iterative-sd.github.io/
+
+9
+
+performance when training on synthetic questions and answers compared to synthetic answers only, showing that the generation of novel
+questions by the teacher yields some lower quality synthetic questions. Regardless, next we
+show how this enables us to scale dataset sizes
+efficiently.
+5.4.2 Iterative Generation is More Data
+Efficient than Static Generation
+Active selection is more data efficient
+than random sampling for generating
+productive synthetic data, resulting in
+better performance using fewer samples.
+Figure 3 shows learning curves, with each plot
+measuring the test accuracy of a given selection
+method as a function of the labelling budget;
+each point is an active learning iteration. As Figure 4: Pairwise winrate over all datasets
+mentioned earlier, random selection, because it and methods. Pij corresponds to the number of
+is not conditioned on the current state of the times algorithm i outperforms j. Overall perforstudent, is equivalent to the typical approach mance is shown in the last row (lower is better).
+of static generation at the indicated data size.
+We find that this technique is often outperformed by a student-in-the-loop alternative—horizontal
+lines indicate the number of additional samples that would be required by static, random sampling
+in order to achieve the same performance as the best active learner in the corresponding plot (between 1.3× and 2×). We find that uncertainty sampling performs roughly as well, and often better
+than LLM-based scoring methods. For some datasets, like Game of 24, reward-based methods do
+quite poorly, likely as a result of the task being out of distribution for the reward model.
+Figure 4 aggregates performance differences between all selection strategies and model-dataset
+pairs considered in this paper. Each experiment composing this figure produced a learning curve
+in Figure 3, with each method producing a different SLM test accuracy for a variety of generation
+budgets. Here, we aggregate results by measuring which algorithms outperform their peers at each
+generation budget across all models and datasets.
+Specifically, we aggregate results as a pairwise winrate matrix P . We increment Pij if 1{µ̂i − α ·
+sei > µ̂j + α · ˆ
+ˆ
+sej }, where µ̂i is the sample mean and se
+ˆ i is the standard error of the performance of
+algorithm i for a dataset, for a particular dataset size, and α is the confidence level which we set to
+1 (making it a 68% confidence interval). By summing the “wins” across the rows and normalizing
+we can understand how often algorithms are outperformed on average. Column-wise averages are
+shown in the last row, where lower is better, to understand which algorithm is more data efficient
+in total. We find that random sampling—equivalent to static generation of data—is outperformed
+by various other methods that use the student model to guide synthetic data generation (Figure 4).
+We can glean from Figure 4 that the highest-performing approach is simply uncertainty sampling, using the SLM’s loss on its own generations. LLM-as-a-judge also tends to be somewhat
+effective, though by a reduced margin. Interestingly, BADGE and Lion, which both aim to select
+diverse data, do not perform much better than random sampling (Figure 4). This is likely because
+10
+
+Figure 6: The rank correlations between original and synthetic dataset scores from iterative synthetic data generation. We plot student loss and reward scores and show Spearman’s
+rank correlations (ρ) between dataset medians before and after synthetic data generation. We
+zoom in on relationships at an individual data-point level where there is low correlation between
+the original and synthetic data point scores (centre). The red line is the line of best fit to the data.
+All rank correlations are highly significant (p < 0.001).
+
+Accuracy
+
+synthetic data generation is noisy (Section 5.4.3), which diverse selection may exacerbate.
+Because of the need to access a teacher model for scoring, LLM-as-a-judge is computationally
+demanding. Assuming that the cost of evaluating the teacher model dominates the cost of evaluating
+the student, a common assumption in the active learning literature and a reasonable assumption
+as the number of parameters of the teacher model can be 3 orders of magnitude larger than the
+student models we consider. Then, if we consider the total number of teacher input and output
+tokens as a budget instead of the number of generated samples, Lion and LLM-as-a-judge (hard) are
+far more expensive than other methods (Figure 5). Our
+random
+llm-judge (hard)
+rwd (low)
+lion
+loss (high)
+BADGE
+results suggest this additional compute is better
+allocated towards simply generating more synGSM8k Mistral 7B
+thetic data with a cheaper and more effective selection strategy, like uncertainty sampling.
+0.80
+Reward scoring also requires an external model, but
+because we can use a reward model that has the same
+0.75
+number of parameters as our student, calls to the reward
+model are generally less expensive than to a teacher—we
+0.70
+opt to not treat them in the same way and do not count
+107
+108
+the number of input tokens to the reward model in FigNum. input and output tokens
+ure 5. Overall random selection requires between 33% to
+100% more SFT data to obtain the same performance as Figure 5: Active learning curves
+the best selection methods across all datasets (Figure 3). on GSM8k: student performance
+For 2/4 of these datasets, iterative synthetic data genera- against the number of teacher
+tion using the loss on the student’s own predictions leads input and output tokens. The total
+to more data efficient results compared to prior works number of input and output tokens are
+that perform SFT using similarly sized datasets (see Sec- a proxy for the amount of compute used
+tion C.2 for comparisons).
+by the teacher for various methods.
+11
+
+GSM8K
+
+6
+
+rwd (low) ordering
+
+Math1-3
+
+first iteration
+
+7.5
+
+4
+
+5.0
+
+2
+
+2.5
+
+0
+0
+
+500
+
+1000
+
+4
+
+final iteration
+
+% Cumulative Accuracy (rand. score-ordered)
+
+rand. ordering
+
+2
+0
+0
+
+500
+
+1000
+
+Samples Seen
+
+0.0
+8
+6
+4
+2
+0
+
+0
+
+0
+
+500
+
+500
+
+1000
+
+1000
+
+Samples Seen
+
+0.75
+0.50
+0.25
+0.00
+0.25
+0.50
+0.75
+0.50
+0.25
+0.00
+0.25
+0.50
+
+loss (high) ordering
+
+ProntoQA
+
+Game of 24
+
+2
+1
+0
+
+0
+
+500
+
+1000
+
+1
+
+0
+
+500
+
+1000
+
+500
+
+1000
+
+2
+1
+0
+0
+
+500
+
+1000
+
+Samples Seen
+
+1
+
+0
+
+Samples Seen
+
+Figure 7: The percentage difference in synthetic data cumulative accuracy between
+samples ordered by score and randomly shuffled. Data are sorted either by uncertainty
+(high to low) or reward (low to high). Positive values suggest that score ordering picks more
+difficult synthetic samples in turn yielding lower accuracies. For each original data point we score
+it using the student model from the first and final iteration of iterative synthetic data generation
+(rows). See Figure 11 for the cumulative accuracies for individual replicates.
+5.4.3
+
+Fidelity of Synthetic Data to its Original Data
+
+Synthetic data generation is a noisy process, perturbing data by rephrasing, complicating or simplifying and adding chain-of-thought rationales. As such the score—either uncertainty (measured
+by the loss) or data quality (measured by the reward)—of an individual seed sample and its corresponding generated sample appear to have little to do with each other. In aggregate, however, we
+find high rank correlation between the median score of the seed and generated datasets (Figure 6).
+This relationship is the underlying principal governing why careful selection of the seed questionresponse pairs is important: Generated samples inherit underlying properties from the
+data used to produce them. These attributes, such as the SLM loss, shape the student’s
+optimization trajectory and generalization capabilities.
+Unsurprisingly, samples with high uncertainty, again measured using the student’s loss on its
+own generations, tend to also be samples for which the student model struggles to obtain a correct
+answer. Figure 7 sorts samples by this uncertainty and compares the model’s accuracy on these
+data in comparison to a random shuffle, this is equivalent to random selection. Specifically, we plot
+the cumulative percent difference between the SLM accuracy on samples sorted by loss and the
+SLM accuracy on randomly ordered data. The curve in Figure 7 presents this as a function of the
+number of samples being used in the calculation, and is repeated for scores from a reward model.
+In both cases, prioritizing data in this fashion often effectively prioritizes low-accuracy samples, as
+indicated by the curve’s positive values. The trend is least clear for the ProntoQA dataset, which
+shows reward scoring as positive and uncertainty scoring as neutral or negative—unlike for other
+datasets, reward scoring was indeed a slightly more effective selection strategy (fig. 3). Low reward
+selection also selects lower-accuracy samples compared to random for the Game of 24 dataset (Fig12
+
+ure 7), but still performs more poorly in terms of SFT performance than random (Figure 3). This
+is because the reward scorer introduces biases; specifically, it prefers longer responses, an effect
+that has been observed in other work (Shen et al., 2023; Bu et al., 2025).
+
+6
+
+Conclusion and Discussion
+
+This work shows that student-in-the-loop synthetic data generation yields more data-efficient SLM
+improvements than static one-shot generation, and that simple, active-learning–inspired criteria
+for selecting seed examples outperform more elaborate LLM-based judging. We demonstrate that
+synthetic data are partially steerable, with teacher outputs reflecting the properties of selected
+seeds. These results highlight the value—and underexploration—of principled, effective selection
+strategies for advancing SLM training. Limitations are overviewed in Section A.
+
+7
+
+Acknowledgements
+
+We thank Guoqing Zheng for insightful discussions.
+
+References
+Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Florencia Leoni Aleman,
+Diogo Almeida, Janko Altenschmidt, Sam Altman, Shyamal Anadkat, et al. Gpt-4 technical
+report. arXiv preprint arXiv:2303.08774, 2023. 1
+Jordan T Ash and Ryan P Adams. On warm-starting neural network training. Advances in neural
+information processing systems, 33:3884–3894, 2020. 8
+Jordan T Ash, Chicheng Zhang, Akshay Krishnamurthy, John Langford, and Alekh Agarwal. Deep
+batch active learning by diverse, uncertain gradient lower bounds. In International Conference
+on Learning Representations, 2019. 5, 6
+Jordan T Ash, Surbhi Goel, Akshay Krishnamurthy, and Sham Kakade. Gone fishing: Neural
+active learning with fisher embeddings. Advances in Neural Information Processing Systems, 34:
+8927–8939, 2021. 4
+Peter Belcak, Greg Heinrich, Shizhe Diao, Yonggan Fu, Xin Dong, Saurav Muralidharan,
+Yingyan Celine Lin, and Pavlo Molchanov. Small language models are the future of agentic
+ai. arXiv preprint arXiv:2506.02153, 2025. 1
+Yuyan Bu, Liangyu Huo, Yi Jing, and Qing Yang. Beyond excess and deficiency: Adaptive length
+bias mitigation in reward models for rlhf. In Findings of the Association for Computational
+Linguistics: NAACL 2025, pages 3091–3098, 2025. 13
+Sébastien Bubeck, Varun Chandrasekaran, Ronen Eldan, Johannes Gehrke, Eric Horvitz, Ece Kamar, Peter Lee, Yin Tat Lee, Yuanzhi Li, Scott Lundberg, et al. Sparks of artificial general
+intelligence: Early experiments with gpt-4. arXiv preprint arXiv:2303.12712, 2023. 1
+
+13
+
+Yihan Cao, Yanbin Kang, Chi Wang, and Lichao Sun. Instruction mining: Instruction data selection
+for tuning large language models. arXiv preprint arXiv:2307.06290, 2023. 5
+Lichang Chen, Shiyang Li, Jun Yan, Hai Wang, Kalpa Gunaratna, Vikas Yadav, Zheng Tang, Vijay
+Srinivasan, Tianyi Zhou, Heng Huang, et al. Alpagasus: Training a better alpaca with fewer data.
+In The Twelfth International Conference on Learning Representations, 2023. 2, 4, 5
+Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun, Lukasz Kaiser,
+Matthias Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano, et al. Training verifiers to
+solve math word problems. arXiv preprint arXiv:2110.14168, 2021. 7, 28
+Cody Coleman, Christopher Yeh, Stephen Mussmann, Baharan Mirzasoleiman, Peter Bailis, Percy
+Liang, Jure Leskovec, and Matei Zaharia. Selection via proxy: Efficient data selection for deep
+learning. In International Conference on Learning Representations, 2019. 4
+Yalun Dai, Yangyu Huang, Xin Zhang, Wenshan Wu, Chong Li, Wenhui Lu, Shijie Cao, Li Dong,
+and Scarlett Li. Data efficacy for language model training. arXiv preprint arXiv:2506.21545,
+2025. 5
+Florian E Dorner, Vivian Yvonne Nastl, and Moritz Hardt. Limits to scalable evaluation at the
+frontier: Llm as judge won’t beat twice the data. In ICLR, 2025. 5
+Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad Al-Dahle, Aiesha
+Letman, Akhil Mathur, Alan Schelten, Amy Yang, Angela Fan, et al. The llama 3 herd of models.
+arXiv e-prints, pages arXiv–2407, 2024. 5, 6, 7, 29
+Talfan Evans, Shreya Pathak, Hamza Merzic, Jonathan Schwarz, Ryutaro Tanno, and Olivier J
+Henaff. Bad students make great teachers: Active learning accelerates large-scale visual understanding. In European Conference on Computer Vision, pages 264–280. Springer, 2024. 5
+Yoav Freund, H Sebastian Seung, Eli Shamir, and Naftali Tishby. Selective sampling using the
+query by committee algorithm. Machine learning, 28(2):133–168, 1997. 4
+Yarin Gal, Riashat Islam, and Zoubin Ghahramani. Deep bayesian active learning with image data.
+In International conference on machine learning, pages 1183–1192. PMLR, 2017. 4
+Amirata Ghorbani and James Zou. Data shapley: Equitable valuation of data for machine learning.
+In International conference on machine learning, pages 2242–2251. PMLR, 2019. 5
+Dan Hendrycks, Collin Burns, Saurav Kadavath, Akul Arora, Steven Basart, Eric Tang, Dawn
+Song, and Jacob Steinhardt. Measuring mathematical problem solving with the math dataset.
+NeurIPS, 2021. 7, 29
+Geoffrey Hinton. Distilling the knowledge in a neural network. arXiv preprint arXiv:1503.02531,
+2015. 4
+Neil Houlsby, Ferenc Huszár, Zoubin Ghahramani, and Máté Lengyel. Bayesian active learning for
+classification and preference learning. arXiv preprint arXiv:1112.5745, 2011. 4
+Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang,
+Weizhu Chen, et al. Lora: Low-rank adaptation of large language models. ICLR, 1(2):3, 2022. 8
+14
+
+Audrey Huang, Adam Block, Dylan J Foster, Dhruv Rohatgi, Cyril Zhang, Max Simchowitz, Jordan T Ash, and Akshay Krishnamurthy. Self-improvement in language models: The sharpening
+mechanism. In The Thirteenth International Conference on Learning Representations, 2024. 29
+Metod Jazbec, Menglin Xia, Ankur Mallick, Daniel Madrigal, Dongge Han, Samuel Kessler, and
+Victor Rühle. On efficient distillation from llms to slms. In NeurIPS 2024 Workshop on FineTuning in Modern Machine Learning: Principles and Scalability, 2024. 4, 8
+Albert Q Jiang, Alexandre Sablayrolles, Arthur Mensch, Chris Bamford, Devendra Singh Chaplot,
+Diego de las Casas, Florian Bressand, Gianna Lengyel, Guillaume Lample, Lucile Saulnier, et al.
+Mistral 7b. arXiv preprint arXiv:2310.06825, 2023a. 7, 28
+Angela H Jiang, Daniel L-K Wong, Giulio Zhou, David G Andersen, Jeffrey Dean, Gregory R
+Ganger, Gauri Joshi, Michael Kaminksy, Michael Kozuch, Zachary C Lipton, et al. Accelerating
+deep learning by focusing on the biggest losers. arXiv preprint arXiv:1910.00762, 2019. 5
+Weisen Jiang, Han Shi, Longhui Yu, Zhengying Liu, Yu Zhang, Zhenguo Li, and James Kwok.
+Forward-backward reasoning in large language models for mathematical verification. In Findings
+of the Association for Computational Linguistics: ACL 2024, pages 6647–6661, 2024. 7, 29
+Yuxin Jiang, Chunkit Chan, Mingyang Chen, and Wei Wang. Lion: Adversarial distillation of
+proprietary large language models. In Houda Bouamor, Juan Pino, and Kalika Bali, editors,
+Proceedings of the 2023 Conference on Empirical Methods in Natural Language Processing, pages
+3134–3154, Singapore, December 2023b. Association for Computational Linguistics. doi: 10.
+18653/v1/2023.emnlp-main.189. URL https://aclanthology.org/2023.emnlp-main.189/. 2,
+3, 4, 5, 6, 8, 28
+William B Johnson, Joram Lindenstrauss, et al. Extensions of lipschitz mappings into a hilbert
+space. Contemporary mathematics, 26(189-206):1, 1984. 6
+Hoang Anh Just, Feiyang Kang, Tianhao Wang, Yi Zeng, Myeongseob Ko, Ming Jin, and Ruoxi Jia.
+Lava: Data valuation without pre-specified learning algorithms. In The Eleventh International
+Conference on Learning Representations, 2023. 5
+Jean Kaddour, Oscar Key, Piotr Nawrot, Pasquale Minervini, and Matt J Kusner. No train no
+gain: Revisiting efficient training algorithms for transformer-based language models. Advances
+in Neural Information Processing Systems, 36:25793–25818, 2023. 5
+Angelos Katharopoulos and François Fleuret. Not all samples are created equal: Deep learning
+with importance sampling. In International conference on machine learning, pages 2525–2534.
+PMLR, 2018. 5
+Daniel Martin Katz, Michael James Bommarito, Shang Gao, and Pablo Arredondo. Gpt-4 passes
+the bar exam. Philosophical Transactions of the Royal Society A, 382(2270):20230254, 2024. 1
+Samuel Kessler, Tam Le, and Vu Nguyen. Sava: Scalable learning-agnostic data valuation. In The
+Thirteenth International Conference on Learning Representations, 2025. 5
+Diederik P Kingma and Jimmy Ba. Adam: A method for stochastic optimization. arXiv preprint
+arXiv:1412.6980, 2014. 8
+15
+
+Andreas Kirsch, Joost Van Amersfoort, and Yarin Gal. Batchbald: Efficient and diverse batch
+acquisition for deep bayesian active learning. Advances in neural information processing systems,
+32, 2019. 4
+Pang Wei Koh and Percy Liang. Understanding black-box predictions via influence functions. In
+International conference on machine learning, pages 1885–1894. PMLR, 2017. 5
+Nathan Lambert, Valentina Pyatkin, Jacob Morrison, Lester James Validad Miranda, Bill Yuchen
+Lin, Khyathi Chandu, Nouha Dziri, Sachin Kumar, Tom Zick, Yejin Choi, et al. Rewardbench:
+Evaluating reward models for language modeling. In Findings of the Association for Computational Linguistics: NAACL 2025, pages 1755–1797, 2025. 8
+Nicholas Lee, Thanakul Wattanawong, Sehoon Kim, Karttikeya Mangalam, Sheng Shen, Gopala
+Anumanchipalli, Michael Mahoney, Kurt Keutzer, and Amir Gholami. Llm2llm: Boosting llms
+with novel iterative data enhancement. In Findings of the Association for Computational Linguistics: ACL 2024, pages 6498–6526, 2024. 2, 4, 5, 7, 9, 21, 22
+Ming Li, Yong Zhang, Zhitao Li, Jiuhai Chen, Lichang Chen, Ning Cheng, Jianzong Wang, Tianyi
+Zhou, and Jing Xiao. From quantity to quality: Boosting llm performance with self-guided
+data selection for instruction tuning. In Proceedings of the 2024 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies
+(Volume 1: Long Papers), pages 7602–7635, 2024. 4, 5
+Chin-Yew Lin. ROUGE: A package for automatic evaluation of summaries. In Text Summarization Branches Out, pages 74–81, Barcelona, Spain, July 2004. Association for Computational
+Linguistics. URL https://aclanthology.org/W04-1013/. 28
+Chengyuan Liu, Fubang Zhao, Kun Kuang, Yangyang Kang, Zhuoren Jiang, Changlong Sun, and
+Fei Wu. Evolving knowledge distillation with large language models and active learning. In
+Proceedings of the 2024 Joint International Conference on Computational Linguistics, Language
+Resources and Evaluation (LREC-COLING 2024), pages 6717–6731, 2024a. 2, 4, 9, 21, 22, 23,
+28
+Wei Liu, Weihao Zeng, Keqing He, Yong Jiang, and Junxian He. What makes good data for
+alignment? a comprehensive study of automatic data selection in instruction tuning. In The
+Twelfth International Conference on Learning Representations, 2024b. 5
+Ilya Loshchilov and Frank Hutter. Online batch selection for faster training of neural networks.
+arXiv preprint arXiv:1511.06343, 2015. 5, 6
+Haipeng Luo, Qingfeng Sun, Can Xu, Pu Zhao, Jian-Guang Lou, Chongyang Tao, Xiubo Geng,
+Qingwei Lin, Shifeng Chen, Yansong Tang, et al. Wizardmath: Empowering mathematical
+reasoning for large language models via reinforced evol-instruct. In The Thirteenth International
+Conference on Learning Representations, 2025. 2, 4
+David JC MacKay. Information-based objective functions for active data selection. Neural computation, 4(4):590–604, 1992. 4, 6
+
+16
+
+Pratyush Maini, Vineeth Dorna, Parth Doshi, Aldo Carranza, Fan Pan, Jack Urbanek, Paul
+Burstein, Alex Fang, Alvin Deng, Amro Abbas, et al. Beyondweb: Lessons from scaling synthetic
+data for trillion-scale pretraining. arXiv preprint arXiv:2508.10975, 2025. 20
+Sören Mindermann, Jan M Brauner, Muhammed T Razzak, Mrinank Sharma, Andreas Kirsch,
+Winnie Xu, Benedikt Höltgen, Aidan N Gomez, Adrien Morisot, Sebastian Farquhar, et al. Prioritized training on points that are learnable, worth learning, and not yet learnt. In International
+Conference on Machine Learning, pages 15630–15649. PMLR, 2022. 5
+Baharan Mirzasoleiman, Jeff Bilmes, and Jure Leskovec. Coresets for data-efficient training of
+machine learning models. In International Conference on Machine Learning, pages 6950–6960.
+PMLR, 2020. 4
+Arindam Mitra, Hamed Khanpour, Corby Rosset, and Ahmed Awadallah. Orca-math: Unlocking
+the potential of slms in grade school math. arXiv preprint arXiv:2402.14830, 2024. 2, 4, 6, 23,
+24, 28, 37
+Tianwei Ni, Allen Nie, Sapana Chaudhary, Yao Liu, Huzefa Rangwala, and Rasool Fakoor. Offline
+learning and forgetting for reasoning with large language models, 2025. URL https://arxiv.
+org/abs/2504.11364. 8, 23, 24, 35
+Long Ouyang, Jeffrey Wu, Xu Jiang, Diogo Almeida, Carroll Wainwright, Pamela Mishkin, Chong
+Zhang, Sandhini Agarwal, Katarina Slama, Alex Ray, et al. Training language models to follow
+instructions with human feedback. Advances in neural information processing systems, 35:27730–
+27744, 2022. 1
+Arjun Panickssery, Samuel Bowman, and Shi Feng. Llm evaluators recognize and favor their own
+generations. Advances in Neural Information Processing Systems, 37:68772–68802, 2024. 5
+Baolin Peng, Chunyuan Li, Pengcheng He, Michel Galley, and Jianfeng Gao. Instruction tuning
+with gpt-4. arXiv preprint arXiv:2304.03277, 2023. 4
+Qwen, :, An Yang, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu, Chengyuan
+Li, Dayiheng Liu, Fei Huang, Haoran Wei, Huan Lin, Jian Yang, Jianhong Tu, Jianwei Zhang,
+Jianxin Yang, Jiaxi Yang, Jingren Zhou, Junyang Lin, Kai Dang, Keming Lu, Keqin Bao, Kexin
+Yang, Le Yu, Mei Li, Mingfeng Xue, Pei Zhang, Qin Zhu, Rui Men, Runji Lin, Tianhao Li,
+Tianyi Tang, Tingyu Xia, Xingzhang Ren, Xuancheng Ren, Yang Fan, Yang Su, Yichang Zhang,
+Yu Wan, Yuqiong Liu, Zeyu Cui, Zhenru Zhang, and Zihan Qiu. Qwen2.5 technical report, 2025.
+URL https://arxiv.org/abs/2412.15115. 7, 29
+Abulhair Saparov and He He. Language models are greedy reasoners: A systematic formal analysis
+of chain-of-thought. In The Eleventh International Conference on Learning Representations,
+2023. 7, 29, 32
+Akanksha Saran, Safoora Yousefi, Akshay Krishnamurthy, John Langford, and Jordan T Ash.
+Streaming active learning with deep neural networks. In International Conference on Machine
+Learning, pages 30005–30021. PMLR, 2023. 4
+Ozan Sener and Silvio Savarese. Active learning for convolutional neural networks: A core-set
+approach. In International Conference on Learning Representations, 2018. 4
+17
+
+Burr Settles. Active learning literature survey. 2009. 4
+Burr Settles and Mark Craven. An analysis of active learning strategies for sequence labeling tasks.
+In proceedings of the 2008 conference on empirical methods in natural language processing, pages
+1070–1079, 2008. 4, 5, 6
+Wei Shen, Rui Zheng, Wenyu Zhan, Jun Zhao, Shihan Dou, Tao Gui, Qi Zhang, and Xuan-Jing
+Huang. Loose lips sink ships: Mitigating length bias in reinforcement learning from human
+feedback. In Findings of the Association for Computational Linguistics: EMNLP 2023, pages
+2859–2873, 2023. 13
+Jacob Mitchell Springer, Sachin Goyal, Kaiyue Wen, Tanishq Kumar, Xiang Yue, Sadhika Malladi,
+Graham Neubig, and Aditi Raghunathan. Overtrained language models are harder to fine-tune.
+In Forty-second International Conference on Machine Learning, 2025. 8
+Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li, Carlos Guestrin, Percy
+Liang, and Tatsunori B. Hashimoto. Stanford alpaca: An instruction-following llama model.
+https://github.com/tatsu-lab/stanford_alpaca, 2023. 4
+Gemma Team, Morgane Riviere, Shreya Pathak, Pier Giuseppe Sessa, Cassidy Hardin, Surya
+Bhupatiraju, Léonard Hussenot, Thomas Mesnard, Bobak Shahriari, Alexandre Ramé, et al.
+Gemma 2: Improving open language models at a practical size. arXiv preprint arXiv:2408.00118,
+2024. 4
+Shubham Toshniwal, Ivan Moshkov, Sean Narenthiran, Daria Gitman, Fei Jia, and Igor Gitman.
+Openmathinstruct-1: A 1.8 million math instruction tuning dataset. Advances in Neural Information Processing Systems, 37:34737–34774, 2024. 23
+Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten Bosma, Fei Xia, Ed Chi, Quoc V Le, Denny
+Zhou, et al. Chain-of-thought prompting elicits reasoning in large language models. Advances in
+neural information processing systems, 35:24824–24837, 2022. 2, 3
+Miao Xiong, Zhiyuan Hu, Xinyang Lu, YIFEI LI, Jie Fu, Junxian He, and Bryan Hooi. Can
+llms express their uncertainty? an empirical evaluation of confidence elicitation in llms. In The
+Twelfth International Conference on Learning Representations, 2024. 5
+Can Xu, Qingfeng Sun, Kai Zheng, Xiubo Geng, Pu Zhao, Jiazhan Feng, Chongyang Tao, Qingwei
+Lin, and Daxin Jiang. Wizardlm: Empowering large pre-trained language models to follow
+complex instructions. In The Twelfth International Conference on Learning Representations,
+2024. 6
+Zitong Yang, Neil Band, Shuangping Li, Emmanuel Candes, and Tatsunori Hashimoto. Synthetic
+continued pretraining. In The Thirteenth International Conference on Learning Representations,
+2025. 20
+Liang Zeng, Liangjun Zhong, Liang Zhao, Tianwen Wei, Liu Yang, Jujie He, Cheng Cheng, Rui Hu,
+Yang Liu, Shuicheng Yan, et al. Skywork-math: Data scaling laws for mathematical reasoning
+in large language models–the story goes on. arXiv preprint arXiv:2407.08348, 2024. 4
+
+18
+
+Yifei Zhang, Bo Pan, Chen Ling, Yuntong Hu, and Liang Zhao. ELAD: Explanation-guided large
+language models active distillation. In Lun-Wei Ku, Andre Martins, and Vivek Srikumar, editors, Findings of the Association for Computational Linguistics: ACL 2024, pages 4463–4475,
+Bangkok, Thailand, August 2024. Association for Computational Linguistics. doi: 10.18653/v1/
+2024.findings-acl.264. URL https://aclanthology.org/2024.findings-acl.264/. 4
+Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan Zhuang, Zhanghao Wu, Yonghao Zhuang,
+Zi Lin, Zhuohan Li, Dacheng Li, Eric Xing, et al. Judging llm-as-a-judge with mt-bench and
+chatbot arena. Advances in neural information processing systems, 36:46595–46623, 2023. 3, 5,
+6
+Chunting Zhou, Pengfei Liu, Puxin Xu, Srinivasan Iyer, Jiao Sun, Yuning Mao, Xuezhe Ma, Avia
+Efrat, Ping Yu, Lili Yu, et al. Lima: Less is more for alignment. Advances in Neural Information
+Processing Systems, 36, 2024. 2
+
+19
+
+Appendix
+Table of Contents
+A Limitations
+
+20
+
+B Additional Experimental Setup Details
+
+21
+
+B.1 LoRA Hyper-parameter Tuning Setup . . . . . . . . . . . . . . . . . . . . . . . . . 21
+C Additional Results
+
+21
+
+C.1 Prioritizing Incorrect Samples . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 22
+C.2 Comparing to Other SFT Methods . . . . . . . . . . . . . . . . . . . . . . . . . . . 23
+C.3 Synthetic Data Generation Preserves Properties of the Selected Data . . . . . . . . 24
+C.4 Prioritizing Difficult Data Creates Difficult Synthetic Data . . . . . . . . . . . . . . 26
+C.5 Different Selection Algorithms have their own Selection Biases . . . . . . . . . . . . 26
+C.6 On the Design Choices for Iterative Synthetic Data Generation . . . . . . . . . . . 27
+D Dataset Further Details
+
+28
+
+D.1 Seed Dataset Sizes . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 30
+D.2 Synthetic Data Generation Prompts . . . . . . . . . . . . . . . . . . . . . . . . . . 30
+D.3 Evaluation prompts
+
+A
+
+. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 36
+
+Limitations
+
+Iterative synthetic data generation for finetuning. We only consider SFT, we do not consider efficient synthetic data generation to accelerate training for RLHF, continual pre-training (Yang
+et al., 2025) or pre-training (Maini et al., 2025), for instance. These are promising directions of
+future work.
+The limits of the teacher. We assume that the teacher is able to generate high quality questions
+and answers. For GSM8k, Math1-3 and ProntoQA the teacher performance is high and so we assume
+ẑi is correct. For Game of 24 we rely on backward reasoning (specific to arithmetic) and a verifier
+to assess the teacher’s synthetic data. We have yet to test the limits of prompt-based synthetic
+data generation in settings where teacher capabilities fall short.
+Data generation is noisy. We can obtain improved student capabilities using iterative synthetic data generation. However, synthetic data generation is a noisy process where we show that
+properties of the selected datasets are preserved (Section 5.4.3). However, it is not clear how we
+can guarantee that synthetic data retains desirable properties from the seed dataset. For example,
+reward scoring performs poorly for the Game of 24 since it is biased by long student answers despite also selecting low quality student responses for synthetic data generation as required. We have
+20
+
+Model
+
+Dataset
+
+Mistral-7B-Instruct-v0.3
+Llama-3-8B-Instruct
+Qwen1.5-7B-Chat
+Qwen2.5-7B-Instruct
+Mistral-7B-Instruct-v0.3
+Llama-3-8B-Instruct
+Qwen1.5-7B-Chat
+Qwen2.5-7B-Instruct
+
+GSM8k seed
+Math1-3 seed
+ProntoQA seed
+Game of 24 seed
+GSM8k synthetic
+Math1-3 synthetic
+ProntoQA synthetic
+Game of 24 synthetic
+
+LoRA Rank
+
+Learning Rate
+
+Epochs
+
+32
+32
+32
+16
+32
+64
+32
+16
+
+1e-4
+1e-6
+1e-5
+1e-5
+1e-4
+1e-4
+1e-5
+5e-4
+
+10
+13
+13
+13
+10
+13
+13
+30
+
+Table 1: Optimal hyper-parameters for LoRA fine-tuning for all seed and synthetic datasets.
+presented an initial study of the “steerability” of synthetic data generation. However the ability to
+add further desirable properties is left for future work.
+
+B
+
+Additional Experimental Setup Details
+
+We introduce additional details of our experimental setup from Section 5.3. We outline the hyperparameter grid search for SFT.
+
+B.1
+
+LoRA Hyper-parameter Tuning Setup
+
+To obtain the best hyperparameters for our seed datasets D0 and our synthetic datasets D̂t , we
+sweep through a grid of learning rates, number of training epochs and LoRA rank hyper-parameters
+using 1k question-answer pairs from the original seed dataset and 1k question-answer pairs synthetically generated by the teacher model. Refer to Table 1 for the optimal hyperparameters found
+in our sweep.
+
+C
+
+Additional Results
+
+We introduce additional results that support the claims in our main paper. In Section C.1, we introduce the results of prioritizing synthetic data generation using incorrect student predictions (Lee
+et al., 2024) and an even number of correct and incorrect student data (Liu et al., 2024a). We do
+not include these results in the main paper for comparison since they require the ground truth
+answer y for scoring unlike the other active scoring methods considered (Section 5.4.2). In Section C.2, we compare iterative synthetic data generation with comparable SFT methods from the
+literature. In Section C.3, we analyse the workings of synthetic data generation to show that despite introducing noise, the synthetic data retains the scores of the original selected seed data in
+aggregate. Furthermore, in Section C.4, we study how the synthetic datasets which are prioritized
+by low reward and high loss selection algorithms result in more difficult synthetic datasets since
+we observe lower student accuracies. In Section C.5, we show how the different scorers produce
+synthetic datasets with different token frequency distributions. These observations explain why
+selecting data prior to synthetic data generation results in data that has similar properties to our
+
+21
+
+Figure 8: Iterative synthetic data generation learning curves, showing student SFT
+performance after training on synthetic data of increasing size with incorrect (Lee
+et al., 2024) and EvoKD (Liu et al., 2024a) data prioritization. Each consecutive increase
+in dataset size corresponds to an iteration of iterative synthetic data generation (Algorithm 1).
+Learning curves are across various dataset student model pairs. Curves are an average and standard
+error over 3 replicates.
+selected data and therefore enhanced student performance upon finetuning. Finally, in Section C.6,
+we compare various design choices for iterative synthetic data generation (Algorithm 1).
+
+C.1
+
+Prioritizing Incorrect Samples
+
+Prioritizing incorrect student predictions
+yields strong performance on all but one
+of the datasets we consider. A simple data
+point scoring mechanism is to assign a {0, 1}
+score for an incorrect or correct answer from
+the student model. This scoring mechanism requires a verifier or the ground truth answer y
+and so is not directly comparable to the active
+scoring methods we consider that do not require the ground truth answer for scoring (Section 5.3). Regardless, we show the results of
+performing iterative synthetic data generation
+by prioritizing incorrect samples in Figure 8.
+For GSM8k this method severely underperforms
+other prioritization methods and random sampling. For Math1-3 and Game of 24 incorrect
+student answer prioritization is as data efficient
+as high loss scoring which is the most data efficient method identified in Section 5.4.2. For
+the ProntoQA dataset incorrect answer prioritization obtains results on par with the best
+scoring methods if not better results for certain
+dataset sizes n. Considering a pairwise win-rate
+(described in Section 5.4.2) we can see from the
+
+Figure 9: The pairwise win rate matrix
+over all datasets and all methods including
+incorrect prioritization. Element Pij corresponds roughly to the number of times algorithm
+i outperforms algorithm j including results of incorrect student answer prioritization (Lee et al.,
+2024) and EvoKD (Liu et al., 2024a). Columnwise averages at the bottom display overall performance (lower is better).
+22
+
+Dataset
+
+Method
+
+LLM
+
+SFT Dataset Size
+
+Performance
+
+GSM8k
+
+Teacher
+Orca-Math (Mitra et al., 2024)
+OpenMathInstruct (Toshniwal et al., 2024)
+Iterative Synthetic Data Generation (ours)
+
+GPT-4o
+Mistral-7B-Instruct-v0.3
+Mistral-7B-Instruct-v0.3
+Mistral-7B-Instruct-v0.3
+
+n/a
+10k
+1.8M
+10k
+
+94.9 ± 1.1
+70.2
+80.2
+80.6 ± 1.2
+
+Math1-3
+
+Teacher
+Iterative Synthetic Data Generation (ours)
+
+GPT-4o
+Llama-3-8B-Instruct
+
+n/a
+10k
+
+91.8 ± 0.7
+56.1 ± 0.9
+
+ProntoQA
+
+Teacher
+Iterative Synthetic Data Generation (ours)
+
+GPT-4o
+Qwen1.5-7B-Chat
+
+n/a
+8k
+
+98.9 ± 0.4
+96.9 ± 0.8
+
+Game of 24
+
+Teacher
+UFT (Ni et al., 2025)
+Iterative Synthetic Data Generation (ours)
+
+GPT-o3-mini
+Qwen2.5-7B-Instruct
+Qwen2.5-7B-Instruct
+
+n/a
+13.7k
+6k
+
+22.6 ± 1.8
+30.2 ± 2.1
+85.0 ± 1.3
+
+Table 2: Iterative synthetic data generation performs comparably to state-of-the-art
+SFT methods on certain datasets. The results of iterative synthetic data generation using high
+loss selection, as this selection method performs the best overall. We compare only to methods
+that use the same LLM and omit work that relies on larger datasets to achieve higher performance,
+as we cannot determine whether such gains stem from better techniques or simply from increased
+data. All SFT methods report the amount of data used for SFT. We report a mean and standard
+error over multiple seeds for our work, however some baselines only report a single seed.
+row for incorrect prioritization that it is more data efficient in many instances with a high number
+of “wins” versus other methods. However at the same time looking at the corresponding column
+it is outperformed by many of the other methods in particular high loss and low reward selection
+due to its poor performance on the GSM8k dataset so it results in a poor overall score in the final
+row (Figure 9). Overall it is a simple method and has the possibility of obtaining strong capabilities
+and being more data efficient than random sampling in certain domains.
+EvoKD underperforms random sampling and other active selection methods. Similar to Lion, which samples evenly from easy and hard data pools as determined by LLM-as-a-judge
+scores, we can sample data evenly from correct and incorrect student predictions for synthetic data
+generation (Liu et al., 2024a). Evolving Knowledge Distillation (EvoKD), denoted as “EvoKD”
+in Figure 8, can be viewed as a diversity-based sampling approach for synthetic data generation. It
+achieves performance comparable to incorrect-data prioritization on GSM8k and Game of 24, but
+underperforms it on Math1-3 and ProntoQA. For GSM8k, EvoKD shares the same pathologies as
+promoting incorrect samples, they both underperform random sampling. EvoKD also underperforms methods that explicitly promote difficult samples (Figure 9), since it promotes hard samples
+through incorrect prioritization while simultaneously including easy samples to preserve the original data distribution. Overall, diversity-based criteria underperform approaches that emphasize
+difficult samples across the methods and datasets we study.
+
+C.2
+
+Comparing to Other SFT Methods
+
+Iterative synthetic data generation obtains comparable results to state-of-the-art SFT
+methods on certain datasets. Table 2 compares the results of iterative synthetic data generation
+with high-loss selection to prior works in SFT which use the same LLM and similar dataset sizes.
+In our definition of data efficiency (Section 2), we can only properly compare against baselines that
+use the same model and that perform SFT on datasets of the same size, or if a baseline has a lower
+
+23
+
+Original vs Synthetic Scores Datapoints Correlation
+GSM8K - Loss
+Math1-3 - Loss
+ProntoQA - Loss
+Game of 24 - Loss
+Spearman = 0.078** Spearman = 0.129*** Spearman = 0.145*** Spearman = 0.126***
+
+Synthetic Scores
+
+0.15
+
+0.15
+
+0.10
+
+0.10
+0.10
+
+0.15
+
+0.15
+
+0.10
+
+0.10
+
+0.15
+
+0.10
+
+0.15
+
+0.10
+
+0.15
+
+0.10
+
+0.15
+
+GSM8K - Reward
+Math1-3 - Reward
+ProntoQA - Reward
+Game of 24 - Reward
+Spearman = 0.154*** Spearman = 0.108*** Spearman = 0.145*** Spearman = 0.085**
+20
+
+20
+
+20
+
+20
+
+0
+
+0
+
+0
+
+0
+
+20
+
+20
+
+0
+
+20
+
+Original Scores
+
+20
+
+20
+
+0
+
+20
+
+20
+
+Original Scores
+
+20
+
+0
+
+20
+
+Original Scores
+
+20
+
+20
+
+0
+
+20
+
+Original Scores
+
+Figure 10: The scores for individual datapoints before and after 1 step of synthetic
+data generation. We consider the loss and reward of the student’s predictions and look at the
+individual data points scores across all datasets. The Spearman correlation measures the rank
+correlation before and after synthetic data generation. The red line shows the line of best fit to
+these data. The number of asterisks denotes the rank correlation’s p-value: *** indicates p < 0.001.
+performance on a larger dataset size. Then we can conclude whether our method or the baseline
+is more data efficient, as defined in Section 2. If a baseline has better performance with a larger
+dataset size, then it is not possible to say whether the baseline we are comparing against or our
+method is more data efficient without scaling to the same dataset sizes. Since we cannot disentangle
+the performance improvements due to data quality or to increased dataset sizes. For GSM8k our
+work is more data efficient when compared to Orca-Math Mitra et al. (2024). Also for Game of 24
+our method outperforms state-of-the-art SFT baselines that use a Qwen2.5-7B-Instruct LLM Ni
+et al. (2025). For the Math1-3 and ProntoQA datasets we did not find a comparable SFT methods
+to compare data efficiency with.
+
+C.3
+
+Synthetic Data Generation Preserves Properties of the Selected Data
+
+At the dataset level synthetic data generation preserves properties of the original seed
+dataset. We score the selected seed dataset and take a median over scores and compare to the
+median score over the resulting synthetic data. If we do this for all iterations, we observe a very high
+rank correlation between median scores in Figure 6. This indicates that the scores across the
+iterative synthetic data generation curriculum are similar before and after synthetic
+data generation.
+When we look at the scores over individual data points and consider the score of a selected
+data point and the corresponding score of the synthetically generated datapoint, then we find there
+is a low but significantly greater than 0 rank correlation between reward and loss scores for all
+datasets (Figure 10).
+
+24
+
+Cum. acc. rwd (low)
+final iter.
+
+Cum. acc. rwd (low)
+first iter.
+
+Cum. acc. loss (high)
+final iter.
+
+Cum. acc. loss (high)
+first iter.
+
+random ordering
+
+GSM8K
+
+Math1-3
+
+200
+0
+
+500
+
+1000
+
+600
+
+0
+
+400
+
+200
+
+200
+0
+
+500
+
+1000
+
+1000
+
+0
+
+500
+
+1000
+
+0
+
+600
+
+600
+
+400
+
+400
+
+200
+
+200
+0
+
+500
+
+Data Seen
+
+1000
+
+0
+
+600
+400
+200
+0
+
+500
+
+1000
+
+0
+
+0
+
+500
+
+1000
+
+1000
+750
+500
+
+500
+
+250
+0
+
+500
+
+0
+
+1000
+
+1000
+750
+500
+250
+0
+
+200
+0
+
+Game of 24
+
+1000
+
+400
+
+200
+
+0
+
+500
+
+600
+
+400
+
+0
+
+0
+
+600
+
+400
+
+0
+
+1000
+750
+500
+250
+0
+
+400
+
+200
+
+loss (high) ordering
+
+ProntoQA
+
+600
+
+400
+
+0
+
+rwd (low) ordering
+
+0
+
+500
+
+1000
+
+0
+
+500
+
+1000
+
+Data Seen
+
+0
+
+1000
+
+250 500 750 1000
+
+200
+0
+
+500
+
+1000
+
+0
+
+0
+
+500
+
+1000
+
+1000
+750
+500
+
+500
+500
+
+0
+
+400
+
+1000
+
+0
+
+0
+
+250
+0
+
+500
+
+Data Seen
+
+1000
+
+0
+
+0
+
+250 500 750 1000
+
+Data Seen
+
+Figure 11: The synthetic data cumulative accuracies when using random sampling and
+score ordering: high to low loss and low to high reward. For each original data point
+we score it using the student model from the first and final iteration of iterative synthetic data
+generation (alternating rows). Then we generate a synthetic data point. We compare the cumulative
+accuracy over the synthetic data when ordering data randomly versus ordering according to the
+loss and reward scores. We plot individual replicates as individual lines.
+
+25
+
+These two observations are consistent: synthetic data generation is preserving distributional
+factors such as dataset uncertainty (as measured by the loss over student predictions) and dataset
+quality (as measured by the reward over student predictions). But the noise from prompt-based
+synthetic data generation means that there is a low but significant correlation between scores at
+an individual data point level.
+
+C.4
+
+Prioritizing Difficult Data Creates Difficult Synthetic Data
+
+The teacher produces difficult synthetic data when hard samples are prioritized by
+the student. We score seed data according to its loss or reward and then generate corresponding
+synthetic data. We obtain the cumulative accuracy of the synthetic data ordered by the original
+data scores. A random ordering corresponds to random sampling, while ordering the cumulative
+accuracy according to a high to low loss or low to high reward corresponds to prioritizing “difficult”
+data as we do in iterative synthetic data generation. For random sampling the cumulative accuracy
+versus the amount of data seen so far follows a diagonal line (Figure 11).
+We plot the cumulative accuracy curves for synthetic data ordered from high to low original
+data loss (loss (high) ordering) in the first two rows and by low to high original data reward (rwd
+(low) ordering) in the final two rows of Figure 11. For GSM8k and Math1-3 the cumulative accuracy
+curves for synthetic data ordered using high to low original data loss and low to high reward are
+below random sampling so prioritizing data according to these scores results synthetic data that
+the student gets lower accuracies versus random sampling. The synthetic data is “harder” using
+these active learning approaches and these “hardness” qualities are integrated in the synthetic data
+the teacher generates. This is also seen for the first iteration for the Game of 24 dataset for both
+scorers. In contrast, in the final iteration the student is able to get a high accuracy on the synthetic
+data and so it is difficult to see any difference between random ordering and prioritizing according
+to a high loss or low reward. This is also the case for the ProntoQA dataset, for the first iteration
+we see high student accuracies for the synthetic data making comparison versus random sampling
+difficult, despite the reward scorer obtaining better performance than random on the ProntoQA
+dataset (Figure 8).
+To obtain the cumulative difference plots presented in the main body of this manuscript in (Figure 7), we simply take the vertical distances between corresponding random sampling cumulative
+accuracies and the scorer cumulative accuracies in Figure 11 and aggregate across all replicates to
+obtain means and standard errors.
+
+C.5
+
+Different Selection Algorithms have their own Selection Biases
+
+The different selection algorithms we consider manifest as differences in the synthetic dataset distributions. When we compare the synthetic datasets to the original seed
+datasets over the course iterative synthetic data generation, then differences between selection
+algorithms are evident by looking at the token distributions in Figure 12. In particular, we measure the difference between
+two token distributions using the total variation distance (TVD):
+P
+TVD(PD0 , PD̂t ) = 12 x∈V |PD0 (x) − PD̂t (x)| where x is a token in the vocabulary V and P is
+the empirical token distribution. The token distribution P can be thought of as a histogram where
+the bin size is the normalized frequency of the token in the dataset. This distance is essentially
+looking at the absolute differences in token counts between two datasets. When measuring the TVD
+between synthetic datasets and the original seed dataset prior to selection, D0 . We can see that
+26
+
+random
+
+TVD Distance
+
+GSM8k
+0.35
+0.30
+0.25
+
+1 2 3 4 5 6 7 8 9 10
+Iteration
+
+loss (high)
+
+0.45
+0.40
+0.35
+0.30
+0.25
+
+rwd (low)
+
+lion
+
+Math1-3
+
+llm-as-a-judge (hard)
+
+BADGE
+
+ProntoQA
+
+1 2 3 4 5 6 7
+Iteration
+
+Game of 24
+
+0.24
+
+0.205
+
+0.22
+
+0.200
+
+0.20
+
+0.195
+1 2 3 4 5 6 7 8
+Iteration
+
+incorrect
+
+1 2 3 4 5 6 7 8 9 10
+Iteration
+
+Figure 12: The total variation distances between token distributions of our synthetic
+data and the original seed datasets. We observe differences in the token distributions over
+the course of iterative synthetic data generation across for data selection algorithms, indicating
+differences in the synthetic datasets arise due to the different selection algorithms used.
+the distance varies between different selection algorithms which shows that there are differences in
+the synthetic datasets at a token distribution level. The Game of 24 dataset is the sole case where
+the selection algorithms yield almost indistinguishable TVDs, as its questions and answers draw
+from a highly restricted token range to compute 24 from four numbers using basic arithmetic operations. This points to there being distributional differences between synthetic datasets of different
+selection algorithms and thus shows that the selection algorithms manifest in different synthetic
+datasets with different properties over the course of iterative synthetic data generation. These distributional differences lead to performance differences between different selection algorithms which
+have been studied in the main results (Figure 4).
+
+C.6
+
+On the Design Choices for Iterative Synthetic Data Generation
+
+Argmax selection, rather than sampling, results in the best SFT performance. In Figure 13, we compare various data prioritization design choices. The performance for scorers that
+prioritize data where the student answer is the most uncertain (high loss) or worse quality (low
+reward) results in the best performance when compared to data for which the model is confident
+(low loss) or is of better quality (high reward). Furthermore, we compare whether using the ground
+truth answer y (denoted “gt” in Figure 13) or the student’s own prediction ŷ is more data efficient. We can see worse performance when computing scores with the ground-truth answer for the
+loss scorer, while scoring with the reward model results in equal SFT performance. There is no
+benefit to using the ground truth answers over the student’s own predictions.
+Finally, we compare selection methods: argmax selection and sampling and can see lower SFT
+performance when using sampling (labelled with “sampling” in Figure 13). We sample m points
+m
+by sampling from a distribution proportional to these scores: D̄t ∼ softmax({si }ni=1 ). We found
+poor performance when sampling because sampling from the softmax distribution of loss or reward scores results in a similar distribution of scores for selected data as if we performed random
+sampling. Moreover, if we select m = 1k data points from the GSM8k seed dataset and look at
+the distribution of loss scores via sampling for the highest and lowest 1k scoring data, then the
+distributions are indistinguishable to the naked eye. Argmax selection however produces distinct
+distributions (Figure 14).
+
+27
+
+Figure 13: Performance of iterative synthetic data generation on various data scoring and selection options. We train on 1k data points at each iteration with a Mistral-7BInstruct-v0.3 student on GSM8k. We compare prioritizing “difficult” or “easy” data points with
+a high or low loss or reward. We compare using ground truth answers y to the student’s own
+predictions ŷ and using argmax selection against sampling.
+
+D
+
+Dataset Further Details
+
+In this section we provide in depth details on the datasets used in our experiments together with
+the dataset sizes used throughout our empirical study of iterative synthetic data generation (Section D.1). Also we provide the teacher prompts used for synthetic data generation (Section D.2).
+We introduce the seed question and answer datasets D0 . The validation and test sets are
+taken from the original seed datasets as opposed to using synthetic data. The train sets D̂t are
+synthetically generated. We summarize the datasets sizes in Section D.1. Unless otherwise stated
+we use a GPT-4o teacher. We prompt the teacher with few-shot examples from D0 to generate
+a new synthetic questions (Liu et al., 2024a). For all datasets we throw away similar synthetic
+questions if the rouge-score (Lin, 2004) with respect to all previously generated questions is above
+0.7 (Jiang et al., 2023b).
+Sampling
+Argmax
+GSM8k. We perform SFT on a Mistral-7BInstruct-v0.3 (Jiang et al., 2023a) student
+on school level mathematics questions (Cobbe
+et al., 2021). We use an external language
+model gpt4o-mini to assess whether the student’s answer is equivalent to the ground truth
+answer, in a similar manner to Mitra et al.
+(2024), see Section D.3 for prompting details.
+We take 748 question-answer pairs from the test
+set as a validation set and use 500 questionanswer pairs as a test set† .
+†
+
+loss (high)
+loss (low)
+0.00 0.05 0.10 0.15 0.00 0.05 0.10 0.15
+
+Loss
+
+Loss
+
+Figure 14: Distribution of losses for different
+sampling methods. We select 1k according to
+a high or low loss sampling (left) and argmax selection (right) for GSM8k and can see almost no
+difference when using sampling.
+
+https://huggingface.co/datasets/openai/gsm8k
+
+28
+
+Math1-3. We finetune a Llama-3-8B-Instruct (Dubey et al., 2024) student on the competition
+math dataset (Hendrycks et al., 2021) which consists of more difficult math questions‡ . The dataset
+is classified into 5 levels of question difficulty. We use the easiest levels 1 to 3 and pick 500 questionanswer pairs from the test set for validation. We assess the correctness of an answer by matching
+the solution to the regular expression \boxed{(\d*)}. The dataset is also categorized by the type of
+mathematics question: geometry, algebra etc. We use the category in our synthetic data generation
+prompt.
+ProntoQA. The questions are synthetically generated logical chain-of-thought style reasoning questions with boolean answers (Saparov and He, 2023). We perform SFT with a Qwen1.5-7B-Chat
+student model. We use an external language model gpt4o-mini to assess whether the student’s
+reasoning steps are correct and whether the student answer is equivalent to the ground truth answer
+like for GSM8k, see Section D.3 for details. We use 300 question-answer pairs as a validation set and
+the remaining 200 as a test set§ .
+Game of 24. We use a Qwen2.5-7B-Instruct (Qwen et al., 2025) student for SFT on the task of
+using 4 numbers to obtain the number 24 by finding which basic arithmetic operations are needed¶ .
+Each question can have multiple solutions, we treat each solution as a separate data point. We use
+backward reasoning to synthetically generate new questions (Jiang et al., 2024) and use GPT-o3mini as a teacher model (qualitatively this produces better questions than GPT-4o). In backward
+reasoning if the answer is 13*8-10*8=24, for example, we can construct a new question by setting
+two integers to variables a*b-10*8=24 and solving to generate new questions and answers (Jiang
+et al., 2024). We verify that the backward reasoned final answer evaluates to 24 and that it uses
+the 4 numbers in the question. We use GPT-4o to then generate reasoning steps to obtain the final
+backward-reasoned answer. We assess the correctness of the student’s final answer by matching the
+regular expression in \boxed{} and that the extracted answer evaluates to 24 and checking that all
+numbers in the question are used once. Synthetic questions are not checked for rouge-score overlap
+since the set of tokens required to make questions and answers is a small subset of the vocabulary.
+Dataset
+
+Seed Size
+
+Validation Size
+
+Test size
+
+GSM8k
+Math1-3
+ProntoQA
+Game of 24
+
+7473
+3504
+2880
+2217
+
+748
+500
+300
+500
+
+500
+500
+200
+300
+
+Table 3: Summary of the seed dataset sizes, validation and test set sizes. For all datasets we use
+1k data points per iteration for finetuning.
+‡
+
+https://huggingface.co/datasets/hendrycks/competition_math
+We usehttps://huggingface.co/datasets/renma/ProntoQA for validation and testing, as a train set we use
+https://huggingface.co/datasets/longface/prontoqa-train like in (Huang et al., 2024), questions are distinct
+between these two ProntoQA datasets.
+¶
+https://huggingface.co/datasets/nlile/24-game
+§
+
+29
+
+D.1
+
+Seed Dataset Sizes
+
+We summarize the seed dataset sizes for all datasets used in our experiments in Table 3. The
+seed dataset D0 , is used for scoring and selecting data points to get the selected data D̄t . The
+selected data is then put forward for prompt-based synthetic data generation (Section 4.2). We set
+the validation and test sets to be from the original seed datasets. We use the resulting synthetic
+datasets D̂t for SFT, we generate a fixed sized synthetic dataset to enable fair comparison between
+selection methods and assess data efficiency (Section 5.1).
+
+D.2
+
+Synthetic Data Generation Prompts
+
+We provide the prompts used for prompt-based synthetic data generation (described in Section 4.2)
+below for all datasets used in our experiments:
+• GSM8k see Section D.2.1.
+• Math1-3 see Section D.2.2.
+• ProntoQA see Section D.2.3.
+• Game of 24 see Section D.2.4.
+D.2.1
+
+Grade School Maths
+
+Below is the prompt we use for synthetic question generation for GSM8k using a GPT-4o teacher. In
+the prompt below {0} are few-shot examples of questions and answers: {zi }ki=1 ∼ D0 , we set k = 5
+for all our experiments and {1} is the question from the data selected by the student: x̄ = z̄[0] where
+z̄ ∼ D̄t . The few-shot examples are formatted as follows: #Given Instruction#: {} #Answer#: {}
+
+30
+
+GSM8k synthetic question generation prompt
+I want you to act as Instruction Creator.
+Your objective is to rewrite a #Given Instruction# into a more complex
+version, to make it a bit harder.
+The #Rewritten Instruction# must be reasonable and must be understood and
+responded to by humans.
+Here are some #Examples#:
+{0}
+I want you to act as Instruction Creator.
+Your objective is to rewrite a #Given Instruction# into a more complex
+version, to make it a bit harder.
+The #Rewritten Instruction# must be reasonable and must be understood and
+responded to by humans.
+You MUST complicate the #Given Instruction# using the following method:
+1. Change the names of people #Given Instruction#.
+2. Change the objects in the #Given Instruction#.
+3. Change any quantities and durations in the #Given Instruction#.
+4. Add 1 to 3 more operations in #Rewritten Instruction#.
+5. Change the operations, for example: multiplication, division,
+subtraction, addition, percentages, fractions and combinations of these.
+6. You should try your best not to make the #Rewritten Instruction# become
+verbose, #Rewritten Instruction# can only add 10 to 20 words into #Given
+Instruction#.
+Use #Examples# to complicate #Given Instruction#.
+’#Given Instruction#’, ’#Rewritten Instruction#’, ’given instruction’
+and ’rewritten instruction’ are not allowed to appear in #Rewritten
+Instruction#.
+#Given Instruction#:
+{1}
+#Rewritten Instruction#:
+We use the following prompt to obtain synthetic answers from our GPT-4o teacher (and from
+our student model):
+GSM8k answer prompt
+Question:
+
+D.2.2
+
+{} Solve the problem step-by-step.
+
+Answer:
+
+Math1-3
+
+Below is the prompt we use for synthetic question generation for Math1-3 using a GPT-4o teacher,
+{0} are few shot examples of questions, answers and the type of problem e.g. Geometry, Algebra etc. The number of few-shot examples is 5 and are of the same type as the seed question. In the prompt below {1} is the type of mathematics problem and {2} is the question from
+the selected dataset: x̄ = z̄[0] where z̄ ∼ D̄t . The few-shot examples are formatted as follows:
+
+31
+
+The type of math problem is {}.
+
+#Given Instruction#:
+
+{} #Answer#:
+
+{}
+
+Math1-3 synthetic question generation prompt
+I want you to act as an Instruction Creator for {1} mathematics problems.
+Create a new question #Rewritten Instruction# by using #Given Instruction#
+as inspiration. The new question should have a single unique answer.
+Ensure that the type of the question you generate #Rewritten Instruction#
+matches the type of instruction #Given Instruction#.
+Make #Rewritten Instruction# different from #Given Instruction#.
+The #Rewritten Instruction# must be reasonable, have a solution and must be
+understood and responded to by humans. Here are some #Examples#:
+{0}
+Use #Examples# as inspiration to make #Rewritten Instruction# different to
+#Given Instruction#.
+’#Given Instruction#’, ’#Rewritten Instruction#’, ’given instruction’
+and ’rewritten instruction’ are not allowed to appear in #Rewritten
+Instruction#.
+#Given Instruction# is a {1} math problem.
+#Given Instruction#:
+{2}
+#Rewritten Instruction#:
+
+We use the following prompt for obtaining synthetic answers from our GPT-4o teacher (and for
+obtaining answers from our student model):
+Math1-3 answer prompt
+Can you solve the following math problem? {0}. Provide a bullet point
+summary of your reasoning. Your final answer should be a single answer, in
+the form \boxed{answer}, at the end of your response.
+
+D.2.3
+
+ProntoQA
+
+We present the prompt we use for synthetic question generation using a GPT-4o teacher for the
+ProntoQA dataset (Saparov and He, 2023). A datapoint from the ProntoQA dataset is comprised
+of a context, question and answer z = (x = (c, q), y) where x is comprised of the context c and
+question q. The answers y are boolean. The few-shot question generation is therefore comprised of
+contexts and questions for the teacher to generate new synthetic context and questions, x̂. In the
+prompt below {0} are few-shot examples of questions and answers from {zi }ki=1 ∼ D0 , we set k = 5
+for all our experiments and {1} is the question from the selected dataset x̄ = z̄[0] where z̄ ∼ D̄t .
+The few-shot examples {0} are formatted as follows: Context: {} Question: {}.
+
+32
+
+ProntoQA synthetic question generation prompt
+I want you to act as an Instruction Creator for logical problems.
+Create a new question #Rewritten Instruction# by using #Given Instruction#
+as inspiration.
+Make #Rewritten Instruction# different from #Given Instruction# by changing
+the names, objects and adjectives. Also vary the number of logical
+reasoning steps in #Rewritten Instruction#. Ensure that it is possible
+to answer the question with true or false answer.
+The #Rewritten Instruction# must be reasonable, have a solution and must be
+understood and responded to by humans.
+Here are some #Examples#:
+{0}
+Use #Examples# as inspiration to make #Rewritten Instruction# different to
+#Given Instruction#.
+’#Given Instruction#’, ’#Rewritten Instruction#’, ’given instruction’
+and ’rewritten instruction’ are not allowed to appear in #Rewritten
+Instruction#.
+#Given Instruction#:
+{1}
+#Rewritten Instruction#:
+
+We use the following prompt for obtaining synthetic answers from the GPT-4o teacher (and for
+obtaining answers from our student model):
+ProntoQA answer prompt
+Context:
+
+D.2.4
+
+{} Let’s think step by step.
+
+Response:
+
+Game of 24
+
+Below is the prompt we use for synthetic question generation using GPT-o3-mini teacher for the
+Game of 24 dataset. A datapoint from the Game of 24 dataset is comprised of a set of four
+numbers and the arithmetic one-line solution to obtain 24. In the prompt below {0} is the question,
+a set of numbers for instance x̄ = [8, 8, 10, 12] and {1} is the arithmetic answer for instance ȳ =
+(12 − 10) × 8 + 8 where z̄ = (x̄, ȳ) and z̄ ∼ D̄t . We use backward reasoning to to obtain a new
+question and answer to the Game of 24 (see the prompt below). We verify that the synthetic
+answer evaluates to 24 and that all the numbers from the synthetic question are also present in
+the synthetic answer. Since backward reasoning for synthetic data generation produces both the
+question and the answer, we then prompt our teacher, GPT-4o in a second step, with both the
+synthetic question and answer to get a synthetic reasoning trace without any verification of the
+reasoning steps to construct our synthetic dataset D̂t (in the second prompt below).
+
+33
+
+Game of 24 synthetic question generation prompt
+I want you to act as an instruction creator. I want you to write a new
+problem to the game of 24.
+The numbers {0} need to be used to obtain the number 24. Use each number
+once, even if a number is repeated use it multiple times, with the
+arithmetic operations +, -, *, / to obtain 24. Here is how the above
+numbers {0} are used to obtain 24: {1}.
+I want you to create a new problem to the game of 24 using {1}. Let’s use
+a backward thinking method. Take two of the distinct numbers in {1}. Call
+them a and b. Then construct an equation with two unknowns, a and b. Pick
+integer values for the first variable b then solve for a.
+For example the numbers 8, 8, 10, 13 can be used to get 24: 13*8-10*8=24.
+We can construct the following equation a*b-10*8=24 by substituting a=13 and
+b=8. Rearranging we get a=104/b. Let’s pick an integer which divides into
+104 for b: b=4 therefore a=26.
+We also could have picked b=2 and so a=62. Therefore one possible answer
+to the game of 24 using this backward method is \boxed{4*26-10*8}. If no
+answer is possible return \boxed{null}.
+Here is the current solution {1} again. Enclose the new equation which
+results in 24 in \boxed{}. Let’s use this backward thinking method and
+think step by step.
+
+34
+
+Game of 24 prompt for synthetic reasoning steps
+Use numbers and basic arithmetic operations (+ - * /) to obtain 24. Each
+step, you are only allowed to choose two of the remaining numbers to obtain
+a new number.
+Input: 4 4 6 8
+Steps:
+4 + 8 = 12 (left: 4 6 12)
+6 - 4 = 2 (left: 2 12)
+2 * 12 = 24 (left: 24)
+Answer: (6 - 4) * (4 + 8) = 24
+Input: 2 9 10 12
+Steps:
+12 * 2 = 24 (left: 9 10 24)
+10 - 9 = 1 (left: 1 24)
+24 * 1 = 24 (left: 24)
+Answer: (12 * 2) * (10 - 9) = 24 Input: 4 9 10 13
+Steps:
+13 - 10 = 3 (left: 3 4 9)
+9 - 3 = 6 (left: 4 6)
+4 * 6 = 24 (left: 24)
+Answer: 4 * (9 - (13 - 10)) = 24
+Input: 1 4 8 8
+Steps:
+8 / 4 = 2 (left: 1 2 8)
+1 + 2 = 3 (left: 3 8)
+3 * 8 = 24 (left: 24)
+Answer: (1 + 8 / 4) * 8 = 24
+Input: 5 5 5 9
+Steps:
+5 + 5 = 10 (left: 5 9 10)
+10 + 5 = 15 (left: 9 15)
+15 + 9 = 24 (left: 24)
+Answer: ((5 + 5) + 5) + 9 = 24
+Input: {question}
+Here is the final answer: {answer}
+Provide the steps to obtain the final answer which equates to 24, as
+if you did not have access to the answer. Put your final answer within
+\boxed{answer}. Steps:
+We use the following prompt to get answers from the student, similarly to Ni et al. (2025):
+
+35
+
+Game of 24 student prediction prompt
+Use numbers and basic arithmetic operations (+ - * /) to obtain 24. Each
+step, you are only allowed to choose two of the remaining numbers to obtain
+a new number.
+Input: 4 4 6 8
+Steps:
+4 + 8 = 12 (left: 4 6 12)
+6 - 4 = 2 (left: 2 12)
+2 * 12 = 24 (left: 24)
+Answer: (6 - 4) * (4 + 8) = 24
+Input: 2 9 10 12
+Steps:
+12 * 2 = 24 (left: 9 10 24)
+10 - 9 = 1 (left: 1 24)
+24 * 1 = 24 (left: 24)
+Answer: (12 * 2) * (10 - 9) = 24 Input: 4 9 10 13
+Steps:
+13 - 10 = 3 (left: 3 4 9)
+9 - 3 = 6 (left: 4 6)
+4 * 6 = 24 (left: 24)
+Answer: 4 * (9 - (13 - 10)) = 24
+Input: 1 4 8 8
+Steps:
+8 / 4 = 2 (left: 1 2 8)
+1 + 2 = 3 (left: 3 8)
+3 * 8 = 24 (left: 24)
+Answer: (1 + 8 / 4) * 8 = 24
+Input: 5 5 5 9
+Steps:
+5 + 5 = 10 (left: 5 9 10)
+10 + 5 = 15 (left: 9 15)
+15 + 9 = 24 (left: 24)
+Answer: ((5 + 5) + 5) + 9 = 24
+Input: {question}
+Put your final answer within \boxed{answer}. Steps:
+
+D.3
+
+Evaluation prompts
+
+To assess whether the student’s prediction is equal to the ground-truth answer we use gpt4o-mini
+to verify the correctness of the student. We use the following prompt and a system prompt which
+is different for each dataset used:
+
+36
+
+GSM8k and ProntoQA evaluation prompt
+Question:{} Problem Setter’s answer:{} Student’s answer:{}
+For GSM8k we use the following system prompt for evaluation, similarly to Mitra et al. (2024):
+GSM8k evaluation system prompt
+As an expert Math teacher, your role is to evaluate a student’s answer to a
+word problem. The problem is accompanied by a correct solution provided by
+the problem setter. It is important to remember that there may be various
+methods to solve a word problem, so the student’s steps might not always
+align with those in the problem setter’s solution. However, the final
+answer, typically a number, should be unique and match the problem setter’s
+answer. Your task involves analyzing the student’s solution to identify
+any mistakes and determine whether the answer can be modified to correct
+the error. If the student’s answer is unfixable, consider creating practice
+problems to help improve their understanding. Use the following format:
+Error Analysis: In one sentence, extract the final answer from the problem
+setter’s solution and compare it with the student’s answer. Do they match?
+Final Verdict: Correct/Incorrect.
+For ProntoQA we use the following system prompt for evaluation:
+ProntoQA evaluation system prompt
+You are a logical expert. Your role is to evaluate a student’s answer to a
+logical reasoning problem. The problem is accompanied by a correct solution
+provided by the problem setter. Your task is to assess whether the problem
+setter’s answer and the student’s answer match. Use the following format:
+Error Analysis: In one sentence, extract the final answer from the problem
+setter’s solution and compare it with the student’s answer. Do they match?
+Final Verdict: Correct/Incorrect.
+If the output contains string variations of "Final Verdict: Correct" then the student’s
+prediction is correct and wrong otherwise. For the Math1-3 and Game of 24 datasets we use
+pattern matching to extract the student’s answer and compare to the ground truth, see Section 5.1
+for details.
+
+37
+
+

@@ -1,0 +1,1532 @@
+When Models Know When They Do Not Know
+Calibration, Cascading, and Cleaning
+
+arXiv:2601.07965v2 [cs.AI] 28 Jun 2026
+
+Chenjie Hao1 , Weyl Lu1 , Yuko Ishiwaka3 , Zengyi Li2 , Weier Wan2 , Yubei Chen1,2†
+1
+University of California, Davis, 2 Aizip
+3
+SoftBank Corp.
+
+Abstract
+When a model knows when it does not know, many possibilities emerge. The
+first question is how to enable a model to recognize that it does not know. A
+promising approach is to use confidence, computed from the model’s internal
+signals, to reflect its ignorance. Prior work in specific domains has shown that
+calibration can provide reliable confidence estimates. In this work, we propose
+a simple, effective, and universal training-free method that applies to both vision
+and language models, performing model calibration, cascading, and data cleaning
+to better exploit a model’s ability to recognize when it does not know. We first
+highlight two key empirical observations: higher confidence corresponds to higher
+accuracy within a single model, and models calibrated on the validation set remain
+calibrated on a held-out test set. These findings empirically establish the reliability
+and comparability of calibrated confidence. Building on this, we introduce two
+applications: 1. Model cascading with calibrated advantage routing and 2. Data
+cleaning based on model ensemble. Using the routing signal derived from the
+comparability of calibrated confidences, we cascade large and small models to
+improve efficiency with almost no compromise in accuracy, and we further cascade
+two models of comparable scale to achieve performance beyond either model
+alone. Leveraging multiple experts and their calibrated confidences, we design a
+simple yet effective data-cleaning method that balances precision and detection
+rate to identify mislabeled samples in ImageNet and Massive Multitask Language
+Understanding (MMLU) datasets. Our results demonstrate that enabling models to
+recognize when they do not know is a practical step toward more efficient, reliable,
+and trustworthy AI.
+
+1
+
+Introduction
+
+Modern deep neural networks have achieved remarkable success in both vision and language domains.
+However, models still frequently produce incorrect [32] in regions of ignorance. Confidence, computed from intrinsic model signals, offers a promising path to estimate such ignorance. Prior work
+[9, 17, 25, 28, 10] has shown in specific domains that model calibration can yield reliable confidence
+estimates. In this work, we first introduce a unified framework for model calibration that applies to
+both vision and language models across diverse tasks.
+We highlight two core observations about confidence and calibration: (1) For a single model, confidence functions defined as likelihoods from logits exhibit an approximate monotonic relation, where
+higher-confidence samples tend to have higher accuracy, even without calibration. (2) Confidence
+calibrated on a validation set remains calibrated on a held-out test set, consistent with previous
+findings [8]. Based on these observations, we empirically demonstrate the reliability and cross-model
+comparability of calibrated confidence.
+† Corresponding author.
+
+Building on calibrated confidence, we propose two applications that are broadly applicable to both
+vision and language models. The first application is model cascading. Prior works have introduced
+routers or gating modules to decide whether an input should be handled by a larger model, an external
+resource, or a human [26, 24, 14, 3, 29]. We propose a training-free cascading method: using
+calibrated confidence, we construct a reliable routing signal—confidence advantage—that determines
+whether to invoke a larger model. On tasks spanning image classification (ImageNet-1K [23]), code
+generation (Mostly Basic Python Problems (MBPP) [2], and BigCodeBench [33]), reasoning and
+math task(ARC-Challenage [4], GSM8K [5]) , and knowledge-intensive QA (MMLU) [13], we
+show that this method achieves an effective balance of accuracy and efficiency. We further extend
+cascading to large–large model pairs, where the combined cascade surpasses the performance of
+both standalone models. Notably, on ImageNet-1K, cascading two state-of-the-art models achieves
+accuracy beyond the previous state of the art.
+The second application is data cleaning. Previous work (e.g., Confident Learning [18]) has demonstrated that confidence can signal mislabeled data: when a model is highly confident yet disagrees with
+the given label, the label is likely incorrect. We build upon this idea by using calibrated confidence as
+a reference signal. Since even calibrated single models may still err, we introduce an ensemble approach for data cleaning, where calibrated confidence provides a tunable trade-off between precision
+and detection rate. This method is simple yet effective. We apply it to ImageNet-1K and MMLU
+test sets, and through large-scale manual verification on ImageNet, we show that it outperforms prior
+methods in both accuracy and detection power.
+In summary, we propose a unified and streamlined framework for calibration, cascading, and cleaning
+that applies across domains and tasks. Our contributions are threefold: (1) we formalize a unified
+view of model calibration and empirically validate the reliability and comparability of existing
+methods; (2) we introduce a confidence-based cascading method, balancing accuracy and efficiency
+for small–large pairs and achieving superior performance with large–large pairs; and (3) we present a
+calibration-driven mixture-of-experts data cleaning approach that is simple, effective, and validated
+through human annotation. Together, these components provide a practical recipe for leveraging
+when models know when they do not know.
+
+2
+
+Method
+
+This section introduces our formalization of model calibration, key empirical observations, and two
+downstream applications. We begin with a unified formulation applicable to both vision and language
+models, followed by two calibration methods used in our experiments: temperature scaling and
+Platt scaling [21]. We then present key observations —— higher confidence corresponds to higher
+accuracy, and calibration learned on validation generalizes to held-out test sets —— which establish
+that calibrated confidence is both reliable and comparable across models. Building on these findings,
+we develop two applications: confidence-based model cascading to balance efficiency and accuracy
+or to combine strong models for improved performance, and agreement-driven data cleaning where
+confidence naturally balances precision and recall.
+2.1 On calibration of vision model and language model
+Formulation. Previous work has proposed calibration formulations tailored to specific cases, such
+as image classification models. Here we provide a unified formulation of model calibration that
+applies to both vision and language models, accommodates diverse downstream tasks, and supports
+different calibration methods.
+One sentence summary: calibration is making the model’s confidence cM align with the expected
+score E[v] from a verifier v, where the expectation is estimated as an average within bins.
+Confidence function
+
+c
+confidence
+
+align
+
+binning
+E[v]
+
+v
+
+accuracy
+
+verification score
+
+Verifier
+
+A calibration setup consists of the following components:
+• Model M takes input X ∈ X and generates internal states z = zM (X, Y ), used to
+sample a prediction Ŷ ∈ Y and to calculate confidence. For image classification model,
+2
+
+X is input image, Y is a class, z is logits over the label set Y; for language model, X is
+prompt, Y is a possible answer sequence and z is logits over sequence and token space.
+• Verifier v assesses the correctness of an input–answer pair: Specifically, a verifier v takes
+a pair (X, Y ) as input and outputs a verification score v(X, Y ) ∈ [0, 1]. For cases where
+correctness can be clearly determined, we consider a binary verifier, i.e., v(X, Y ) ∈ {0, 1}
+with v(X, Y ) = 0 (invalid) and v(X, Y ) = 1 (valid). For example, in classification tasks
+(e.g., image classification and multiple-choice benchmarks such as MMLU) where each input
+∗
+X has a corresponding ground-truth label Y ∗ , the verifier is defined as v(X, Y ) = 1Y =Y .
+For code-generation benchmarks, the verifier checks whether the generated code executes
+correctly and produces the expected output. A verifier must extract task-relevant information
+from model outputs, typically in a simplified manner. For example, in MMLU, one may
+only check whether the first generated token matches the correct label. For code tasks, the
+verifier needs to extract executable code segments from the output and run them. On average,
+the binary verification score reduces to accuracy.
+• Confidence function c(z) ∈ [0, 1] calculates the confidence of an input–output pair
+based on the model’s internal states z = zM (X, Y ). For classification models, a common
+choice is c = softmax(z/T ), a temperature-scaled softmax applied to logits, which yields
+likelihoods over all class labels. For languageQmodels, given an output sequence Y1 Y2 . . . Yn ,
+n
+the conditional joint likelihood ℓ(Y | X) = i=1 ℓ(Yi | X, Y1 , . . . , Yi−1 ) computed via the
+softmax function can be used as confidence. Alternatively, one may let the language model
+self-report its confidence, which amounts to an additional sampling step from the model. As
+noted above, verifier usually evaluates specific subsequences or restricted sub-token spaces.
+In such cases, the confidence function should also be constrained accordingly. For example,
+in MMLU only the first token (subsequence) and the four options {A, B, C, D} (sub-token
+space) are relevant. Thus the confidence function should be restricted to this subset and
+renormalized to preserve its probabilistic interpretation. In what follows, we will also absorb
+zM into c and use the shorthand cM (X, Y ).
+• Binning {Bi }N
+i=1 is a coarse-graining of the data, over which expectations can be
+estimated. Binning is essential with binary verifiers, since individual correctness is nonstatistical. Accuracy must be considered as an average over equivalence classes (bins).
+Common binning methods include: Confidence-based binning: Partition the interval [0, 1]
+into N equal intervals and assign each sample to a bin according to its confidence value.
+Sample-based binning (i.e., histogram equalization): Sort samples in ascending order of
+confidence and split them evenly into N bins {Bi }N
+i=1 . This partitioning prevents samples
+from concentrating in a few confidence bins, thereby improving robustness. In this work,
+we adopt sample-based binning.
+In general, confidence functions include learnable parameters. The process of optimizing these
+parameters on a validation set so that the confidence better reflects verifier scores is called model
+calibration. An ideal calibration means confidence perfectly reflects accuracy expectation, i.e.,
+cM (X, Y ) = E[v(X ′ , Y ′ ) | (X ′ , Y ′ ) ∈ Bi , where (X, Y ) ∈ Bi ].
+In practice, we approximate the expectation by the empirical average, and similarly apply binning
+average to the confidence, the form of ideal calibration then becomes:
+X
+X
+1
+1
+cM (X ′ , Y ′ ) =
+v(X ′ , Y ′ ).
+|Bi | ′ ′
+|Bi | ′ ′
+(X ,Y )∈Bi
+
+(X ,Y )∈Bi
+
+The left-hand side is the average confidence c̄i of the bin Bi , and the right-hand side is the corresponding average accuracy v̄i . For uncalibrated or non-ideal calibration, we measure the effectiveness
+of model confidence by the deviation between these two quantities: The Expected Calibration Error
+(ECE) is defined as:
+N
+X
+|Bi |
+ECE =
+|c̄i − v̄i |,
+n
+i=1
+where n denotes the total number of samples, and |Bi | the number of samples in the i-th bin.
+If the model adopts deterministic sampling such as greedy decoding (so that Ŷ is uniquely determined
+by X) and we only care about the confidence of the final prediction, then the above dependence of
+3
+
+confidence and accuracy on (X, Y ) pairs can be simplified to depend solely on X. In what follows,
+we will also use the shorthand notation cM (X), which implicitly denotes cM (X, Ŷ ).
+We employ two model calibration methods: temperature scaling (for vision tasks) and Platt scaling
+(for language tasks). Both methods involve a few calibration parameters trained on a validation set
+that is held out from the training and test sets, and both are optimized using the negative log-likelihood
+(NLL) loss. A notable result is that, despite not directly optimizing ECE, this optimization objective
+tends to reduce the ECE of the calibrated model, as shown in Fig.1 and Tab.1.
+Temperature Scaling. Temperature scaling introduces a single learned scalar parameter T > 0
+applied to the logit vector z over classes to calculate confidence: c = softmax(z/T ). The temperature
+T is trained using the same objective as in model training, namely the NLL loss over the class labels.
+Temperature scaling can be used for calibrating multiclass classifiers.
+Platt Scaling. Platt scaling [22] is a simple parametric calibration method tailored for binary
+classification. For a model output sequence Y1 . . . Yn , we obtain n logit vectors z1 . . . zn . Taking
+P
+(Y )
+their values at the sampled tokens, ẑi = zi i , we use their arithmetic mean z̄ = n1 i ẑi as a logit
+estimate for the sequence. Platt scaling then applies a sigmoid function to compute confidence:
+c = σ(az̄ + b),
+where a, b ∈ R are learned parameters and σ is the sigmoid function. These parameters are trained by
+fitting the confidence to the binary verifier’s judgment (0 for invalid, 1 for valid) using the NLL loss.
+Since it is inherently designed for binary outcomes, Platt scaling is particularly suitable for program
+evaluation tasks, where the result can only be pass or fail.
+We next present two key empirical observations that make calibrated confidences reliable:
+• Higher confidence implies higher accuracy. For the confidence functions defined above,
+even without calibration, samples with higher confidence tend to have higher accuracy (see
+Fig.1). The calibration methods described above do not alter the confidence ranking of
+samples during training, so this approximate monotonic relationship between confidence
+and accuracy is essential for these methods to be ultimately calibrated.
+• Calibration trained on the validation set generalizes to the test set. As shown in
+Fig.1, a confidence function calibrated on the validation set also remains calibrated on the
+test set. This indicates that confidence reflects the model’s underlying estimation of the
+data distribution, rather than being specialized only to the training set. Hence, calibrated
+confidence can be expected to remain reliable on in-distribution new data.
+The reliability of calibration is also reflected in the quantitative ECE (see Tab.1). Moreover, calibrated
+confidences across different models become comparable, which enables us to leverage confidence
+advantage between models to estimate their relative accuracy on specific problems.
+2.2 Cascading with Calibrated Advantage Routing
+Building on the comparability of confidences across models, we introduce the notion of confidence
+advantage. Consider two models M1 and M2 , define the confidence advantage of M1 compared
+to M2 in the i-th bin Bi as aci = c̄1i − c̄2i , and the accuracy advantage as avi = v̄i1 − v̄i2 , where
+superscripts 1 and 2 denote the respective model indices.
+A natural idea is to use confidence advantage as a routing signal for model cascading. Consider a large
+model Ml and a small model Ms . Both models are calibrated on the validation set, and histogram
+equalization is applied based on the confidence of the small model. Define the advantage function on
+the validation set as aci = c̄li − c̄si . By the generalization property of the advantage function, for data
+x outside the validation set, if its confidence under the small model falls into the i-th bin, then its
+expected advantage under the large model will also be close to aci . This calibrated advantage function
+reflects how much the M1 is better than that of M2 on bin Bi .
+Based on this, we design the following cascading method: consider the bins {Bi }N
+i=1 , sort them in
+ascending order of aci , and select the top K bins, corresponding to the K bins where the large model
+shows the smallest advantage over the small model, where K is a hyperparameter balancing accuracy
+and efficiency. For a new input x, we first perform inference with the small model to obtain the output
+4
+
+Ŷ and confidence cs (x). If cs (x) falls into one of the selected K bins, this indicates that the large
+model has only a marginal advantage on x, and thus we adopt the small model’s result. Otherwise, if
+cs (x) does not belong to these bins, we then invoke the large model for inference and use its output.
+The pseudocode of this algorithm is provided in Appendix Alg. 1.
+While cascading between a large and a small model provides a balance between accuracy and
+efficiency, we can also cascade two large models to push the performance limit. Our experiments
+show that such large–large cascades can surpass the performance of either individual model.
+2.3 Data Cleaning with Model Ensemble
+Even when the verifier contains occasional errors (e.g., mislabeled data in the dataset), calibrated
+confidence still provides a useful signal about the accuracy of model outputs. This in turn allows us
+to use model confidence to correct erroneous labels. We demonstrate our approach on data cleaning
+for the ImageNet and MMLU datasets, which are known to contain mislabeled samples.
+Basic Cleaning. The basic method is to treat cases where the model’s top-1 prediction (the class
+with the highest confidence) disagrees with the given label as labeling errors. However, this ignores
+the model’s own error probability, even if the model achieves high accuracy. Introducing multiple
+models as a mixture-of-experts can alleviate this issue. For example, consider two models M1 and
+M2 . The most basic filtering rule is to check whether both M1 and M2 produce top-1 predictions
+inconsistent with the ground-truth label. If both disagree, the label is likely incorrect. This approach
+depends on the accuracy of individual models and the independence between experts: the more
+independent the experts, the better the performance.
+Cleaning with Calibration. A more refined approach is to incorporate confidence, since models
+are highly accurate only on samples where they assign high calibrated confidence. A label is then
+flagged as erroneous when both models’ top-1 predictions disagree with the ground-truth label and
+their corresponding confidences fall into the top-K confidence bins, where the hyperparameter K
+thus controls the trade-off between precision and recall in data cleaning.
+Confident Learning. As a comparison, previous work has also used calibrated confidence for data
+cleaning, notably the Confident Learning (CL)[18] framework, in particular its Method 2. Let the
+given label of an input X be Ylabel (X). For each class Y , define its class-level average confidence as
+X
+1
+c̄(Y ) =
+cM (X ′ , Y ),
+′
+′
+|{X | Ylabel (X ) = Y }| ′
+′
+X :Ylabel (X )=Y
+
+where cM (X ′ , Y ) is the calibrated confidence of model M on class Y for input X ′ .
+For a new sample (X, Ylabel ), consider the set of candidate classes
+C(X) = {Y | cM (X, Y ) > c̄(Y )}.
+Among these candidates, take the class Y ∗ = arg maxY ∈C(X) cM (X, Y ). If Y ∗ ̸= Ylabel , then the
+label is predicted to be incorrect; otherwise, it is retained as correct. Appendix Alg.2 presents the
+pseudocodes for the three methods described above.
+
+3
+
+Experiments
+
+In this section, we first show that calibration is reliable: calibrated confidence is monotonic in
+accuracy and generalizes from the calibration split to a held-out test split. Building on this, we
+evaluate cascades in both vision and language. In small–large cascades, our approach assigns to the
+small model the subset it can solve, achieving a favorable accuracy–small model ratio trade-off; in
+large–large pairs, our approach exploits complementary strengths to further improve accuracy. Finally,
+we use cross-model agreement to drive data cleaning and show that higher confidence consistently
+yields higher cleaning precision. We split the validation set in half, using one part for calibration and
+the other for testing, and report all results on the test split.
+3.1
+
+calibration can be reliable
+
+We first validate the two key conclusions from Section 2.1—that higher confidence correlates with
+higher accuracy, and that calibration generalizes to the held-out test set. For consistency, we also
+5
+
+Reliability Diagrams Before and After Calibration.
+
+Reliability Diagrams Before and After Calibration.
+1.0
+
+0.8
+
+0.8
+
+0.6
+
+0.6
+
+Accuracy
+
+Accuracy
+
+1.0
+
+0.4
+
+0.4
+
+0.2
+
+0.2
+
+Val (No calib)
+Test (No calib)
+0.0
+0.0
+
+0.2
+
+0.4
+0.6
+Confidence
+
+Val (No calib)
+Test (No calib)
+
+Val (Calibrated)
+Test (Calibrated)
+0.8
+
+0.0
+0.0
+
+1.0
+
+0.2
+
+0.4
+
+0.6
+
+Val (Calibrated)
+Test (Calibrated)
+0.8
+
+1.0
+
+Confidence
+
+(a) ImageNet-1K (vision domain)
+
+(b) MMLU (language domain)
+
+Figure 1: Reliability Diagrams Before and After Calibration. Each panel plots accuracy vs. confidence across 15 equal-count bins. Light curves represent uncalibrated predictions; dark curves
+represent calibrated predictions. After calibration, confidence becomes more monotonic with accuracy and aligns more closely with the diagonal, indicating improved reliability and generalization
+from the calibration split to the held-out test split. Left: ImageNet model (EVA02-Large-448).
+Right: MMLU results from a LLama-8B-Instruct.
+Table 1: ECE Before and After Calibration on Validation and Test Sets. Results are reported for
+both the vision domain (ImageNet) and the language domain (MMLU). Calibration substantially
+reduces ECE on the validation set, and the improvement generalizes to the held-out test set.
+Dataset
+ImageNet
+MMLU
+
+Validation ECE (↓)
+
+Test ECE (↓)
+
+Before
+
+After
+
+Before
+
+After
+
+0.2617
+0.1902
+
+0.0271
+0.0913
+
+0.2624
+0.1830
+
+0.0296
+0.0901
+
+adopt equal-count binning to partition predictions, reporting bin-wise accuracy and confidence for
+both validation and test sets.
+Calibration on ImageNet Classification We first present the results on ImageNet using a single
+state-of-the-art model, EVA02-Large-448[6]. As shown in Figure 1a, the accuracy consistently
+increases with confidence across all bins, confirming the positive correlation between confidence and
+accuracy. Moreover, calibration performed on the validation set transfers well to the held-out test set,
+as evidenced by the close alignment between the ECE 1 on validation and test, demonstrating strong
+generalization of the calibration.
+Calibration on Language Model Generation We perform the same evaluation procedure on large
+language models. Specifically, we use calibrated confidence scores from LLaMA-8B-Instruct[7]
+and validate them on the MMLU benchmark. As shown in Figure 1b, validation and test accuracies
+remain closely aligned across confidence bins, confirming that the calibrated confidence scores
+generalize well even in the language modeling setting.
+3.2
+
+Cascade Small and Large Models
+
+In this section, we use the calibrated confidence advantage as a routing signal for combining models
+of small and large. Experiments show that the raw confidence advantage already serves as an effective
+indicator for the portion of data the small model can reliably handle. Calibration further stabilizes
+this signal, leading to more consistent routing decisions and achieving a better accuracy–small-model
+ratio trade-off on several datasets.
+We apply our proposed method to both image and language models. For evaluation, we consider the
+following baselines:
+6
+
+1. Random Cascading (RC) — Data instances are randomly assigned to the small model, and
+we report the theoretical accuracy computed as the average accuracy of the small model
+rather than running an explicit experiment.
+2. Confidence-Based Cascading (UC) — Instances with the highest confidence advantage
+from the small model are selected without applying any post-hoc calibration. This corresponds to the first (non-parametric) stage of our method alone.
+3. Confidence-Based Cascading with Calibration Method (CC) — Instances are selected
+based on the confidence advantage after applying post-hoc temperature scaling calibrator(hereafter referred to as t-scaling). This corresponds to the full version of our proposed
+method. We further show that the performance of our approach is not sensitive to the specific
+choice of calibration method, and that similar cascading behavior can be achieved with
+alternative calibrators; detailed results are provided in Appendix A.3.
+4. Matrix Factorization Routing (MF) — We additionally compare with the
+matrix–factorization-based router implemented in RouteLLM [19], a widely used stateof-the-art baseline for preference-driven routing. This method learns a low-dimensional
+scoring function to predict the relative quality between a small and a large model from
+pairwise preference data, and routes an input to the large model when the predicted win
+probability exceeds a learned threshold. Implementation and experimental settings of this
+baseline are detailed in Appendix D.
+Cascade ImageNet-only Small + Large
+
+Imagenet: Large-Model Cascade
+
+Imagenet: medium-Model
+Cascade
+best performance
+
+best trade-off
+
+0.860
+
+0.902
+
+0.90
+
+best performance
+0.901
+
+0.855
+
+Accuracy
+
+Accuracy
+
+0.850
+0.845
+0.840
+0.835
+
+Accuracy
+
+0.88
+
+0.86
+
+0.84
+
+0.82
+0.0
+
+0.2
+
+0.4
+0.6
+Small model ratio
+
+0.8
+
+1.0
+
+0.899
+0.898
+
+0.830
+0.825
+
+0.900
+
+0.897
+0.0
+
+(a)
+
+0.2
+
+0.4
+0.6
+model(eva02) ratio
+
+0.8
+
+(b)
+without t-scaling
+
+with t-scaling
+
+0.0
+
+1.0
+
+0.2
+
+0.4
+0.6
+model(eva02) ratio
+
+0.8
+
+1.0
+
+(c)
+Random baseline
+
+Figure 2: Cascade Results on ImageNet-1K. Each panel shows cascade accuracy vs. the routing
+ratio p. Panel (a) uses a small–large model pair, while panels (b) and (c) combine models of the same
+size, with panel (b) using a medium–medium pair and panel (c) using a large–large pair.
+MMLU
+0.78
+
+MBPP
+
+Best performance
+
+GSM8K
+0.86
+
+Best performance
+
+0.66
+
+Best performance
+
+0.76
+
+0.72
+0.70
+0.68
+
+Accuracy
+
+Accuracy
+
+Accuracy
+
+0.84
+
+0.64
+
+0.74
+
+0.62
+0.60
+0.58
+0.56
+
+0.2
+
+0.4
+
+0.6
+
+0.8
+
+1.0
+
+0.0
+
+0.2
+
+Small model ratio
+
+(a)
+
+0.6
+
+0.8
+
+(b)
+
+0.46
+
+0.84
+0.82
+
+0.6
+
+0.8
+
+1.0
+
+0.0
+
+0.800
+
+0.790
+0.2
+
+Small model ratio
+
+0.4
+
+0.6
+
+0.8
+
+1.0
+
+Small model ratio
+
+(d)
+with t-scaling
+
+0.805
+
+0.795
+
+0.80
+0.4
+
+1.0
+
+0.810
+
+0.86
+
+0.44
+0.42
+
+0.8
+
+0.815
+
+Accuracy
+
+Accuracy
+
+0.48
+
+0.6
+
+MMLU: Largte-Model Cascade
+Best performance
+
+0.88
+
+0.50
+
+0.4
+
+(c)
+
+ARC
+
+Best performance
+
+0.2
+
+0.2
+
+Small model ratio
+
+0.90
+
+0.52
+
+0.0
+
+0.76
+0.0
+
+1.0
+
+Best performance
+
+0.54
+
+Accuracy
+
+0.4
+
+Small model ratio
+
+BigCodeBench
+
+0.56
+
+0.80
+0.78
+
+0.66
+0.64
+0.0
+
+0.82
+
+(e)
+without t-scaling
+
+RouteLLM baseline
+
+0.0
+
+0.2
+
+0.4
+
+0.6
+
+0.8
+
+1.0
+
+model(qwen3) ratio
+
+(f)
+Random baseline
+
+Figure 3: Cascade Results on Language Models. Panels (a)–(e) show small–large model cascades
+on five datasets. Panel (f) shows a large–large cascade, where p denotes the fraction of samples routed
+to the first large model.
+7
+
+Cascading Results on ImageNet In the ImageNet experiments, we evaluate a single group of
+ImageNet-only models, consisting of a small model and a large model trained exclusively on
+ImageNet. As shown in Figure 2, we plot the accuracy curves of UC, CC, and a random-pick
+baseline as the proportion of small-model predictions increases. Because the small model on
+ImageNet is already well calibrated, UC and CC yield very similar performance. Nevertheless, both
+approaches consistently outperform random selection under the same proportion of small-model
+usage, demonstrating the effectiveness and robustness of the method on image classification models.
+Cascading Results on Language Models In the language model experiments, we select five diverse
+and widely adopted datasets: MBPP, BigCodeBench, MMLU, GSM8K, and ARC-Challenge. We use
+LLaMA-70B as the large model and LLaMA-8B as the small model. As shown in figure 3, CC
+consistently outperform matrix factorization routing and the random-pick baseline across all datasets.
+Moreover, CC consistently outperforms UC across the entire accuracy–small-model-ratio trade-off
+curve across all evaluated datasets, providing strong evidence that calibrated confidence leads to more
+effective routing in language modeling.
+3.3
+
+Cascading Same-Size Models
+
+In this section, we extend our approach to pairs of Same-Size models. We further show that using
+calibrated confidence as the routing signal enables two models with comparable overall capacity to
+complement each other by specializing on the data where each performs best, thereby improving
+overall accuracy. As illustrated in Figures 2b and 2c, when we cascade two medium-sized models
+(DeiT-B [27] and TinyViT [30]), each achieving around 82% accuracy individually, As illustrated
+in Figures 2b and 2c, when we cascade two medium-sized models—each achieving around 82%
+accuracy individually—the combined system reaches an astonishing peak accuracy of up to 90%.
+Moreover, cascading two state-of-the-art ImageNet models in this manner consistently achieves
+higher accuracy than either model alone.
+Similarly, on the MMLU dataset, pairing Qwen-32B with LLaMA-70B yields further performance gains
+as show in figure 3(f), demonstrating that calibrated confidence not only guides efficient routing but
+also facilitates effective collaboration between high-capacity models.
+Table 2: Cascade accuracy (%) of two EVA-02-Large models on the original and Cleaned half
+ImageNet validation sets. Model 1: eva02_large_patch14_448.mim_m38m_ft_in22k_in1k;
+Model 2: eva02_large_patch14_448.mim_in22k_ft_in22k_in1k.
+Model Combination
+Original ImageNet Cleaned ImageNet
+EVA02-L (M38M) + EVA02-L (IN22k)
+3.4
+
+90.116
+
+96.266
+
+Data Cleaning
+
+In this section, we demonstrate the effectiveness of leveraging model prediction agreement for data
+cleaning on both image and language models. We further show that cleaning precision improves as
+model confidence increases, highlighting a strong positive correlation between confidence and the
+reliability of the cleaned data.
+ImageNet Cleaning We use two high-performing ImageNet models (ranked 3rd and 4th1 as of the
+time of writing) as complementary experts to flag potential label issues. This avoids using the same
+models for both cleaning and evaluation, ensuring that the subsequent accuracy measurement remains
+independent. We compare our method against CL, a widely used label-cleaning approach. To assess
+quality, we randomly sampled 1,000 flagged images for manual verification by trained annotators,
+which serves as ground truth for estimating precision and detection rate. As shown in Table 3, Our
+method recovers most mislabeled samples found by CL and additionally discovers a much larger set of
+label errors with high verified precision, demonstrating its stronger ability to improve dataset integrity.
+We categorize errors into Wrong Label, Multi-Object, Similar Class, Subclass, and Superclass, with
+definitions and examples in Appendix C.
+Table 3: Comparison between our cleaning method and CL on ImageNet. We report the number of
+samples flagged by each method, the overlap between them, and the accuracy of samples uniquely
+flagged by each approach.
+1 https://github.com/huggingface/pytorch-image-models/blob/main/results/results-imagenet.
+
+csv
+
+8
+
+Method
+
+Overlap
+
+Flagged Samples
+
+Unique Accuracy (%)
+
+1283
+
+994
+82
+
+0.665
+0.537
+
+Ours
+Confident Learning
+
+Furthermore, to validate the conclusion of Section 2.3 — that the accuracy of identified mislabeled
+samples decreases as confidence decreases — we present the results in Figure 4a. As the detection rate
+increases (by progressively lowering the confidence threshold), the cleaning precision consistently
+declines, corroborating our claim. Moreover, across the entire detection range, our method achieves
+higher cleaning precision than CL at the same detection rate, demonstrating the superior.
+Ours
+Confident Learning
+
+Ours
+72.0%
+
+92.0%
+
+Cleaning Precision
+
+Cleaning Precision
+
+94.0%
+
+90.0%
+
+88.0%
+
+86.0%
+
+84.0%
+2.0%
+
+4.0%
+
+6.0%
+
+68.0%
+
+66.0%
+
+64.0%
+
+Confident Learning
+
+0.0%
+
+70.0%
+
+62.0%
+0.0%
+
+8.0%
+
+Cleaning Detection Rate
+
+2.5%
+
+5.0%
+
+7.5%
+
+10.0%
+
+Cleaning Detection Rate
+
+(a) ImageNet-1K
+
+(b) MMLU
+
+Figure 4: Cleaning Precision vs. Detection Rate. The horizontal axis (Cleaning Detection Rate) is
+defined as the ratio of flagged samples to the total dataset size. The vertical axis (Cleaning Precision)
+measures the fraction of truly mislabeled samples among the flagged ones, estimated using human
+verification. Samples are sorted by calibrated confidence in descending order and grouped into
+15 equal-count bins; progressively lowering the confidence threshold increases detection rate but
+typically decreases precision. The red star in panel (a) denotes the operating point of CL.
+Finally, after completing the data-cleaning process, we apply our cascade method to combine the two
+state-of-the-art ImageNet models(ranked 1th and 2th). As shown in Table 2, the combined model
+achieves an impressive accuracy of 96.266%, substantially surpassing the performance of either
+individual model.This result suggests that, when combined with proper data cleaning, the current
+state-of-the-art models already approach the upper bound of ImageNet performance, indicating that
+ImageNet has become a nearly saturated benchmark.
+Language Data Cleaning. Analogous to the vision setting, we use Qwen-32B [31] and LLaMA-70B
+as expert models to identify potentially mislabeled samples in language benchmarks including MMLU,
+ARC, and MBPP. Owing to the high cost of large-scale manual verification, we use responses generated
+by GPT-4o [1] in thinking mode as pseudo-labels for estimating precision and detection rate.
+Applying the same confidence-based filtering procedure as in the vision experiments, we partition
+flagged samples into 15 equal-count bins and observe a consistent monotonic trend across all datasets:
+precision decreases as bin confidence decreases. These results suggest that calibrated confidence
+provides a robust signal for balancing precision and detection rate in language-model settings.
+
+4
+
+Limitations and Conclusion
+
+Limitations. Our method relies on the availability of reliable confidence signals, which are naturally
+defined in classification and multiple-choice settings. Extending confidence estimation to freeform, open-ended language tasks remains an active area of research. Recent work has begun to
+explore confidence estimation for generated text, including black-box confidence modeling [20] and
+fine-grained confidence estimation during generation [11]. Additionally, methods for evaluating
+open-ended generation, such as LLM-based evaluators [15], have been proposed to provide proxy
+correctness signals.
+Conclusion. We propose a simple, multi-modal, and training-free framework that leverages calibrated confidence for model cascading and data cleaning. Our results show that calibrated confidence serves as a practical signal for identifying when a model does not know, enabling favorable
+accuracy–efficiency trade-offs and improved data quality. Overall, our work highlights the potential
+of transforming model self-awareness into actionable signals for building more efficient and reliable
+AI systems.
+9
+
+References
+[1] Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Florencia Leoni
+Aleman, Diogo Almeida, Janko Altenschmidt, Sam Altman, Shyamal Anadkat, et al. Gpt-4
+technical report. arXiv preprint arXiv:2303.08774, 2023.
+[2] Jacob Austin, Augustus Odena, Maxwell Nye, Maarten Bosma, Henryk Michalewski, David
+Dohan, Ellen Jiang, Carrie Cai, Michael Terry, Quoc Le, et al. Program synthesis with large
+language models. arXiv preprint arXiv:2108.07732, 2021.
+[3] Tolga Bolukbasi, Joseph Wang, Ofer Dekel, and Venkatesh Saligrama. Adaptive neural networks
+for efficient inference. In Proceedings of the 34th International Conference on Machine Learning
+(ICML), pages 527–536. PMLR, 2017.
+[4] Peter Clark, Isaac Cowhey, Oren Etzioni, Tushar Khot, Ashish Sabharwal, Carissa Schoenick,
+and Oyvind Tafjord. Think you have solved question answering? try arc, the ai2 reasoning
+challenge. arXiv preprint arXiv:1803.05457, 2018.
+[5] Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun, Lukasz Kaiser,
+Matthias Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano, et al. Training verifiers to
+solve math word problems. arXiv preprint arXiv:2110.14168, 2021.
+[6] Yuxin Fang, Quan Sun, Xinggang Wang, Tiejun Huang, Xinlong Wang, and Yue Cao. Eva-02:
+A visual representation for neon genesis. Image and Vision Computing, 149:105171, 2024.
+[7] Aaron Grattafiori, Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian,
+Ahmad Al-Dahle, Aiesha Letman, Akhil Mathur, Alan Schelten, Alex Vaughan, et al. The llama
+3 herd of models. arXiv preprint arXiv:2407.21783, 2024.
+[8] Devin Guillory, Vaishaal Shankar, Sayna Ebrahimi, Trevor Darrell, and Ludwig Schmidt. Predicting with confidence on unseen distributions. In Proceedings of the IEEE/CVF international
+conference on computer vision, pages 1134–1144, 2021.
+[9] Chuan Guo, Geoff Pleiss, Yu Sun, and Kilian Q. Weinberger. On calibration of modern neural
+networks. In Proceedings of the 34th International Conference on Machine Learning (ICML),
+pages 1321–1330. PMLR, 2017.
+[10] Chirag Gupta and Aaditya Ramdas. Distribution-free calibration guarantees for histogram
+binning without sample splitting. ArXiv, abs/2105.04656, 2021. URL https://api.
+semanticscholar.org/CorpusID:234357974.
+[11] Jinyi Han, Tingyun Li, Shisong Chen, Jie Shi, Xinyi Wang, Guanglei Yue, Jiaqing Liang, Xin
+Lin, Liqian Wen, Zulong Chen, and Yanghua Xiao. Mind the generation process: Fine-grained
+confidence estimation during llm generation, 2025. URL https://arxiv.org/abs/2508.
+12040.
+[12] Dan Hendrycks and Thomas Dietterich. Benchmarking neural network robustness to common
+corruptions and perturbations. arXiv preprint arXiv:1903.12261, 2019.
+[13] Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn Song, and
+Jacob Steinhardt. Measuring massive multitask language understanding. arXiv preprint
+arXiv:2009.03300, 2020.
+[14] Dmitry Lepikhin, HyoukJoong Lee, Yuanzhong Xu, Dehao Chen, Orhan Firat, Yanping Huang,
+Maxim Krikun, Noam Shazeer, and Zhifeng Chen. Gshard: Scaling giant models with conditional computation and automatic sharding. In International Conference on Learning Representations (ICLR), 2021.
+[15] Yang Liu, Dan Iter, Yichong Xu, Shuohang Wang, Ruochen Xu, and Chenguang Zhu. Geval: NLG evaluation using gpt-4 with better human alignment. In Houda Bouamor, Juan
+Pino, and Kalika Bali, editors, Proceedings of the 2023 Conference on Empirical Methods
+in Natural Language Processing, pages 2511–2522, Singapore, December 2023. Association
+for Computational Linguistics. doi: 10.18653/v1/2023.emnlp-main.153. URL https://
+aclanthology.org/2023.emnlp-main.153/.
+10
+
+[16] Francesco Maria Molfese, Luca Moroni, Luca Gioffrè, Alessandro Scirè, Simone Conia, and
+Roberto Navigli. Right answer, wrong score: Uncovering the inconsistencies of llm evaluation
+in multiple-choice question answering. In Findings of the Association for Computational
+Linguistics: ACL 2025, 2025.
+[17] Jeremy Nixon, Michael Dusenberry, Linchuan Zhang, Ghassen Jerfel, and Dustin Tran. Measuring calibration in deep learning. arXiv preprint arXiv:1904.01685, 2019.
+[18] Curtis G. Northcutt, Lu Jiang, and Isaac L. Chuang. Confident learning: Estimating uncertainty
+in dataset labels, 2022. URL https://arxiv.org/abs/1911.00068.
+[19] Isaac Ong, Amjad Almahairi, Vincent Wu, Wei-Lin Chiang, Tianhao Wu, Joseph E. Gonzalez,
+M Waleed Kadous, and Ion Stoica. RouteLLM: Learning to route LLMs from preference
+data. In The Thirteenth International Conference on Learning Representations, 2025. URL
+https://openreview.net/forum?id=8sSqNntaMr.
+[20] Tejaswini Pedapati, Amit Dhurandhar, Soumya Ghosh, Soham Dan, and Prasanna Sattigeri.
+Large language model confidence estimation via black-box access. Transactions on Machine
+Learning Research, 2025. ISSN 2835-8856. URL https://openreview.net/forum?id=
+WrWYChkyRI.
+[21] John Platt. Probabilistic outputs for support vector machines and comparisons to regularized likelihood methods. 1999. URL https://api.semanticscholar.org/CorpusID:56563878.
+[22] John Platt. Probabilistic outputs for support vector machines and comparisons to regularized
+likelihood methods. In Advances in Large Margin Classifiers, pages 61–74. MIT Press, 1999.
+[23] Olga Russakovsky, Jia Deng, Hao Su, Jonathan Krause, Sanjeev Satheesh, Sean Ma, Zhiheng
+Huang, Andrej Karpathy, Aditya Khosla, Michael Bernstein, et al. Imagenet large scale visual
+recognition challenge. International journal of computer vision, 115(3):211–252, 2015.
+[24] Noam Shazeer, Azalia Mirhoseini, Piotr Maziarz, Andy Davis, Quoc V. Le, Geoffrey Hinton,
+and Jeff Dean. Outrageously large neural networks: The sparsely-gated mixture-of-experts
+layer. In International Conference on Learning Representations (ICLR), 2017.
+[25] Claudio Spiess, David Gros, Kunal Suresh Pai, Michael Pradel, Md Rafiqul Islam Rabin, Amin
+Alipour, Susmit Jha, Prem Devanbu, and Toufique Ahmed. Calibration and correctness of
+language models for code. arXiv preprint arXiv:2402.02047, 2024.
+[26] Surat Teerapittayanon, Bradley McDanel, and Hsiang-Tsung Kung. Branchynet: Fast inference
+via early exiting from deep neural networks. In Proceedings of the 23rd International Conference
+on Pattern Recognition (ICPR), pages 2464–2469. IEEE, 2016.
+[27] Hugo Touvron, Matthieu Cord, Matthijs Douze, Francisco Massa, Alexandre Sablayrolles, and
+Hervé Jégou. Training data-efficient image transformers & distillation through attention. In
+International conference on machine learning, pages 10347–10357. PMLR, 2021.
+[28] Deng-Bao Wang, Lei Feng, and Min-Ling Zhang. Rethinking calibration of deep neural
+networks: Do not be afraid of overconfidence. In A. Beygelzimer, Y. Dauphin, P. Liang, and
+J. Wortman Vaughan, editors, Advances in Neural Information Processing Systems, 2021. URL
+https://openreview.net/forum?id=NJS8kp15zzH.
+[29] Xiaofang Wang, Dan Kondratyuk, Eric Christiansen, Kris M Kitani, Yair Alon, and Elad Eban.
+Wisdom of committees: An overlooked approach to faster and more accurate models. arXiv
+preprint arXiv:2012.01988, 2020.
+[30] Kan Wu, Jinnian Zhang, Houwen Peng, Mengchen Liu, Bin Xiao, Jianlong Fu, and Lu Yuan.
+Tinyvit: Fast pretraining distillation for small vision transformers. In European conference on
+computer vision, pages 68–85. Springer, 2022.
+[31] An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu,
+Chang Gao, Chengen Huang, Chenxu Lv, et al. Qwen3 technical report. arXiv preprint
+arXiv:2505.09388, 2025.
+11
+
+[32] Yue Zhang, Yafu Li, Leyang Cui, Deng Cai, Lemao Liu, Tingchen Fu, Xinting Huang, Enbo
+Zhao, Yu Zhang, Yulong Chen, et al. Siren’s song in the ai ocean: A survey on hallucination in
+large language models. Computational Linguistics, pages 1–46, 2025.
+[33] Terry Yue Zhuo, Minh Chien Vu, Jenny Chim, Han Hu, Wenhao Yu, Ratnadira Widyasari,
+Imam Nur Bani Yusuf, Haolan Zhan, Junda He, Indraneil Paul, et al. Bigcodebench: Benchmarking code generation with diverse function calls and complex instructions. arXiv preprint
+arXiv:2406.15877, 2024.
+
+12
+
+Appendix
+A
+
+Robustness Analysis of Model Cascading
+
+A.1
+
+Average Performance Gap Recovered (APGR)
+
+To evaluate the effectiveness of model cascading under different cost budgets, we use a normalized
+version of the Average Performance Gap Recovered (APGR), defined as the area under the normalized
+performance–cost curve.
+Let c ∈ [0, 1] denote the relative inference cost, and let P (c) denote the performance of the cascade
+at cost c. Let Pweak and Pstrong be the performances of the weak and strong models respectively. We
+first normalize the performance as:
+P̃ (c) =
+
+P (c) − Pweak
+.
+Pstrong − Pweak
+
+(1)
+
+The normalized APGR is then defined as:
+Z 1
+APGR =
+
+P̃ (c) dc.
+
+(2)
+
+0
+
+Under this normalization, the weak model corresponds to P̃ (c) = 0, the strong model corresponds
+to P̃ (c) = 1, and a random routing baseline corresponds to APGR = 0.5 (the diagonal in the
+cost–performance plane). Higher APGR therefore indicates a more effective cascade that recovers
+more of the performance gap between the weak and strong models across cost budgets.
+A.2
+
+Out-of-Distribution (OOD) Evaluation
+
+To evaluate the robustness of our cascading method under out-of-distribution (OOD) conditions, we
+select MMLU-Adversarial [16] as the OOD dataset for language models. For vision models, we
+choose three representative corruption types from ImageNet-C — Gaussian Noise, Motion Blur, and
+Fog — as OOD benchmarks, and evaluate the performance of the proposed cascading method on
+these datasets.
+ImageNet-C Gaussian Noise (severity=5)
+
+ImageNet-C Fog (severity=5)
+
+ImageNet-C Motion Blur (severity=5)
+0.750
+
+0.70
+
+0.50
+
+0.65
+
+0.725
+
+0.60
+
+0.700
+Accuracy
+
+0.55
+
+Accuracy
+
+Accuracy
+
+0.60
+
+0.55
+0.50
+0.45
+
+0.600
+
+0.35
+0.0
+
+0.2
+
+0.4
+0.6
+Small model ratio
+
+0.8
+
+1.0
+
+0.650
+0.625
+
+0.40
+
+0.45
+
+0.675
+
+0.575
+0.0
+
+0.2
+
+0.4
+0.6
+Small model ratio
+
+0.8
+
+1.0
+
+0.0
+
+0.2
+
+0.4
+0.6
+Small model ratio
+
+0.8
+
+1.0
+
+Figure 5: OOD evaluation on ImageNet-C [12] with all corruption types at severity level 5. Results
+for severity levels 1 and 3 are provided in the appendix.
+MMLU-Adversial
+
+0.78
+
+Accuracy
+
+0.76
+0.74
+0.72
+0.70
+Calibrated
+Random baseline
+
+0.68
+0.0
+
+0.2
+
+0.4
+
+0.6
+
+0.8
+
+1.0
+
+Small model ratio
+
+Figure 6: OOD Evaluation on MMLU-Adversarial
+13
+
+As shown in the figures 5 and 6 , on vision tasks, even under the most severe corruption setting
+(severity = 5), the cascading approach(CC) still significantly outperforms the random baseline. On
+language tasks, cascading performance is likewise substantially better than the random baseline,
+demonstrating the robustness and generalization ability of the CC method.
+A.3
+
+Effect of Calibration Methods on Model Cascading
+
+We evaluate several calibration methods. As shown in Table 4, the cascading performance remains
+largely consistent across different calibration method choices, indicating that CC method is not
+sensitive to the specific calibration technique used.
+Table 4: APGR of model cascading with different Post-hoc calibration methods.
+APGR / Dataset
+MMLU MBPP GSM8K
+Histogram Binning
+Temperature Scaling
+Platt Scaling
+
+A.4
+
+0.7006
+0.7013
+0.7013
+
+0.6609
+0.6772
+0.6897
+
+0.7489
+0.7593
+0.7496
+
+Sensitivity to the Number of Bins
+
+Additional experiments are conducted to analyze how the number of bins affects cascading performance. As shown in Table 5, the method remains stable across a wide range of bin choices.
+Table 5: Effect of the number of bins on model cascading (APGR).
+Dataset
+#Bins = 5 #Bins = 15 #Bins = 50 #Bins = 100
+MMLU
+GSM8K
+
+A.5
+
+0.6917
+0.7378
+
+0.7013
+0.7496
+
+0.7044
+0.7547
+
+0.7035
+0.7551
+
+Additional OOD Results on ImageNet-C (Severity Levels 1 and 3)
+
+It can be observed that as the OOD severity increases, the cascading performance gradually degrades.
+However, even at the most severe corruption level (severity = 5), the cascading performance remains
+well above the random baseline (0.5), demonstrating the robustness of the proposed cascading method.
+Table 6: APGR of Model Cascading on OOD Image Datasets.
+Severity
+Gaussian Noise Motion Blur
+Fog
+Original ImageNet
+1
+3
+5
+
+0.7984
+0.8158
+0.7588
+0.6364
+
+B
+
+Annotation and Verification Procedure
+
+B.1
+
+Imagenet Cleaning Verification Guidelines
+
+–
+0.8014
+0.7267
+0.5999
+
+Guidelines for Label-Cleaning Validation (Full Instructions)
+Columns in the Excel Sheet
+• Image Index
+• Image
+• Model 1 Prediction
+
+14
+
+–
+0.7675
+0.7220
+0.5409
+
+• Model 2 Prediction
+• Ground-Truth (GT) Label
+• Your Answer
+Important Note. All provided samples are cases where the predictions from Model 1 and/or Model 2
+do not match the ground-truth (GT) label. However, the predictions from Model 1 and Model 2 may be
+identical to each other.
+Your Task. Determine the correctness of the GT label by referencing the Image, the Model 1 & 2
+Predictions, and the GT Label. Based on your evaluation, enter an integer 1–4 in the “Your Answer” cell
+for that row.
+Classification Categories
+1. (GT wrong): The image does not contain the object described by the GT label.
+2. (GT and model correct): The object in the GT label and the object in at least one of the model
+predictions (Model 1 or 2) are present in the image.
+3. (Only GT correct): The image only contains the object described by the GT label (and does not contain
+the objects from either of the model predictions).
+4. Unable to determine.
+Supplementary Instructions
+Tools. You may use LLMs (e.g., Gemini, ChatGPT) and search engines to assist your judgment. When using
+a search engine, adding the keyword “ImageNet” can refine your search. This website can also provide other
+images from a specific category, e.g., https://salient-imagenet.cs.umd.edu/explore/. However,
+you should not accept an LLM’s answer directly. For challenging cases—such as distinguishing between
+two similar biological species—you must use these tools to learn about the key features and then make
+your own informed decision.
+Focus. Your primary goal is to assess the correctness of the GT label. However, it is essential to consider
+the model predictions, as comparing the different labels is often critical for making an accurate judgment.
+Clarification for Category 1 (GT wrong). If the image clearly does not contain the object specified by
+the GT label, you should select Category 1 immediately. You do not need to evaluate whether the model
+predictions are present in the image.
+Examples for Category 2 (GT and model correct).
+• Multiple Objects: The image contains several objects. The model prediction(s) correctly identify one
+object, while the GT label correctly identifies a different one.
+• Hierarchical/Aspectual Labels: The model prediction(s) and the GT label describe the image at
+different levels of specificity or from different perspectives, but both are technically correct (e.g.,
+“off-road vehicle” vs. “four-wheeler”; “laptop” vs. “notebook”).
+Handling Lack of Information.
+• If you can clearly determine that the image contains the object from a model prediction, but you lack
+sufficient information to judge the object in the GT label, choose Category 1 (GT wrong).
+• If you can clearly determine that the image contains the object from the GT label, but you lack sufficient
+information to judge the object(s) in the model prediction(s), choose Category 3 (Only GT correct).
+• Choose Category 4 (Unable to determine) only when there is insufficient information to determine the
+presence of both the GT label’s object and the model predictions’ objects.
+Handling Identical Label Names (Rare Case). In the very rare situation where the GT label and a model
+prediction are the same name but refer to different actual categories, please select Category 1 (GT wrong).
+
+B.2
+
+MMLU Cleaning Verification Guidelines
+
+To verify the correctness of samples in the Confmat00 set (where both models fail), we reconstruct
+the original MMLU questions and prompt a GPT model as an independent judge. Each question is
+presented with its four multiple-choice options, and the model is instructed to answer with exactly
+one capital letter (A, B, C, or D) without explanation. We then compare the model’s response with
+the ground-truth label to estimate the true accuracy of samples in this error region. Temperature is set
+to 0.0 to minimize randomness.
+15
+
+C
+
+Representative Examples of ImageNet Label Errors
+
+(1) Wrong Label: the annotated label does not correspond to any object in the image (e.g., a digital
+watch labeled as “stopwatch”).
+
+Label: stopwatchTrue: digital watch Label: projectileTrue: warplane Label: water jugTrue: water bottle
+
+(2) Multi-Object: images containing multiple objects where only one was labeled, leading to
+incomplete annotations (e.g., “phone” without lamp, “screen” without desk, or “shovel” without the
+tent).
+
+Label: phoneTrue: phone + lamp Label: screenTrue: screen + desk Label: shovelTrue: shovel + mountain tent
+
+(3) Similar Class: cases where the annotated label belongs to a visually similar.
+
+Label: desktopSimilar: notebook Label: maillotSimilar: maillot Label: screenSimilar: monitior
+
+Super/Sub Class: errors where the annotated label is at a different granularity level from the ground
+truth. This includes cases where the label is too broad (super-class) or too specific (sub-class)
+compared to the true category, as well as sibling-class mismatches within the same hierarchy.
+16
+
+Label: garden spiderSub: black and gold garden spider
+
+D
+
+Label: mushroom Sub: agaric
+
+Label: water jugTrue: water bottle
+
+Implementation Details of the Matrix Factorization Router
+
+In this section, we describe the implementation and experimental settings for the Matrix Factorization
+(MF) routing baseline adopted in our comparisons.
+Training settings.
+
+We implement the MF router in three ways:
+
+1. Pretrained: We directly use the pretrained router checkpoint provided by the authors of
+RouteLLM.
+2. Fine-tuned: We fine-tune the pretrained router on the target task dataset using the same loss
+and optimization settings as in the original work.
+3. From scratch: We train the router from scratch on the target task dataset using randomly
+initialized parameters.
+In Figure 3, for each dataset we select the implementation that achieves the highest APGR as the
+baseline for comparison with other methods.
+Table 7: APGR of different MF router implementations across datasets.
+Implementation MMLU GSM8K MBPP ARC Bigcodebench
+Pretrained
+Fine-tuned
+From scratch
+
+E
+
+0.5418
+0.5497
+0.5267
+
+0.5672
+0.5718
+0.6234
+
+Algorithm Pseudo-codes
+
+17
+
+0.5500
+0.5479
+0.5909
+
+0.5102
+0.5114
+0.4933
+
+0.4320
+0.4310
+0.4185
+
+Algorithm 1: Model Cascading with t-scaling Advantage Routing
+Input: Large model Ml , small model Ms ; validation set V; number of bins N ; selection budget
+K (1 ≤ K ≤ N ).
+Output: A router that decides whether to use Ms or Ml for a new input x.
+Phase I: Calibration and bin statistics on V.
+Calibrate Ml and Ms on a held-out validation set V to obtain calibrated confidence functions
+cl (·) and cs (·).
+foreach (X, Y ) ∈ V do
+Compute the small-model confidence cs (X) (or cs (X, Ŷ ) if label-specific).
+Apply histogram equalization on {cs (X) : (X, Y ) ∈ V} to form N bins {bi }N
+i=1 of
+(approximately) equal size.
+for i ← 1 to N do
+P
+Compute c̄si := |b1i | (X,Y )∈bi cs (X).
+P
+Compute c̄li := |b1i | (X,Y )∈bi cl (X).
+Compute the confidence advantage aci := c̄li − c̄si .
+Sort bins {b1 , . . . , bN } in ascending order of aci and let S ⊂ {b1 , . . . , bN } be the first K bins
+(smallest advantages).
+Phase II: Routing on a new input x.
+Obtain the small-model prediction Ŷs (x) and confidence cs (x).
+Find the bin index i such that cs (x) ∈ bi .
+if bi ∈ S then
+return use Ms : output Ŷs (x).
+else
+Run the large model to obtain Ŷl (x); return use Ml : output Ŷl (x).
+
+18
+
+Algorithm 2: Data Cleaning with t-scaling Confidence
+Input: Noisy dataset D, calibrated models M1 , M2 , . . . , Mm , number of bins N , threshold T .
+Output: Filtered dataset D′ with corrected labels.
+Method 1: Top-1 Disagreement (Sec. 2.3.1).
+foreach (X, Ylabel ) ∈ D do
+foreach model Mj , j = 1, . . . , m do
+Compute Yj∗ (X) = arg maxY cMj (X, Y ).
+if Yj∗ (X) ̸= Ylabel for all j then
+Mark Ylabel as erroneous.
+Method 2: High-Confidence Disagreement (Sec. 2.3.2).
+On the validation set, for each model Mj , apply histogram equalization to its confidences
+j
+{cMj (X)} to form N bins {bji }N
+i=1 . Let Btop-K denote the K bins (for model Mj ) with the
+highest average accuracy.
+foreach (X, Ylabel ) ∈ D do
+foreach model Mj , j = 1, . . . , m do
+Compute
+Yj∗ (X) = arg max cMj (X, Y ),
+Y
+
+cMj (X) = max cMj (X, Y ).
+Y
+
+j
+if Yj∗ (X) ̸= Ylabel for all j and cMj (X) ∈ Btop-K
+for all j then
+Mark Ylabel as erroneous.
+
+Method 3: CLEANLAB-inspired Averaging (Sec. 2.3.3).
+For each class Y , compute
+X
+1
+c̄(Y ) =
+′
+′
+|{X : Ylabel (X ) = Y }| ′
+′
+
+X :Ylabel (X )=Y
+
+foreach (X, Ylabel ) ∈ D do
+Define C(X) = {Y : cM (X, Y ) > c̄(Y )}.
+Let Y ∗ (X) = arg maxY ∈C(X) cM (X, Y ).
+if Y ∗ (X) ̸= Ylabel then
+Mark Ylabel as erroneous.
+
+19
+
+cM (X ′ , Y ).
+
+
